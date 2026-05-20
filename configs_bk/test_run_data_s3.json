@@ -1,0 +1,69 @@
+{
+  "model": {
+    "latent_channels": 32,
+    "patch_size": 16,
+    "sigmas": [
+      2,
+      4,
+      8,
+      16
+    ],
+    "cell_sizes": [
+      16,
+      32,
+      64,
+      128
+    ],
+    "max_targets_per_image": 16,
+    "ema_momentum": 0.996,
+    "normalize_loss": true
+  },
+  "data": {
+    "data_root": "data",
+    "npy_pattern": "*.npy",
+    "log_transform": true,
+    "log_eps": 1.0,
+    "cube_slice_strategy": "random",
+    "cube_slice_axis": 0,
+    "cube_slice_index": 0,
+    "num_samples": 64,
+    "image_size": 256
+  },
+  "train": {
+    "epochs": 1,
+    "batch_size": 4,
+    "num_workers": 0,
+    "lr": 0.0001,
+    "weight_decay": 1e-05,
+    "momentum": 0.996,
+    "log_interval": 1
+  },
+  "loss": {
+    "weight_jepa": 1.0,
+    "weight_pixel": 0.0
+  },
+  "blur_demo": {
+    "scales": [
+      2,
+      4,
+      8,
+      16
+    ],
+    "radius": 32,
+    "num_random_centers": "auto",
+    "use_grid_centers": true,
+    "grid_size": 8,
+    "grid_rows": 8,
+    "grid_cols": 8,
+    "box_half": 16,
+    "mask_scale": 2.0,
+    "pyramid_spacing_mult": 2.0,
+    "auto_pyramid_count": true,
+    "channel_box_from_scales": true,
+    "use_gaussian_dip": false,
+    "dip_sigma_mult": 1.0,
+    "center_jitter": 8,
+    "seed": 303,
+    "make_channel_plot": false
+  }
+}
