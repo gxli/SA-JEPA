@@ -1,3 +1,3 @@
-from .losses import DualJEPALoss
+from .losses import LegacyDualJEPALoss
 
-__all__ = ["DualJEPALoss"]
+__all__ = ["LegacyDualJEPALoss"]

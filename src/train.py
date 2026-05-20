@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import csv
+import hashlib
 import json
 import os
 import time
@@ -12,7 +15,18 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from src.dataset import JEPADataset
+from src.inference import run_post_training_inference
 from src.models.build_jepa import PyramidGridJEPA
+
+
+def _fmt_metric(v: float) -> str:
+    x = float(v)
+    ax = abs(x)
+    if ax == 0.0:
+        return "0.0000"
+    if ax < 1e-3 or ax >= 1e3:
+        return f"{x:.3e}"
+    return f"{x:.4f}"
 
 
 def _compute_pca_2d(x: np.ndarray) -> np.ndarray:
@@ -20,7 +34,8 @@ def _compute_pca_2d(x: np.ndarray) -> np.ndarray:
         from sklearn.decomposition import PCA
 
         return PCA(n_components=2).fit_transform(x)
-    except Exception:
+    except Exception as e:
+        print(f"[warning] sklearn PCA(2D) failed: {type(e).__name__}: {e}; falling back to torch.pca_lowrank")
         x_t = torch.from_numpy(x.astype(np.float32))
         x_t = x_t - x_t.mean(dim=0, keepdim=True)
         u, s, _ = torch.pca_lowrank(x_t, q=2)
@@ -34,38 +49,75 @@ def _compute_pca_3d(x: np.ndarray) -> np.ndarray:
         from sklearn.decomposition import PCA
 
         return PCA(n_components=3).fit_transform(x)
-    except Exception:
+    except Exception as e:
+        print(f"[warning] sklearn PCA(3D) failed: {type(e).__name__}: {e}; falling back to numpy SVD")
         u, s, _ = np.linalg.svd(x.astype(np.float64), full_matrices=False)
         z = (u[:, :3] * s[:3]).astype(np.float32)
         return z
 
 
-def _compute_umap_nd(x: np.ndarray, n_components: int = 3) -> np.ndarray:
+def _preprocess_latents_for_umap(x: np.ndarray, l2_normalize: bool = False, standardize: bool = False) -> np.ndarray:
+    z = np.asarray(x, dtype=np.float32)
+    if l2_normalize:
+        denom = np.linalg.norm(z, axis=1, keepdims=True)
+        z = z / np.clip(denom, 1e-12, None)
+    if standardize:
+        mu = z.mean(axis=0, keepdims=True)
+        sd = z.std(axis=0, keepdims=True)
+        z = (z - mu) / np.clip(sd, 1e-6, None)
+    return z
+
+
+def _compute_umap_nd(
+    x: np.ndarray,
+    n_components: int = 3,
+    n_neighbors: int = 15,
+    min_dist: float = 0.05,
+    metric: str = "cosine",
+    random_state: int = 42,
+) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
     try:
         from cuml.manifold import UMAP as CuMLUMAP
 
-        return CuMLUMAP(n_components=n_components, random_state=42).fit_transform(x)
-    except Exception:
-        pass
+        return CuMLUMAP(
+            n_components=n_components,
+            n_neighbors=int(n_neighbors),
+            min_dist=float(min_dist),
+            metric=str(metric),
+            random_state=int(random_state),
+        ).fit_transform(x)
+    except Exception as e:
+        print(f"[warning] cuML UMAP failed: {type(e).__name__}: {e}")
 
     try:
         import torchdr
 
         if hasattr(torchdr, "UMAP"):
-            model = torchdr.UMAP(n_components=n_components)
+            model = torchdr.UMAP(
+                n_components=n_components,
+                n_neighbors=int(n_neighbors),
+                min_dist=float(min_dist),
+            )
             z = model.fit_transform(torch.from_numpy(x.astype(np.float32)))
             if isinstance(z, torch.Tensor):
                 return z.cpu().numpy()
             return np.asarray(z)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[warning] torchdr UMAP failed: {type(e).__name__}: {e}")
 
     try:
         import umap
 
-        return umap.UMAP(n_components=n_components, random_state=42).fit_transform(x)
-    except Exception:
-        pass
+        return umap.UMAP(
+            n_components=n_components,
+            n_neighbors=int(n_neighbors),
+            min_dist=float(min_dist),
+            metric=str(metric),
+            random_state=int(random_state),
+        ).fit_transform(x)
+    except Exception as e:
+        print(f"[warning] umap-learn failed: {type(e).__name__}: {e}")
 
     if n_components == 2:
         return _compute_pca_2d(x)
@@ -76,57 +128,140 @@ def _compute_umap_nd(x: np.ndarray, n_components: int = 3) -> np.ndarray:
 
 
 def _save_latent_overview_html(session_dir: str, pca_points: np.ndarray, umap_points: np.ndarray, h: int, w: int) -> str:
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-
-    def rgb_from_points(points: np.ndarray):
-        mins = points.min(axis=0)
-        maxs = points.max(axis=0)
-        rng = np.maximum(maxs - mins, 1e-12)
-        norm = np.clip((points - mins) / rng, 0.0, 1.0)
-        rgb_u8 = (norm * 255.0).astype(np.uint8)
-        colors = [f"rgb({r},{g},{b})" for r, g, b in rgb_u8]
-        return rgb_u8.reshape(h, w, 3), colors
-
-    pca_img, pca_colors = rgb_from_points(pca_points)
-    umap_img, umap_colors = rgb_from_points(umap_points)
-
-    fig = make_subplots(
-        rows=2,
-        cols=2,
-        specs=[[{"type": "xy"}, {"type": "scene"}], [{"type": "xy"}, {"type": "scene"}]],
-        subplot_titles=["PCA Color Map", "PCA XYZ", "UMAP Color Map", "UMAP XYZ"],
-        horizontal_spacing=0.06,
-        vertical_spacing=0.08,
-    )
-    fig.add_trace(go.Image(z=pca_img), row=1, col=1)
-    fig.add_trace(
-        go.Scatter3d(
-            x=pca_points[:, 0], y=pca_points[:, 1], z=pca_points[:, 2], mode="markers", marker={"size": 2, "color": pca_colors}
-        ),
-        row=1,
-        col=2,
-    )
-    fig.add_trace(go.Image(z=umap_img), row=2, col=1)
-    fig.add_trace(
-        go.Scatter3d(
-            x=umap_points[:, 0], y=umap_points[:, 1], z=umap_points[:, 2], mode="markers", marker={"size": 2, "color": umap_colors}
-        ),
-        row=2,
-        col=2,
-    )
-    fig.update_layout(
-        title="Latent Overview: PCA/UMAP Color Maps vs XYZ",
-        template="plotly_white",
-        width=1400,
-        height=900,
-        scene={"xaxis_title": "PC1", "yaxis_title": "PC2", "zaxis_title": "PC3", "aspectmode": "cube"},
-        scene2={"xaxis_title": "U1", "yaxis_title": "U2", "zaxis_title": "U3", "aspectmode": "cube"},
-    )
-    fig.update_yaxes(scaleanchor="x", scaleratio=1, row=1, col=1)
-    fig.update_yaxes(scaleanchor="x2", scaleratio=1, row=2, col=1)
     out_path = os.path.join(session_dir, "latent_overview_4panel.html")
-    fig.write_html(out_path, include_plotlyjs="cdn")
+    pca = np.asarray(pca_points, dtype=np.float32)
+    umap = np.asarray(umap_points, dtype=np.float32)
+    if pca.shape[1] != 3 or umap.shape[1] != 3:
+        raise ValueError(f"Expected 3D points for PCA/UMAP, got pca={pca.shape}, umap={umap.shape}")
+    n = int(h * w)
+    if pca.shape[0] != n or umap.shape[0] != n:
+        raise ValueError(f"Point count mismatch with map shape: h*w={n}, pca={pca.shape[0]}, umap={umap.shape[0]}")
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Latent Overview: PCA/UMAP Color Maps vs XYZ</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 14px; color: #111; }}
+    .topbar {{ display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }}
+    .topbar label {{ font-size: 13px; }}
+    #plot {{ width: 100%; height: 920px; }}
+  </style>
+</head>
+<body>
+  <h2>Latent Overview: PCA/UMAP Color Maps vs XYZ</h2>
+  <div class="topbar">
+    <label>Low percentile <input id="pctLow" type="number" min="0" max="99" step="0.1" value="1.0" /></label>
+    <label>High percentile <input id="pctHigh" type="number" min="1" max="100" step="0.1" value="99.0" /></label>
+    <button id="applyBtn" type="button">Apply Range</button>
+    <span id="status"></span>
+  </div>
+  <div id="plot"></div>
+<script>
+const H = {int(h)};
+const W = {int(w)};
+const pca = {json.dumps(pca.tolist())};
+const umap = {json.dumps(umap.tolist())};
+function clamp(v, lo, hi) {{ return Math.max(lo, Math.min(hi, v)); }}
+function percentile(sortedArr, pct) {{
+  if (sortedArr.length === 0) return 0.0;
+  const p = clamp(pct, 0, 100) / 100.0;
+  const idx = (sortedArr.length - 1) * p;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sortedArr[lo];
+  const t = idx - lo;
+  return sortedArr[lo] * (1.0 - t) + sortedArr[hi] * t;
+}}
+function mapRgb(points, loPct, hiPct) {{
+  const n = points.length;
+  const d0 = new Array(n);
+  const d1 = new Array(n);
+  const d2 = new Array(n);
+  for (let i = 0; i < n; i++) {{
+    d0[i] = points[i][0];
+    d1[i] = points[i][1];
+    d2[i] = points[i][2];
+  }}
+  const s0 = d0.slice().sort((a, b) => a - b);
+  const s1 = d1.slice().sort((a, b) => a - b);
+  const s2 = d2.slice().sort((a, b) => a - b);
+  const lo0 = percentile(s0, loPct), hi0 = percentile(s0, hiPct);
+  const lo1 = percentile(s1, loPct), hi1 = percentile(s1, hiPct);
+  const lo2 = percentile(s2, loPct), hi2 = percentile(s2, hiPct);
+  const r = new Uint8Array(n), g = new Uint8Array(n), b = new Uint8Array(n);
+  const colors = new Array(n);
+  const rgbImage = new Array(H);
+  for (let y = 0; y < H; y++) rgbImage[y] = new Array(W);
+  for (let i = 0; i < n; i++) {{
+    const rr = clamp((d0[i] - lo0) / (Math.max(hi0 - lo0, 1e-8)), 0.0, 1.0);
+    const gg = clamp((d1[i] - lo1) / (Math.max(hi1 - lo1, 1e-8)), 0.0, 1.0);
+    const bb = clamp((d2[i] - lo2) / (Math.max(hi2 - lo2, 1e-8)), 0.0, 1.0);
+    r[i] = Math.round(rr * 255.0);
+    g[i] = Math.round(gg * 255.0);
+    b[i] = Math.round(bb * 255.0);
+    colors[i] = `rgb(${{r[i]}},${{g[i]}},${{b[i]}})`;
+    const yy = Math.floor(i / W);
+    const xx = i - yy * W;
+    rgbImage[yy][xx] = [r[i], g[i], b[i]];
+  }}
+  return {{ rgbImage, colors }};
+}}
+function mkScatter(points, colors, sceneName) {{
+  return {{
+    type: "scatter3d",
+    mode: "markers",
+    x: points.map(p => p[0]),
+    y: points.map(p => p[1]),
+    z: points.map(p => p[2]),
+    marker: {{ size: 2, opacity: 0.5, color: colors }},
+    scene: sceneName,
+    showlegend: false,
+  }};
+}}
+function render(loPct, hiPct) {{
+  const lo = Number.isFinite(loPct) ? loPct : 1.0;
+  const hi = Number.isFinite(hiPct) ? hiPct : 99.0;
+  const pcaMapped = mapRgb(pca, lo, hi);
+  const umapMapped = mapRgb(umap, lo, hi);
+  const traces = [
+    {{ type: "image", z: pcaMapped.rgbImage, xaxis: "x", yaxis: "y", hoverinfo: "skip" }},
+    mkScatter(pca, pcaMapped.colors, "scene"),
+    {{ type: "image", z: umapMapped.rgbImage, xaxis: "x2", yaxis: "y2", hoverinfo: "skip" }},
+    mkScatter(umap, umapMapped.colors, "scene2"),
+  ];
+  const layout = {{
+    width: 1400, height: 920, template: "plotly_white",
+    margin: {{l: 30, r: 10, t: 70, b: 20}},
+    annotations: [
+      {{text: "PCA Color Map", x: 0.18, y: 1.03, xref: "paper", yref: "paper", showarrow: false}},
+      {{text: "PCA XYZ", x: 0.72, y: 1.03, xref: "paper", yref: "paper", showarrow: false}},
+      {{text: "UMAP Color Map", x: 0.18, y: 0.48, xref: "paper", yref: "paper", showarrow: false}},
+      {{text: "UMAP XYZ", x: 0.72, y: 0.48, xref: "paper", yref: "paper", showarrow: false}},
+    ],
+    xaxis: {{domain: [0.0, 0.44], showticklabels: false}},
+    yaxis: {{domain: [0.55, 1.0], showticklabels: false, scaleanchor: "x", scaleratio: 1}},
+    xaxis2: {{domain: [0.0, 0.44], showticklabels: false}},
+    yaxis2: {{domain: [0.0, 0.45], showticklabels: false, scaleanchor: "x2", scaleratio: 1}},
+    scene: {{domain: {{x: [0.52, 1.0], y: [0.55, 1.0]}}, aspectmode: "cube", xaxis: {{title: "PC1"}}, yaxis: {{title: "PC2"}}, zaxis: {{title: "PC3"}}}},
+    scene2: {{domain: {{x: [0.52, 1.0], y: [0.0, 0.45]}}, aspectmode: "cube", xaxis: {{title: "U1"}}, yaxis: {{title: "U2"}}, zaxis: {{title: "U3"}}}},
+  }};
+  Plotly.newPlot("plot", traces, layout, {{responsive: true}});
+  document.getElementById("status").textContent = `Applied range: low=${{lo.toFixed(1)}} high=${{hi.toFixed(1)}}`;
+}}
+document.getElementById("applyBtn").addEventListener("click", () => {{
+  const lo = parseFloat(document.getElementById("pctLow").value);
+  const hi = parseFloat(document.getElementById("pctHigh").value);
+  render(lo, hi);
+}});
+render(1.0, 99.0);
+</script>
+</body></html>
+"""
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
     return out_path
 
 
@@ -150,14 +285,32 @@ def save_blurred_debug_images(
     return out_dir
 
 
-def save_inference_dashboard(session_dir: str, outputs: dict) -> str:
+def save_blurred_reference_images(session_dir: str, x_clean_raw: torch.Tensor, x_context_raw: torch.Tensor) -> str:
+    out_dir = os.path.join(session_dir, "results")
+    os.makedirs(out_dir, exist_ok=True)
+    clean = x_clean_raw[0, 0].detach().cpu().numpy().astype(np.float32)
+    ctx = x_context_raw[0, 0].detach().cpu().numpy().astype(np.float32)
+    delta = clean - ctx
+    plt.imsave(os.path.join(out_dir, "reference_000_clean.png"), clean, cmap="gray")
+    plt.imsave(os.path.join(out_dir, "reference_000_context_blurred.png"), ctx, cmap="gray")
+    plt.imsave(os.path.join(out_dir, "reference_000_clean_minus_context.png"), delta, cmap="coolwarm")
+    return out_dir
+
+
+def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | None = None) -> str:
+    umap_cfg = dict(umap_cfg or {})
+    umap_n_neighbors = int(umap_cfg.get("n_neighbors", 15))
+    umap_min_dist = float(umap_cfg.get("min_dist", 0.05))
+    umap_metric = str(umap_cfg.get("metric", "cosine"))
+    umap_random_state = int(umap_cfg.get("random_state", 42))
+    umap_l2_normalize = bool(umap_cfg.get("l2_normalize", False))
+    umap_standardize = bool(umap_cfg.get("standardize", False))
+
     x_clean_raw = outputs.get("x_clean_raw", outputs["x_clean"])
     x_context_raw = outputs.get("x_context_raw", outputs["x_context"])
     x_clean = outputs["x_clean"]
     x_context = outputs["x_context"]
     target_locations = outputs["target_locations"]
-    target_scales = outputs["target_scales"]
-    target_valid = outputs["target_valid"]
     pred_map = outputs["pred_map"]
     gt_map = outputs["gt_map"]
     context_map = outputs.get("context_map")
@@ -176,16 +329,20 @@ def save_inference_dashboard(session_dir: str, outputs: dict) -> str:
     pred_vec = pred_map.detach().cpu().permute(0, 2, 3, 1).reshape(-1, pred_map.shape[1]).numpy()
     gt_vec = gt_map.detach().cpu().permute(0, 2, 3, 1).reshape(-1, gt_map.shape[1]).numpy()
     x = np.concatenate([pred_vec, gt_vec], axis=0)
-    y = np.concatenate(
-        [np.zeros(pred_vec.shape[0], dtype=np.int32), np.ones(gt_vec.shape[0], dtype=np.int32)], axis=0
-    )
 
     pca_cache = os.path.join(session_dir, "pca_embeddings.npy")
-    umap_cache = os.path.join(session_dir, "umap_embeddings.npy")
+    umap_cache_key = hashlib.md5(json.dumps(umap_cfg, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+    umap_cache = os.path.join(session_dir, f"umap_embeddings_{umap_cache_key}.npy")
+    x_umap = _preprocess_latents_for_umap(
+        x,
+        l2_normalize=umap_l2_normalize,
+        standardize=umap_standardize,
+    )
     if os.path.exists(pca_cache):
         try:
             pca_2d = np.load(pca_cache)
-        except Exception:
+        except Exception as e:
+            print(f"[warning] failed to load PCA cache {pca_cache}: {type(e).__name__}: {e}; recomputing")
             pca_2d = _compute_pca_2d(x)
             np.save(pca_cache, pca_2d)
     else:
@@ -194,15 +351,31 @@ def save_inference_dashboard(session_dir: str, outputs: dict) -> str:
     if os.path.exists(umap_cache):
         try:
             umap_3d = np.load(umap_cache)
-        except Exception:
-            umap_3d = _compute_umap_nd(x, n_components=3)
+        except Exception as e:
+            print(f"[warning] failed to load UMAP cache {umap_cache}: {type(e).__name__}: {e}; recomputing")
+            umap_3d = _compute_umap_nd(
+                x_umap,
+                n_components=3,
+                n_neighbors=umap_n_neighbors,
+                min_dist=umap_min_dist,
+                metric=umap_metric,
+                random_state=umap_random_state,
+            )
             np.save(umap_cache, umap_3d)
     else:
-        umap_3d = _compute_umap_nd(x, n_components=3)
+        umap_3d = _compute_umap_nd(
+            x_umap,
+            n_components=3,
+            n_neighbors=umap_n_neighbors,
+            min_dist=umap_min_dist,
+            metric=umap_metric,
+            random_state=umap_random_state,
+        )
         np.save(umap_cache, umap_3d)
     # Session plot compatibility artifacts.
     results_dir = os.path.join(session_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
+    save_blurred_reference_images(session_dir, x_clean_raw, x_context_raw)
     np.save(os.path.join(results_dir, "latent_vectors_full.npy"), x.astype(np.float32))
     np.save(os.path.join(results_dir, "umap_x.npy"), umap_3d[:, 0].astype(np.float32))
     np.save(os.path.join(results_dir, "umap_y.npy"), umap_3d[:, 1].astype(np.float32))
@@ -213,8 +386,20 @@ def save_inference_dashboard(session_dir: str, outputs: dict) -> str:
         h_map = int(fmap.shape[-2])
         w_map = int(fmap.shape[-1])
         z = fmap[0].detach().cpu().permute(1, 2, 0).reshape(-1, fmap.shape[1]).numpy().astype(np.float32)
+        z_umap = _preprocess_latents_for_umap(
+            z,
+            l2_normalize=umap_l2_normalize,
+            standardize=umap_standardize,
+        )
         pca3 = _compute_pca_3d(z).astype(np.float32)
-        umap3 = _compute_umap_nd(z, n_components=3).astype(np.float32)
+        umap3 = _compute_umap_nd(
+            z_umap,
+            n_components=3,
+            n_neighbors=umap_n_neighbors,
+            min_dist=umap_min_dist,
+            metric=umap_metric,
+            random_state=umap_random_state,
+        ).astype(np.float32)
         np.save(os.path.join(results_dir, f"{branch_name}_spatial_shape.npy"), np.asarray([h_map, w_map], dtype=np.int64))
         np.save(os.path.join(results_dir, f"{branch_name}_latent_vectors_full.npy"), z)
         np.save(os.path.join(results_dir, f"{branch_name}_pca_xyz.npy"), pca3)
@@ -232,8 +417,20 @@ def save_inference_dashboard(session_dir: str, outputs: dict) -> str:
 
     # Spatial latent map overview (sample-0 pred map only): PCA/UMAP colormap + XYZ scatter.
     pred0 = pred_map[0].detach().cpu().permute(1, 2, 0).reshape(-1, pred_map.shape[1]).numpy().astype(np.float32)
+    pred0_umap = _preprocess_latents_for_umap(
+        pred0,
+        l2_normalize=umap_l2_normalize,
+        standardize=umap_standardize,
+    )
     pca0_3d = _compute_pca_3d(pred0)
-    umap0_3d = _compute_umap_nd(pred0, n_components=3)
+    umap0_3d = _compute_umap_nd(
+        pred0_umap,
+        n_components=3,
+        n_neighbors=umap_n_neighbors,
+        min_dist=umap_min_dist,
+        metric=umap_metric,
+        random_state=umap_random_state,
+    )
     latent_html_path = _save_latent_overview_html(session_dir, pca0_3d, umap0_3d, pred_map.shape[-2], pred_map.shape[-1])
 
     # Historical target-location heatmap loaded from session CSV log.
@@ -248,13 +445,115 @@ def save_inference_dashboard(session_dir: str, outputs: dict) -> str:
                     cx = int(float(row["x"]))
                     if 0 <= cy < hist_vis.shape[0] and 0 <= cx < hist_vis.shape[1]:
                         hist_vis[cy, cx] += 1.0
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[warning] failed to read {hist_path}: {type(e).__name__}: {e}")
     if float(hist_vis.max()) > 0.0:
         hist_vis = hist_vis / float(hist_vis.max())
+    np.save(os.path.join(results_dir, "target_locations_vis.npy"), target_vis.astype(np.float32))
+    np.save(os.path.join(results_dir, "target_locations_hist_vis.npy"), hist_vis.astype(np.float32))
+    target_vis_img = os.path.join(results_dir, "target_locations_vis.png")
+    hist_vis_img = os.path.join(results_dir, "target_locations_hist_vis.png")
+    plt.imsave(target_vis_img, target_vis, cmap="magma")
+    plt.imsave(hist_vis_img, hist_vis, cmap="viridis")
 
-    # PNG dashboard export is disabled; use HTML dashboards only.
-    return latent_html_path
+    # Build a single assembled dashboard entrypoint for this session.
+    dashboard_path = os.path.join(session_dir, "dashboard.html")
+    latent_name = os.path.basename(latent_html_path)
+    metrics_path = os.path.join(session_dir, "metrics.csv")
+    loss_x = []
+    loss_total = []
+    loss_jepa = []
+    loss_pixel = []
+    if os.path.exists(metrics_path):
+        try:
+            with open(metrics_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    loss_x.append(float(row["epoch"]) + 0.001 * float(row["batch"]))
+                    loss_total.append(float(row["total_loss"]))
+                    loss_jepa.append(float(row["loss_jepa"]))
+                    loss_pixel.append(float(row["loss_pixel"]))
+        except Exception as e:
+            print(f"[warning] failed to read {metrics_path}: {type(e).__name__}: {e}")
+    ref_clean = os.path.join("results", "reference_000_clean.png")
+    ref_ctx = os.path.join("results", "reference_000_context_blurred.png")
+    ref_delta = os.path.join("results", "reference_000_clean_minus_context.png")
+    target_vis_rel = os.path.join("results", "target_locations_vis.png")
+    hist_vis_rel = os.path.join("results", "target_locations_hist_vis.png")
+    loss_html = (
+        '<div id="loss-plot" style="width: 100%; height: 420px; border: 1px solid #ddd; border-radius: 6px;"></div>'
+        if len(loss_x) > 0
+        else "<p>Loss data not available yet.</p>"
+    )
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JEPA Dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 20px; color: #111; }}
+    h1, h2 {{ margin: 0 0 12px 0; }}
+    .section {{ margin: 0 0 24px 0; }}
+    .grid {{ display: grid; grid-template-columns: repeat(3, minmax(240px, 1fr)); gap: 12px; }}
+    .card {{ border: 1px solid #ddd; padding: 8px; border-radius: 6px; background: #fff; }}
+    img {{ width: 100%; height: auto; display: block; }}
+    iframe {{ width: 100%; height: 920px; border: 1px solid #ddd; border-radius: 6px; }}
+  </style>
+</head>
+<body>
+  <h1>JEPA Session Dashboard</h1>
+  <div class="section">
+    <h2>Loss Curve</h2>
+    {loss_html}
+  </div>
+  <div class="section">
+    <h2>Reference Images (Sample 0)</h2>
+    <div class="grid">
+      <div class="card"><p>Clean</p><img src="{ref_clean}" alt="reference_clean" /></div>
+      <div class="card"><p>Blurred Context</p><img src="{ref_ctx}" alt="reference_context" /></div>
+      <div class="card"><p>Clean - Context</p><img src="{ref_delta}" alt="reference_delta" /></div>
+    </div>
+  </div>
+  <div class="section">
+    <h2>Target Sampling Diagnostics</h2>
+    <div class="grid">
+      <div class="card"><p>Current Sample Target Locations</p><img src="{target_vis_rel}" alt="target_locations_vis" /></div>
+      <div class="card"><p>Historical Target Visit Heatmap</p><img src="{hist_vis_rel}" alt="target_locations_hist_vis" /></div>
+    </div>
+  </div>
+  <div class="section">
+    <h2>Latent Overview</h2>
+    <iframe src="{latent_name}" title="latent_overview_4panel"></iframe>
+  </div>
+</body>
+</html>
+"""
+    if len(loss_x) > 0:
+        script = f"""
+<script>
+const lossX = {json.dumps(loss_x)};
+const lossTotal = {json.dumps(loss_total)};
+const lossJepa = {json.dumps(loss_jepa)};
+const lossPixel = {json.dumps(loss_pixel)};
+Plotly.newPlot('loss-plot', [
+  {{x: lossX, y: lossTotal, mode: 'lines', name: 'total_loss'}},
+  {{x: lossX, y: lossJepa, mode: 'lines', name: 'loss_jepa'}},
+  {{x: lossX, y: lossPixel, mode: 'lines', name: 'loss_pixel'}}
+], {{
+  title: 'Training Loss Curve',
+  xaxis: {{title: 'epoch + 0.001*batch'}},
+  yaxis: {{title: 'loss'}},
+  template: 'plotly_white',
+  margin: {{l: 60, r: 20, t: 50, b: 55}}
+}}, {{responsive: true}});
+</script>
+"""
+        html = html.replace("</body>", script + "\n</body>")
+    with open(dashboard_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return dashboard_path
 
 
 def save_loss_curve(session_dir: str):
@@ -297,16 +596,48 @@ def _offdiag(x: torch.Tensor) -> torch.Tensor:
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 
+def extract_valid_pooled_embeddings(outputs: dict, key: str = "pred_patches") -> torch.Tensor:
+    patches = outputs[key]  # B,K,C,P,P
+    valid = outputs["target_valid"]  # B,K
+    _, _, c, _, _ = patches.shape
+    pooled = patches.mean(dim=(3, 4))  # B,K,C
+    vm = valid.reshape(-1)
+    z = pooled.reshape(-1, c)[vm]
+    return z
+
+
+def sketched_sigreg_loss(z: torch.Tensor, sketch_dim: int = 64) -> torch.Tensor:
+    """
+    Lightweight SIGReg-style isotropic Gaussian regularization.
+    Encourages projected embeddings to have mean 0 and variance 1.
+    """
+    if z.numel() == 0:
+        return z.sum() * 0.0
+    if z.shape[0] < 2:
+        return z.sum() * 0.0
+
+    z = z - z.mean(dim=0, keepdim=True)
+    c = z.shape[1]
+    sketch_dim = int(max(1, sketch_dim))
+    a = torch.randn((c, sketch_dim), device=z.device, dtype=z.dtype)
+    a = a / a.norm(dim=0, keepdim=True).clamp_min(1e-6)
+    y = z @ a  # N,sketch_dim
+
+    mean_loss = y.mean(dim=0).pow(2).mean()
+    var_loss = (y.var(dim=0, unbiased=False) - 1.0).pow(2).mean()
+    return mean_loss + var_loss
+
+
 def compute_sim_var_cov(outputs: dict) -> tuple[float, float, float]:
     pred = outputs["pred_patches"].detach()  # B,K,C,P,P
     gt = outputs["gt_patches"].detach()  # B,K,C,P,P
     valid = outputs["target_valid"].detach()  # B,K
 
     b, k, c, p, _ = pred.shape
-    # reshape to (B,K,P*P,C), then gather valid rows
-    pred_v = pred.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
-    gt_v = gt.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
-    vm = valid.unsqueeze(-1).unsqueeze(-1).expand(b, k, p * p, 1).reshape(-1)
+    # Pool spatial dimensions so VICReg acts on patch-level concepts, not adjacent pixels.
+    pred_v = pred.mean(dim=(3, 4))  # B,K,C
+    gt_v = gt.mean(dim=(3, 4))  # B,K,C
+    vm = valid.reshape(-1)
     z1 = pred_v.reshape(-1, c)[vm]
     z2 = gt_v.reshape(-1, c)[vm]
     if z1.numel() == 0 or z2.numel() == 0:
@@ -339,9 +670,10 @@ def compute_sim_var_cov_torch(outputs: dict) -> tuple[torch.Tensor, torch.Tensor
     valid = outputs["target_valid"]
 
     b, k, c, p, _ = pred.shape
-    pred_v = pred.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
-    gt_v = gt.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
-    vm = valid.unsqueeze(-1).unsqueeze(-1).expand(b, k, p * p, 1).reshape(-1)
+    # Pool spatial dimensions so VICReg acts on patch-level concepts, not adjacent pixels.
+    pred_v = pred.mean(dim=(3, 4))  # B,K,C
+    gt_v = gt.mean(dim=(3, 4))  # B,K,C
+    vm = valid.reshape(-1)
     z1 = pred_v.reshape(-1, c)[vm]
     z2 = gt_v.reshape(-1, c)[vm]
     if z1.numel() == 0 or z2.numel() == 0:
@@ -403,7 +735,8 @@ def compute_target_energy_map(outputs: dict, image_size: tuple[int, int]) -> tor
     loc = outputs["target_locations"]
     valid = outputs["target_valid"]
     h, w = int(image_size[0]), int(image_size[1])
-    b, k, _, _, _ = pred.shape
+    b, k, _, p, _ = pred.shape
+    half = p // 2
     energy_map = torch.zeros((b, 1, h, w), device=pred.device, dtype=pred.dtype)
     count_map = torch.zeros((b, 1, h, w), device=pred.device, dtype=pred.dtype)
     err = (pred - gt).pow(2).mean(dim=(2, 3, 4))
@@ -411,11 +744,29 @@ def compute_target_energy_map(outputs: dict, image_size: tuple[int, int]) -> tor
         for ki in range(k):
             if not bool(valid[bi, ki]):
                 continue
-            y = int(loc[bi, ki, 0].item())
-            x = int(loc[bi, ki, 1].item())
-            if 0 <= y < h and 0 <= x < w:
-                energy_map[bi, 0, y, x] += err[bi, ki]
-                count_map[bi, 0, y, x] += 1.0
+            cy = int(loc[bi, ki, 0].item())
+            cx = int(loc[bi, ki, 1].item())
+
+            y0 = cy - half
+            y1 = cy + half
+            x0 = cx - half
+            x1 = cx + half
+
+            if y0 < 0:
+                y0 = 0
+                y1 = p
+            if x0 < 0:
+                x0 = 0
+                x1 = p
+            if y1 > h:
+                y1 = h
+                y0 = h - p
+            if x1 > w:
+                x1 = w
+                x0 = w - p
+
+            energy_map[bi, 0, y0:y1, x0:x1] += err[bi, ki]
+            count_map[bi, 0, y0:y1, x0:x1] += 1.0
     energy_map = energy_map / count_map.clamp_min(1.0)
     return energy_map
 
@@ -480,6 +831,22 @@ def make_session_dir(root: str, config_name: str) -> str:
     return path
 
 
+def resolve_pipeline_config(data_cfg: dict, model_cfg: dict) -> tuple[bool, bool, bool]:
+    blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
+    if blur_mode not in ("gaussian", "cdd"):
+        raise ValueError(
+            f"Unsupported blur_mode={blur_mode}. "
+            "Allowed blur_mode values are 'gaussian' and 'cdd'."
+        )
+    # Policy:
+    # - gaussian mode: dataset runs CDD, no pre-log, model may apply post-log.
+    # - cdd mode: dataset skips CDD and pre-log, model performs CDD masking.
+    dataset_apply_cdd = (blur_mode == "gaussian")
+    dataset_log_transform = False
+    model_post_log = bool(model_cfg.get("post_log_transform", data_cfg.get("log_transform", True)))
+    return dataset_apply_cdd, dataset_log_transform, model_post_log
+
+
 def run_training(config: dict, config_name: str, sessions_root: str = "sessions") -> str:
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -506,27 +873,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     with open(os.path.join(session_dir, "config_used.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
-    blur_mode = model_cfg.get("blur_mode", "gaussian")
-    dataset_log_transform = bool(data_cfg.get("log_transform", True))
-    dataset_apply_cdd = True
-    model_post_log = True
-    # Pipeline policy:
-    # - blur_mode is gaussian-only:
-    #   dataset: normalize + mandatory dataset CDD, no dataset log
-    #   model: gaussian masking + shared optional log
-    if blur_mode != "gaussian":
-        raise ValueError(
-            f"Unsupported blur_mode={blur_mode}. "
-            "Allowed blur_mode is only 'gaussian' (mask_fill_mode: zero or gaussian_dip)."
-        )
-    dataset_apply_cdd = True
-    dataset_log_transform = False
-    model_post_log = bool(data_cfg.get("log_transform", True))
+    blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
+    dataset_apply_cdd, dataset_log_transform, model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
 
     print(
-        f"[{config_name}] mode: blur_mode={blur_mode} "
-        f"dataset_apply_cdd={dataset_apply_cdd} dataset_log_transform={dataset_log_transform} "
-        f"post_log_transform={model_post_log} cdd_mode={model_cfg.get('cdd_mode', data_cfg.get('cdd_mode', 'log'))}"
+        f"[{config_name}] resolved_pipeline "
+        f"blur_mode={blur_mode} "
+        f"dataset_apply_cdd={dataset_apply_cdd} "
+        f"dataset_log_transform={dataset_log_transform} "
+        f"model_post_log_transform={model_post_log} "
+        f"data.log_transform={data_cfg.get('log_transform', True)} "
+        f"model.post_log_transform={model_cfg.get('post_log_transform', '<unset>')} "
+        f"data.cdd_mode={data_cfg.get('cdd_mode', 'log')} "
+        f"model.cdd_mode={model_cfg.get('cdd_mode', 'log')}"
     )
 
     model = PyramidGridJEPA(
@@ -536,12 +895,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
         max_targets_per_image=model_cfg.get("max_targets_per_image", 16),
-        mask_fraction=model_cfg.get("mask_fraction", 0.20),
-        spacing_mult=model_cfg.get("spacing_mult", 1.5),
+        mask_fraction=model_cfg.get("mask_fraction", 1.0),
         box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
         mask_scale=model_cfg.get("mask_scale", 1.0),
         min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
-        spacing_scale=model_cfg.get("spacing_scale", 2.0),
+        spacing_scale=model_cfg.get("spacing_scale", 1.5),
         full_grid=model_cfg.get("full_grid", True),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
@@ -553,26 +911,152 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
         mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
         dip_sigma_mult=model_cfg.get("dip_sigma_mult", 1.0),
+        constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
         post_log_transform=model_cfg.get("post_log_transform", model_post_log),
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
         ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
         normalize_loss=model_cfg.get("normalize_loss", True),
+        predictor_layernorm=model_cfg.get("predictor_layernorm", False),
+        encoder_type=model_cfg.get("encoder_type", "fullres"),
+        encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
+        encoder_depth=model_cfg.get("encoder_depth", 4),
+        encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
     ).to(device)
+    allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
+    resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
+    if resume_mismatch_action not in ("skip", "error"):
+        raise ValueError(
+            f"Unsupported resume_mismatch_action={resume_mismatch_action}. "
+            "Use 'skip' or 'error'."
+        )
+    optimizer_mismatch_action = str(train_cfg.get("optimizer_mismatch_action", "continue_fresh_optimizer")).lower()
+    if optimizer_mismatch_action not in ("continue_fresh_optimizer", "restart_epoch0"):
+        raise ValueError(
+            f"Unsupported optimizer_mismatch_action={optimizer_mismatch_action}. "
+            "Use 'continue_fresh_optimizer' or 'restart_epoch0'."
+        )
+
     start_epoch = 0
     resume_state = None
     if os.path.exists(resume_ckpt_path):
         resume_state = torch.load(resume_ckpt_path, map_location=device)
         if "model_state_dict" in resume_state:
-            model.load_state_dict(resume_state["model_state_dict"], strict=False)
-        start_epoch = int(resume_state.get("epoch", 0))
-        print(f"resume_checkpoint={resume_ckpt_path} start_epoch={start_epoch}")
+            missing, unexpected = model.load_state_dict(resume_state["model_state_dict"], strict=False)
+            print(f"[{config_name}] resume_model missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
+            if missing:
+                print(f"[{config_name}] resume_model missing_keys_list={missing}")
+            if unexpected:
+                print(f"[{config_name}] resume_model unexpected_keys_list={unexpected}")
+            if (missing or unexpected) and not allow_partial_resume:
+                if resume_mismatch_action == "error":
+                    raise RuntimeError(
+                        "Checkpoint model-state mismatch detected and allow_partial_resume=False. "
+                        "Set train.allow_partial_resume=true to permit partial model resume."
+                    )
+                print(
+                    f"[{config_name}] warning: checkpoint model-state mismatch; "
+                    "skipping resume checkpoint and starting fresh model/optimizer/scaler."
+                )
+                resume_state = None
+                start_epoch = 0
+                model = PyramidGridJEPA(
+                    latent_channels=model_cfg.get("latent_channels", 32),
+                    predictor_hidden=model_cfg.get("predictor_hidden"),
+                    patch_size=model_cfg.get("patch_size", 2),
+                    sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
+                    cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
+                    max_targets_per_image=model_cfg.get("max_targets_per_image", 16),
+                    mask_fraction=model_cfg.get("mask_fraction", 1.0),
+                    box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
+                    mask_scale=model_cfg.get("mask_scale", 1.0),
+                    min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
+                    spacing_scale=model_cfg.get("spacing_scale", 1.5),
+                    full_grid=model_cfg.get("full_grid", True),
+                    global_shift=model_cfg.get("global_shift", True),
+                    align_scales=model_cfg.get("align_scales", True),
+                    constant_mask_box=model_cfg.get("constant_mask_box", True),
+                    mask_box_size=model_cfg.get("mask_box_size", 16),
+                    blur_mode=blur_mode,
+                    cdd_mode=model_cfg.get("cdd_mode", "log"),
+                    cdd_constrained=model_cfg.get("cdd_constrained", True),
+                    cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
+                    mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
+                    dip_sigma_mult=model_cfg.get("dip_sigma_mult", 1.0),
+                    constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
+                    post_log_transform=model_cfg.get("post_log_transform", model_post_log),
+                    log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
+                    cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
+                    ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
+                    normalize_loss=model_cfg.get("normalize_loss", True),
+                    predictor_layernorm=model_cfg.get("predictor_layernorm", False),
+                    encoder_type=model_cfg.get("encoder_type", "fullres"),
+                    encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
+                    encoder_depth=model_cfg.get("encoder_depth", 4),
+                    encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
+                ).to(device)
+                print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
+        if resume_state is not None:
+            start_epoch = int(resume_state.get("epoch", 0))
+            print(f"resume_checkpoint={resume_ckpt_path} start_epoch={start_epoch}")
     elif resume_from_existing:
-        model.load_state_dict(torch.load(model_ckpt_path, map_location=device), strict=False)
-        print(f"resume_model={model_ckpt_path}")
+        missing, unexpected = model.load_state_dict(torch.load(model_ckpt_path, map_location=device), strict=False)
+        print(f"[{config_name}] resume_model missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
+        if missing:
+            print(f"[{config_name}] resume_model missing_keys_list={missing}")
+        if unexpected:
+            print(f"[{config_name}] resume_model unexpected_keys_list={unexpected}")
+        if (missing or unexpected) and not allow_partial_resume:
+            if resume_mismatch_action == "error":
+                raise RuntimeError(
+                    "Model checkpoint mismatch detected and allow_partial_resume=False. "
+                    "Set train.allow_partial_resume=true to permit partial model resume."
+                )
+            print(
+                f"[{config_name}] warning: model checkpoint mismatch; "
+                "ignoring model_last and starting fresh model/optimizer/scaler."
+            )
+            model = PyramidGridJEPA(
+                latent_channels=model_cfg.get("latent_channels", 32),
+                predictor_hidden=model_cfg.get("predictor_hidden"),
+                patch_size=model_cfg.get("patch_size", 2),
+                sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
+                cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
+                max_targets_per_image=model_cfg.get("max_targets_per_image", 16),
+                mask_fraction=model_cfg.get("mask_fraction", 1.0),
+                box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
+                mask_scale=model_cfg.get("mask_scale", 1.0),
+                min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
+                spacing_scale=model_cfg.get("spacing_scale", 1.5),
+                full_grid=model_cfg.get("full_grid", True),
+                global_shift=model_cfg.get("global_shift", True),
+                align_scales=model_cfg.get("align_scales", True),
+                constant_mask_box=model_cfg.get("constant_mask_box", True),
+                mask_box_size=model_cfg.get("mask_box_size", 16),
+                blur_mode=blur_mode,
+                cdd_mode=model_cfg.get("cdd_mode", "log"),
+                cdd_constrained=model_cfg.get("cdd_constrained", True),
+                cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
+                mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
+                dip_sigma_mult=model_cfg.get("dip_sigma_mult", 1.0),
+                constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
+                post_log_transform=model_cfg.get("post_log_transform", model_post_log),
+                log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
+                cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
+                ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
+                normalize_loss=model_cfg.get("normalize_loss", True),
+                predictor_layernorm=model_cfg.get("predictor_layernorm", False),
+                encoder_type=model_cfg.get("encoder_type", "fullres"),
+                encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
+                encoder_depth=model_cfg.get("encoder_depth", 4),
+                encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
+            ).to(device)
+            print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
+        else:
+            print(f"resume_model={model_ckpt_path}")
 
     scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
-    auto_roll_max = max(1, int(round(scale_max * float(model_cfg.get("mask_scale", 1.0)) * float(model_cfg.get("spacing_scale", 2.0)))))
+    auto_roll_max = max(1, int(round(scale_max * float(model_cfg.get("mask_scale", 1.0)) * float(model_cfg.get("spacing_scale", 1.5)))))
 
     dataset = JEPADataset(
         num_samples=data_cfg.get("num_samples", 2000),
@@ -597,6 +1081,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
         cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
         cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
+        precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
     )
     val_fraction = float(train_cfg.get("val_fraction", 0.1))
     val_fraction = min(max(val_fraction, 0.0), 0.95)
@@ -638,6 +1123,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
             cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
             cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
+            precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
         )
         val_dataset.sample_index = val_idx
     print(
@@ -685,20 +1171,40 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         lr=train_cfg.get("lr", 1e-4),
         weight_decay=train_cfg.get("weight_decay", 1e-5),
     )
-    use_amp = torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
-    scaler = GradScaler("cuda", enabled=torch.cuda.is_available())
+    use_amp = device.type == "cuda"
+    scaler = GradScaler("cuda", enabled=use_amp)
     if resume_state is not None:
+        optimizer_state_loaded = False
         if "optimizer_state_dict" in resume_state:
-            optimizer.load_state_dict(resume_state["optimizer_state_dict"])
-        if "scaler_state_dict" in resume_state and torch.cuda.is_available():
-            scaler.load_state_dict(resume_state["scaler_state_dict"])
+            try:
+                optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+                optimizer_state_loaded = True
+            except ValueError as e:
+                # Model parameterization changed (e.g., architecture update): choose explicit behavior.
+                if optimizer_mismatch_action == "restart_epoch0":
+                    print(f"[{config_name}] warning: optimizer_state_incompatible, restarting epoch counter at 0: {e}")
+                    start_epoch = 0
+                else:
+                    print(
+                        f"[{config_name}] warning: optimizer_state_incompatible, "
+                        f"continuing from epoch {start_epoch} with fresh optimizer: {e}"
+                    )
+        if optimizer_state_loaded and "scaler_state_dict" in resume_state and torch.cuda.is_available():
+            try:
+                scaler.load_state_dict(resume_state["scaler_state_dict"])
+            except Exception as e:
+                print(f"[{config_name}] warning: scaler_state_incompatible, starting scaler fresh: {e}")
 
     epochs = train_cfg.get("epochs", 20)
     log_interval = train_cfg.get("log_interval", 10)
     force_recompute_inference = bool(train_cfg.get("force_recompute_inference", False))
+    umap_cfg = dict(train_cfg.get("umap", {}))
+    print(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
     jepa_loss_weight = float(train_cfg.get("jepa_loss_weight", 100.0))
     vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", 1.0))
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", 0.1))
+    sigreg_weight = float(train_cfg.get("sigreg_weight", 0.0))
+    sigreg_sketch_dim = int(train_cfg.get("sigreg_sketch_dim", 64))
 
     metrics_path = os.path.join(session_dir, "metrics.csv")
     if not os.path.exists(metrics_path):
@@ -716,6 +1222,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     "cov",
                     "raw_mse",
                     "norm_err",
+                    "valid_frac",
                     "time_sec",
                 ]
             )
@@ -747,6 +1254,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         epoch_sim = 0.0
         epoch_var = 0.0
         epoch_cov = 0.0
+        epoch_sigreg = 0.0
+        epoch_valid_frac = 0.0
         epoch_batches = 0
         metrics_rows = []
         masked_scale_rows = []
@@ -760,8 +1269,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 outputs = model(x_raw)
                 loss_jepa = model.compute_loss(outputs)
                 _, var_term_t, cov_term_t = compute_sim_var_cov_torch(outputs)
-                total_loss = (jepa_loss_weight * loss_jepa) + (vicreg_var_weight * var_term_t) + (vicreg_cov_weight * cov_term_t)
-                loss_pixel = torch.zeros_like(total_loss)
+                z_pred = extract_valid_pooled_embeddings(outputs, key="pred_patches")
+                loss_sigreg = sketched_sigreg_loss(z_pred, sketch_dim=sigreg_sketch_dim)
+                total_loss = (
+                    (jepa_loss_weight * loss_jepa)
+                    + (vicreg_var_weight * var_term_t)
+                    + (vicreg_cov_weight * cov_term_t)
+                    + (sigreg_weight * loss_sigreg)
+                )
+                loss_pixel_val = 0.0
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -770,6 +1286,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             model.update_target_encoder()
             sim_val, var_val, cov_val = compute_sim_var_cov(outputs)
             raw_mse_val, norm_err_val = compute_raw_mse_and_norm_err(outputs)
+            valid_frac = float(outputs["target_valid"].float().mean().item())
 
             elapsed = time.time() - start
             metrics_rows.append(
@@ -778,12 +1295,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     batch_idx,
                     float(total_loss.item()),
                     float(loss_jepa.item()),
-                    float(loss_pixel.item()),
+                    float(loss_pixel_val),
                     float(sim_val),
                     float(var_val),
                     float(cov_val),
                     float(raw_mse_val),
                     float(norm_err_val),
+                    float(valid_frac),
                     round(elapsed, 4),
                 ]
             )
@@ -830,16 +1348,20 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             if batch_idx % log_interval == 0:
                 print(
                     f"[{config_name}] Epoch {epoch + 1}/{epochs} Batch {batch_idx}/{len(dataloader)} "
-                    f"total={total_loss.item():.4f} jepa={loss_jepa.item():.4f} pixel={loss_pixel.item():.4f} "
-                    f"sim={sim_val:.4f} var={var_val:.4f} cov={cov_val:.4f} "
-                    f"raw_mse={raw_mse_val:.4f} norm_err={norm_err_val:.4f}"
+                    f"total={_fmt_metric(total_loss.item())} jepa={_fmt_metric(loss_jepa.item())} pixel={_fmt_metric(loss_pixel_val)} "
+                    f"sigreg={_fmt_metric(loss_sigreg.item())} "
+                    f"sim={_fmt_metric(sim_val)} var={_fmt_metric(var_val)} cov={_fmt_metric(cov_val)} "
+                    f"raw_mse={_fmt_metric(raw_mse_val)} norm_err={_fmt_metric(norm_err_val)} "
+                    f"valid_frac={_fmt_metric(valid_frac)}"
                 )
             epoch_total += float(total_loss.item())
             epoch_jepa += float(loss_jepa.item())
-            epoch_pixel += float(loss_pixel.item())
+            epoch_pixel += float(loss_pixel_val)
             epoch_sim += float(sim_val)
             epoch_var += float(var_val)
             epoch_cov += float(cov_val)
+            epoch_sigreg += float(loss_sigreg.item())
+            epoch_valid_frac += float(valid_frac)
             epoch_batches += 1
 
         if metrics_rows:
@@ -857,12 +1379,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         if epoch_batches > 0:
             print(
                 f"[{config_name}] Epoch {epoch + 1}/{epochs} summary "
-                f"avg_total={epoch_total/epoch_batches:.4f} "
-                f"avg_jepa={epoch_jepa/epoch_batches:.4f} "
-                f"avg_pixel={epoch_pixel/epoch_batches:.4f} "
-                f"avg_sim={epoch_sim/epoch_batches:.4f} "
-                f"avg_var={epoch_var/epoch_batches:.4f} "
-                f"avg_cov={epoch_cov/epoch_batches:.4f}"
+                f"avg_total={_fmt_metric(epoch_total/epoch_batches)} "
+                f"avg_jepa={_fmt_metric(epoch_jepa/epoch_batches)} "
+                f"avg_pixel={_fmt_metric(epoch_pixel/epoch_batches)} "
+                f"avg_sigreg={_fmt_metric(epoch_sigreg/epoch_batches)} "
+                f"avg_sim={_fmt_metric(epoch_sim/epoch_batches)} "
+                f"avg_var={_fmt_metric(epoch_var/epoch_batches)} "
+                f"avg_cov={_fmt_metric(epoch_cov/epoch_batches)} "
+                f"avg_valid_frac={_fmt_metric(epoch_valid_frac/epoch_batches)}"
             )
         val_loss = 0.0
         val_sim = 0.0
@@ -879,7 +1403,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             val_error_by_scale = dict(v["val_error_by_scale"])
             print(
                 f"[{config_name}] Epoch {epoch + 1}/{epochs} validation "
-                f"val_loss={val_loss:.4f} val_sim={val_sim:.4f} "
+                f"val_loss={_fmt_metric(val_loss)} val_sim={_fmt_metric(val_sim)} "
                 f"val_error_by_scale={json.dumps(val_error_by_scale, sort_keys=True)}"
             )
         with open(epoch_summary_path, "a", newline="", encoding="utf-8") as f:
@@ -911,112 +1435,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     torch.save(model.state_dict(), os.path.join(session_dir, "model_last.pt"))
 
-    inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
-    inference_required = [
-        inference_outputs_path,
-        os.path.join(session_dir, "network_input_clean.npy"),
-        os.path.join(session_dir, "network_input_context.npy"),
-        os.path.join(session_dir, "pred_map.npy"),
-        os.path.join(session_dir, "gt_map.npy"),
-        os.path.join(session_dir, "target_energy_map.npy"),
-        os.path.join(session_dir, "jepa_energy_summary.json"),
-    ]
-    if (not force_recompute_inference) and all(os.path.exists(p) for p in inference_required):
-        print(
-            f"[{config_name}] inference artifacts already exist; "
-            "skipping post-training inference (set train.force_recompute_inference=true to recompute)"
-        )
-        return session_dir
-
-    print(f"[{config_name}] post_training_inference begin")
-    model.eval()
-    with torch.no_grad():
-        print(f"[{config_name}] post_training_inference loading sample batch")
-        x_raw = next(iter(dataloader))
-        x_raw = x_raw.to(device)
-        print(f"[{config_name}] post_training_inference model forward")
-        outputs = model(x_raw)
-
-    inference_outputs = {
-        "x_clean_raw": outputs.get("x_clean_raw", outputs["x_clean"])[:8].detach().cpu(),
-        "x_context_raw": outputs.get("x_context_raw", outputs["x_context"])[:8].detach().cpu(),
-        "x_clean": outputs["x_clean"][:8].detach().cpu(),
-        "x_context": outputs["x_context"][:8].detach().cpu(),
-        "target_locations": outputs["target_locations"][:8].detach().cpu(),
-        "target_scales": outputs["target_scales"][:8].detach().cpu(),
-        "target_valid": outputs["target_valid"][:8].detach().cpu(),
-        "pred_map": outputs["pred_map"][:2].detach().cpu(),
-        "gt_map": outputs["gt_map"][:2].detach().cpu(),
-        "context_map": outputs.get("context_map", outputs["pred_map"])[:2].detach().cpu(),
-        "pred_patches": outputs["pred_patches"][:2].detach().cpu(),
-        "gt_patches": outputs["gt_patches"][:2].detach().cpu(),
-    }
-    energy_scalar = compute_jepa_energy(outputs, normalize=False)
-    energy_scalar_norm = compute_jepa_energy(outputs, normalize=True)
-    e_map = compute_target_energy_map(outputs, image_size=outputs["x_clean"].shape[-2:])
-    inference_outputs["jepa_energy"] = torch.tensor(energy_scalar, dtype=torch.float32)
-    inference_outputs["jepa_energy_normalized"] = torch.tensor(energy_scalar_norm, dtype=torch.float32)
-    inference_outputs["target_energy_map"] = e_map[:8].detach().cpu()
-    # Canonical visualization target map for downstream plotting tools.
-    tloc = inference_outputs["target_locations"]
-    tvalid = inference_outputs["target_valid"]
-    bsz, _, _ = tloc.shape
-    h, w = inference_outputs["x_clean"].shape[-2:]
-    tmap = torch.zeros((bsz, 1, h, w), dtype=inference_outputs["x_clean"].dtype)
-    for bi in range(bsz):
-        for ki in range(tloc.shape[1]):
-            if not bool(tvalid[bi, ki].item()):
-                continue
-            cy = int(tloc[bi, ki, 0].item())
-            cx = int(tloc[bi, ki, 1].item())
-            if 0 <= cy < h and 0 <= cx < w:
-                tmap[bi, 0, cy, cx] = 1.0
-    inference_outputs["target_map"] = tmap
-    torch.save(inference_outputs, os.path.join(session_dir, "inference_outputs.pt"))
-    print(f"[{config_name}] saved inference_outputs.pt")
-
-    # Explicitly save the exact network inputs for quick external inspection.
-    np.save(os.path.join(session_dir, "network_input_clean.npy"), inference_outputs["x_clean"].numpy())
-    np.save(os.path.join(session_dir, "network_input_context.npy"), inference_outputs["x_context"].numpy())
-    np.save(os.path.join(session_dir, "network_input_clean_raw.npy"), inference_outputs["x_clean_raw"].numpy())
-    np.save(os.path.join(session_dir, "network_input_context_raw.npy"), inference_outputs["x_context_raw"].numpy())
-    np.save(os.path.join(session_dir, "target_valid.npy"), inference_outputs["target_valid"].numpy())
-    if visit_counts is not None:
-        np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
-    np.save(os.path.join(session_dir, "target_energy_map.npy"), inference_outputs["target_energy_map"].numpy())
-    with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "jepa_energy": float(energy_scalar),
-                "jepa_energy_normalized": float(energy_scalar_norm),
-            },
-            f,
-            indent=2,
-        )
-    np.save(os.path.join(session_dir, "pred_map.npy"), inference_outputs["pred_map"].numpy())
-    np.save(os.path.join(session_dir, "gt_map.npy"), inference_outputs["gt_map"].numpy())
-    pred_norm = inference_outputs["pred_map"].norm(dim=1).numpy()
-    gt_norm = inference_outputs["gt_map"].norm(dim=1).numpy()
-    err_norm = (inference_outputs["pred_map"] - inference_outputs["gt_map"]).norm(dim=1).numpy()
-    np.save(os.path.join(session_dir, "pred_latent_norm.npy"), pred_norm)
-    np.save(os.path.join(session_dir, "gt_latent_norm.npy"), gt_norm)
-    np.save(os.path.join(session_dir, "pred_gt_latent_error_norm.npy"), err_norm)
-
-    print(f"[{config_name}] building dashboard artifacts (pca/umap may take time on first run)")
-    dashboard_path = save_inference_dashboard(session_dir, inference_outputs)
-    print(f"dashboard_saved={dashboard_path}")
-    if bool(train_cfg.get("save_blurred_images", False)):
-        project_root = os.path.abspath(os.path.join(session_dir, os.pardir, os.pardir))
-        blur_dir = save_blurred_debug_images(
-            project_root=project_root,
-            session_name=config_name,
-            x_clean_raw=inference_outputs["x_clean_raw"],
-            x_context_raw=inference_outputs["x_context_raw"],
-            max_images=int(train_cfg.get("save_blurred_images_max", 8)),
-        )
-        print(f"blurred_debug_images_saved={blur_dir}")
-    loss_curve_path = save_loss_curve(session_dir)
-    if loss_curve_path is not None:
-        print(f"loss_curve_saved={loss_curve_path}")
-
-    return session_dir
+    return run_post_training_inference(
+        model=model,
+        dataloader=dataloader,
+        session_dir=session_dir,
+        config_name=config_name,
+        visit_counts=visit_counts,
+        force_recompute_inference=force_recompute_inference,
+        compute_jepa_energy_fn=compute_jepa_energy,
+        compute_target_energy_map_fn=compute_target_energy_map,
+    )

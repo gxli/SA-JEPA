@@ -43,6 +43,11 @@ elif rsync --help 2>/dev/null | grep -q -- '--append'; then
     RSYNC_RESUME_FLAG="--append"
 fi
 
+RSYNC_MKPATH_FLAG=""
+if rsync --help 2>/dev/null | grep -q -- '--mkpath'; then
+    RSYNC_MKPATH_FLAG="--mkpath"
+fi
+
 run_rsync_retry() {
     # Retries transient rsync/ssh failures (e.g., status 11 over unstable link).
     local attempts=3
@@ -101,20 +106,46 @@ copy_and_verify_file() {
     verify_remote_file_md5 "$local_file" "$remote_file"
 }
 
-force_sync_critical_files() {
+collect_changed_code_files() {
     local remote_root="$1"
-    local files=(
-        "src/train.py"
-        "src/models/build_jepa.py"
-        "scripts/session_overview_4panel.py"
+    local -a changed=()
+    local line path
+    # Use rsync dry-run itemization to collect only changed .py/.sh files.
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # Skip rsync metadata lines.
+        [[ "$line" == "sending incremental file list" ]] && continue
+        [[ "$line" == sent\ * ]] && continue
+        [[ "$line" == total\ size\ * ]] && continue
+        # Itemized output starts with change flags then a space then path.
+        # Example: >f..t...... src/train.py
+        path="${line#* }"
+        [[ -z "$path" || "$path" == "$line" ]] && continue
+        case "$path" in
+            *.py|*.sh)
+                if [[ -f "$path" ]]; then
+                    changed+=("$path")
+                fi
+                ;;
+        esac
+    done < <(
+        rsync "${RSYNC_COMMON[@]}" \
+            --dry-run \
+            --itemize-changes \
+            --delete \
+            --exclude '.git' \
+            --exclude 'experiments/' \
+            --exclude 'result_local/' \
+            --exclude 'results/' \
+            --exclude 'sessions/' \
+            --exclude 'outputs/' \
+            --exclude '__pycache__/' \
+            --exclude '*.pyc' \
+            ./ "$REMOTE:$remote_root" 2>/dev/null || true
     )
-    for f in "${files[@]}"; do
-        if [[ -f "$f" ]]; then
-            run_rsync_retry "${RSYNC_COMMON[@]}" \
-                ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
-                "$f" "$REMOTE:${remote_root}/$f"
-        fi
-    done
+    if [[ ${#changed[@]} -gt 0 ]]; then
+        printf '%s\n' "${changed[@]}"
+    fi
 }
 
 usage() {
@@ -152,6 +183,15 @@ case "$1" in
     push)
         echo "Applying safe mirror push to $REMOTE:$REMOTE_DEST (preserve excluded dirs)"
         ssh "$REMOTE" "mkdir -p \"$REMOTE_HOME/proj/$REL_PATH\""
+        changed_code_files=()
+        while IFS= read -r _f; do
+            [[ -n "$_f" ]] && changed_code_files+=("$_f")
+        done < <(collect_changed_code_files "$REMOTE_HOME/proj/$REL_PATH")
+        if [[ ${#changed_code_files[@]} -eq 0 ]]; then
+            echo "changed_code_files=0"
+        else
+            echo "changed_code_files=${#changed_code_files[@]}"
+        fi
         run_rsync_retry "${RSYNC_COMMON[@]}" \
             ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
             --delete \
@@ -164,12 +204,14 @@ case "$1" in
             --exclude '__pycache__/' \
             --exclude '*.pyc' \
             ./ "$REMOTE:$REMOTE_DEST"
-        # Force-sync critical code paths explicitly (guards against edge-case filter drift).
-        force_sync_critical_files "$REMOTE_HOME/proj/$REL_PATH"
-        # Verify critical code files landed correctly.
-        copy_and_verify_file "src/train.py" "$REMOTE_HOME/proj/$REL_PATH/src/train.py"
-        copy_and_verify_file "src/models/build_jepa.py" "$REMOTE_HOME/proj/$REL_PATH/src/models/build_jepa.py"
-        copy_and_verify_file "scripts/session_overview_4panel.py" "$REMOTE_HOME/proj/$REL_PATH/scripts/session_overview_4panel.py"
+        # Verify only changed python/shell files landed correctly.
+        if [[ ${#changed_code_files[@]} -eq 0 ]]; then
+            echo "verify skipped: no changed .py/.sh files detected"
+        else
+            for f in "${changed_code_files[@]}"; do
+                copy_and_verify_file "$f" "$REMOTE_HOME/proj/$REL_PATH/$f"
+            done
+        fi
         ;;
     push-preview)
         echo "Previewing safe mirror push (dry-run) to $REMOTE:$REMOTE_DEST (preserve excluded dirs)"
@@ -207,13 +249,17 @@ case "$1" in
         echo "  trying: $REMOTE:$d -> ./$local_dst"
         if ssh "$REMOTE" "test -d \"$d\""; then
             mkdir -p "$local_dst"
+            # Precreate common nested plot destinations to avoid move_file errors on some rsync builds.
+            mkdir -p "$local_dst/dashboard" "$local_dst/plots/session_dashboards" "$local_dst/dashboards" "$local_dst/plots"
             EXTRA_REFRESH_ARGS=()
             if [[ "$REFRESH_ONLY" -eq 1 ]]; then
                 EXTRA_REFRESH_ARGS+=(--update)
             fi
+            # Resume flags (--append/--append-verify) can interact badly with filtered tree pulls.
+            # Use plain transfer for pull-plots stability.
             run_rsync_retry "${RSYNC_COMMON[@]}" \
-                ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
-                "${EXTRA_REFRESH_ARGS[@]}" \
+                ${RSYNC_MKPATH_FLAG:+$RSYNC_MKPATH_FLAG} \
+                ${EXTRA_REFRESH_ARGS[@]+"${EXTRA_REFRESH_ARGS[@]}"} \
                 --include='*/' \
                 --include='*.html' --include='*.htm' \
                 --include='*.png'  --include='*.jpg' \

@@ -2,6 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ "${1:-}" != "--force" ]]; then
+  echo "run_all_session_plots is deprecated for the main pipeline and is disabled by default."
+  echo "Use ./session_to_dash.sh instead, or pass --force to run this legacy script intentionally."
+  exit 0
+fi
+
 SESSIONS_DIR="$ROOT_DIR/sessions"
 PLOT_SCRIPT="$ROOT_DIR/scripts/session_overview_4panel.py"
 FALLBACK_DASH_SCRIPT="$ROOT_DIR/scripts/session_to_dash.py"

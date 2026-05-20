@@ -64,6 +64,31 @@ def l2_normalize_rows(x: np.ndarray, enable: bool) -> np.ndarray:
     return x / norms
 
 
+def tile_maps_batch(maps: np.ndarray) -> np.ndarray:
+    arr = np.asarray(maps, dtype=np.float32)
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 4 and arr.shape[1] == 1:
+        arr = arr[:, 0]
+    elif arr.ndim == 3:
+        pass
+    else:
+        raise ValueError(f"Unsupported map shape for tiling: {arr.shape}")
+    n, h, w = arr.shape
+    if n <= 1:
+        return arr[0]
+    cols = int(np.ceil(np.sqrt(float(n))))
+    rows = int(np.ceil(float(n) / float(cols)))
+    canvas = np.zeros((rows * h, cols * w), dtype=np.float32)
+    for i in range(n):
+        r = i // cols
+        c = i % cols
+        y0 = r * h
+        x0 = c * w
+        canvas[y0 : y0 + h, x0 : x0 + w] = arr[i]
+    return canvas
+
+
 def _load_session_cfg(session_dir: Path, config_override: str = None) -> dict:
     if config_override:
         cfg_path = Path(config_override)
@@ -269,15 +294,14 @@ def make_session_overview_plot(
     fig.update_yaxes(range=[h_img, 0], scaleanchor="x4", scaleratio=1, constrain="domain", row=3 + row_offset, col=2)
     if have_energy:
         em = np.asarray(energy_map, dtype=np.float32)
-        if em.shape != tuple(view_shape):
-            em = np.zeros(view_shape, dtype=np.float32)
         e_row = 4 + row_offset
         fig.add_trace(go.Heatmap(z=em, colorscale="Magma", showscale=True), row=e_row, col=1)
         fig.add_trace(go.Heatmap(z=np.log1p(em), colorscale="Cividis", showscale=True), row=e_row, col=2)
-        fig.update_xaxes(range=[0, w_img], constrain="domain", row=e_row, col=1)
-        fig.update_yaxes(range=[h_img, 0], scaleanchor="x5", scaleratio=1, constrain="domain", row=e_row, col=1)
-        fig.update_xaxes(range=[0, w_img], constrain="domain", row=e_row, col=2)
-        fig.update_yaxes(range=[h_img, 0], scaleanchor="x6", scaleratio=1, constrain="domain", row=e_row, col=2)
+        eh, ew = int(em.shape[0]), int(em.shape[1])
+        fig.update_xaxes(range=[0, ew], constrain="domain", row=e_row, col=1)
+        fig.update_yaxes(range=[eh, 0], scaleanchor="x5", scaleratio=1, constrain="domain", row=e_row, col=1)
+        fig.update_xaxes(range=[0, ew], constrain="domain", row=e_row, col=2)
+        fig.update_yaxes(range=[eh, 0], scaleanchor="x6", scaleratio=1, constrain="domain", row=e_row, col=2)
     pio.write_html(fig, str(out_path), include_plotlyjs="cdn")
 
 
@@ -415,12 +439,8 @@ def main() -> None:
         if epath.exists():
             try:
                 em = to_native(np.load(epath))
-                if em.ndim == 4:
-                    em = em[0, 0]
-                elif em.ndim == 3:
-                    em = em[0]
-                if image_shape is not None and em.shape == tuple(image_shape):
-                    energy_map = em.astype(np.float32)
+                em = tile_maps_batch(em)
+                energy_map = em.astype(np.float32)
             except Exception:
                 energy_map = None
         train_curve = None

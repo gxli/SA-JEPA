@@ -6,10 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .encoders import FullResEncoder
+from .dense_unet import DenseUNetSmallEncoder
+from .encoders import ConvNeXtDenseEncoder, FullResEncoder, ResCNNDenseEncoder
 from .predictor import FullResPredictor
 
-_WARNED_CDD_FORWARD_CPU = False
 
 def gaussian_blur_batch(x: torch.Tensor, sigma: float) -> torch.Tensor:
     """
@@ -31,17 +31,68 @@ def gaussian_blur_batch(x: torch.Tensor, sigma: float) -> torch.Tensor:
     return F.conv2d(x, weight, padding=radius, groups=channels)
 
 
+def _shared_grid_centers(
+    h: int,
+    w: int,
+    base_margin: int,
+    spacing_px: int,
+    global_shift: bool,
+    device: torch.device,
+):
+    """Generate one globally-shifted full-image lattice, then boundary-mask it."""
+    spacing_px = int(max(1, spacing_px))
+    if global_shift:
+        shift_y = int(torch.randint(0, spacing_px, (1,), device=device).item())
+        shift_x = int(torch.randint(0, spacing_px, (1,), device=device).item())
+    else:
+        shift_y = 0
+        shift_x = 0
+
+    y_centers = list(range(shift_y % spacing_px, h, spacing_px))
+    x_centers = list(range(shift_x % spacing_px, w, spacing_px))
+    if len(y_centers) == 0:
+        y_centers = [h // 2]
+    if len(x_centers) == 0:
+        x_centers = [w // 2]
+
+    raw_centers = [(cy, cx) for cy in y_centers for cx in x_centers]
+    grid_dy = (float(torch.rand(1, device=device).item()) - 0.5) * float(spacing_px)
+    grid_dx = (float(torch.rand(1, device=device).item()) - 0.5) * float(spacing_px)
+
+    shared_centers = []
+    for cy, cx in raw_centers:
+        jy = int(round(float(cy) + grid_dy))
+        jx = int(round(float(cx) + grid_dx))
+        jy = int(min(h - 1, max(0, jy)))
+        jx = int(min(w - 1, max(0, jx)))
+        edge_dist = min(jy, (h - 1) - jy, jx, (w - 1) - jx)
+        if edge_dist < int(base_margin):
+            continue
+        shared_centers.append((jy, jx))
+
+    if len(shared_centers) == 0:
+        y_min = int(base_margin)
+        y_max = int(max(y_min, h - 1 - int(base_margin)))
+        x_min = int(base_margin)
+        x_max = int(max(x_min, w - 1 - int(base_margin)))
+        for cy, cx in raw_centers:
+            iy = int(min(y_max, max(y_min, int(cy))))
+            ix = int(min(x_max, max(x_min, int(cx))))
+            shared_centers.append((iy, ix))
+
+    return shared_centers
+
+
 def make_pyramid_grid_context(
     x_clean: torch.Tensor,
     sigmas=(2, 4, 8, 16),
     cell_sizes=(16, 32, 64, 128),
     max_targets_per_image: int = 16,
-    mask_fraction: float = 0.20,
-    spacing_mult: float = 1.5,
+    mask_fraction: float = 1.0,
     box_sigma_mult: float = 4.0,
     mask_scale: float = 1.0,
     min_mask_scale: float = 0.0,
-    spacing_scale: float = 2.0,
+    spacing_scale: float = 1.5,
     full_grid: bool = True,
     global_shift: bool = True,
     align_scales: bool = True,
@@ -53,6 +104,7 @@ def make_pyramid_grid_context(
     cdd_sm_mode: str = "reflect",
     mask_fill_mode: str = "zero",
     dip_sigma_mult: float = 1.0,
+    constant_gaussian_sigma: float = 1.0,
     inner_target_size: int = 2,
     return_debug: bool = False,
 ):
@@ -69,17 +121,13 @@ def make_pyramid_grid_context(
 
     if x_clean.shape[1] != 1:
         raise ValueError(f"Expected grayscale input with 1 channel, got {x_clean.shape[1]}")
-    if blur_mode != "gaussian":
-        raise ValueError(
-            f"Unsupported blur_mode: {blur_mode}. "
-            "Allowed blur_mode is only 'gaussian' (use mask_fill_mode=zero or gaussian_dip)."
-        )
-    if mask_fill_mode not in ("zero", "gaussian_dip"):
+    if blur_mode not in ("gaussian", "cdd"):
+        raise ValueError(f"Unsupported blur_mode: {blur_mode}")
+    if mask_fill_mode not in ("zero", "gaussian_dip", "constant_gaussian"):
         raise ValueError(f"Unsupported mask_fill_mode: {mask_fill_mode}")
 
     b, _, h, w = x_clean.shape
     x_context = x_clean.clone()
-    global _WARNED_CDD_FORWARD_CPU
 
     all_locations = []
     all_scales = []
@@ -119,41 +167,35 @@ def make_pyramid_grid_context(
         dip_field_ch = np.zeros((max(1, len(active_sigmas)), h, w), dtype=np.float32)
         dip_proto_ch = np.zeros((max(1, len(active_sigmas)), h, w), dtype=np.float32)
         dip_proto_written = np.zeros((max(1, len(active_sigmas)),), dtype=np.int32)
-        if blur_mode == "cdd":
-            if x_clean.device.type in ("cuda", "mps") and not _WARNED_CDD_FORWARD_CPU:
-                print(
-                    "[PyramidGridJEPA] warning: blur_mode='cdd' runs CPU NumPy CDD in forward "
-                    "(device bounce CPU<->GPU). Consider dataset-side CDD or torch-native implementation."
-                )
-                _WARNED_CDD_FORWARD_CPU = True
-            import constrained_diffusion as cdd
+        # Always decompose first, then apply scale-aware masking on CDD channels.
+        import constrained_diffusion as cdd
 
-            arr = x_clean[bi, 0].detach().cpu().numpy().astype(np.float32)
-            cdd_kwargs = dict(
-                mode=cdd_mode,
-                constrained=bool(cdd_constrained),
-                sm_mode=cdd_sm_mode,
-                return_scales=True,
-                verbose=False,
-                use_gpu=False,
+        arr = x_clean[bi, 0].detach().cpu().numpy().astype(np.float32)
+        cdd_kwargs = dict(
+            mode=cdd_mode,
+            constrained=bool(cdd_constrained),
+            sm_mode=cdd_sm_mode,
+            return_scales=True,
+            verbose=False,
+            use_gpu=False,
+        )
+        try:
+            cdd_result, cdd_residual, _ = cdd.constrained_diffusion_decomposition(
+                arr,
+                scales=active_sigmas,
+                **cdd_kwargs,
             )
-            try:
-                cdd_result, cdd_residual, _ = cdd.constrained_diffusion_decomposition(
-                    arr,
-                    scales=active_sigmas,
-                    **cdd_kwargs,
-                )
-            except TypeError:
-                cdd_result, cdd_residual, _ = cdd.constrained_diffusion_decomposition(
-                    arr,
-                    num_channels=max(1, len(active_sigmas)),
-                    **cdd_kwargs,
-                )
-            cdd_result = np.asarray(cdd_result, dtype=np.float32)
-            cdd_residual = np.asarray(cdd_residual, dtype=np.float32)
-            # Treat CDD channels as non-negative components.
-            cdd_result = np.clip(cdd_result, a_min=0.0, a_max=None)
-            cdd_mod = cdd_result.copy()
+        except TypeError:
+            cdd_result, cdd_residual, _ = cdd.constrained_diffusion_decomposition(
+                arr,
+                num_channels=max(1, len(active_sigmas)),
+                **cdd_kwargs,
+            )
+        cdd_result = np.asarray(cdd_result, dtype=np.float32)
+        cdd_residual = np.asarray(cdd_residual, dtype=np.float32)
+        # Treat CDD channels as non-negative components.
+        cdd_result = np.clip(cdd_result, a_min=0.0, a_max=None)
+        cdd_mod = cdd_result.copy()
 
         shared_centers = None
         if align_scales:
@@ -176,22 +218,18 @@ def make_pyramid_grid_context(
                 box_sigma = int(max(2, round(eff_largest_sigma * float(box_sigma_mult) * float(mask_scale))))
                 box_cell = int(max(2, round(max(1, largest_cell) * float(mask_fraction)))) if largest_cell > 0 else 2
                 largest_box = int(max(box_sigma, box_cell))
-            # Align-grid spacing: prefer configured cell size when provided, else sigma rule.
-            sigma_spacing = int(max(largest_box + 1, round(eff_largest_sigma * float(mask_scale) * float(spacing_scale))))
-            cell_spacing = int(max(largest_box + 1, largest_cell)) if largest_cell > 0 else 0
-            base_spacing = int(max(sigma_spacing, cell_spacing))
+            # Spacing rule (all modes):
+            # scale * masking_ratio(mask_scale) * grid_spacing_scale
+            spacing_px = int(max(1, round(eff_largest_sigma * float(mask_scale) * float(spacing_scale))))
             base_margin = largest_box // 2 + 1
-            if global_shift:
-                base_shift_y = int(torch.randint(0, max(1, base_spacing), (1,), device=x_clean.device).item())
-                base_shift_x = int(torch.randint(0, max(1, base_spacing), (1,), device=x_clean.device).item())
-            else:
-                base_shift_y = 0
-                base_shift_x = 0
-            y_start = base_margin + base_shift_y
-            x_start = base_margin + base_shift_x
-            y_centers = list(range(y_start, max(y_start + 1, h - base_margin), base_spacing))
-            x_centers = list(range(x_start, max(x_start + 1, w - base_margin), base_spacing))
-            shared_centers = [(cy, cx) for cy in y_centers for cx in x_centers]
+            shared_centers = _shared_grid_centers(
+                h=h,
+                w=w,
+                base_margin=base_margin,
+                spacing_px=spacing_px,
+                global_shift=global_shift,
+                device=x_clean.device,
+            )
             if not full_grid:
                 base_budget = per_scale_fraction * float(h * w)
                 base_desired = base_budget / max(1.0, float(base_box * base_box))
@@ -219,9 +257,9 @@ def make_pyramid_grid_context(
             if align_scales:
                 centers = shared_centers
             else:
-                spacing_sigma = int(max(box + 1, round(box * float(spacing_mult))))
-                spacing_cell = int(max(box + 1, cell_size)) if cell_size > 0 else 0
-                spacing = int(max(spacing_sigma, spacing_cell))
+                # Spacing rule (all modes):
+                # scale * masking_ratio(mask_scale) * grid_spacing_scale
+                spacing = int(max(1, round(eff_sigma * float(mask_scale) * float(spacing_scale))))
                 margin = half + 1
                 area_budget = per_scale_fraction * float(h * w)
                 desired_count = area_budget / max(1.0, float(box * box))
@@ -247,51 +285,41 @@ def make_pyramid_grid_context(
                 y1 = min(h, cy + half)
                 x0 = max(0, cx - half)
                 x1 = min(w, cx + half)
-                if blur_mode == "gaussian":
-                    if mask_fill_mode == "zero":
-                        x_context[bi : bi + 1, :, y0:y1, x0:x1] = 0.0
-                    elif mask_fill_mode == "gaussian_dip":
-                        s = max(1e-6, float(eff_sigma) * float(dip_sigma_mult))
-                        g = torch.exp(-(((yy_full_t - float(cy)) ** 2 + (xx_full_t - float(cx)) ** 2) / (2.0 * s * s)))
-                        x_context[bi : bi + 1] *= (1.0 - g).view(1, 1, h, w)
-                        g_np = g.detach().cpu().numpy().astype(np.float32)
-                        dip_field = np.maximum(dip_field, g_np)
-                        chp = min(si, dip_field_ch.shape[0] - 1)
-                        dip_field_ch[chp] = np.maximum(dip_field_ch[chp], g_np)
-                        if dip_proto_written[chp] == 0:
-                            dip_proto_ch[chp] = g_np
-                            dip_proto_written[chp] = 1
+                if y1 <= y0 or x1 <= x0:
+                    continue
+                ch = min(si, cdd_mod.shape[0] - 1)
+                if mask_fill_mode in ("gaussian_dip", "constant_gaussian"):
+                    # Constrain gaussian dip to the same local patch footprint as box mode.
+                    if mask_fill_mode == "constant_gaussian":
+                        blur_sigma = max(1e-6, float(constant_gaussian_sigma))
                     else:
-                        # No legacy replacement blur branch: gaussian mode is zero or gaussian_dip only.
-                        pass
+                        blur_sigma = max(1e-6, float(sigma) * float(mask_fraction) * float(dip_sigma_mult))
+                    yy = np.arange(y0, y1, dtype=np.float32).reshape(-1, 1)
+                    xx = np.arange(x0, x1, dtype=np.float32).reshape(1, -1)
+                    g_patch = np.exp(
+                        -(((yy - float(cy)) ** 2 + (xx - float(cx)) ** 2) / (2.0 * blur_sigma * blur_sigma))
+                    ).astype(np.float32)
+                    cdd_mod[ch, y0:y1, x0:x1] *= (1.0 - g_patch)
+                    dip_field[y0:y1, x0:x1] = np.maximum(dip_field[y0:y1, x0:x1], g_patch)
+                    dip_field_ch[ch, y0:y1, x0:x1] = np.maximum(dip_field_ch[ch, y0:y1, x0:x1], g_patch)
+                    if dip_proto_written[ch] == 0:
+                        dip_proto_ch[ch, y0:y1, x0:x1] = g_patch
+                        dip_proto_written[ch] = 1
                 else:
-                    ch = min(si, cdd_mod.shape[0] - 1)
-                    if mask_fill_mode == "gaussian_dip":
-                        s = max(1e-6, float(eff_sigma) * float(dip_sigma_mult))
-                        g = np.exp(-(((yy_full_np - float(cy)) ** 2 + (xx_full_np - float(cx)) ** 2) / (2.0 * s * s))).astype(
-                            np.float32
-                        )
-                        cdd_mod[ch] *= (1.0 - g)
-                        dip_field = np.maximum(dip_field, g)
-                        dip_field_ch[ch] = np.maximum(dip_field_ch[ch], g)
-                        if dip_proto_written[ch] == 0:
-                            dip_proto_ch[ch] = g
-                            dip_proto_written[ch] = 1
-                    else:
-                        cdd_mod[ch, y0:y1, x0:x1] = 0.0
+                    # "box" mode (mask_fill_mode="zero"): hard zero in selected CDD channel.
+                    cdd_mod[ch, y0:y1, x0:x1] = 0.0
                 applied_locations.append((cy, cx))
                 applied_scales.append(float(sigma))
-                # Training targets are grid centers (deduplicated), not per-scale duplicates.
-                sample_locations.append((cy, cx))
-                sample_scales.append(float(sigma))
 
-        if blur_mode == "cdd":
-            recon = np.sum(cdd_mod, axis=0) + cdd_residual
-            # Keep CDD reconstruction non-negative before shared log transform.
-            recon = np.clip(recon, a_min=0.0, a_max=None)
-            x_context[bi, 0] = torch.from_numpy(recon).to(device=x_clean.device, dtype=x_clean.dtype)
+        recon = np.sum(cdd_mod, axis=0) + cdd_residual
+        # Keep CDD reconstruction non-negative before shared log transform.
+        recon = np.clip(recon, a_min=0.0, a_max=None)
+        x_context[bi, 0] = torch.from_numpy(recon).to(device=x_clean.device, dtype=x_clean.dtype)
 
-        # Keep a regular grid of unique centers to avoid overlap-heavy duplicate targets.
+        # Targets must be perfectly aligned with applied masked centers.
+        sample_locations = list(applied_locations)
+        sample_scales = list(applied_scales)
+        # Keep unique centers to avoid overlap-heavy duplicate targets.
         unique_loc_to_scale = {}
         for (cy, cx), s in zip(sample_locations, sample_scales):
             key = (int(cy), int(cx))
@@ -300,18 +328,7 @@ def make_pyramid_grid_context(
         sample_locations = sorted(unique_loc_to_scale.keys())
         sample_scales = [float(unique_loc_to_scale[k]) for k in sample_locations]
 
-        if len(sample_locations) > max_targets_per_image:
-            # Deterministic, evenly spaced downsample keeps target layout regular.
-            idx = torch.linspace(0, len(sample_locations) - 1, steps=max_targets_per_image, device=x_clean.device)
-            keep = [int(round(v)) for v in idx.detach().cpu().numpy().tolist()]
-            sample_locations = [sample_locations[i] for i in keep]
-            sample_scales = [sample_scales[i] for i in keep]
         sample_valid = [1] * len(sample_locations)
-
-        while len(sample_locations) < max_targets_per_image:
-            sample_locations.append((h // 2, w // 2))
-            sample_scales.append(0.0)
-            sample_valid.append(0)
 
         all_locations.append(sample_locations)
         all_scales.append(sample_scales)
@@ -324,15 +341,26 @@ def make_pyramid_grid_context(
                 if key not in seen:
                     seen.add(key)
                     uniq.append(key)
-            if mask_fill_mode == "gaussian_dip":
+            if mask_fill_mode in ("gaussian_dip", "constant_gaussian"):
                 m_soft = np.zeros((h, w), dtype=np.float32)
                 for (cy, cx), s in zip(applied_locations, applied_scales):
+                    if mask_fill_mode == "constant_gaussian":
+                        ss = max(1e-6, float(constant_gaussian_sigma))
+                    else:
+                        ss = max(1e-6, float(s) * float(mask_fraction) * float(dip_sigma_mult))
                     eff_s = max(float(s), float(min_mask_scale))
-                    ss = max(1e-6, eff_s * float(dip_sigma_mult))
-                    g = np.exp(-(((yy_full_np - float(cy)) ** 2 + (xx_full_np - float(cx)) ** 2) / (2.0 * ss * ss))).astype(
-                        np.float32
-                    )
-                    m_soft = np.maximum(m_soft, g)
+                    box_dbg = int(mask_box_size) if constant_mask_box else int(max(2, round(eff_s * float(mask_scale))))
+                    half_dbg = box_dbg // 2
+                    y0 = max(0, int(cy) - half_dbg)
+                    y1 = min(h, int(cy) + half_dbg)
+                    x0 = max(0, int(cx) - half_dbg)
+                    x1 = min(w, int(cx) + half_dbg)
+                    if y1 <= y0 or x1 <= x0:
+                        continue
+                    yy = np.arange(y0, y1, dtype=np.float32).reshape(-1, 1)
+                    xx = np.arange(x0, x1, dtype=np.float32).reshape(1, -1)
+                    g = np.exp(-(((yy - float(cy)) ** 2 + (xx - float(cx)) ** 2) / (2.0 * ss * ss))).astype(np.float32)
+                    m_soft[y0:y1, x0:x1] = np.maximum(m_soft[y0:y1, x0:x1], g)
                 m = (m_soft > 1e-3).astype(np.uint8)
             else:
                 m = np.zeros((h, w), dtype=np.uint8)
@@ -347,12 +375,8 @@ def make_pyramid_grid_context(
                     m[y0:y1, x0:x1] = 1
             all_mask_maps.append(torch.from_numpy(m))
             all_unique_centers.append(torch.tensor(uniq, dtype=torch.long))
-            if blur_mode == "cdd":
-                all_cdd_orig.append(torch.from_numpy(cdd_result))
-                all_cdd_masked.append(torch.from_numpy(cdd_mod))
-            else:
-                all_cdd_orig.append(torch.empty(0))
-                all_cdd_masked.append(torch.empty(0))
+            all_cdd_orig.append(torch.from_numpy(cdd_result))
+            all_cdd_masked.append(torch.from_numpy(cdd_mod))
             all_dip_fields.append(torch.from_numpy(dip_field))
             all_dip_fields_per_channel.append(torch.from_numpy(dip_field_ch))
             all_dip_proto_per_channel.append(torch.from_numpy(dip_proto_ch))
@@ -373,12 +397,8 @@ def make_pyramid_grid_context(
     debug = {
         "mask_map": torch.stack([m.to(device=x_clean.device) for m in all_mask_maps], dim=0),
         "unique_centers": centers_pad,
-        "cdd_channels_orig": torch.stack([t.to(device=x_clean.device, dtype=x_clean.dtype) for t in all_cdd_orig], dim=0)
-        if blur_mode == "cdd"
-        else torch.empty(0, device=x_clean.device, dtype=x_clean.dtype),
-        "cdd_channels_masked": torch.stack([t.to(device=x_clean.device, dtype=x_clean.dtype) for t in all_cdd_masked], dim=0)
-        if blur_mode == "cdd"
-        else torch.empty(0, device=x_clean.device, dtype=x_clean.dtype),
+        "cdd_channels_orig": torch.stack([t.to(device=x_clean.device, dtype=x_clean.dtype) for t in all_cdd_orig], dim=0),
+        "cdd_channels_masked": torch.stack([t.to(device=x_clean.device, dtype=x_clean.dtype) for t in all_cdd_masked], dim=0),
         "dip_field": torch.stack([t.to(device=x_clean.device, dtype=x_clean.dtype) for t in all_dip_fields], dim=0),
         "dip_field_per_channel": torch.stack(
             [t.to(device=x_clean.device, dtype=x_clean.dtype) for t in all_dip_fields_per_channel], dim=0
@@ -455,12 +475,11 @@ class PyramidGridJEPA(nn.Module):
         sigmas=(2, 4, 8, 16),
         cell_sizes=(16, 32, 64, 128),
         max_targets_per_image: int = 16,
-        mask_fraction: float = 0.20,
-        spacing_mult: float = 1.5,
+        mask_fraction: float = 1.0,
         box_sigma_mult: float = 4.0,
         mask_scale: float = 1.0,
         min_mask_scale: float = 0.0,
-        spacing_scale: float = 2.0,
+        spacing_scale: float = 1.5,
         full_grid: bool = True,
         global_shift: bool = True,
         align_scales: bool = True,
@@ -472,11 +491,17 @@ class PyramidGridJEPA(nn.Module):
         cdd_sm_mode: str = "reflect",
         mask_fill_mode: str = "zero",
         dip_sigma_mult: float = 1.0,
+        constant_gaussian_sigma: float = 1.0,
         post_log_transform: bool = True,
         log_eps: float = 1.0,
         cdd_log_std_floor_mult: float = 0.05,
         ema_momentum: float = 0.996,
         normalize_loss: bool = True,
+        predictor_layernorm: bool = False,
+        encoder_type: str = "fullres",
+        encoder_width: int = 32,
+        encoder_depth: int = 4,
+        encoder_kernel_size: int = 7,
     ):
         super().__init__()
 
@@ -485,7 +510,6 @@ class PyramidGridJEPA(nn.Module):
         self.cell_sizes = tuple(cell_sizes)
         self.max_targets_per_image = int(max_targets_per_image)
         self.mask_fraction = float(mask_fraction)
-        self.spacing_mult = float(spacing_mult)
         self.box_sigma_mult = float(box_sigma_mult)
         self.mask_scale = float(mask_scale)
         self.min_mask_scale = float(min_mask_scale)
@@ -496,23 +520,53 @@ class PyramidGridJEPA(nn.Module):
         self.constant_mask_box = bool(constant_mask_box)
         self.mask_box_size = int(mask_box_size)
         self.blur_mode = str(blur_mode)
-        if self.blur_mode != "gaussian":
-            raise ValueError(
-                f"Unsupported blur_mode: {self.blur_mode}. "
-                "Allowed blur_mode is only 'gaussian' (use mask_fill_mode=zero or gaussian_dip)."
-            )
         self.cdd_mode = str(cdd_mode)
         self.cdd_constrained = bool(cdd_constrained)
         self.cdd_sm_mode = str(cdd_sm_mode)
         self.mask_fill_mode = str(mask_fill_mode)
         self.dip_sigma_mult = float(dip_sigma_mult)
+        self.constant_gaussian_sigma = float(constant_gaussian_sigma)
         self.post_log_transform = bool(post_log_transform)
         self.log_eps = float(log_eps)
         self.cdd_log_std_floor_mult = float(cdd_log_std_floor_mult)
         self.ema_momentum = float(ema_momentum)
         self.normalize_loss = bool(normalize_loss)
-
-        self.context_encoder = FullResEncoder(in_channels=1, latent_channels=latent_channels)
+        self.predictor_layernorm = bool(predictor_layernorm)
+        self.encoder_type = str(encoder_type)
+        self.encoder_width = int(encoder_width)
+        self.encoder_depth = int(encoder_depth)
+        self.encoder_kernel_size = int(encoder_kernel_size)
+        if self.encoder_type == "fullres":
+            self.context_encoder = FullResEncoder(in_channels=1, latent_channels=latent_channels)
+        elif self.encoder_type == "convnext_dense":
+            self.context_encoder = ConvNeXtDenseEncoder(
+                in_channels=1,
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=self.encoder_depth,
+                kernel_size=self.encoder_kernel_size,
+                expansion=4,
+                use_reflect_padding=True,
+                final_norm=True,
+            )
+        elif self.encoder_type == "dense_unet_small":
+            self.context_encoder = DenseUNetSmallEncoder(
+                in_channels=1,
+                width=self.encoder_width,
+                latent_channels=latent_channels,
+                groups=8,
+                final_norm=True,
+            )
+        elif self.encoder_type == "rescnn_dense":
+            self.context_encoder = ResCNNDenseEncoder(
+                in_channels=1,
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=self.encoder_depth,
+                final_norm=True,
+            )
+        else:
+            raise ValueError(f"Unknown encoder_type={self.encoder_type}")
 
         self.target_encoder = copy.deepcopy(self.context_encoder)
         for p in self.target_encoder.parameters():
@@ -520,7 +574,11 @@ class PyramidGridJEPA(nn.Module):
 
         if predictor_hidden is None:
             predictor_hidden = latent_channels * 2
-        self.predictor = FullResPredictor(channels=latent_channels, hidden=int(predictor_hidden))
+        self.predictor = FullResPredictor(
+            channels=latent_channels,
+            hidden=int(predictor_hidden),
+            use_layernorm=self.predictor_layernorm,
+        )
 
     def forward(self, x_clean):
         """
@@ -538,7 +596,6 @@ class PyramidGridJEPA(nn.Module):
             cell_sizes=self.cell_sizes,
             max_targets_per_image=self.max_targets_per_image,
             mask_fraction=self.mask_fraction,
-            spacing_mult=self.spacing_mult,
             box_sigma_mult=self.box_sigma_mult,
             mask_scale=self.mask_scale,
             min_mask_scale=self.min_mask_scale,
@@ -554,6 +611,7 @@ class PyramidGridJEPA(nn.Module):
             cdd_sm_mode=self.cdd_sm_mode,
             mask_fill_mode=self.mask_fill_mode,
             dip_sigma_mult=self.dip_sigma_mult,
+            constant_gaussian_sigma=self.constant_gaussian_sigma,
             inner_target_size=self.patch_size,
         )
 

@@ -1,7 +1,9 @@
 import torch.nn as nn
 
 
-class DualJEPALoss(nn.Module):
+class LegacyDualJEPALoss(nn.Module):
+    """Legacy combined JEPA + pixel-mask loss (not used by current training loop)."""
+
     def __init__(self, weight_jepa: float = 1.0, weight_pixel: float = 1.0):
         super().__init__()
         self.w_jepa = weight_jepa

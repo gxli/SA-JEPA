@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import glob
 import hashlib
 import os
@@ -26,7 +28,7 @@ class JEPADataset(Dataset):
         cdd_constrained: bool = True,
         cdd_sm_mode: str = "reflect",
         apply_cdd: bool = True,
-        cube_slice_strategy: str = "random",
+        cube_slice_strategy: str = "auto",
         cube_slice_axis: int = 0,
         cube_slice_index: int = 0,
         random_roll_max: int = 0,
@@ -34,7 +36,15 @@ class JEPADataset(Dataset):
         cdd_cache_dir: str | None = None,
         cdd_mem_cache_max: int = 64,
         cache_random_slices: bool = False,
+        precompute_cdd_cache_all_slices: bool = False,
     ):
+        self.cube_slice_strategy = str(cube_slice_strategy).lower()
+        allowed_strategies = {"auto", "random", "center", "fixed", "all"}
+        if self.cube_slice_strategy not in allowed_strategies:
+            raise ValueError(
+                f"Unknown cube_slice_strategy={cube_slice_strategy}. "
+                "Use 'auto', 'random', 'center', 'fixed', or 'all'."
+            )
         self.num_samples = num_samples
         self.image_size = image_size
         self.log_transform = log_transform
@@ -47,7 +57,6 @@ class JEPADataset(Dataset):
         self.cdd_constrained = cdd_constrained
         self.cdd_sm_mode = cdd_sm_mode
         self.apply_cdd = apply_cdd
-        self.cube_slice_strategy = cube_slice_strategy
         self.cube_slice_axis = cube_slice_axis
         self.cube_slice_index = cube_slice_index
         self.random_roll_max = int(random_roll_max)
@@ -55,10 +64,15 @@ class JEPADataset(Dataset):
         self.cdd_cache_dir = cdd_cache_dir
         self.cdd_mem_cache_max = int(cdd_mem_cache_max)
         self.cache_random_slices = bool(cache_random_slices)
+        self.precompute_cdd_cache_all_slices = bool(precompute_cdd_cache_all_slices)
         self._sample_cache = OrderedDict()
         if self.cache_cdd and self.cdd_cache_dir:
             os.makedirs(self.cdd_cache_dir, exist_ok=True)
-        if self.apply_cdd and self.cache_cdd and self.cube_slice_strategy.lower() == "random" and not self.cache_random_slices:
+        if self.precompute_cdd_cache_all_slices and not self.cache_random_slices:
+            # Precompute is only useful when random-slice reads are allowed to use cache.
+            self.cache_random_slices = True
+            print("[JEPADataset] enabling cache_random_slices=True because precompute_cdd_cache_all_slices=True")
+        if self.apply_cdd and self.cache_cdd and self.cube_slice_strategy in ("random", "auto") and not self.cache_random_slices:
             # Random-slice cache is disabled by default for reproducibility/cost control.
             print("[JEPADataset] cache_random_slices=False: skipping CDD cache for random 3D slices.")
 
@@ -70,6 +84,8 @@ class JEPADataset(Dataset):
         self.sample_index = self._build_sample_index()
         if self.num_samples is None:
             self.num_samples = len(self.sample_index)
+        if self.precompute_cdd_cache_all_slices:
+            self._precompute_cdd_cache_all_slices()
 
     def _build_sample_index(self):
         index = []
@@ -95,15 +111,19 @@ class JEPADataset(Dataset):
         return index
 
     def _pick_slice_index(self, depth: int) -> int:
-        strategy = self.cube_slice_strategy.lower()
+        strategy = self.cube_slice_strategy
+        if strategy == "auto":
+            strategy = "random"
         if strategy == "random":
             return int(np.random.randint(0, depth))
         if strategy == "center":
             return depth // 2
         if strategy == "fixed":
             return int(np.clip(self.cube_slice_index, 0, depth - 1))
-        # Fallback for unknown values: center.
-        return depth // 2
+        raise ValueError(
+            f"Unknown cube_slice_strategy={strategy}. "
+            "Use 'auto', 'random', 'center', 'fixed', or 'all'."
+        )
 
     def _extract_2d_from_array(self, arr: np.ndarray, forced_slice_idx=None) -> tuple[np.ndarray, int | None]:
         if arr.ndim == 2:
@@ -123,14 +143,68 @@ class JEPADataset(Dataset):
         stem = os.path.splitext(os.path.basename(path))[0]
         return os.path.join(self.cdd_cache_dir, f"{stem}__{digest}.npy")
 
+    @staticmethod
+    def _atomic_save_npy(path: str, arr: np.ndarray) -> None:
+        tmp_path = f"{path}.tmp.{os.getpid()}"
+        with open(tmp_path, "wb") as f:
+            np.save(f, arr)
+        os.replace(tmp_path, path)
+
+    def _precompute_cdd_cache_all_slices(self) -> None:
+        if not self.apply_cdd or not self.cache_cdd or not self.cdd_cache_dir:
+            print("[JEPADataset] precompute_cdd_cache_all_slices skipped (requires apply_cdd=true, cache_cdd=true, cdd_cache_dir set)")
+            return
+        n_files_2d = 0
+        n_files_3d = 0
+        n_entries_2d = 0
+        n_slices_total = 0
+        n_written = 0
+        axis = self.cube_slice_axis % 3
+        for path in self.npy_files:
+            arr_mm = np.load(path, mmap_mode="r")
+            if arr_mm.ndim == 2:
+                n_files_2d += 1
+                n_entries_2d += 1
+                cpath = self._cache_file_path(path, None)
+                if not os.path.exists(cpath):
+                    arr = np.asarray(arr_mm, dtype=np.float32)
+                    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                    arr = self._normalize01(arr)
+                    arr = self._apply_cdd(arr)
+                    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                    self._atomic_save_npy(cpath, arr.astype(np.float32, copy=False))
+                    n_written += 1
+                continue
+            if arr_mm.ndim != 3:
+                continue
+            n_files_3d += 1
+            depth = int(arr_mm.shape[axis])
+            for sidx in range(depth):
+                n_slices_total += 1
+                cpath = self._cache_file_path(path, sidx)
+                if os.path.exists(cpath):
+                    continue
+                arr2d, _ = self._extract_2d_from_array(arr_mm, forced_slice_idx=sidx)
+                arr = np.asarray(arr2d, dtype=np.float32)
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                arr = self._normalize01(arr)
+                arr = self._apply_cdd(arr)
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                self._atomic_save_npy(cpath, arr.astype(np.float32, copy=False))
+                n_written += 1
+        print(
+            f"[JEPADataset] precompute_cdd_cache_all_slices done "
+            f"files_2d={n_files_2d} entries_2d={n_entries_2d} "
+            f"files_3d={n_files_3d} slices_total={n_slices_total} slices_written={n_written}"
+        )
+
     def _load_sample(self, path: str, forced_slice_idx=None) -> torch.Tensor:
         arr_mm = np.load(path, mmap_mode="r")
         arr2d, sidx = self._extract_2d_from_array(arr_mm, forced_slice_idx=forced_slice_idx)
         cache_key = (os.path.abspath(path), sidx)
 
-        is_random_slice = (self.cube_slice_strategy.lower() == "random")
-        allow_random_cache = bool(self.cache_random_slices)
-        use_cache = self.apply_cdd and self.cache_cdd and (allow_random_cache or not is_random_slice)
+        is_3d_random_slice = (arr_mm.ndim == 3) and (self.cube_slice_strategy in ("random", "auto"))
+        use_cache = self.apply_cdd and self.cache_cdd and (self.cache_random_slices or not is_3d_random_slice)
         arr = None
         if use_cache and cache_key in self._sample_cache:
             arr = self._sample_cache.pop(cache_key).copy()
@@ -159,7 +233,7 @@ class JEPADataset(Dataset):
                     if self.cdd_cache_dir:
                         cpath = self._cache_file_path(path, sidx)
                         if not os.path.exists(cpath):
-                            np.save(cpath, arr.astype(np.float32, copy=False))
+                            self._atomic_save_npy(cpath, arr.astype(np.float32, copy=False))
 
         if self.log_transform:
             eps = self._choose_log_eps(arr, self.log_eps)

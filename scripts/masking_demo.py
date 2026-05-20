@@ -120,11 +120,10 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
         max_targets_per_image=int(model_cfg.get("max_targets_per_image", 16)),
-        mask_fraction=float(model_cfg.get("mask_fraction", 0.20)),
-        spacing_mult=float(model_cfg.get("spacing_mult", 1.5)),
+        mask_fraction=float(model_cfg.get("mask_fraction", 1.0)),
         box_sigma_mult=float(model_cfg.get("box_sigma_mult", 4.0)),
         mask_scale=float(model_cfg.get("mask_scale", 1.0)),
-        spacing_scale=float(model_cfg.get("spacing_scale", 2.0)),
+        spacing_scale=float(model_cfg.get("spacing_scale", 1.5)),
         full_grid=bool(model_cfg.get("full_grid", True)),
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
@@ -136,6 +135,7 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
         mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
         dip_sigma_mult=float(model_cfg.get("dip_sigma_mult", 1.0)),
+        constant_gaussian_sigma=float(model_cfg.get("constant_gaussian_sigma", 1.0)),
         return_debug=True,
     )
 
@@ -439,12 +439,11 @@ def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
         max_targets_per_image=model_cfg.get("max_targets_per_image", 16),
-        mask_fraction=model_cfg.get("mask_fraction", 0.20),
-        spacing_mult=model_cfg.get("spacing_mult", 1.5),
+        mask_fraction=model_cfg.get("mask_fraction", 1.0),
         box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
         mask_scale=model_cfg.get("mask_scale", 1.0),
         min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
-        spacing_scale=model_cfg.get("spacing_scale", 2.0),
+        spacing_scale=model_cfg.get("spacing_scale", 1.5),
         full_grid=model_cfg.get("full_grid", True),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
@@ -456,11 +455,17 @@ def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
         mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
         dip_sigma_mult=model_cfg.get("dip_sigma_mult", 1.0),
+        constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
         post_log_transform=model_post_log,
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
         ema_momentum=model_cfg.get("ema_momentum", 0.996),
         normalize_loss=model_cfg.get("normalize_loss", True),
+        predictor_layernorm=model_cfg.get("predictor_layernorm", False),
+        encoder_type=model_cfg.get("encoder_type", "fullres"),
+        encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
+        encoder_depth=model_cfg.get("encoder_depth", 4),
+        encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
     )
 
 
@@ -540,8 +545,11 @@ def build_overview_figure(
     diff_i2: np.ndarray,
 ):
     delta = diff_i2 - diff_i1
-    # Exact requested fractional difference on pre-log nonnegative intensities.
-    frac = (frac_i1 - frac_i2) / np.maximum(frac_i1 + frac_i2, 1e-12)
+    # Exact requested fractional difference with a robust denominator floor to
+    # avoid low-signal blow-ups outside masked regions.
+    frac_den = np.clip(frac_i1 + frac_i2, a_min=0.0, a_max=None).astype(np.float32)
+    den_floor = max(1e-12, float(np.percentile(frac_den, 25.0)) * 0.1)
+    frac = (frac_i1 - frac_i2) / np.maximum(frac_den, den_floor)
     mask_map = debug["mask_map"][0].cpu().numpy().astype(np.float32)
     dip_t = debug.get("dip_field")
     if mode == "gaussian_dip" and dip_t is not None and dip_t.numel() > 0:
@@ -733,7 +741,7 @@ def main():
     parser.add_argument("--sessions-dir", type=str, default="sessions")
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--mask-mode", type=str, choices=["config", "zero", "gaussian_dip", "both"], default="both")
+    parser.add_argument("--mask-mode", type=str, choices=["config", "zero", "gaussian_dip", "both"], default="config")
     parser.add_argument("--force-blur-mode", type=str, choices=["gaussian", "cdd"], default=None)
     parser.add_argument("--rigid-mask-box", action="store_true", help="Keep constant box mask size (disable adaptive sizing)")
     args = parser.parse_args()
@@ -759,12 +767,13 @@ def main():
         modes = [args.mask_mode]
 
     all_meta = {"config": args.config, "sample_index": int(args.sample_index), "seed": int(args.seed), "modes": []}
-    if args.mask_mode == "zero":
-        report_name = "masking_demo_box_masked.html"
-    elif args.mask_mode == "gaussian_dip":
-        report_name = "masking_demo_gaussian_dip_only.html"
+    effective_single_mode = modes[0] if len(modes) == 1 else None
+    if effective_single_mode == "zero":
+        report_name = f"masking_demo_{config_name}_box_masked.html"
+    elif effective_single_mode == "gaussian_dip":
+        report_name = f"masking_demo_{config_name}_gaussian_dip_only.html"
     else:
-        report_name = "masking_demo_all.html"
+        report_name = f"masking_demo_{config_name}_all.html"
     report_html = os.path.join(session_dir, report_name)
     html_parts = [
         "<html><head><meta charset='utf-8'><title>Masking Demo All</title>"
@@ -898,9 +907,9 @@ def main():
             "blur_mode": str(model_cfg_run.get("blur_mode", "cdd")),
             "checkpoint_used": ckpt_used,
             "use_cdd": bool(data_cfg.get("use_cdd", True)),
-            "mask_fraction": float(model_cfg_run.get("mask_fraction", 0.20)),
+            "mask_fraction": float(model_cfg_run.get("mask_fraction", 1.0)),
             "mask_scale": float(model_cfg_run.get("mask_scale", 1.0)),
-            "spacing_scale": float(model_cfg_run.get("spacing_scale", 2.0)),
+            "spacing_scale": float(model_cfg_run.get("spacing_scale", 1.5)),
             "sigmas": list(model_cfg_run.get("sigmas", [2, 4, 8, 16])),
             "global_realized_fraction": float(mask.mean()),
             "unique_centers": [[int(y), int(x)] for y, x in centers.tolist()],
@@ -916,7 +925,13 @@ def main():
     with open(report_html, "w", encoding="utf-8") as f:
         f.write("\n".join(html_parts))
 
-    out_meta = os.path.join(session_dir, "masking_demo_meta_all.json")
+    if effective_single_mode == "zero":
+        meta_name = f"masking_demo_meta_{config_name}_box_masked.json"
+    elif effective_single_mode == "gaussian_dip":
+        meta_name = f"masking_demo_meta_{config_name}_gaussian_dip_only.json"
+    else:
+        meta_name = f"masking_demo_meta_{config_name}_all.json"
+    out_meta = os.path.join(session_dir, meta_name)
     with open(out_meta, "w", encoding="utf-8") as f:
         json.dump(all_meta, f, indent=2)
     print(f"session_saved={session_dir}")
