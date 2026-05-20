@@ -1,4 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# If invoked via `sh sync_v2.sh ...`, re-exec under bash so arrays/strict mode behave correctly.
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
 set -euo pipefail
 
 # Mirror full relative path under ~/proj
@@ -25,6 +29,7 @@ LOCAL_RESULTS_DIR="result_local"
 RSYNC_RSH='ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes'
 RSYNC_COMMON=(
     -avz
+    --checksum
     --partial
     --timeout=120
     --contimeout=20
@@ -57,6 +62,58 @@ run_rsync_retry() {
         echo "rsync attempt ${n}/${attempts} failed (exit ${rc}), retrying..."
         sleep $((2 * n))
         n=$((n + 1))
+    done
+}
+
+verify_remote_file_md5() {
+    local local_file="$1"
+    local remote_file="$2"
+    if [[ ! -f "$local_file" ]]; then
+        echo "verify skipped (missing local): $local_file"
+        return 0
+    fi
+    local local_md5
+    local_md5="$(md5 -q "$local_file" 2>/dev/null || md5sum "$local_file" | awk '{print $1}')"
+    local remote_md5
+    remote_md5="$(ssh "$REMOTE" "if command -v md5sum >/dev/null 2>&1; then md5sum '$remote_file' | awk '{print \$1}'; elif command -v md5 >/dev/null 2>&1; then md5 -q '$remote_file'; else echo ''; fi" || true)"
+    if [[ -z "$remote_md5" ]]; then
+        echo "verify failed (no remote hash): $remote_file"
+        return 1
+    fi
+    if [[ "$local_md5" != "$remote_md5" ]]; then
+        echo "verify mismatch:"
+        echo "  local : $local_file $local_md5"
+        echo "  remote: $remote_file $remote_md5"
+        return 1
+    fi
+    echo "verify ok: $local_file"
+}
+
+copy_and_verify_file() {
+    local local_file="$1"
+    local remote_file="$2"
+    if verify_remote_file_md5 "$local_file" "$remote_file"; then
+        return 0
+    fi
+    echo "forcing copy via scp: $local_file -> $remote_file"
+    ssh "$REMOTE" "mkdir -p \"$(dirname "$remote_file")\""
+    scp -q -p "$local_file" "$REMOTE:$remote_file"
+    verify_remote_file_md5 "$local_file" "$remote_file"
+}
+
+force_sync_critical_files() {
+    local remote_root="$1"
+    local files=(
+        "src/train.py"
+        "src/models/build_jepa.py"
+        "scripts/session_overview_4panel.py"
+    )
+    for f in "${files[@]}"; do
+        if [[ -f "$f" ]]; then
+            run_rsync_retry "${RSYNC_COMMON[@]}" \
+                ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
+                "$f" "$REMOTE:${remote_root}/$f"
+        fi
     done
 }
 
@@ -107,6 +164,12 @@ case "$1" in
             --exclude '__pycache__/' \
             --exclude '*.pyc' \
             ./ "$REMOTE:$REMOTE_DEST"
+        # Force-sync critical code paths explicitly (guards against edge-case filter drift).
+        force_sync_critical_files "$REMOTE_HOME/proj/$REL_PATH"
+        # Verify critical code files landed correctly.
+        copy_and_verify_file "src/train.py" "$REMOTE_HOME/proj/$REL_PATH/src/train.py"
+        copy_and_verify_file "src/models/build_jepa.py" "$REMOTE_HOME/proj/$REL_PATH/src/models/build_jepa.py"
+        copy_and_verify_file "scripts/session_overview_4panel.py" "$REMOTE_HOME/proj/$REL_PATH/scripts/session_overview_4panel.py"
         ;;
     push-preview)
         echo "Previewing safe mirror push (dry-run) to $REMOTE:$REMOTE_DEST (preserve excluded dirs)"

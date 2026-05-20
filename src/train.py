@@ -130,6 +130,26 @@ def _save_latent_overview_html(session_dir: str, pca_points: np.ndarray, umap_po
     return out_path
 
 
+def save_blurred_debug_images(
+    project_root: str,
+    session_name: str,
+    x_clean_raw: torch.Tensor,
+    x_context_raw: torch.Tensor,
+    max_images: int = 8,
+) -> str:
+    out_dir = os.path.join(project_root, "results", "debug_blurred_images", session_name)
+    os.makedirs(out_dir, exist_ok=True)
+    n = min(int(max_images), int(x_context_raw.shape[0]))
+    for i in range(n):
+        clean = x_clean_raw[i, 0].detach().cpu().numpy().astype(np.float32)
+        ctx = x_context_raw[i, 0].detach().cpu().numpy().astype(np.float32)
+        delta = clean - ctx
+        plt.imsave(os.path.join(out_dir, f"{i:03d}_clean.png"), clean, cmap="gray")
+        plt.imsave(os.path.join(out_dir, f"{i:03d}_context_blurred.png"), ctx, cmap="gray")
+        plt.imsave(os.path.join(out_dir, f"{i:03d}_clean_minus_context.png"), delta, cmap="coolwarm")
+    return out_dir
+
+
 def save_inference_dashboard(session_dir: str, outputs: dict) -> str:
     x_clean_raw = outputs.get("x_clean_raw", outputs["x_clean"])
     x_context_raw = outputs.get("x_context_raw", outputs["x_context"])
@@ -313,6 +333,38 @@ def compute_sim_var_cov(outputs: dict) -> tuple[float, float, float]:
     return float(sim.item()), float(var_term.item()), float(cov_term.item())
 
 
+def compute_sim_var_cov_torch(outputs: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    pred = outputs["pred_patches"]  # keep graph
+    gt = outputs["gt_patches"]  # keep graph (target branch already no-grad in forward)
+    valid = outputs["target_valid"]
+
+    b, k, c, p, _ = pred.shape
+    pred_v = pred.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
+    gt_v = gt.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
+    vm = valid.unsqueeze(-1).unsqueeze(-1).expand(b, k, p * p, 1).reshape(-1)
+    z1 = pred_v.reshape(-1, c)[vm]
+    z2 = gt_v.reshape(-1, c)[vm]
+    if z1.numel() == 0 or z2.numel() == 0:
+        z = pred.sum() * 0.0
+        return z, z, z
+
+    sim = torch.nn.functional.cosine_similarity(z1, z2, dim=1).mean()
+    if z1.shape[0] < 2:
+        z = sim * 0.0
+        return sim, z, z
+
+    std_z1 = torch.sqrt(z1.var(dim=0, unbiased=False) + 1e-4)
+    std_z2 = torch.sqrt(z2.var(dim=0, unbiased=False) + 1e-4)
+    var_term = 0.5 * (torch.relu(1.0 - std_z1).mean() + torch.relu(1.0 - std_z2).mean())
+
+    z1c = z1 - z1.mean(dim=0, keepdim=True)
+    z2c = z2 - z2.mean(dim=0, keepdim=True)
+    cov_z1 = (z1c.T @ z1c) / max(1, z1c.shape[0] - 1)
+    cov_z2 = (z2c.T @ z2c) / max(1, z2c.shape[0] - 1)
+    cov_term = 0.5 * ((_offdiag(cov_z1).pow(2).mean()) + (_offdiag(cov_z2).pow(2).mean()))
+    return sim, var_term, cov_term
+
+
 def compute_raw_mse_and_norm_err(outputs: dict) -> tuple[float, float]:
     pred = outputs["pred_patches"].detach()  # B,K,C,P,P
     gt = outputs["gt_patches"].detach()  # B,K,C,P,P
@@ -459,22 +511,17 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     dataset_apply_cdd = True
     model_post_log = True
     # Pipeline policy:
-    # - blur_mode == cdd:
-    #   dataset: normalize only
-    #   model: CDD mask + shared log
-    # - blur_mode == gaussian:
+    # - blur_mode is gaussian-only:
     #   dataset: normalize + mandatory dataset CDD, no dataset log
     #   model: gaussian masking + shared optional log
-    if blur_mode == "cdd":
-        # REQUIRED policy: dataset normalize-only; model does CDD masking + shared log.
-        dataset_log_transform = False
-        dataset_apply_cdd = False
-        model_post_log = bool(data_cfg.get("log_transform", True))
-    elif blur_mode == "gaussian":
-        # Gaussian path: dataset CDD yes, dataset pre-log no, model shared-log yes.
-        dataset_apply_cdd = True
-        dataset_log_transform = False
-        model_post_log = bool(data_cfg.get("log_transform", True))
+    if blur_mode != "gaussian":
+        raise ValueError(
+            f"Unsupported blur_mode={blur_mode}. "
+            "Allowed blur_mode is only 'gaussian' (mask_fill_mode: zero or gaussian_dip)."
+        )
+    dataset_apply_cdd = True
+    dataset_log_transform = False
+    model_post_log = bool(data_cfg.get("log_transform", True))
 
     print(
         f"[{config_name}] mode: blur_mode={blur_mode} "
@@ -638,16 +685,20 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         lr=train_cfg.get("lr", 1e-4),
         weight_decay=train_cfg.get("weight_decay", 1e-5),
     )
-    use_cuda_amp = torch.cuda.is_available()
-    scaler = GradScaler("cuda", enabled=use_cuda_amp)
+    use_amp = torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+    scaler = GradScaler("cuda", enabled=torch.cuda.is_available())
     if resume_state is not None:
         if "optimizer_state_dict" in resume_state:
             optimizer.load_state_dict(resume_state["optimizer_state_dict"])
-        if "scaler_state_dict" in resume_state and use_cuda_amp:
+        if "scaler_state_dict" in resume_state and torch.cuda.is_available():
             scaler.load_state_dict(resume_state["scaler_state_dict"])
 
     epochs = train_cfg.get("epochs", 20)
     log_interval = train_cfg.get("log_interval", 10)
+    force_recompute_inference = bool(train_cfg.get("force_recompute_inference", False))
+    jepa_loss_weight = float(train_cfg.get("jepa_loss_weight", 100.0))
+    vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", 1.0))
+    vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", 0.1))
 
     metrics_path = os.path.join(session_dir, "metrics.csv")
     if not os.path.exists(metrics_path):
@@ -697,15 +748,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         epoch_var = 0.0
         epoch_cov = 0.0
         epoch_batches = 0
+        metrics_rows = []
+        masked_scale_rows = []
+        visited_rows = []
         for batch_idx, x_raw in enumerate(dataloader):
             x_raw = x_raw.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(device_type=device.type, enabled=use_cuda_amp):
+            with autocast(device_type=device.type, enabled=use_amp):
                 outputs = model(x_raw)
                 loss_jepa = model.compute_loss(outputs)
-                total_loss = loss_jepa
+                _, var_term_t, cov_term_t = compute_sim_var_cov_torch(outputs)
+                total_loss = (jepa_loss_weight * loss_jepa) + (vicreg_var_weight * var_term_t) + (vicreg_cov_weight * cov_term_t)
                 loss_pixel = torch.zeros_like(total_loss)
 
             scaler.scale(total_loss).backward()
@@ -717,9 +772,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             raw_mse_val, norm_err_val = compute_raw_mse_and_norm_err(outputs)
 
             elapsed = time.time() - start
-            with open(metrics_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow([
+            metrics_rows.append(
+                [
                     epoch + 1,
                     batch_idx,
                     float(total_loss.item()),
@@ -731,17 +785,16 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     float(raw_mse_val),
                     float(norm_err_val),
                     round(elapsed, 4),
-                ])
+                ]
+            )
             # Save masked-scale usage as training log in session dir.
             scales = outputs["target_scales"].detach().cpu().numpy()
             valid = outputs["target_valid"].detach().cpu().numpy().astype(bool)
             valid_scales = scales[valid]
             if valid_scales.size > 0:
                 uniq, cnt = np.unique(np.round(valid_scales.astype(np.float32), 6), return_counts=True)
-                with open(masked_scales_log_path, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    for s, c in zip(uniq.tolist(), cnt.tolist()):
-                        writer.writerow([epoch + 1, batch_idx, float(s), int(c)])
+                for s, c in zip(uniq.tolist(), cnt.tolist()):
+                    masked_scale_rows.append([epoch + 1, batch_idx, float(s), int(c)])
             # Save visited target locations for full-session diagnostics.
             tloc = outputs["target_locations"].detach().cpu().numpy()
             tvalid = outputs["target_valid"].detach().cpu().numpy().astype(bool)
@@ -757,28 +810,23 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     xx = int(tloc[bi, ki, 1])
                     if 0 <= yy < visit_counts.shape[0] and 0 <= xx < visit_counts.shape[1]:
                         visit_counts[yy, xx] += 1.0
-            with open(visited_targets_log_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                bsz = tloc.shape[0]
-                ksz = tloc.shape[1]
-                for bi in range(bsz):
-                    for ki in range(ksz):
-                        if not bool(tvalid[bi, ki]):
-                            continue
-                        writer.writerow(
-                            [
-                                epoch + 1,
-                                batch_idx,
-                                bi,
-                                ki,
-                                int(tloc[bi, ki, 0]),
-                                int(tloc[bi, ki, 1]),
-                                float(tscale[bi, ki]),
-                            ]
-                        )
-        if visit_counts is not None:
-            np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
-
+            bsz = tloc.shape[0]
+            ksz = tloc.shape[1]
+            for bi in range(bsz):
+                for ki in range(ksz):
+                    if not bool(tvalid[bi, ki]):
+                        continue
+                    visited_rows.append(
+                        [
+                            epoch + 1,
+                            batch_idx,
+                            bi,
+                            ki,
+                            int(tloc[bi, ki, 0]),
+                            int(tloc[bi, ki, 1]),
+                            float(tscale[bi, ki]),
+                        ]
+                    )
             if batch_idx % log_interval == 0:
                 print(
                     f"[{config_name}] Epoch {epoch + 1}/{epochs} Batch {batch_idx}/{len(dataloader)} "
@@ -793,6 +841,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_var += float(var_val)
             epoch_cov += float(cov_val)
             epoch_batches += 1
+
+        if metrics_rows:
+            with open(metrics_path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerows(metrics_rows)
+        if masked_scale_rows:
+            with open(masked_scales_log_path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerows(masked_scale_rows)
+        if visited_rows:
+            with open(visited_targets_log_path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerows(visited_rows)
+        if visit_counts is not None:
+            np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
 
         if epoch_batches > 0:
             print(
@@ -850,6 +910,23 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         print(f"[{config_name}] checkpoint_saved={resume_ckpt_path} epoch={epoch + 1}")
 
     torch.save(model.state_dict(), os.path.join(session_dir, "model_last.pt"))
+
+    inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
+    inference_required = [
+        inference_outputs_path,
+        os.path.join(session_dir, "network_input_clean.npy"),
+        os.path.join(session_dir, "network_input_context.npy"),
+        os.path.join(session_dir, "pred_map.npy"),
+        os.path.join(session_dir, "gt_map.npy"),
+        os.path.join(session_dir, "target_energy_map.npy"),
+        os.path.join(session_dir, "jepa_energy_summary.json"),
+    ]
+    if (not force_recompute_inference) and all(os.path.exists(p) for p in inference_required):
+        print(
+            f"[{config_name}] inference artifacts already exist; "
+            "skipping post-training inference (set train.force_recompute_inference=true to recompute)"
+        )
+        return session_dir
 
     print(f"[{config_name}] post_training_inference begin")
     model.eval()
@@ -928,6 +1005,16 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     print(f"[{config_name}] building dashboard artifacts (pca/umap may take time on first run)")
     dashboard_path = save_inference_dashboard(session_dir, inference_outputs)
     print(f"dashboard_saved={dashboard_path}")
+    if bool(train_cfg.get("save_blurred_images", False)):
+        project_root = os.path.abspath(os.path.join(session_dir, os.pardir, os.pardir))
+        blur_dir = save_blurred_debug_images(
+            project_root=project_root,
+            session_name=config_name,
+            x_clean_raw=inference_outputs["x_clean_raw"],
+            x_context_raw=inference_outputs["x_context_raw"],
+            max_images=int(train_cfg.get("save_blurred_images_max", 8)),
+        )
+        print(f"blurred_debug_images_saved={blur_dir}")
     loss_curve_path = save_loss_curve(session_dir)
     if loss_curve_path is not None:
         print(f"loss_curve_saved={loss_curve_path}")

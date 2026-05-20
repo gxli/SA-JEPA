@@ -68,6 +68,11 @@
     "lr": 0.0001,
     "weight_decay": 1e-05,
     "num_workers": 0,
-    "log_interval": 1
+    "log_interval": 1,
+    "save_blurred_images": true,
+    "save_blurred_images_max": 8,
+    "jepa_loss_weight": 100.0,
+    "vicreg_var_weight": 1.0,
+    "vicreg_cov_weight": 0.1
   }
 }

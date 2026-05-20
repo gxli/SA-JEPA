@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from .encoders import FullResEncoder
 from .predictor import FullResPredictor
 
+_WARNED_CDD_FORWARD_CPU = False
 
 def gaussian_blur_batch(x: torch.Tensor, sigma: float) -> torch.Tensor:
     """
@@ -68,13 +69,17 @@ def make_pyramid_grid_context(
 
     if x_clean.shape[1] != 1:
         raise ValueError(f"Expected grayscale input with 1 channel, got {x_clean.shape[1]}")
-    if blur_mode not in ("gaussian", "cdd"):
-        raise ValueError(f"Unsupported blur_mode: {blur_mode}")
+    if blur_mode != "gaussian":
+        raise ValueError(
+            f"Unsupported blur_mode: {blur_mode}. "
+            "Allowed blur_mode is only 'gaussian' (use mask_fill_mode=zero or gaussian_dip)."
+        )
     if mask_fill_mode not in ("zero", "gaussian_dip"):
         raise ValueError(f"Unsupported mask_fill_mode: {mask_fill_mode}")
 
     b, _, h, w = x_clean.shape
     x_context = x_clean.clone()
+    global _WARNED_CDD_FORWARD_CPU
 
     all_locations = []
     all_scales = []
@@ -115,6 +120,12 @@ def make_pyramid_grid_context(
         dip_proto_ch = np.zeros((max(1, len(active_sigmas)), h, w), dtype=np.float32)
         dip_proto_written = np.zeros((max(1, len(active_sigmas)),), dtype=np.int32)
         if blur_mode == "cdd":
+            if x_clean.device.type in ("cuda", "mps") and not _WARNED_CDD_FORWARD_CPU:
+                print(
+                    "[PyramidGridJEPA] warning: blur_mode='cdd' runs CPU NumPy CDD in forward "
+                    "(device bounce CPU<->GPU). Consider dataset-side CDD or torch-native implementation."
+                )
+                _WARNED_CDD_FORWARD_CPU = True
             import constrained_diffusion as cdd
 
             arr = x_clean[bi, 0].detach().cpu().numpy().astype(np.float32)
@@ -485,6 +496,11 @@ class PyramidGridJEPA(nn.Module):
         self.constant_mask_box = bool(constant_mask_box)
         self.mask_box_size = int(mask_box_size)
         self.blur_mode = str(blur_mode)
+        if self.blur_mode != "gaussian":
+            raise ValueError(
+                f"Unsupported blur_mode: {self.blur_mode}. "
+                "Allowed blur_mode is only 'gaussian' (use mask_fill_mode=zero or gaussian_dip)."
+            )
         self.cdd_mode = str(cdd_mode)
         self.cdd_constrained = bool(cdd_constrained)
         self.cdd_sm_mode = str(cdd_sm_mode)
