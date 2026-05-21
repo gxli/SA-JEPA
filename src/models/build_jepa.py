@@ -10,7 +10,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .dense_unet import DenseUNetSmallEncoder
-from .encoders import ConvNeXtDenseEncoder, FullResEncoder, PyramidResDilatedEncoder, ResCNNDenseEncoder
+from .encoders import (
+    ConvNeXtDenseEncoder,
+    FullResEncoder,
+    PyramidConvNeXtDilatedEncoder,
+    PyramidResDilatedEncoder,
+    ResCNNDenseEncoder,
+)
 from .predictor import FullResPredictor
 
 
@@ -100,7 +106,6 @@ def make_pyramid_grid_context(
     x_clean: torch.Tensor,
     sigmas=(2, 4, 8, 16),
     cell_sizes=(16, 32, 64, 128),
-    max_targets_per_image: int = 16,
     mask_fraction: float = 1.0,
     box_sigma_mult: float = 4.0,
     mask_scale: float = 1.0,
@@ -357,10 +362,20 @@ def make_pyramid_grid_context(
             if key not in unique_loc_to_scale:
                 unique_loc_to_scale[key] = float(s)
         # Preserve insertion order from sampling pass; sorting would spatially bias
-        # truncation when max_targets_per_image < number of available centers.
-        sample_locations = list(unique_loc_to_scale.keys())
-        sample_scales = [float(unique_loc_to_scale[k]) for k in sample_locations]
-
+        # target selection when many centers are available.
+        sample_locations = []
+        sample_scales = []
+        patch_half_lo = int(inner_target_size) // 2
+        patch_half_hi = int(inner_target_size) - patch_half_lo
+        for cy, cx in unique_loc_to_scale.keys():
+            iy = int(cy)
+            ix = int(cx)
+            if iy - patch_half_lo < 0 or ix - patch_half_lo < 0:
+                continue
+            if iy + patch_half_hi > h or ix + patch_half_hi > w:
+                continue
+            sample_locations.append((iy, ix))
+            sample_scales.append(float(unique_loc_to_scale[(cy, cx)]))
         sample_valid = [1] * len(sample_locations)
 
         all_locations.append(sample_locations)
@@ -384,8 +399,6 @@ def make_pyramid_grid_context(
             all_dip_proto_per_channel.append(torch.from_numpy(dip_proto_ch))
 
     # Pack variable-length targets to fixed K so batching is always valid.
-    # `max_targets_per_image` is intentionally ignored to avoid spatially-biased
-    # truncation effects and preserve full sampled coverage.
     k_fixed = max((len(v) for v in all_locations), default=0)
     k_fixed = max(1, k_fixed)
 
@@ -452,6 +465,7 @@ def extract_location_patches(
         raise ValueError(f"patch_size={patch_size} exceeds feature map size {(h, w)}")
 
     half = patch_size // 2
+    half_hi = patch_size - half
     patches = []
 
     for bi in range(b):
@@ -462,24 +476,13 @@ def extract_location_patches(
             cx = int(locations[bi, ki, 1].item())
 
             y0 = cy - half
-            y1 = cy + half
+            y1 = cy + half_hi
             x0 = cx - half
-            x1 = cx + half
-
-            if y0 < 0:
-                y0 = 0
-                y1 = patch_size
-            if x0 < 0:
-                x0 = 0
-                x1 = patch_size
-            if y1 > h:
-                y1 = h
-                y0 = h - patch_size
-            if x1 > w:
-                x1 = w
-                x0 = w - patch_size
-
-            sample_patches.append(z[bi : bi + 1, :, y0:y1, x0:x1])
+            x1 = cx + half_hi
+            if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
+                sample_patches.append(z.new_zeros((1, z.shape[1], patch_size, patch_size)))
+            else:
+                sample_patches.append(z[bi : bi + 1, :, y0:y1, x0:x1])
 
         sample_patches = torch.cat(sample_patches, dim=0)
         patches.append(sample_patches.unsqueeze(0))
@@ -495,7 +498,6 @@ class PyramidGridJEPA(nn.Module):
         patch_size: int = 2,
         sigmas=(2, 4, 8, 16),
         cell_sizes=(16, 32, 64, 128),
-        max_targets_per_image: int = 16,
         mask_fraction: float = 1.0,
         box_sigma_mult: float = 4.0,
         mask_scale: float = 1.0,
@@ -524,13 +526,15 @@ class PyramidGridJEPA(nn.Module):
         encoder_width: int = 32,
         encoder_depth: int = 4,
         encoder_kernel_size: int = 7,
+        encoder_norm_type: Optional[str] = None,
+        encoder_norm_groups: Optional[int] = None,
+        encoder_norm_eps: Optional[float] = None,
     ):
         super().__init__()
 
         self.patch_size = patch_size
         self.sigmas = tuple(sigmas)
         self.cell_sizes = tuple(cell_sizes)
-        self.max_targets_per_image = int(max_targets_per_image)
         self.mask_fraction = float(mask_fraction)
         self.box_sigma_mult = float(box_sigma_mult)
         self.mask_scale = float(mask_scale)
@@ -559,9 +563,15 @@ class PyramidGridJEPA(nn.Module):
         self.encoder_width = int(encoder_width)
         self.encoder_depth = int(encoder_depth)
         self.encoder_kernel_size = int(encoder_kernel_size)
+        self.encoder_norm_type = None if encoder_norm_type is None else str(encoder_norm_type).lower()
+        self.encoder_norm_groups = None if encoder_norm_groups is None else int(encoder_norm_groups)
+        self.encoder_norm_eps = None if encoder_norm_eps is None else float(encoder_norm_eps)
         if self.mode not in ("image", "pyramid"):
             raise ValueError(f"Unknown mode={self.mode}; expected 'image' or 'pyramid'")
         if self.encoder_type == "pyramid_cnn_res_dilated":
+            norm_type = self.encoder_norm_type if self.encoder_norm_type is not None else "layernorm"
+            norm_groups = self.encoder_norm_groups if self.encoder_norm_groups is not None else 8
+            norm_eps = self.encoder_norm_eps if self.encoder_norm_eps is not None else 1e-6
             # Per-scale map + per-scale masked-token map.
             pyr_in_channels = 2 * max(1, len(self.sigmas))
             self.context_encoder = PyramidResDilatedEncoder(
@@ -570,6 +580,54 @@ class PyramidGridJEPA(nn.Module):
                 latent_channels=latent_channels,
                 depth=self.encoder_depth,
                 final_norm=True,
+                norm_type=norm_type,
+                norm_groups=norm_groups,
+                norm_eps=norm_eps,
+            )
+        elif self.encoder_type == "pyramid_convnext_dilated":
+            norm_type = self.encoder_norm_type if self.encoder_norm_type is not None else "layernorm"
+            norm_groups = self.encoder_norm_groups if self.encoder_norm_groups is not None else 8
+            norm_eps = self.encoder_norm_eps if self.encoder_norm_eps is not None else 1e-6
+            # Per-scale map + per-scale masked-token map.
+            pyr_in_channels = 2 * max(1, len(self.sigmas))
+            self.context_encoder = PyramidConvNeXtDilatedEncoder(
+                in_channels=pyr_in_channels,
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=max(10, self.encoder_depth),
+                final_norm=True,
+                norm_type=norm_type,
+                norm_groups=norm_groups,
+                norm_eps=norm_eps,
+            )
+        elif self.encoder_type == "convnext_dense_pyramid":
+            # Pyramid input = per-scale CDD channels + per-scale mask/indicator channels.
+            pyr_in_channels = 2 * max(1, len(self.sigmas))
+            self.context_encoder = ConvNeXtDenseEncoder(
+                in_channels=pyr_in_channels,
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=self.encoder_depth,
+                kernel_size=self.encoder_kernel_size,
+                expansion=4,
+                use_reflect_padding=True,
+                final_norm=True,
+            )
+        elif self.encoder_type == "rescnn_dense_pyramid":
+            # Pyramid input = per-scale CDD channels + per-scale mask/indicator channels.
+            pyr_in_channels = 2 * max(1, len(self.sigmas))
+            norm_type = self.encoder_norm_type if self.encoder_norm_type is not None else "groupnorm"
+            norm_groups = self.encoder_norm_groups if self.encoder_norm_groups is not None else 1
+            norm_eps = self.encoder_norm_eps if self.encoder_norm_eps is not None else 1e-5
+            self.context_encoder = ResCNNDenseEncoder(
+                in_channels=pyr_in_channels,
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=self.encoder_depth,
+                final_norm=True,
+                norm_type=norm_type,
+                norm_groups=norm_groups,
+                norm_eps=norm_eps,
             )
         elif self.encoder_type == "fullres":
             self.context_encoder = FullResEncoder(in_channels=1, latent_channels=latent_channels)
@@ -593,12 +651,18 @@ class PyramidGridJEPA(nn.Module):
                 final_norm=True,
             )
         elif self.encoder_type == "rescnn_dense":
+            norm_type = self.encoder_norm_type if self.encoder_norm_type is not None else "groupnorm"
+            norm_groups = self.encoder_norm_groups if self.encoder_norm_groups is not None else 1
+            norm_eps = self.encoder_norm_eps if self.encoder_norm_eps is not None else 1e-5
             self.context_encoder = ResCNNDenseEncoder(
                 in_channels=1,
                 hidden_channels=self.encoder_width,
                 latent_channels=latent_channels,
                 depth=self.encoder_depth,
                 final_norm=True,
+                norm_type=norm_type,
+                norm_groups=norm_groups,
+                norm_eps=norm_eps,
             )
         else:
             raise ValueError(f"Unknown encoder_type={self.encoder_type}")
@@ -637,7 +701,6 @@ class PyramidGridJEPA(nn.Module):
                 x_clean=x_clean,
                 sigmas=self.sigmas,
                 cell_sizes=self.cell_sizes,
-                max_targets_per_image=self.max_targets_per_image,
                 mask_fraction=self.mask_fraction,
                 box_sigma_mult=self.box_sigma_mult,
                 mask_scale=self.mask_scale,
@@ -665,7 +728,6 @@ class PyramidGridJEPA(nn.Module):
                 x_clean=x_clean,
                 sigmas=self.sigmas,
                 cell_sizes=self.cell_sizes,
-                max_targets_per_image=self.max_targets_per_image,
                 mask_fraction=self.mask_fraction,
                 box_sigma_mult=self.box_sigma_mult,
                 mask_scale=self.mask_scale,
@@ -763,6 +825,9 @@ class PyramidGridJEPA(nn.Module):
             gt = F.normalize(gt, dim=2)
         loss_map = F.mse_loss(pred, gt, reduction="none")  # B x K x C x P x P
         w = valid.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).to(loss_map.dtype)
+        if not bool(valid.any().item()):
+            # No valid targets in this batch: return graph-connected zero loss.
+            return loss_map.sum() * 0.0
         denom = torch.clamp(w.sum() * loss_map.shape[2] * loss_map.shape[3] * loss_map.shape[4], min=1.0)
         return (loss_map * w).sum() / denom
 

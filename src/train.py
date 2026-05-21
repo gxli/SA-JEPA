@@ -742,6 +742,25 @@ def compute_target_energy_map(outputs: dict, image_size: tuple[int, int]) -> tor
     return energy_lat
 
 
+def compute_effective_rank_from_features(z: np.ndarray) -> float:
+    z = np.asarray(z, dtype=np.float64)
+    if z.ndim != 2 or z.shape[0] < 2 or z.shape[1] < 1:
+        return 0.0
+    z = z - z.mean(axis=0, keepdims=True)
+    cov = (z.T @ z) / max(1, z.shape[0] - 1)
+    evals = np.linalg.eigvalsh(cov)
+    evals = np.clip(evals, 0.0, None)
+    s = float(evals.sum())
+    if s <= 0.0:
+        return 0.0
+    p = evals / s
+    p = p[p > 0]
+    if p.size == 0:
+        return 0.0
+    h = float(-np.sum(p * np.log(p)))
+    return float(np.exp(h))
+
+
 def compute_error_by_scale(outputs: dict) -> dict[float, float]:
     pred = outputs["pred_patches"].detach()  # B,K,C,P,P
     gt = outputs["gt_patches"].detach()  # B,K,C,P,P
@@ -865,7 +884,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         patch_size=model_cfg.get("patch_size", 2),
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-        max_targets_per_image=model_cfg.get("max_targets_per_image", 16),
         mask_fraction=model_cfg.get("mask_fraction", 1.0),
         box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
         mask_scale=model_cfg.get("mask_scale", 1.0),
@@ -894,6 +912,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
         encoder_depth=model_cfg.get("encoder_depth", 4),
         encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
+        encoder_norm_type=model_cfg.get("encoder_norm_type"),
+        encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
+        encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
     ).to(device)
     allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
     resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
@@ -938,7 +959,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     patch_size=model_cfg.get("patch_size", 2),
                     sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
                     cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-                    max_targets_per_image=model_cfg.get("max_targets_per_image", 16),
                     mask_fraction=model_cfg.get("mask_fraction", 1.0),
                     box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
                     mask_scale=model_cfg.get("mask_scale", 1.0),
@@ -967,6 +987,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
                     encoder_depth=model_cfg.get("encoder_depth", 4),
                     encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
+                    encoder_norm_type=model_cfg.get("encoder_norm_type"),
+                    encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
+                    encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
                 ).to(device)
                 print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
@@ -995,7 +1018,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 patch_size=model_cfg.get("patch_size", 2),
                 sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
                 cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-                max_targets_per_image=model_cfg.get("max_targets_per_image", 16),
                 mask_fraction=model_cfg.get("mask_fraction", 1.0),
                 box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
                 mask_scale=model_cfg.get("mask_scale", 1.0),
@@ -1024,6 +1046,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
                 encoder_depth=model_cfg.get("encoder_depth", 4),
                 encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
+                encoder_norm_type=model_cfg.get("encoder_norm_type"),
+                encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
+                encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
             ).to(device)
             print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
         else:
@@ -1057,6 +1082,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
         cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
         precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
+        cache_cdd_in_ram_all=bool(data_cfg.get("cache_cdd_in_ram_all", False)),
     )
     val_fraction = float(train_cfg.get("val_fraction", 0.1))
     val_fraction = min(max(val_fraction, 0.0), 0.95)
@@ -1100,6 +1126,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
             cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
             precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
+            cache_cdd_in_ram_all=bool(data_cfg.get("cache_cdd_in_ram_all", False)),
         )
         val_dataset.sample_index = val_idx
     print(
@@ -1167,6 +1194,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
         cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
         precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
+        cache_cdd_in_ram_all=bool(data_cfg.get("cache_cdd_in_ram_all", False)),
     )
     inference_dataset.sample_index = list(train_idx)
     inference_dataset.num_samples = train_dataset.num_samples
@@ -1212,7 +1240,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     log_interval = train_cfg.get("log_interval", 10)
     force_recompute_inference = bool(train_cfg.get("force_recompute_inference", False))
     inference_mask_passes = int(train_cfg.get("inference_mask_passes", 1))
+    viz_crop_border = bool(train_cfg.get("viz_crop_border", False))
+    viz_crop_border_px = train_cfg.get("viz_crop_border_px")
     umap_cfg = dict(train_cfg.get("umap", {}))
+    compute_effective_rank = bool(train_cfg.get("compute_effective_rank", False))
     print(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
     jepa_loss_weight = float(train_cfg.get("jepa_loss_weight", 100.0))
     vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", 1.0))
@@ -1464,6 +1495,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         visit_counts=visit_counts,
         force_recompute_inference=force_recompute_inference,
         inference_mask_passes=inference_mask_passes,
+        viz_crop_border=viz_crop_border,
+        viz_crop_border_px=viz_crop_border_px,
         compute_jepa_energy_fn=compute_jepa_energy,
         compute_target_energy_map_fn=compute_target_energy_map,
     )
@@ -1475,6 +1508,22 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             outputs = torch.load(inf_path, map_location="cpu")
             dash_path = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)
             print(f"[{config_name}] dashboard_saved={dash_path}")
+            effective_rank = ""
+            if compute_effective_rank:
+                try:
+                    pred_map = outputs.get("pred_map")
+                    if pred_map is not None:
+                        pm = torch.as_tensor(pred_map)
+                        z = pm[0].detach().cpu().permute(1, 2, 0).reshape(-1, int(pm.shape[1])).numpy()
+                        effective_rank = f"{compute_effective_rank_from_features(z):.8f}"
+                except Exception as er:
+                    print(f"[{config_name}] warning: effective_rank_failed: {type(er).__name__}: {er}")
+            run_results_path = os.path.join(session_dir, "run_results.csv")
+            if not os.path.exists(run_results_path):
+                with open(run_results_path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(["timestamp", "config_name", "compute_effective_rank", "effective_rank"])
+            with open(run_results_path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([int(time.time()), config_name, int(compute_effective_rank), effective_rank])
         except Exception as e:
             print(f"[{config_name}] warning: dashboard generation failed: {type(e).__name__}: {e}")
     else:

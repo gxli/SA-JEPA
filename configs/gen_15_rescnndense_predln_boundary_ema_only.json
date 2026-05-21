@@ -43,7 +43,6 @@
       64,
       128
     ],
-    "max_targets_per_image": 16,
     "mask_fraction": 0.2,
     "box_sigma_mult": 4,
     "mask_scale": 1,

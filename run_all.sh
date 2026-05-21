@@ -4,10 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_DIR="${ROOT_DIR}/configs"
 SESSIONS_DIR="${ROOT_DIR}/sessions"
-FORCE_REINFERENCE="${FORCE_REINFERENCE:-1}"
+FORCE_REINFERENCE="${FORCE_REINFERENCE:-0}"
 CONFIG_GLOB="${CONFIG_GLOB:-*.json}"
+OVERRIDE_DIR="${ROOT_DIR}/.run_all_overrides"
 
 mkdir -p "${SESSIONS_DIR}"
+mkdir -p "${OVERRIDE_DIR}"
 
 shopt -s nullglob
 configs=("${CONFIG_DIR}"/${CONFIG_GLOB})
@@ -17,27 +19,24 @@ if [[ ${#configs[@]} -eq 0 ]]; then
 fi
 
 for cfg in "${configs[@]}"; do
-  echo "Running config: ${cfg}"
-  if [[ "${FORCE_REINFERENCE}" == "1" ]]; then
-    tmp_cfg="$(mktemp "${TMPDIR:-/tmp}/run_all_cfg.XXXXXX.json")"
-    python3 - "${cfg}" "${tmp_cfg}" <<'PY'
+  printf "\nRunning config: %s\n" "${cfg}"
+  # Use a stable override path so config_name (derived from basename) stays
+  # identical to the original config and sessions resume correctly.
+  tmp_cfg="${OVERRIDE_DIR}/$(basename "${cfg}")"
+  python3 - "${cfg}" "${tmp_cfg}" "${FORCE_REINFERENCE}" <<'PY'
 import json
 import sys
 
-src, dst = sys.argv[1], sys.argv[2]
+src, dst, force_flag = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(src, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 train = cfg.setdefault("train", {})
-train["force_recompute_inference"] = True
+train["force_recompute_inference"] = bool(int(force_flag))
 with open(dst, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
 PY
-    python3 "${ROOT_DIR}/main.py" --config "${tmp_cfg}" --sessions-dir "${SESSIONS_DIR}"
-    rm -f "${tmp_cfg}"
-  else
-    python3 "${ROOT_DIR}/main.py" --config "${cfg}" --sessions-dir "${SESSIONS_DIR}"
-  fi
+  python3 "${ROOT_DIR}/main.py" --config "${tmp_cfg}" --sessions-dir "${SESSIONS_DIR}"
 done
 
 echo "All sessions complete."

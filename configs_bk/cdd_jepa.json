@@ -23,7 +23,6 @@
     "predictor_hidden": 64,
     "patch_size": 2,
     "sigmas": [2, 4, 8, 16],
-    "max_targets_per_image": 16,
     "mask_fraction": 0.2,
     "mask_fill_mode": "zero",
     "mask_box_size": 16,

@@ -57,7 +57,6 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         x_clean=x,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-        max_targets_per_image=int(model_cfg.get("max_targets_per_image", 16)),
         mask_fraction=float(model_cfg.get("mask_fraction", 1.0)),
         box_sigma_mult=float(model_cfg.get("box_sigma_mult", 4.0)),
         mask_scale=float(model_cfg.get("mask_scale", 1.0)),

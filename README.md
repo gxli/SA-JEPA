@@ -133,7 +133,7 @@ How it matches training:
 
 - Loads data through `JEPADataset` with your config values (`data_root`, `npy_pattern`, slice strategy, `image_size`, log settings, etc.).
 - Applies context masking via the same function used in model forward pass: `make_pyramid_grid_context(...)`.
-- Uses `model.sigmas`, `model.cell_sizes`, and `model.max_targets_per_image` from the active config.
+- Uses `model.sigmas`, `model.cell_sizes`, and `model.sigmas` and `model.cell_sizes` from the active config.
 
 ## Generate Plots
 

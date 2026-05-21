@@ -62,7 +62,6 @@ def build_model(model_cfg: dict, data_cfg: dict, device: torch.device) -> Pyrami
         patch_size=model_cfg.get("patch_size", 2),
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-        max_targets_per_image=model_cfg.get("max_targets_per_image", 16),
         mask_fraction=model_cfg.get("mask_fraction", 1.0),
         box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
         mask_scale=model_cfg.get("mask_scale", 1.0),

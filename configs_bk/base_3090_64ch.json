@@ -5,7 +5,6 @@
     "patch_size": 16,
     "sigmas": [2, 4, 8, 16],
     "cell_sizes": [16, 32, 64, 128],
-    "max_targets_per_image": 16,
     "ema_momentum": 0.996,
     "normalize_loss": true
   },

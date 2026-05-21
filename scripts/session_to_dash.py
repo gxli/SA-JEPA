@@ -318,6 +318,20 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     loss_x.append(ep + 0.001 * ba)
                     loss_total.append(tl)
                     loss_jepa.append(jl)
+    effective_rank_x, effective_rank_y = [], []
+    run_results_path = os.path.join(session_dir, "run_results.csv")
+    if os.path.exists(run_results_path):
+        with open(run_results_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    ts = float(row.get("timestamp", "nan"))
+                    er = float(row.get("effective_rank", "nan"))
+                except Exception:
+                    continue
+                if np.isfinite(ts) and np.isfinite(er):
+                    effective_rank_x.append(ts)
+                    effective_rank_y.append(er)
 
     np.savez_compressed(
         out_npz,
@@ -348,6 +362,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         loss_x=np.asarray(loss_x, dtype=np.float32),
         loss_total=np.asarray(loss_total, dtype=np.float32),
         loss_jepa=np.asarray(loss_jepa, dtype=np.float32),
+        effective_rank_x=np.asarray(effective_rank_x, dtype=np.float64),
+        effective_rank_y=np.asarray(effective_rank_y, dtype=np.float32),
     )
     return out_npz
 
@@ -395,7 +411,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         rgb = np.asarray(rgb_flat)
         source_n = int(pts.shape[0]) if pts.ndim == 2 and pts.shape[1] >= 3 else 0
         if source_n == 0:
-            x, y, z, colors = [], [], [], None
+            x, y, z = [], [], []
+            colors = []
             rendered_n = 0
         else:
             n = source_n
@@ -412,9 +429,10 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                     rgb = rgb[::step]
             rendered_n = int(pts.shape[0])
             x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
-            colors = None
             if rgb.ndim == 2 and rgb.shape[1] >= 3:
                 colors = [f"rgb({int(c[0])},{int(c[1])},{int(c[2])})" for c in rgb]
+            else:
+                colors = ["rgb(127,127,127)"] * rendered_n
         fig = go.Figure(
             [
                 go.Scatter3d(
@@ -422,7 +440,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                     y=y,
                     z=z,
                     mode="markers",
-                    marker=dict(size=2, opacity=0.82, color=colors),
+                    marker=dict(size=2, opacity=0.82, color=colors, showscale=False),
                     showlegend=False,
                 )
             ]
@@ -437,6 +455,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 yaxis_title="dim-2",
                 zaxis_title="dim-3",
                 aspectmode="data",
+                camera=dict(projection=dict(type="orthographic")),
             ),
         )
         return fig, source_n, rendered_n
@@ -458,26 +477,70 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     )
     fig_loss.update_xaxes(title_text="epoch+0.001*batch")
     fig_loss.update_yaxes(title_text="loss")
+    er_x = np.asarray(data["effective_rank_x"], dtype=np.float64) if "effective_rank_x" in data.files else np.asarray([], dtype=np.float64)
+    er_y = np.asarray(data["effective_rank_y"], dtype=np.float32) if "effective_rank_y" in data.files else np.asarray([], dtype=np.float32)
+    fig_eff_rank = go.Figure()
+    if er_x.size > 0 and er_y.size > 0:
+        m = min(er_x.size, er_y.size)
+        fig_eff_rank.add_trace(go.Scatter(x=er_x[:m], y=er_y[:m], mode="lines+markers", name="effective_rank"))
+    fig_eff_rank.update_layout(
+        template="plotly_white",
+        title={"text": "Effective Rank", "x": 0.02},
+        margin=dict(l=42, r=8, t=36, b=36),
+        height=330,
+    )
+    fig_eff_rank.update_xaxes(title_text="timestamp")
+    fig_eff_rank.update_yaxes(title_text="effective_rank")
 
-    cards: list[tuple[str, go.Figure]] = [
-        ("Input (Log-Norm)", heat("Input (Log-Norm)", data["orig"], "Viridis")),
-        ("Loss Curve", fig_loss),
-        ("Target Locations", heat("Target Locations", data["target"], "Magma")),
-        ("Target Location Heatmap", heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma")),
-        ("Energy Map", heat("Energy Map", data["energy_map"], "Inferno")),
-        ("Visit Frequency Heatmap", heat("Visit Frequency Heatmap", data["visit_heatmap"], "Cividis")),
-    ]
+    cards: list[dict] = []
     for name, stem in (("Context", "context"), ("Predict", "pred"), ("Target", "gt")):
         pca_scatter, _, _ = scatter3d(f"{name} PCA 3D Scatter", data[f"{stem}_pca3d"], data[f"{stem}_pca_rgb_flat"])
         umap_scatter, _, _ = scatter3d(f"{name} UMAP 3D Scatter", data[f"{stem}_umap3d"], data[f"{stem}_umap_rgb_flat"])
-        cards.append((f"{name} PCA Color", img(f"{name} PCA Color", data[f"{stem}_pca_rgb"])))
-        cards.append((f"{name} PCA 3D Scatter", pca_scatter))
-        cards.append((f"{name} UMAP Color", img(f"{name} UMAP Color", data[f"{stem}_umap_rgb"])))
-        cards.append((f"{name} UMAP 3D Scatter", umap_scatter))
+        # Keep strict left-right pairing: RGB map (left), RGB scatter (right).
+        cards.append({"title": f"{name} PCA RGB", "fig": img(f"{name} PCA RGB", data[f"{stem}_pca_rgb"]), "group": f"{stem}-pca"})
+        cards.append({"title": f"{name} PCA RGB Scatter", "fig": pca_scatter, "group": f"{stem}-pca"})
+        cards.append({"title": f"{name} UMAP RGB", "fig": img(f"{name} UMAP RGB", data[f"{stem}_umap_rgb"]), "group": f"{stem}-umap"})
+        cards.append({"title": f"{name} UMAP RGB Scatter", "fig": umap_scatter, "group": f"{stem}-umap"})
+    # Non-pair panels afterwards.
+    cards.extend(
+        [
+            {"title": "Input (Log-Norm)", "fig": heat("Input (Log-Norm)", data["orig"], "Viridis"), "group": "input"},
+            {"title": "Loss Curve", "fig": fig_loss, "group": "loss"},
+            {"title": "Effective Rank", "fig": fig_eff_rank, "group": "eff-rank"},
+            {"title": "Target Locations", "fig": heat("Target Locations", data["target"], "Magma"), "group": "target-loc"},
+            {"title": "Target Location Heatmap", "fig": heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma"), "group": "target-heat"},
+            {"title": "Energy Map", "fig": heat("Energy Map", data["energy_map"], "Inferno"), "group": "energy"},
+            {"title": "Visit Frequency Heatmap", "fig": heat("Visit Frequency Heatmap", data["visit_heatmap"], "Cividis"), "group": "visit"},
+        ]
+    )
 
     rendered = []
-    for i, (_, fig) in enumerate(cards):
-        rendered.append(f'<section class="card">{fig.to_html(full_html=False, include_plotlyjs=("cdn" if i == 0 else False), config={"responsive": True, "displaylogo": False})}</section>')
+    seen_groups: set[str] = set()
+    for i, card in enumerate(cards):
+        fig = card["fig"]
+        group = card["group"]
+        controls = ""
+        if group not in seen_groups and ("-pca" in group or "-umap" in group):
+            controls = (
+                f'<div class="controls local-controls" data-group="{group}">'
+                f'<label>xmin <input type="number" step="any" data-k="xmin"></label>'
+                f'<label>xmax <input type="number" step="any" data-k="xmax"></label>'
+                f'<label>ymin <input type="number" step="any" data-k="ymin"></label>'
+                f'<label>ymax <input type="number" step="any" data-k="ymax"></label>'
+                f'<label>zmin <input type="number" step="any" data-k="zmin"></label>'
+                f'<label>zmax <input type="number" step="any" data-k="zmax"></label>'
+                f'<button class="apply-local" type="button" data-group="{group}">Apply</button>'
+                f"</div>"
+            )
+            seen_groups.add(group)
+        rendered.append(
+            f'<section class="card" data-group="{group}">{controls}'
+            f'{fig.to_html(full_html=False, include_plotlyjs=("cdn" if i == 0 else False), config={"responsive": True, "displaylogo": False})}'
+            f'</section>'
+        )
+    # Keep grid alignment stable: if odd number of cards, append a dummy placeholder.
+    if len(rendered) % 2 == 1:
+        rendered.append('<section class="card card-dummy" aria-hidden="true"></section>')
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -491,13 +554,86 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     h1 {{ margin: 0 0 12px 2px; font-size: 24px; font-weight: 650; }}
     .version {{ color: #596275; font-size: 13px; font-weight: 500; margin-left: 8px; }}
     .grid {{ display: grid; grid-template-columns: repeat(2, minmax(420px, 1fr)); gap: 12px; }}
+    .controls {{ display:flex; flex-wrap:wrap; gap:8px; margin: 0 0 12px 2px; align-items:center; }}
+    .controls input {{ width:88px; }}
+    .local-controls {{ margin: 2px 2px 8px 2px; padding: 6px; background: #f7f9ff; border: 1px solid #dde3f0; border-radius: 6px; }}
     .card {{ background: #fff; border: 1px solid #d9deea; border-radius: 10px; box-shadow: 0 1px 2px rgba(10,20,40,0.08); padding: 6px; overflow: hidden; }}
+    .card-dummy {{ visibility: hidden; min-height: 340px; }}
     @media (max-width: 1120px) {{ .grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
   <h1>JEPA Session Dashboard: {os.path.basename(session_dir)} <span class="version">{DASHBOARD_VERSION}</span></h1>
   <div class="grid">{''.join(rendered)}</div>
+  <script>
+  function num(el) {{
+    const v = parseFloat(el.value);
+    return Number.isFinite(v) ? v : null;
+  }}
+  function applyRangesForGroup(group) {{
+    const controls = document.querySelector('.local-controls[data-group="' + group + '"]');
+    if (!controls) return;
+    const get = (k) => {{
+      const el = controls.querySelector('input[data-k="' + k + '"]');
+      return el ? num(el) : null;
+    }};
+    const xmin = get("xmin"), xmax = get("xmax");
+    const ymin = get("ymin"), ymax = get("ymax");
+    const zmin = get("zmin"), zmax = get("zmax");
+    const sections = document.querySelectorAll('.card[data-group="' + group + '"] .js-plotly-plot');
+    function clamp01(v) {{
+      return Math.max(0.0, Math.min(1.0, v));
+    }}
+    function map01(v, lo, hi) {{
+      const den = Math.max(1e-12, hi - lo);
+      return clamp01((v - lo) / den);
+    }}
+    function autoRange(arr) {{
+      let lo = Infinity, hi = -Infinity;
+      for (let i = 0; i < arr.length; i++) {{
+        const v = Number(arr[i]);
+        if (!Number.isFinite(v)) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }}
+      if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return [0.0, 1.0];
+      return [lo, hi];
+    }}
+    sections.forEach((gd) => {{
+      const fl = gd._fullLayout || {{}};
+      if (fl.scene) {{
+        const rl = {{
+          "scene.camera.projection.type": "orthographic",
+        }};
+        if (xmin !== null && xmax !== null) rl["scene.xaxis.range"] = [xmin, xmax];
+        if (ymin !== null && ymax !== null) rl["scene.yaxis.range"] = [ymin, ymax];
+        if (zmin !== null && zmax !== null) rl["scene.zaxis.range"] = [zmin, zmax];
+        Plotly.relayout(gd, rl);
+        (gd.data || []).forEach((tr, i) => {{
+          if (!tr || tr.type !== "scatter3d") return;
+          const xs = tr.x || [];
+          const ys = tr.y || [];
+          const zs = tr.z || [];
+          const xr = (xmin !== null && xmax !== null) ? [xmin, xmax] : autoRange(xs);
+          const yr = (ymin !== null && ymax !== null) ? [ymin, ymax] : autoRange(ys);
+          const zr = (zmin !== null && zmax !== null) ? [zmin, zmax] : autoRange(zs);
+          const n = Math.min(xs.length || 0, ys.length || 0, zs.length || 0);
+          const colors = new Array(n);
+          for (let k = 0; k < n; k++) {{
+            const r = Math.round(map01(Number(xs[k]), xr[0], xr[1]) * 255.0);
+            const g = Math.round(map01(Number(ys[k]), yr[0], yr[1]) * 255.0);
+            const b = Math.round(map01(Number(zs[k]), zr[0], zr[1]) * 255.0);
+            colors[k] = `rgb(${{r}},${{g}},${{b}})`;
+          }}
+          Plotly.restyle(gd, {{"marker.color": [colors]}}, [i]);
+        }});
+      }}
+    }});
+  }}
+  document.querySelectorAll(".apply-local").forEach((btn) => {{
+    btn.addEventListener("click", () => applyRangesForGroup(btn.getAttribute("data-group")));
+  }});
+  </script>
 </body>
 </html>
 """
@@ -508,9 +644,13 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     print(f"dashboard_plot_summary_begin session={session_dir}")
     print(f"dashboard_plot_summary_cards={len(cards)}")
     print(f"dashboard_plot_item=Loss Curve: {'ok' if n > 0 else 'empty'} (total_points={n} jepa_points={n})")
+    er_n = int(min(er_x.size, er_y.size)) if (er_x.size and er_y.size) else 0
+    print(f"dashboard_plot_item=Effective Rank: {'ok' if er_n > 0 else 'empty'} (points={er_n})")
     for name, stem in (("Context", "context"), ("Predict", "pred"), ("Target", "gt")):
         pca_arr = np.asarray(data[f"{stem}_pca3d"], dtype=np.float32)
         um_arr = np.asarray(data[f"{stem}_umap3d"], dtype=np.float32)
+        print(f"dashboard_plot_item={name} PCA Array Shape: shape={tuple(pca_arr.shape)}")
+        print(f"dashboard_plot_item={name} UMAP Array Shape: shape={tuple(um_arr.shape)}")
         _, pca_source_n, pca_rendered_n = scatter3d(f"{name} PCA 3D Scatter", pca_arr, data[f"{stem}_pca_rgb_flat"])
         _, umap_source_n, umap_rendered_n = scatter3d(f"{name} UMAP 3D Scatter", um_arr, data[f"{stem}_umap_rgb_flat"])
         same_shape = pca_arr.shape == um_arr.shape
@@ -600,6 +740,16 @@ def main():
             continue
         print("=" * 72)
         print(f"dashboard_session_begin={session_dir}")
+        dash_html_path = os.path.join(session_dir, "dashboard.html")
+        export_path = os.path.join(export_dir, f"{name.replace('/', '_')}.html")
+        if (not args.overwrite) and (not args.reset) and os.path.exists(dash_html_path) and os.path.exists(export_path):
+            print(
+                f"skip_dashboard_exists={session_dir} "
+                f"session_html={dash_html_path} export_html={export_path}"
+            )
+            skipped += 1
+            print(f"dashboard_session_end={session_dir}")
+            continue
         inf_path = os.path.join(session_dir, "inference_outputs.pt")
         if not os.path.exists(inf_path):
             print(f"skip_no_inference={session_dir}")

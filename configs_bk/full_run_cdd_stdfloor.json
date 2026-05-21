@@ -23,7 +23,6 @@
     "patch_size": 2,
     "sigmas": [2, 4, 8, 16],
     "cell_sizes": [16, 32, 64, 128],
-    "max_targets_per_image": 16,
     "mask_fraction": 0.2,
     "spacing_mult": 1.5,
     "box_sigma_mult": 4.0,

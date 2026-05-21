@@ -39,6 +39,23 @@ def _accumulate_point_energy(
     return total, n_valid
 
 
+def _apply_nan_boundary_frame(x: torch.Tensor, border_px: int) -> torch.Tensor:
+    if border_px <= 0:
+        return x
+    if x.dim() != 4:
+        raise ValueError(f"Expected BCHW tensor, got shape={tuple(x.shape)}")
+    out = x.clone()
+    _, _, h, w = out.shape
+    b = int(max(0, min(border_px, h // 2, w // 2)))
+    if b <= 0:
+        return out
+    out[:, :, :b, :] = float("nan")
+    out[:, :, h - b :, :] = float("nan")
+    out[:, :, :, :b] = float("nan")
+    out[:, :, :, w - b :] = float("nan")
+    return out
+
+
 def run_post_training_inference(
     *,
     model,
@@ -48,6 +65,8 @@ def run_post_training_inference(
     visit_counts,
     force_recompute_inference: bool,
     inference_mask_passes: int,
+    viz_crop_border: bool,
+    viz_crop_border_px: int | None,
     compute_jepa_energy_fn: Callable,
     compute_target_energy_map_fn: Callable,
 ) -> str:
@@ -143,11 +162,30 @@ def run_post_training_inference(
         inference_outputs["pyramid_mask_token"] = outputs["pyramid_mask_token"][:8].detach().cpu()
     energy_scalar = float(total_energy / max(1, total_valid))
     energy_scalar_norm = compute_jepa_energy_fn(outputs, normalize=True)
-    e_map = energy_sum / count_map.clamp_min(1.0)
+    # Dense full-image energy from lattice prediction/target maps.
+    e_map_dense = compute_target_energy_map_fn(
+        outputs,
+        image_size=(int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])),
+    )
+    # Keep point-sampled target energy as a secondary diagnostic.
+    e_map_points = energy_sum / count_map.clamp_min(1.0)
     inference_outputs["jepa_energy"] = torch.tensor(energy_scalar, dtype=torch.float32)
     inference_outputs["jepa_energy_normalized"] = torch.tensor(energy_scalar_norm, dtype=torch.float32)
-    inference_outputs["target_energy_map"] = e_map[:8].detach().cpu()
+    inference_outputs["target_energy_map"] = e_map_dense[:8].detach().cpu()
+    inference_outputs["target_energy_point_map"] = e_map_points[:8].detach().cpu()
     inference_outputs["target_energy_count_map"] = count_map[:8].detach().cpu()
+
+    if bool(viz_crop_border):
+        if viz_crop_border_px is None:
+            auto_border = int(max(getattr(model, "sigmas", (16.0,))))
+        else:
+            auto_border = int(max(0, viz_crop_border_px))
+        inference_outputs["target_energy_map"] = _apply_nan_boundary_frame(
+            inference_outputs["target_energy_map"], auto_border
+        )
+        inference_outputs["target_energy_point_map"] = _apply_nan_boundary_frame(
+            inference_outputs["target_energy_point_map"], auto_border
+        )
 
     if "target_mask_map" in inference_outputs:
         tmap = inference_outputs["target_mask_map"]
@@ -191,6 +229,7 @@ def run_post_training_inference(
     if visit_counts is not None:
         np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
     np.save(os.path.join(session_dir, "target_energy_map.npy"), inference_outputs["target_energy_map"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_point_map.npy"), inference_outputs["target_energy_point_map"].numpy())
     np.save(os.path.join(session_dir, "target_energy_count_map.npy"), inference_outputs["target_energy_count_map"].numpy())
     with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
         json.dump(
