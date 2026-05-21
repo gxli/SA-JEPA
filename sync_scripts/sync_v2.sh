@@ -36,6 +36,15 @@ RSYNC_COMMON=(
     -e "$RSYNC_RSH"
 )
 
+# For pull-plots we intentionally skip checksum work and never overwrite existing local files.
+RSYNC_PLOT_PULL_COMMON=(
+    -avz
+    --partial
+    --timeout=120
+    --contimeout=20
+    -e "$RSYNC_RSH"
+)
+
 RSYNC_RESUME_FLAG=""
 if rsync --help 2>/dev/null | grep -q -- '--append-verify'; then
     RSYNC_RESUME_FLAG="--append-verify"
@@ -159,7 +168,7 @@ usage() {
     echo "  push-preview-> Local to Remote mirror PREVIEW (dry-run, ignores sessions/, results/, result_local/)"
     echo "  pull        -> Remote outputs/ to Local $LOCAL_RESULTS_DIR/ (all files)"
     echo "  pull-plots  -> Remote results/ to Local $LOCAL_RESULTS_DIR/ (only .html/.png/.jpg/.pdf/.svg)"
-    echo "                 add 'refresh' to copy only when remote file is newer"
+    echo "                 skips files that already exist locally (no checksum)"
     echo "  pull_plots  -> Alias of pull-plots"
     echo "  pull-plot   -> Alias of pull-plots"
     echo "  pull_plot   -> Alias of pull-plots"
@@ -239,10 +248,9 @@ case "$1" in
         ;;
     pull-plots|pull_plots|pull-plot|pull_plot)
         if [[ "$REFRESH_ONLY" -eq 1 ]]; then
-            echo "Refreshing plot files from remote results/ to ./$LOCAL_RESULTS_DIR/ (only if remote is newer)"
-        else
-            echo "Pulling plot files (.html and images) from remote results/ to ./$LOCAL_RESULTS_DIR/"
+            echo "pull-plots refresh mode: existing local files are still skipped (--ignore-existing)"
         fi
+        echo "Pulling plot files (.html and images) from remote results/ to ./$LOCAL_RESULTS_DIR/ (skip existing local files)"
         mkdir -p "$LOCAL_RESULTS_DIR"
         d="$REMOTE_HOME/proj/$REL_PATH/results/"
         local_dst="$LOCAL_RESULTS_DIR/results/"
@@ -251,15 +259,11 @@ case "$1" in
             mkdir -p "$local_dst"
             # Precreate common nested plot destinations to avoid move_file errors on some rsync builds.
             mkdir -p "$local_dst/dashboard" "$local_dst/plots/session_dashboards" "$local_dst/dashboards" "$local_dst/plots"
-            EXTRA_REFRESH_ARGS=()
-            if [[ "$REFRESH_ONLY" -eq 1 ]]; then
-                EXTRA_REFRESH_ARGS+=(--update)
-            fi
             # Resume flags (--append/--append-verify) can interact badly with filtered tree pulls.
             # Use plain transfer for pull-plots stability.
-            run_rsync_retry "${RSYNC_COMMON[@]}" \
+            run_rsync_retry "${RSYNC_PLOT_PULL_COMMON[@]}" \
                 ${RSYNC_MKPATH_FLAG:+$RSYNC_MKPATH_FLAG} \
-                ${EXTRA_REFRESH_ARGS[@]+"${EXTRA_REFRESH_ARGS[@]}"} \
+                --ignore-existing \
                 --include='*/' \
                 --include='*.html' --include='*.htm' \
                 --include='*.png'  --include='*.jpg' \

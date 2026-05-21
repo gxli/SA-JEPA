@@ -1,5 +1,8 @@
 import copy
 import math
+import os
+import tempfile
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -7,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .dense_unet import DenseUNetSmallEncoder
-from .encoders import ConvNeXtDenseEncoder, FullResEncoder, ResCNNDenseEncoder
+from .encoders import ConvNeXtDenseEncoder, FullResEncoder, PyramidResDilatedEncoder, ResCNNDenseEncoder
 from .predictor import FullResPredictor
 
 
@@ -38,10 +41,16 @@ def _shared_grid_centers(
     spacing_px: int,
     global_shift: bool,
     device: torch.device,
+    forced_shift_y: Optional[int] = None,
+    forced_shift_x: Optional[int] = None,
+    enable_grid_jitter: bool = True,
 ):
     """Generate one globally-shifted full-image lattice, then boundary-mask it."""
     spacing_px = int(max(1, spacing_px))
-    if global_shift:
+    if forced_shift_y is not None and forced_shift_x is not None:
+        shift_y = int(forced_shift_y)
+        shift_x = int(forced_shift_x)
+    elif global_shift:
         shift_y = int(torch.randint(0, spacing_px, (1,), device=device).item())
         shift_x = int(torch.randint(0, spacing_px, (1,), device=device).item())
     else:
@@ -56,8 +65,12 @@ def _shared_grid_centers(
         x_centers = [w // 2]
 
     raw_centers = [(cy, cx) for cy in y_centers for cx in x_centers]
-    grid_dy = (float(torch.rand(1, device=device).item()) - 0.5) * float(spacing_px)
-    grid_dx = (float(torch.rand(1, device=device).item()) - 0.5) * float(spacing_px)
+    if enable_grid_jitter:
+        grid_dy = (float(torch.rand(1, device=device).item()) - 0.5) * float(spacing_px)
+        grid_dx = (float(torch.rand(1, device=device).item()) - 0.5) * float(spacing_px)
+    else:
+        grid_dy = 0.0
+        grid_dx = 0.0
 
     shared_centers = []
     for cy, cx in raw_centers:
@@ -107,6 +120,8 @@ def make_pyramid_grid_context(
     constant_gaussian_sigma: float = 1.0,
     inner_target_size: int = 2,
     return_debug: bool = False,
+    forced_grid_shift: Optional[Tuple[int, int]] = None,
+    enable_grid_jitter: bool = True,
 ):
     """
     x_clean: B x 1 x H x W
@@ -167,7 +182,12 @@ def make_pyramid_grid_context(
         dip_field_ch = np.zeros((max(1, len(active_sigmas)), h, w), dtype=np.float32)
         dip_proto_ch = np.zeros((max(1, len(active_sigmas)), h, w), dtype=np.float32)
         dip_proto_written = np.zeros((max(1, len(active_sigmas)),), dtype=np.int32)
+        # Exact applied hard-footprint map written from the same windows used by masking.
+        applied_mask_hard = np.zeros((h, w), dtype=np.uint8)
         # Always decompose first, then apply scale-aware masking on CDD channels.
+        if "MPLCONFIGDIR" not in os.environ:
+            os.environ["MPLCONFIGDIR"] = os.path.join(tempfile.gettempdir(), "mplconfig")
+        os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
         import constrained_diffusion as cdd
 
         arr = x_clean[bi, 0].detach().cpu().numpy().astype(np.float32)
@@ -229,6 +249,9 @@ def make_pyramid_grid_context(
                 spacing_px=spacing_px,
                 global_shift=global_shift,
                 device=x_clean.device,
+                forced_shift_y=(None if forced_grid_shift is None else int(forced_grid_shift[0])),
+                forced_shift_x=(None if forced_grid_shift is None else int(forced_grid_shift[1])),
+                enable_grid_jitter=bool(enable_grid_jitter),
             )
             if not full_grid:
                 base_budget = per_scale_fraction * float(h * w)
@@ -253,14 +276,16 @@ def make_pyramid_grid_context(
                 box_cell = int(max(2, round(max(1, cell_size) * float(mask_fraction)))) if cell_size > 0 else 2
                 base_box = int(max(box_sigma, box_cell))
             box = int(max(base_box, min_box))
-            half = box // 2
+            # Use explicit asymmetric halves so odd/even box sizes are both centered correctly.
+            half_lo = box // 2
+            half_hi = box - half_lo
             if align_scales:
                 centers = shared_centers
             else:
                 # Spacing rule (all modes):
                 # scale * masking_ratio(mask_scale) * grid_spacing_scale
                 spacing = int(max(1, round(eff_sigma * float(mask_scale) * float(spacing_scale))))
-                margin = half + 1
+                margin = max(half_lo, half_hi) + 1
                 area_budget = per_scale_fraction * float(h * w)
                 desired_count = area_budget / max(1.0, float(box * box))
                 base_count = int(math.floor(desired_count))
@@ -269,8 +294,12 @@ def make_pyramid_grid_context(
                 max_count = max(0, base_count + extra)
                 if max_count <= 0:
                     continue
-                shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
-                shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
+                if forced_grid_shift is not None:
+                    shift_y = int(forced_grid_shift[0]) % max(1, spacing)
+                    shift_x = int(forced_grid_shift[1]) % max(1, spacing)
+                else:
+                    shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
+                    shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
                 y_start = margin + shift_y
                 x_start = margin + shift_x
                 y_centers = list(range(y_start, max(y_start + 1, h - margin), spacing))
@@ -281,10 +310,11 @@ def make_pyramid_grid_context(
                     centers = [centers[int(i)] for i in idx]
 
             for cy, cx in centers:
-                y0 = max(0, cy - half)
-                y1 = min(h, cy + half)
-                x0 = max(0, cx - half)
-                x1 = min(w, cx + half)
+                # Build [start, end) slices with exact `box` pixels whenever fully in-bounds.
+                y0 = max(0, cy - half_lo)
+                y1 = min(h, cy + half_hi)
+                x0 = max(0, cx - half_lo)
+                x1 = min(w, cx + half_hi)
                 if y1 <= y0 or x1 <= x0:
                     continue
                 ch = min(si, cdd_mod.shape[0] - 1)
@@ -308,6 +338,7 @@ def make_pyramid_grid_context(
                 else:
                     # "box" mode (mask_fill_mode="zero"): hard zero in selected CDD channel.
                     cdd_mod[ch, y0:y1, x0:x1] = 0.0
+                applied_mask_hard[y0:y1, x0:x1] = 1
                 applied_locations.append((cy, cx))
                 applied_scales.append(float(sigma))
 
@@ -325,7 +356,9 @@ def make_pyramid_grid_context(
             key = (int(cy), int(cx))
             if key not in unique_loc_to_scale:
                 unique_loc_to_scale[key] = float(s)
-        sample_locations = sorted(unique_loc_to_scale.keys())
+        # Preserve insertion order from sampling pass; sorting would spatially bias
+        # truncation when max_targets_per_image < number of available centers.
+        sample_locations = list(unique_loc_to_scale.keys())
         sample_scales = [float(unique_loc_to_scale[k]) for k in sample_locations]
 
         sample_valid = [1] * len(sample_locations)
@@ -341,38 +374,7 @@ def make_pyramid_grid_context(
                 if key not in seen:
                     seen.add(key)
                     uniq.append(key)
-            if mask_fill_mode in ("gaussian_dip", "constant_gaussian"):
-                m_soft = np.zeros((h, w), dtype=np.float32)
-                for (cy, cx), s in zip(applied_locations, applied_scales):
-                    if mask_fill_mode == "constant_gaussian":
-                        ss = max(1e-6, float(constant_gaussian_sigma))
-                    else:
-                        ss = max(1e-6, float(s) * float(mask_fraction) * float(dip_sigma_mult))
-                    eff_s = max(float(s), float(min_mask_scale))
-                    box_dbg = int(mask_box_size) if constant_mask_box else int(max(2, round(eff_s * float(mask_scale))))
-                    half_dbg = box_dbg // 2
-                    y0 = max(0, int(cy) - half_dbg)
-                    y1 = min(h, int(cy) + half_dbg)
-                    x0 = max(0, int(cx) - half_dbg)
-                    x1 = min(w, int(cx) + half_dbg)
-                    if y1 <= y0 or x1 <= x0:
-                        continue
-                    yy = np.arange(y0, y1, dtype=np.float32).reshape(-1, 1)
-                    xx = np.arange(x0, x1, dtype=np.float32).reshape(1, -1)
-                    g = np.exp(-(((yy - float(cy)) ** 2 + (xx - float(cx)) ** 2) / (2.0 * ss * ss))).astype(np.float32)
-                    m_soft[y0:y1, x0:x1] = np.maximum(m_soft[y0:y1, x0:x1], g)
-                m = (m_soft > 1e-3).astype(np.uint8)
-            else:
-                m = np.zeros((h, w), dtype=np.uint8)
-                for (cy, cx), s in zip(applied_locations, applied_scales):
-                    eff_s = max(float(s), float(min_mask_scale))
-                    box = int(mask_box_size) if constant_mask_box else int(max(2, round(eff_s * float(mask_scale))))
-                    half = box // 2
-                    y0 = max(0, int(cy) - half)
-                    y1 = min(h, int(cy) + half)
-                    x0 = max(0, int(cx) - half)
-                    x1 = min(w, int(cx) + half)
-                    m[y0:y1, x0:x1] = 1
+            m = applied_mask_hard
             all_mask_maps.append(torch.from_numpy(m))
             all_unique_centers.append(torch.tensor(uniq, dtype=torch.long))
             all_cdd_orig.append(torch.from_numpy(cdd_result))
@@ -381,9 +383,28 @@ def make_pyramid_grid_context(
             all_dip_fields_per_channel.append(torch.from_numpy(dip_field_ch))
             all_dip_proto_per_channel.append(torch.from_numpy(dip_proto_ch))
 
-    target_locations = torch.tensor(all_locations, dtype=torch.long, device=x_clean.device)
-    target_scales = torch.tensor(all_scales, dtype=x_clean.dtype, device=x_clean.device)
-    target_valid = torch.tensor(all_valid, dtype=torch.bool, device=x_clean.device)
+    # Pack variable-length targets to fixed K so batching is always valid.
+    # `max_targets_per_image` is intentionally ignored to avoid spatially-biased
+    # truncation effects and preserve full sampled coverage.
+    k_fixed = max((len(v) for v in all_locations), default=0)
+    k_fixed = max(1, k_fixed)
+
+    loc_np = np.zeros((b, k_fixed, 2), dtype=np.int64)
+    sca_np = np.zeros((b, k_fixed), dtype=np.float32)
+    val_np = np.zeros((b, k_fixed), dtype=np.bool_)
+
+    for bi in range(b):
+        n_total = len(all_locations[bi])
+        n = min(n_total, k_fixed)
+        if n <= 0:
+            continue
+        loc_np[bi, :n, :] = np.asarray(all_locations[bi][:n], dtype=np.int64)
+        sca_np[bi, :n] = np.asarray(all_scales[bi][:n], dtype=np.float32)
+        val_np[bi, :n] = True
+
+    target_locations = torch.from_numpy(loc_np).to(device=x_clean.device, dtype=torch.long)
+    target_scales = torch.from_numpy(sca_np).to(device=x_clean.device, dtype=x_clean.dtype)
+    target_valid = torch.from_numpy(val_np).to(device=x_clean.device, dtype=torch.bool)
 
     if not return_debug:
         return x_context, target_locations, target_scales, target_valid
@@ -498,6 +519,7 @@ class PyramidGridJEPA(nn.Module):
         ema_momentum: float = 0.996,
         normalize_loss: bool = True,
         predictor_layernorm: bool = False,
+        mode: str = "image",
         encoder_type: str = "fullres",
         encoder_width: int = 32,
         encoder_depth: int = 4,
@@ -532,11 +554,24 @@ class PyramidGridJEPA(nn.Module):
         self.ema_momentum = float(ema_momentum)
         self.normalize_loss = bool(normalize_loss)
         self.predictor_layernorm = bool(predictor_layernorm)
+        self.mode = str(mode)
         self.encoder_type = str(encoder_type)
         self.encoder_width = int(encoder_width)
         self.encoder_depth = int(encoder_depth)
         self.encoder_kernel_size = int(encoder_kernel_size)
-        if self.encoder_type == "fullres":
+        if self.mode not in ("image", "pyramid"):
+            raise ValueError(f"Unknown mode={self.mode}; expected 'image' or 'pyramid'")
+        if self.encoder_type == "pyramid_cnn_res_dilated":
+            # Per-scale map + per-scale masked-token map.
+            pyr_in_channels = 2 * max(1, len(self.sigmas))
+            self.context_encoder = PyramidResDilatedEncoder(
+                in_channels=pyr_in_channels,
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=self.encoder_depth,
+                final_norm=True,
+            )
+        elif self.encoder_type == "fullres":
             self.context_encoder = FullResEncoder(in_channels=1, latent_channels=latent_channels)
         elif self.encoder_type == "convnext_dense":
             self.context_encoder = ConvNeXtDenseEncoder(
@@ -580,7 +615,13 @@ class PyramidGridJEPA(nn.Module):
             use_layernorm=self.predictor_layernorm,
         )
 
-    def forward(self, x_clean):
+    def forward(
+        self,
+        x_clean,
+        return_debug: bool = False,
+        forced_grid_shift: Optional[Tuple[int, int]] = None,
+        enable_grid_jitter: bool = True,
+    ):
         """
         x_clean: B x 1 x H x W
         """
@@ -590,30 +631,62 @@ class PyramidGridJEPA(nn.Module):
         if x_clean.shape[1] != 1:
             raise ValueError(f"Expected grayscale input, got {x_clean.shape[1]} channels")
 
-        x_context, target_locations, target_scales, target_valid = make_pyramid_grid_context(
-            x_clean=x_clean,
-            sigmas=self.sigmas,
-            cell_sizes=self.cell_sizes,
-            max_targets_per_image=self.max_targets_per_image,
-            mask_fraction=self.mask_fraction,
-            box_sigma_mult=self.box_sigma_mult,
-            mask_scale=self.mask_scale,
-            min_mask_scale=self.min_mask_scale,
-            spacing_scale=self.spacing_scale,
-            full_grid=self.full_grid,
-            global_shift=self.global_shift,
-            align_scales=self.align_scales,
-            constant_mask_box=self.constant_mask_box,
-            mask_box_size=self.mask_box_size,
-            blur_mode=self.blur_mode,
-            cdd_mode=self.cdd_mode,
-            cdd_constrained=self.cdd_constrained,
-            cdd_sm_mode=self.cdd_sm_mode,
-            mask_fill_mode=self.mask_fill_mode,
-            dip_sigma_mult=self.dip_sigma_mult,
-            constant_gaussian_sigma=self.constant_gaussian_sigma,
-            inner_target_size=self.patch_size,
-        )
+        need_debug_tensors = bool(return_debug or self.mode == "pyramid")
+        if need_debug_tensors:
+            x_context, target_locations, target_scales, target_valid, debug = make_pyramid_grid_context(
+                x_clean=x_clean,
+                sigmas=self.sigmas,
+                cell_sizes=self.cell_sizes,
+                max_targets_per_image=self.max_targets_per_image,
+                mask_fraction=self.mask_fraction,
+                box_sigma_mult=self.box_sigma_mult,
+                mask_scale=self.mask_scale,
+                min_mask_scale=self.min_mask_scale,
+                spacing_scale=self.spacing_scale,
+                full_grid=self.full_grid,
+                global_shift=self.global_shift,
+                align_scales=self.align_scales,
+                constant_mask_box=self.constant_mask_box,
+                mask_box_size=self.mask_box_size,
+                blur_mode=self.blur_mode,
+                cdd_mode=self.cdd_mode,
+                cdd_constrained=self.cdd_constrained,
+                cdd_sm_mode=self.cdd_sm_mode,
+                mask_fill_mode=self.mask_fill_mode,
+                dip_sigma_mult=self.dip_sigma_mult,
+                constant_gaussian_sigma=self.constant_gaussian_sigma,
+                inner_target_size=self.patch_size,
+                return_debug=True,
+                forced_grid_shift=forced_grid_shift,
+                enable_grid_jitter=enable_grid_jitter,
+            )
+        else:
+            x_context, target_locations, target_scales, target_valid = make_pyramid_grid_context(
+                x_clean=x_clean,
+                sigmas=self.sigmas,
+                cell_sizes=self.cell_sizes,
+                max_targets_per_image=self.max_targets_per_image,
+                mask_fraction=self.mask_fraction,
+                box_sigma_mult=self.box_sigma_mult,
+                mask_scale=self.mask_scale,
+                min_mask_scale=self.min_mask_scale,
+                spacing_scale=self.spacing_scale,
+                full_grid=self.full_grid,
+                global_shift=self.global_shift,
+                align_scales=self.align_scales,
+                constant_mask_box=self.constant_mask_box,
+                mask_box_size=self.mask_box_size,
+                blur_mode=self.blur_mode,
+                cdd_mode=self.cdd_mode,
+                cdd_constrained=self.cdd_constrained,
+                cdd_sm_mode=self.cdd_sm_mode,
+                mask_fill_mode=self.mask_fill_mode,
+                dip_sigma_mult=self.dip_sigma_mult,
+                constant_gaussian_sigma=self.constant_gaussian_sigma,
+                inner_target_size=self.patch_size,
+                forced_grid_shift=forced_grid_shift,
+                enable_grid_jitter=enable_grid_jitter,
+            )
 
         x_clean_enc = x_clean
         x_context_enc = x_context
@@ -630,16 +703,30 @@ class PyramidGridJEPA(nn.Module):
                 x_clean_enc = torch.log(torch.clamp(x_clean, min=0.0) + eps)
                 x_context_enc = torch.log(torch.clamp(x_context, min=0.0) + eps)
 
-        with torch.no_grad():
-            gt_map = self.target_encoder(x_clean_enc)
+        # Optional pyramid-mode path: encode multiscale channel cubes directly.
+        # Keep x_clean/x_context image outputs for backward-compatible diagnostics.
+        enc_target = x_clean_enc
+        enc_context = x_context_enc
+        if self.mode == "pyramid":
+            cdd_orig = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
+            cdd_masked = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
+            dip_per_ch = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
+            zero_token = torch.zeros_like(dip_per_ch)
+            # target: original per-scale channels + zero token maps
+            enc_target = torch.cat([cdd_orig, zero_token], dim=1)
+            # context: masked per-scale channels + mask token maps
+            enc_context = torch.cat([cdd_masked, dip_per_ch], dim=1)
 
-        context_map = self.context_encoder(x_context_enc)
+        with torch.no_grad():
+            gt_map = self.target_encoder(enc_target)
+
+        context_map = self.context_encoder(enc_context)
         pred_map = self.predictor(context_map)
 
         pred_patches = extract_location_patches(pred_map, target_locations, patch_size=self.patch_size)
         gt_patches = extract_location_patches(gt_map, target_locations, patch_size=self.patch_size)
 
-        return {
+        out = {
             "pred_patches": pred_patches,
             "gt_patches": gt_patches,
             # Raw pre-encoder tensors (for diagnostics/visualization).
@@ -655,6 +742,15 @@ class PyramidGridJEPA(nn.Module):
             "pred_map": pred_map,
             "gt_map": gt_map,
         }
+        if return_debug or self.mode == "pyramid":
+            # Exact applied hard mask footprint from make_pyramid_grid_context.
+            if return_debug:
+                out["target_mask_map"] = debug["mask_map"].unsqueeze(1).to(dtype=x_clean.dtype)
+            out["cdd_channels_orig"] = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
+            out["cdd_channels_masked"] = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
+            out["dip_field_per_channel"] = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
+            out["pyramid_mask_token"] = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
+        return out
 
     def compute_loss(self, outputs):
         pred = outputs["pred_patches"]

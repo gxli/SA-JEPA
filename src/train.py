@@ -730,45 +730,16 @@ def compute_jepa_energy(outputs: dict, normalize: bool = False) -> float:
 
 
 def compute_target_energy_map(outputs: dict, image_size: tuple[int, int]) -> torch.Tensor:
-    pred = outputs["pred_patches"]
-    gt = outputs["gt_patches"].detach()
-    loc = outputs["target_locations"]
-    valid = outputs["target_valid"]
+    # Dense full-image energy from latent map reconstruction error.
+    # This intentionally does NOT depend on sparse target points.
+    pred_map = outputs["pred_map"]
+    gt_map = outputs["gt_map"].detach()
     h, w = int(image_size[0]), int(image_size[1])
-    b, k, _, p, _ = pred.shape
-    half = p // 2
-    energy_map = torch.zeros((b, 1, h, w), device=pred.device, dtype=pred.dtype)
-    count_map = torch.zeros((b, 1, h, w), device=pred.device, dtype=pred.dtype)
-    err = (pred - gt).pow(2).mean(dim=(2, 3, 4))
-    for bi in range(b):
-        for ki in range(k):
-            if not bool(valid[bi, ki]):
-                continue
-            cy = int(loc[bi, ki, 0].item())
-            cx = int(loc[bi, ki, 1].item())
-
-            y0 = cy - half
-            y1 = cy + half
-            x0 = cx - half
-            x1 = cx + half
-
-            if y0 < 0:
-                y0 = 0
-                y1 = p
-            if x0 < 0:
-                x0 = 0
-                x1 = p
-            if y1 > h:
-                y1 = h
-                y0 = h - p
-            if x1 > w:
-                x1 = w
-                x0 = w - p
-
-            energy_map[bi, 0, y0:y1, x0:x1] += err[bi, ki]
-            count_map[bi, 0, y0:y1, x0:x1] += 1.0
-    energy_map = energy_map / count_map.clamp_min(1.0)
-    return energy_map
+    # Per-pixel latent MSE across channels -> Bx1xH_latxW_lat
+    energy_lat = (pred_map - gt_map).pow(2).mean(dim=1, keepdim=True)
+    if energy_lat.shape[-2:] != (h, w):
+        energy_lat = F.interpolate(energy_lat, size=(h, w), mode="bilinear", align_corners=False)
+    return energy_lat
 
 
 def compute_error_by_scale(outputs: dict) -> dict[float, float]:
@@ -918,6 +889,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
         normalize_loss=model_cfg.get("normalize_loss", True),
         predictor_layernorm=model_cfg.get("predictor_layernorm", False),
+        mode=model_cfg.get("mode", "image"),
         encoder_type=model_cfg.get("encoder_type", "fullres"),
         encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
         encoder_depth=model_cfg.get("encoder_depth", 4),
@@ -990,6 +962,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
                     normalize_loss=model_cfg.get("normalize_loss", True),
                     predictor_layernorm=model_cfg.get("predictor_layernorm", False),
+                    mode=model_cfg.get("mode", "image"),
                     encoder_type=model_cfg.get("encoder_type", "fullres"),
                     encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
                     encoder_depth=model_cfg.get("encoder_depth", 4),
@@ -1046,6 +1019,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
                 normalize_loss=model_cfg.get("normalize_loss", True),
                 predictor_layernorm=model_cfg.get("predictor_layernorm", False),
+                mode=model_cfg.get("mode", "image"),
                 encoder_type=model_cfg.get("encoder_type", "fullres"),
                 encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
                 encoder_depth=model_cfg.get("encoder_depth", 4),
@@ -1077,6 +1051,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
         cube_slice_index=data_cfg.get("cube_slice_index", 0),
         random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
+        d4_augment=bool(data_cfg.get("d4_augment", False)),
         cache_cdd=bool(data_cfg.get("cache_cdd", True)),
         cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
         cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
@@ -1119,6 +1094,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
             cube_slice_index=data_cfg.get("cube_slice_index", 0),
             random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
+            d4_augment=False,
             cache_cdd=bool(data_cfg.get("cache_cdd", True)),
             cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
             cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
@@ -1165,6 +1141,43 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
         )
+    # Inference must use canonical orientation (no D4 augmentation).
+    inference_dataset = JEPADataset(
+        num_samples=train_dataset.num_samples,
+        image_size=data_cfg.get("image_size", 256),
+        data_root=data_cfg.get("data_root", "data"),
+        npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+        log_transform=dataset_log_transform,
+        log_eps=data_cfg.get("log_eps", 1.0),
+        cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8, 16]),
+        cdd_strength=data_cfg.get("cdd_strength", 1.0),
+        cdd_clip=data_cfg.get("cdd_clip", True),
+        norm_before_cdd=data_cfg.get("norm_before_cdd", True),
+        cdd_mode=data_cfg.get("cdd_mode", "log"),
+        cdd_constrained=data_cfg.get("cdd_constrained", True),
+        cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
+        apply_cdd=dataset_apply_cdd,
+        cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
+        cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
+        cube_slice_index=data_cfg.get("cube_slice_index", 0),
+        random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
+        d4_augment=False,
+        cache_cdd=bool(data_cfg.get("cache_cdd", True)),
+        cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
+        cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
+        cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
+        precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
+    )
+    inference_dataset.sample_index = list(train_idx)
+    inference_dataset.num_samples = train_dataset.num_samples
+    inference_loader = DataLoader(
+        inference_dataset,
+        batch_size=train_cfg.get("batch_size", 32),
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
 
     optimizer = optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -1198,6 +1211,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     epochs = train_cfg.get("epochs", 20)
     log_interval = train_cfg.get("log_interval", 10)
     force_recompute_inference = bool(train_cfg.get("force_recompute_inference", False))
+    inference_mask_passes = int(train_cfg.get("inference_mask_passes", 1))
     umap_cfg = dict(train_cfg.get("umap", {}))
     print(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
     jepa_loss_weight = float(train_cfg.get("jepa_loss_weight", 100.0))
@@ -1309,6 +1323,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             scales = outputs["target_scales"].detach().cpu().numpy()
             valid = outputs["target_valid"].detach().cpu().numpy().astype(bool)
             valid_scales = scales[valid]
+            if "cdd_channels_masked" in outputs:
+                cube_path = os.path.join(session_dir, "example_masked_channel_cube.npy")
+                if not os.path.exists(cube_path):
+                    np.save(
+                        cube_path,
+                        outputs["cdd_channels_masked"][0].detach().cpu().numpy().astype(np.float32),
+                    )
             if valid_scales.size > 0:
                 uniq, cnt = np.unique(np.round(valid_scales.astype(np.float32), 6), return_counts=True)
                 for s, c in zip(uniq.tolist(), cnt.tolist()):
@@ -1435,13 +1456,27 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     torch.save(model.state_dict(), os.path.join(session_dir, "model_last.pt"))
 
-    return run_post_training_inference(
+    session_dir = run_post_training_inference(
         model=model,
-        dataloader=dataloader,
+        dataloader=inference_loader,
         session_dir=session_dir,
         config_name=config_name,
         visit_counts=visit_counts,
         force_recompute_inference=force_recompute_inference,
+        inference_mask_passes=inference_mask_passes,
         compute_jepa_energy_fn=compute_jepa_energy,
         compute_target_energy_map_fn=compute_target_energy_map,
     )
+    # Keep dashboard artifacts in sync with inference outputs for all runs.
+    # This writes session/results/* embedding files required by session_to_dash.py.
+    inf_path = os.path.join(session_dir, "inference_outputs.pt")
+    if os.path.exists(inf_path):
+        try:
+            outputs = torch.load(inf_path, map_location="cpu")
+            dash_path = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)
+            print(f"[{config_name}] dashboard_saved={dash_path}")
+        except Exception as e:
+            print(f"[{config_name}] warning: dashboard generation failed: {type(e).__name__}: {e}")
+    else:
+        print(f"[{config_name}] warning: inference_outputs.pt missing; skip dashboard generation")
+    return session_dir

@@ -183,3 +183,57 @@ class ResCNNDenseEncoder(nn.Module):
         x = self.head(x)
         x = self.final_norm(x)
         return x
+
+
+class PyramidResDilatedBlock(nn.Module):
+    def __init__(self, channels: int, dilation: int):
+        super().__init__()
+        pad = int(dilation)
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=pad, dilation=dilation),
+            nn.GroupNorm(num_groups=1, num_channels=channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=pad, dilation=dilation),
+            nn.GroupNorm(num_groups=1, num_channels=channels),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(x + self.net(x))
+
+
+class PyramidResDilatedEncoder(nn.Module):
+    """
+    Encoder for multiscale pyramid cubes (not raw single-channel images).
+    Expects BCHW with channels containing per-scale maps + mask-token maps.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int = 32,
+        latent_channels: int = 32,
+        depth: int = 6,
+        final_norm: bool = True,
+    ):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups=1, num_channels=hidden_channels),
+            nn.GELU(),
+        )
+        # Cycle dilations for wider receptive field while preserving resolution.
+        dilations = [1, 2, 4, 8]
+        blocks = []
+        for i in range(int(depth)):
+            blocks.append(PyramidResDilatedBlock(hidden_channels, dilation=dilations[i % len(dilations)]))
+        self.blocks = nn.Sequential(*blocks)
+        self.head = nn.Conv2d(hidden_channels, latent_channels, kernel_size=1)
+        self.final_norm = nn.GroupNorm(num_groups=1, num_channels=latent_channels) if final_norm else nn.Identity()
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.head(x)
+        x = self.final_norm(x)
+        return x

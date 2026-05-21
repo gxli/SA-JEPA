@@ -8,6 +8,37 @@ import numpy as np
 import torch
 
 
+def _accumulate_point_energy(
+    *,
+    outputs: dict,
+    energy_sum: torch.Tensor,
+    count_map: torch.Tensor,
+    image_size: tuple[int, int],
+) -> tuple[float, int]:
+    pred = outputs["pred_patches"]
+    gt = outputs["gt_patches"].detach()
+    loc = outputs["target_locations"]
+    valid = outputs["target_valid"]
+    h, w = int(image_size[0]), int(image_size[1])
+    err = (pred - gt).pow(2).mean(dim=(2, 3, 4))  # B,K
+    total = 0.0
+    n_valid = 0
+    bsz, ksz = err.shape
+    for bi in range(bsz):
+        for ki in range(ksz):
+            if not bool(valid[bi, ki]):
+                continue
+            cy = int(loc[bi, ki, 0].item())
+            cx = int(loc[bi, ki, 1].item())
+            if 0 <= cy < h and 0 <= cx < w:
+                v = float(err[bi, ki].item())
+                energy_sum[bi, 0, cy, cx] += v
+                count_map[bi, 0, cy, cx] += 1.0
+                total += v
+                n_valid += 1
+    return total, n_valid
+
+
 def run_post_training_inference(
     *,
     model,
@@ -16,10 +47,19 @@ def run_post_training_inference(
     config_name: str,
     visit_counts,
     force_recompute_inference: bool,
+    inference_mask_passes: int,
     compute_jepa_energy_fn: Callable,
     compute_target_energy_map_fn: Callable,
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
+    dashboard_html_path = os.path.join(session_dir, "dashboard.html")
+    if (not force_recompute_inference) and os.path.exists(dashboard_html_path):
+        print(
+            f"[{config_name}] dashboard already exists; "
+            "skipping post-training inference (set train.force_recompute_inference=true to recompute)"
+        )
+        return session_dir
+
     inference_required = [
         inference_outputs_path,
         os.path.join(session_dir, "network_input_clean.npy"),
@@ -42,8 +82,42 @@ def run_post_training_inference(
         print(f"[{config_name}] post_training_inference loading sample batch")
         x_raw = next(iter(dataloader))
         x_raw = x_raw.to(next(model.parameters()).device)
-        print(f"[{config_name}] post_training_inference model forward")
-        outputs = model(x_raw)
+        # Deterministic lattice sweep: move mask grid by 1px over one spacing period.
+        largest_sigma = float(max(getattr(model, "sigmas", (16.0,))))
+        min_mask_scale = float(getattr(model, "min_mask_scale", 0.0))
+        eff_largest_sigma = max(largest_sigma, min_mask_scale)
+        spacing = int(max(1, round(eff_largest_sigma * float(getattr(model, "mask_scale", 1.0)) * float(getattr(model, "spacing_scale", 1.5)))))
+        all_shifts = [(dy, dx) for dy in range(spacing) for dx in range(spacing)]
+        n_passes = max(1, int(inference_mask_passes))
+        shifts = all_shifts if n_passes <= 0 else all_shifts[: min(len(all_shifts), n_passes)]
+        print(f"[{config_name}] post_training_inference model forward deterministic_shifts={len(shifts)} spacing={spacing}")
+        outputs = None
+        energy_sum = None
+        count_map = None
+        total_energy = 0.0
+        total_valid = 0
+        for pi, shift in enumerate(shifts):
+            out_i = model(
+                x_raw,
+                return_debug=(pi == 0),
+                forced_grid_shift=shift,
+                enable_grid_jitter=False,
+            )
+            if outputs is None:
+                outputs = out_i
+                h, w = outputs["x_clean"].shape[-2:]
+                bsz = outputs["x_clean"].shape[0]
+                energy_sum = torch.zeros((bsz, 1, h, w), device=outputs["x_clean"].device, dtype=outputs["x_clean"].dtype)
+                count_map = torch.zeros_like(energy_sum)
+            e_tot_i, n_val_i = _accumulate_point_energy(
+                outputs=out_i,
+                energy_sum=energy_sum,
+                count_map=count_map,
+                image_size=(h, w),
+            )
+            total_energy += float(e_tot_i)
+            total_valid += int(n_val_i)
+        assert outputs is not None and energy_sum is not None and count_map is not None
 
     inference_outputs = {
         "x_clean_raw": outputs.get("x_clean_raw", outputs["x_clean"])[:8].detach().cpu(),
@@ -59,43 +133,39 @@ def run_post_training_inference(
         "pred_patches": outputs["pred_patches"][:2].detach().cpu(),
         "gt_patches": outputs["gt_patches"][:2].detach().cpu(),
     }
-    energy_scalar = compute_jepa_energy_fn(outputs, normalize=False)
+    if "target_mask_map" in outputs:
+        inference_outputs["target_mask_map"] = outputs["target_mask_map"][:8].detach().cpu()
+    if "cdd_channels_orig" in outputs:
+        inference_outputs["cdd_channels_orig"] = outputs["cdd_channels_orig"][:8].detach().cpu()
+    if "cdd_channels_masked" in outputs:
+        inference_outputs["cdd_channels_masked"] = outputs["cdd_channels_masked"][:8].detach().cpu()
+    if "pyramid_mask_token" in outputs:
+        inference_outputs["pyramid_mask_token"] = outputs["pyramid_mask_token"][:8].detach().cpu()
+    energy_scalar = float(total_energy / max(1, total_valid))
     energy_scalar_norm = compute_jepa_energy_fn(outputs, normalize=True)
-    e_map = compute_target_energy_map_fn(outputs, image_size=outputs["x_clean"].shape[-2:])
+    e_map = energy_sum / count_map.clamp_min(1.0)
     inference_outputs["jepa_energy"] = torch.tensor(energy_scalar, dtype=torch.float32)
     inference_outputs["jepa_energy_normalized"] = torch.tensor(energy_scalar_norm, dtype=torch.float32)
     inference_outputs["target_energy_map"] = e_map[:8].detach().cpu()
+    inference_outputs["target_energy_count_map"] = count_map[:8].detach().cpu()
 
-    tloc = inference_outputs["target_locations"]
-    tvalid = inference_outputs["target_valid"]
-    patch_size = int(inference_outputs["pred_patches"].shape[-1])
-    half = patch_size // 2
-    bsz, _, _ = tloc.shape
-    h, w = inference_outputs["x_clean"].shape[-2:]
-    tmap = torch.zeros((bsz, 1, h, w), dtype=inference_outputs["x_clean"].dtype)
-    for bi in range(bsz):
-        for ki in range(tloc.shape[1]):
-            if not bool(tvalid[bi, ki].item()):
-                continue
-            cy = int(tloc[bi, ki, 0].item())
-            cx = int(tloc[bi, ki, 1].item())
-            y0 = cy - half
-            y1 = cy + half
-            x0 = cx - half
-            x1 = cx + half
-            if y0 < 0:
-                y0 = 0
-                y1 = patch_size
-            if x0 < 0:
-                x0 = 0
-                x1 = patch_size
-            if y1 > h:
-                y1 = h
-                y0 = h - patch_size
-            if x1 > w:
-                x1 = w
-                x0 = w - patch_size
-            tmap[bi, 0, y0:y1, x0:x1] = 1.0
+    if "target_mask_map" in inference_outputs:
+        tmap = inference_outputs["target_mask_map"]
+    else:
+        # Fallback map should represent target centers as points, not squares.
+        tloc = inference_outputs["target_locations"]
+        tvalid = inference_outputs["target_valid"]
+        bsz, _, _ = tloc.shape
+        h, w = inference_outputs["x_clean"].shape[-2:]
+        tmap = torch.zeros((bsz, 1, h, w), dtype=inference_outputs["x_clean"].dtype)
+        for bi in range(bsz):
+            for ki in range(tloc.shape[1]):
+                if not bool(tvalid[bi, ki].item()):
+                    continue
+                cy = int(tloc[bi, ki, 0].item())
+                cx = int(tloc[bi, ki, 1].item())
+                if 0 <= cy < h and 0 <= cx < w:
+                    tmap[bi, 0, cy, cx] = 1.0
     inference_outputs["target_map"] = tmap
     torch.save(inference_outputs, inference_outputs_path)
     print(f"[{config_name}] saved inference_outputs.pt")
@@ -105,14 +175,30 @@ def run_post_training_inference(
     np.save(os.path.join(session_dir, "network_input_clean_raw.npy"), inference_outputs["x_clean_raw"].numpy())
     np.save(os.path.join(session_dir, "network_input_context_raw.npy"), inference_outputs["x_context_raw"].numpy())
     np.save(os.path.join(session_dir, "target_valid.npy"), inference_outputs["target_valid"].numpy())
+    if "target_mask_map" in inference_outputs:
+        np.save(os.path.join(session_dir, "target_mask_map.npy"), inference_outputs["target_mask_map"].numpy())
+    if "cdd_channels_orig" in inference_outputs:
+        np.save(os.path.join(session_dir, "cdd_channels_orig.npy"), inference_outputs["cdd_channels_orig"].numpy())
+    if "cdd_channels_masked" in inference_outputs:
+        np.save(os.path.join(session_dir, "cdd_channels_masked.npy"), inference_outputs["cdd_channels_masked"].numpy())
+        # Requested artifact: one example masked channel cube for quick inspection.
+        np.save(
+            os.path.join(session_dir, "example_masked_channel_cube.npy"),
+            inference_outputs["cdd_channels_masked"][0].numpy().astype(np.float32),
+        )
+    if "pyramid_mask_token" in inference_outputs:
+        np.save(os.path.join(session_dir, "pyramid_mask_token.npy"), inference_outputs["pyramid_mask_token"].numpy())
     if visit_counts is not None:
         np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
     np.save(os.path.join(session_dir, "target_energy_map.npy"), inference_outputs["target_energy_map"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_count_map.npy"), inference_outputs["target_energy_count_map"].numpy())
     with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
                 "jepa_energy": float(energy_scalar),
                 "jepa_energy_normalized": float(energy_scalar_norm),
+                "inference_mask_passes": int(len(shifts)),
+                "inference_grid_spacing": int(spacing),
             },
             f,
             indent=2,
@@ -130,4 +216,3 @@ def run_post_training_inference(
         f"(run scripts/session_to_dash.py to generate plots/dashboards)"
     )
     return session_dir
-

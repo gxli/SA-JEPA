@@ -735,6 +735,50 @@ def build_gaussian_mask_channels_figure(debug: dict, title: str):
     fig.update_layout(height=320, width=max(900, 280 * c), title=title, margin=dict(l=20, r=20, t=50, b=20))
     return fig, dip
 
+
+def evaluate_mask_symmetry(
+    ds: JEPADataset,
+    model_cfg_run: dict,
+    n_samples: int,
+    base_seed: int,
+) -> tuple[np.ndarray, dict]:
+    if n_samples <= 0:
+        raise ValueError("n_samples must be > 0")
+    n = int(max(1, n_samples))
+    x0 = ds[0][0].numpy().astype(np.float32)
+    h, w = int(x0.shape[0]), int(x0.shape[1])
+    acc = np.zeros((h, w), dtype=np.float64)
+    for i in range(n):
+        x = ds[i % len(ds)][0].numpy().astype(np.float32)
+        x_t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
+        _, _, _, _, debug = make_context_and_debug(x_t, model_cfg_run, int(base_seed + i))
+        dip_t = debug.get("dip_field")
+        if str(model_cfg_run.get("mask_fill_mode", "zero")) == "gaussian_dip" and dip_t is not None and dip_t.numel() > 0:
+            mask = np.clip(dip_t[0].cpu().numpy().astype(np.float32), 0.0, 1.0)
+        else:
+            mask = np.clip(debug["mask_map"][0].cpu().numpy().astype(np.float32), 0.0, 1.0)
+        acc += mask.astype(np.float64)
+    heat = (acc / float(n)).astype(np.float32)
+
+    lr_flip = heat[:, ::-1]
+    tb_flip = heat[::-1, :]
+    lr_mae = float(np.mean(np.abs(heat - lr_flip)))
+    tb_mae = float(np.mean(np.abs(heat - tb_flip)))
+    top = float(np.mean(heat[: (h // 2), :]))
+    bot = float(np.mean(heat[(h // 2) :, :]))
+    left = float(np.mean(heat[:, : (w // 2)]))
+    right = float(np.mean(heat[:, (w // 2) :]))
+    metrics = {
+        "samples": int(n),
+        "mean_mask_value": float(np.mean(heat)),
+        "lr_symmetry_mae": lr_mae,
+        "tb_symmetry_mae": tb_mae,
+        "top_minus_bottom": float(top - bot),
+        "left_minus_right": float(left - right),
+    }
+    return heat, metrics
+
+
 def main():
     parser = argparse.ArgumentParser(description="Masking demo wrapper over core pipeline")
     parser.add_argument("--config", type=str, required=True)
@@ -744,6 +788,7 @@ def main():
     parser.add_argument("--mask-mode", type=str, choices=["config", "zero", "gaussian_dip", "both"], default="config")
     parser.add_argument("--force-blur-mode", type=str, choices=["gaussian", "cdd"], default=None)
     parser.add_argument("--rigid-mask-box", action="store_true", help="Keep constant box mask size (disable adaptive sizing)")
+    parser.add_argument("--eval-samples", type=int, default=0, help="If >0, run aggregate mask symmetry eval with this many samples")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -870,6 +915,47 @@ def main():
         else:
             mask_path = None
 
+        eval_metrics = None
+        eval_heatmap_path = None
+        if int(args.eval_samples) > 0:
+            heat, eval_metrics = evaluate_mask_symmetry(
+                ds=ds,
+                model_cfg_run=model_cfg_run,
+                n_samples=int(args.eval_samples),
+                base_seed=int(args.seed),
+            )
+            fig_eval = make_subplots(
+                rows=1,
+                cols=1,
+                subplot_titles=(f"Mask Frequency Heatmap ({int(args.eval_samples)} samples)",),
+            )
+            fig_eval.add_trace(
+                go.Heatmap(z=heat, colorscale="Magma", zmin=0.0, zmax=float(max(1e-6, np.max(heat))), showscale=True),
+                row=1,
+                col=1,
+            )
+            fig_eval.update_xaxes(constrain="domain", row=1, col=1)
+            fig_eval.update_yaxes(scaleanchor="x1", scaleratio=1, row=1, col=1)
+            fig_eval.update_layout(height=620, width=760, title=f"Mask Symmetry Eval ({mode})", margin=dict(l=20, r=20, t=50, b=20))
+            html_parts.append("<div class='panel'>")
+            html_parts.append(pio.to_html(fig_eval, include_plotlyjs=False, full_html=False, config={"responsive": True}))
+            html_parts.append("</div>")
+            html_parts.append("<div class='panel'>")
+            html_parts.append(
+                "<pre style='font-size:13px;background:#f7f7f7;border:1px solid #ddd;padding:10px;'>"
+                f"Mask Symmetry Metrics ({mode})\\n"
+                f"samples: {eval_metrics['samples']}\\n"
+                f"mean_mask_value: {eval_metrics['mean_mask_value']:.6g}\\n"
+                f"lr_symmetry_mae: {eval_metrics['lr_symmetry_mae']:.6g}\\n"
+                f"tb_symmetry_mae: {eval_metrics['tb_symmetry_mae']:.6g}\\n"
+                f"top_minus_bottom: {eval_metrics['top_minus_bottom']:.6g}\\n"
+                f"left_minus_right: {eval_metrics['left_minus_right']:.6g}"
+                "</pre>"
+            )
+            html_parts.append("</div>")
+            eval_heatmap_path = os.path.join(session_dir, f"mask_symmetry_heatmap_{mode}.npy")
+            np.save(eval_heatmap_path, heat)
+
         # CDD consistency checks for in-dashboard review.
         cdd_summary = None
         cdd_orig_t = debug.get("cdd_channels_orig")
@@ -916,6 +1002,8 @@ def main():
             "target_scales": [float(s) for s in target_scales[0].cpu().numpy().tolist()],
             "target_locations": [[int(y), int(x)] for y, x in target_locations[0].cpu().numpy().tolist()],
             "gaussian_mask_per_channel_path": mask_path,
+            "mask_symmetry_heatmap_path": eval_heatmap_path,
+            "mask_symmetry_metrics": eval_metrics,
             "cdd_summary": cdd_summary,
         }
         all_meta["modes"].append(meta)

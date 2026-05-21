@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import os
+import tempfile
 from collections import OrderedDict
 
 import numpy as np
@@ -32,6 +33,7 @@ class JEPADataset(Dataset):
         cube_slice_axis: int = 0,
         cube_slice_index: int = 0,
         random_roll_max: int = 0,
+        d4_augment: bool = False,
         cache_cdd: bool = True,
         cdd_cache_dir: str | None = None,
         cdd_mem_cache_max: int = 64,
@@ -60,6 +62,7 @@ class JEPADataset(Dataset):
         self.cube_slice_axis = cube_slice_axis
         self.cube_slice_index = cube_slice_index
         self.random_roll_max = int(random_roll_max)
+        self.d4_augment = bool(d4_augment)
         self.cache_cdd = bool(cache_cdd)
         self.cdd_cache_dir = cdd_cache_dir
         self.cdd_mem_cache_max = int(cdd_mem_cache_max)
@@ -239,13 +242,8 @@ class JEPADataset(Dataset):
             eps = self._choose_log_eps(arr, self.log_eps)
             arr = np.log(np.clip(arr, a_min=0.0, a_max=None) + eps)
 
+        # Keep original resolution; no forced resize before model input.
         x = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)  # 1 x H x W
-        x = F.interpolate(
-            x.unsqueeze(0),
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
         return x
 
     @staticmethod
@@ -258,6 +256,9 @@ class JEPADataset(Dataset):
         return np.zeros_like(arr, dtype=np.float32)
 
     def _apply_cdd(self, arr01: np.ndarray) -> np.ndarray:
+        if "MPLCONFIGDIR" not in os.environ:
+            os.environ["MPLCONFIGDIR"] = os.path.join(tempfile.gettempdir(), "mplconfig")
+        os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
         import constrained_diffusion as cdd
 
         arr_in = arr01.astype(np.float32, copy=True)
@@ -309,6 +310,13 @@ class JEPADataset(Dataset):
     def __getitem__(self, idx):
         path, forced_slice_idx = self.sample_index[idx % len(self.sample_index)]
         sample = self._load_sample(path, forced_slice_idx=forced_slice_idx).clone()  # 1 x H x W
+        if self.d4_augment:
+            # Uniform random dihedral-4 transform: identity, R90/180/270, and each with mirror.
+            k = int(np.random.randint(0, 4))
+            if k:
+                sample = torch.rot90(sample, k=k, dims=(-2, -1))
+            if bool(np.random.randint(0, 2)):
+                sample = torch.flip(sample, dims=(-1,))
         if self.random_roll_max > 0:
             # Inclusive, symmetric dithering in [-random_roll_max, random_roll_max].
             dy = int(np.random.randint(-self.random_roll_max, self.random_roll_max + 1))
