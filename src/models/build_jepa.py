@@ -17,6 +17,7 @@ from .encoders import (
     PyramidResDilatedEncoder,
     ResCNNDenseEncoder,
 )
+from .mfae_convnext import MFAEConvNeXtDenseEncoder
 from .predictor import FullResPredictor
 
 
@@ -529,6 +530,10 @@ class PyramidGridJEPA(nn.Module):
         encoder_norm_type: Optional[str] = None,
         encoder_norm_groups: Optional[int] = None,
         encoder_norm_eps: Optional[float] = None,
+        mfae_scales=(1, 2, 4),
+        mfae_features=("x", "gradmag", "abslap", "local_std"),
+        mfae_normalize_attributes: bool = False,
+        mfae_include_mask_tokens: bool = True,
     ):
         super().__init__()
 
@@ -566,6 +571,10 @@ class PyramidGridJEPA(nn.Module):
         self.encoder_norm_type = None if encoder_norm_type is None else str(encoder_norm_type).lower()
         self.encoder_norm_groups = None if encoder_norm_groups is None else int(encoder_norm_groups)
         self.encoder_norm_eps = None if encoder_norm_eps is None else float(encoder_norm_eps)
+        self.mfae_scales = tuple(mfae_scales)
+        self.mfae_features = tuple(mfae_features)
+        self.mfae_normalize_attributes = bool(mfae_normalize_attributes)
+        self.mfae_include_mask_tokens = bool(mfae_include_mask_tokens)
         if self.mode not in ("image", "pyramid"):
             raise ValueError(f"Unknown mode={self.mode}; expected 'image' or 'pyramid'")
         if self.encoder_type == "pyramid_cnn_res_dilated":
@@ -641,6 +650,31 @@ class PyramidGridJEPA(nn.Module):
                 expansion=4,
                 use_reflect_padding=True,
                 final_norm=True,
+            )
+        elif self.encoder_type == "mfae_convnext":
+            if self.mode == "pyramid":
+                field_channels = len(self.sigmas)
+                include_mask_tokens = bool(self.mfae_include_mask_tokens)
+            elif self.mode == "image":
+                field_channels = 1
+                include_mask_tokens = False
+            else:
+                raise ValueError(
+                    f"mfae_convnext supports mode='image' or mode='pyramid', got mode={self.mode}"
+                )
+            self.context_encoder = MFAEConvNeXtDenseEncoder(
+                field_channels=field_channels,
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=self.encoder_depth,
+                kernel_size=self.encoder_kernel_size,
+                expansion=4,
+                use_reflect_padding=True,
+                final_norm=True,
+                mfae_scales=self.mfae_scales,
+                mfae_features=self.mfae_features,
+                mfae_normalize_attributes=self.mfae_normalize_attributes,
+                include_mask_tokens=include_mask_tokens,
             )
         elif self.encoder_type == "dense_unet_small":
             self.context_encoder = DenseUNetSmallEncoder(
@@ -778,11 +812,26 @@ class PyramidGridJEPA(nn.Module):
             enc_target = torch.cat([cdd_orig, zero_token], dim=1)
             # context: masked per-scale channels + mask token maps
             enc_context = torch.cat([cdd_masked, dip_per_ch], dim=1)
-
-        with torch.no_grad():
-            gt_map = self.target_encoder(enc_target)
-
-        context_map = self.context_encoder(enc_context)
+        if self.encoder_type == "mfae_convnext":
+            if self.mode == "image":
+                context_map = self.context_encoder(x_context_enc)
+                with torch.no_grad():
+                    gt_map = self.target_encoder(x_clean_enc)
+            elif self.mode == "pyramid":
+                cdd_orig = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
+                cdd_masked = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
+                mask_tokens = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
+                context_map = self.context_encoder(cdd_masked, mask_tokens=mask_tokens)
+                with torch.no_grad():
+                    gt_map = self.target_encoder(cdd_orig, mask_tokens=torch.zeros_like(mask_tokens))
+            else:
+                raise ValueError(
+                    f"mfae_convnext supports mode='image' or mode='pyramid', got mode={self.mode}"
+                )
+        else:
+            with torch.no_grad():
+                gt_map = self.target_encoder(enc_target)
+            context_map = self.context_encoder(enc_context)
         pred_map = self.predictor(context_map)
 
         pred_patches = extract_location_patches(pred_map, target_locations, patch_size=self.patch_size)

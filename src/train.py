@@ -915,6 +915,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         encoder_norm_type=model_cfg.get("encoder_norm_type"),
         encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
         encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
+        mfae_scales=tuple(model_cfg.get("mfae_scales", [1, 2, 4])),
+        mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
+        mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
+        mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
     ).to(device)
     allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
     resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
@@ -990,6 +994,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     encoder_norm_type=model_cfg.get("encoder_norm_type"),
                     encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
                     encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
+                    mfae_scales=tuple(model_cfg.get("mfae_scales", [1, 2, 4])),
+                    mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
+                    mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
+                    mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
                 ).to(device)
                 print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
@@ -1049,6 +1057,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 encoder_norm_type=model_cfg.get("encoder_norm_type"),
                 encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
                 encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
+                mfae_scales=tuple(model_cfg.get("mfae_scales", [1, 2, 4])),
+                mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
+                mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
+                mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
             ).to(device)
             print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
         else:
