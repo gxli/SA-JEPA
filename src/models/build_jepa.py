@@ -112,6 +112,7 @@ def make_pyramid_grid_context(
     mask_scale: float = 1.0,
     min_mask_scale: float = 0.0,
     spacing_scale: float = 1.5,
+    mask_size: float = 0.0,
     full_grid: bool = True,
     global_shift: bool = True,
     align_scales: bool = True,
@@ -231,22 +232,17 @@ def make_pyramid_grid_context(
             if constant_mask_box:
                 base_box = int(mask_box_size)
             else:
-                # Use both sigma and configured cell size to avoid misleading knobs.
-                box_sigma = int(max(2, round(eff_base_sigma * float(box_sigma_mult) * float(mask_scale))))
-                box_cell = int(max(2, round(max(1, base_cell) * float(mask_fraction)))) if base_cell > 0 else 2
-                base_box = int(max(box_sigma, box_cell))
+                base_box = int(max(2, round(float(base_sigma) * float(mask_fraction) + float(mask_size))))
             largest_sigma = float(max(active_sigmas))
             eff_largest_sigma = max(float(largest_sigma), float(min_mask_scale))
             largest_cell = int(max(active_cells))
             if constant_mask_box:
                 largest_box = int(mask_box_size)
             else:
-                box_sigma = int(max(2, round(eff_largest_sigma * float(box_sigma_mult) * float(mask_scale))))
-                box_cell = int(max(2, round(max(1, largest_cell) * float(mask_fraction)))) if largest_cell > 0 else 2
-                largest_box = int(max(box_sigma, box_cell))
+                largest_box = int(max(2, round(float(largest_sigma) * float(mask_fraction) + float(mask_size))))
             # Spacing rule (all modes):
-            # scale * masking_ratio(mask_scale) * grid_spacing_scale
-            spacing_px = int(max(1, round(eff_largest_sigma * float(mask_scale) * float(spacing_scale))))
+            # masking_size * mask_spacing_scaling
+            spacing_px = int(max(1, round(float(largest_box) * float(spacing_scale))))
             base_margin = largest_box // 2 + 1
             shared_centers = _shared_grid_centers(
                 h=h,
@@ -278,9 +274,7 @@ def make_pyramid_grid_context(
             if constant_mask_box:
                 base_box = int(mask_box_size)
             else:
-                box_sigma = int(max(2, round(eff_sigma * float(box_sigma_mult) * float(mask_scale))))
-                box_cell = int(max(2, round(max(1, cell_size) * float(mask_fraction)))) if cell_size > 0 else 2
-                base_box = int(max(box_sigma, box_cell))
+                base_box = int(max(2, round(float(sigma) * float(mask_fraction) + float(mask_size))))
             box = int(max(base_box, min_box))
             # Use explicit asymmetric halves so odd/even box sizes are both centered correctly.
             half_lo = box // 2
@@ -289,8 +283,8 @@ def make_pyramid_grid_context(
                 centers = shared_centers
             else:
                 # Spacing rule (all modes):
-                # scale * masking_ratio(mask_scale) * grid_spacing_scale
-                spacing = int(max(1, round(eff_sigma * float(mask_scale) * float(spacing_scale))))
+                # masking_size * mask_spacing_scaling
+                spacing = int(max(1, round(float(box) * float(spacing_scale))))
                 margin = max(half_lo, half_hi) + 1
                 area_budget = per_scale_fraction * float(h * w)
                 desired_count = area_budget / max(1.0, float(box * box))
@@ -504,6 +498,7 @@ class PyramidGridJEPA(nn.Module):
         mask_scale: float = 1.0,
         min_mask_scale: float = 0.0,
         spacing_scale: float = 1.5,
+        mask_size: float = 0.0,
         full_grid: bool = True,
         global_shift: bool = True,
         align_scales: bool = True,
@@ -545,6 +540,7 @@ class PyramidGridJEPA(nn.Module):
         self.mask_scale = float(mask_scale)
         self.min_mask_scale = float(min_mask_scale)
         self.spacing_scale = float(spacing_scale)
+        self.mask_size = float(mask_size)
         self.full_grid = bool(full_grid)
         self.global_shift = bool(global_shift)
         self.align_scales = bool(align_scales)
@@ -740,6 +736,7 @@ class PyramidGridJEPA(nn.Module):
                 mask_scale=self.mask_scale,
                 min_mask_scale=self.min_mask_scale,
                 spacing_scale=self.spacing_scale,
+                mask_size=self.mask_size,
                 full_grid=self.full_grid,
                 global_shift=self.global_shift,
                 align_scales=self.align_scales,
@@ -767,6 +764,7 @@ class PyramidGridJEPA(nn.Module):
                 mask_scale=self.mask_scale,
                 min_mask_scale=self.min_mask_scale,
                 spacing_scale=self.spacing_scale,
+                mask_size=self.mask_size,
                 full_grid=self.full_grid,
                 global_shift=self.global_shift,
                 align_scales=self.align_scales,

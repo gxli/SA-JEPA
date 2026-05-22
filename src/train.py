@@ -864,6 +864,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         json.dump(config, f, indent=2)
 
     blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
+    # Naming cleanup (backward compatible):
+    # - box scaling: mask_scaling_box (legacy: mask_scale)
+    # - gaussian dip scaling: mask_scaling_gaussian (legacy: dip_sigma_mult)
+    mask_scaling_box = float(model_cfg.get("mask_scaling_box", model_cfg.get("mask_scale", 1.0)))
+    mask_scaling_gaussian = float(model_cfg.get("mask_scaling_gaussian", model_cfg.get("dip_sigma_mult", 1.0)))
+    mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", model_cfg.get("spacing_scale", 1.5)))
+    mask_size = float(model_cfg.get("mask_size", 0.0))
     dataset_apply_cdd, dataset_log_transform, model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
 
     print(
@@ -886,9 +893,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
         mask_fraction=model_cfg.get("mask_fraction", 1.0),
         box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
-        mask_scale=model_cfg.get("mask_scale", 1.0),
+        mask_scale=mask_scaling_box,
         min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
-        spacing_scale=model_cfg.get("spacing_scale", 1.5),
+        spacing_scale=mask_spacing_scaling,
+        mask_size=mask_size,
         full_grid=model_cfg.get("full_grid", True),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
@@ -899,7 +907,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         cdd_constrained=model_cfg.get("cdd_constrained", True),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
         mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-        dip_sigma_mult=model_cfg.get("dip_sigma_mult", 1.0),
+        dip_sigma_mult=mask_scaling_gaussian,
         constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
         post_log_transform=model_cfg.get("post_log_transform", model_post_log),
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
@@ -965,9 +973,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
                     mask_fraction=model_cfg.get("mask_fraction", 1.0),
                     box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
-                    mask_scale=model_cfg.get("mask_scale", 1.0),
+                    mask_scale=mask_scaling_box,
                     min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
-                    spacing_scale=model_cfg.get("spacing_scale", 1.5),
+                    spacing_scale=mask_spacing_scaling,
+                    mask_size=mask_size,
                     full_grid=model_cfg.get("full_grid", True),
                     global_shift=model_cfg.get("global_shift", True),
                     align_scales=model_cfg.get("align_scales", True),
@@ -978,7 +987,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     cdd_constrained=model_cfg.get("cdd_constrained", True),
                     cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
                     mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-                    dip_sigma_mult=model_cfg.get("dip_sigma_mult", 1.0),
+                    dip_sigma_mult=mask_scaling_gaussian,
                     constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
                     post_log_transform=model_cfg.get("post_log_transform", model_post_log),
                     log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
@@ -1028,9 +1037,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
                 mask_fraction=model_cfg.get("mask_fraction", 1.0),
                 box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
-                mask_scale=model_cfg.get("mask_scale", 1.0),
+                mask_scale=mask_scaling_box,
                 min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
-                spacing_scale=model_cfg.get("spacing_scale", 1.5),
+                spacing_scale=mask_spacing_scaling,
+                mask_size=mask_size,
                 full_grid=model_cfg.get("full_grid", True),
                 global_shift=model_cfg.get("global_shift", True),
                 align_scales=model_cfg.get("align_scales", True),
@@ -1041,7 +1051,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 cdd_constrained=model_cfg.get("cdd_constrained", True),
                 cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
                 mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-                dip_sigma_mult=model_cfg.get("dip_sigma_mult", 1.0),
+                dip_sigma_mult=mask_scaling_gaussian,
                 constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
                 post_log_transform=model_cfg.get("post_log_transform", model_post_log),
                 log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
@@ -1067,7 +1077,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             print(f"resume_model={model_ckpt_path}")
 
     scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
-    auto_roll_max = max(1, int(round(scale_max * float(model_cfg.get("mask_scale", 1.0)) * float(model_cfg.get("spacing_scale", 1.5)))))
+    auto_roll_max = max(1, int(round(scale_max * mask_scaling_box * mask_spacing_scaling)))
 
     dataset = JEPADataset(
         num_samples=data_cfg.get("num_samples", 2000),
@@ -1530,6 +1540,21 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         effective_rank = f"{compute_effective_rank_from_features(z):.8f}"
                 except Exception as er:
                     print(f"[{config_name}] warning: effective_rank_failed: {type(er).__name__}: {er}")
+            # Dedicated artifact for simple downstream collection.
+            # Empty string means rank was not computed for this run.
+            with open(os.path.join(session_dir, "effective_rank.txt"), "w", encoding="utf-8") as f:
+                f.write(f"{effective_rank}\n")
+            with open(os.path.join(session_dir, "effective_rank.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "timestamp": int(time.time()),
+                        "config_name": config_name,
+                        "compute_effective_rank": bool(compute_effective_rank),
+                        "effective_rank": (None if effective_rank == "" else float(effective_rank)),
+                    },
+                    f,
+                    indent=2,
+                )
             run_results_path = os.path.join(session_dir, "run_results.csv")
             if not os.path.exists(run_results_path):
                 with open(run_results_path, "w", newline="", encoding="utf-8") as f:

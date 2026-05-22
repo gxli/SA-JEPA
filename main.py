@@ -1,5 +1,6 @@
 import argparse
 import os
+import copy
 
 from src.train import load_config, run_training
 
@@ -8,6 +9,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run one JEPA config")
     parser.add_argument("--config", type=str, required=True, help="Path to JSON config")
     parser.add_argument("--sessions-dir", type=str, default="sessions", help="Session output root")
+    parser.add_argument(
+        "--update-effective-rank",
+        action="store_true",
+        help="Update mode: skip training, reuse session weights, and compute/save effective rank.",
+    )
+    parser.add_argument(
+        "--recompute-inference",
+        action="store_true",
+        help="When used with --update-effective-rank, force regeneration of inference artifacts.",
+    )
     return parser.parse_args()
 
 
@@ -15,6 +26,13 @@ def main():
     args = parse_args()
     config = load_config(args.config)
     config_name = os.path.splitext(os.path.basename(args.config))[0]
+    if args.update_effective_rank:
+        cfg = copy.deepcopy(config)
+        cfg.setdefault("train", {})
+        cfg["train"]["epochs"] = 0
+        cfg["train"]["compute_effective_rank"] = True
+        cfg["train"]["force_recompute_inference"] = bool(args.recompute_inference)
+        config = cfg
     session_dir = run_training(config, config_name=config_name, sessions_root=args.sessions_dir)
     print(f"session_saved={session_dir}")
 
