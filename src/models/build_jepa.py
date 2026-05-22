@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .dense_unet import DenseUNetSmallEncoder
+from .cdd_opnet import CDDOpNetEncoder
 from .encoders import (
     ConvNeXtDenseEncoder,
     FullResEncoder,
@@ -529,6 +530,9 @@ class PyramidGridJEPA(nn.Module):
         mfae_features=("x", "gradmag", "abslap", "local_std"),
         mfae_normalize_attributes: bool = False,
         mfae_include_mask_tokens: bool = True,
+        opnet_dilation_mode: str = "half_cdd_scale",
+        opnet_dilations=None,
+        opnet_max_dilation: int = 16,
     ):
         super().__init__()
 
@@ -571,6 +575,9 @@ class PyramidGridJEPA(nn.Module):
         self.mfae_features = tuple(mfae_features)
         self.mfae_normalize_attributes = bool(mfae_normalize_attributes)
         self.mfae_include_mask_tokens = bool(mfae_include_mask_tokens)
+        self.opnet_dilation_mode = str(opnet_dilation_mode)
+        self.opnet_dilations = opnet_dilations
+        self.opnet_max_dilation = int(opnet_max_dilation)
         if self.mode not in ("image", "pyramid"):
             raise ValueError(f"Unknown mode={self.mode}; expected 'image' or 'pyramid'")
         if self.encoder_type == "pyramid_cnn_res_dilated":
@@ -633,6 +640,24 @@ class PyramidGridJEPA(nn.Module):
                 norm_type=norm_type,
                 norm_groups=norm_groups,
                 norm_eps=norm_eps,
+            )
+        elif self.encoder_type == "cdd_opnet":
+            self.context_encoder = CDDOpNetEncoder(
+                field_channels=max(1, len(self.sigmas)),
+                scales=tuple(float(s) for s in self.sigmas),
+                latent_channels=latent_channels,
+                hidden_channels=self.encoder_width,
+                depth=self.encoder_depth,
+                kernel_size=self.encoder_kernel_size,
+                expansion=4,
+                use_reflect_padding=True,
+                final_norm=True,
+                include_mask_tokens=True,
+                log_eps=self.log_eps,
+                log_std_floor_mult=self.cdd_log_std_floor_mult,
+                opnet_dilation_mode=self.opnet_dilation_mode,
+                opnet_dilations=self.opnet_dilations,
+                opnet_max_dilation=self.opnet_max_dilation,
             )
         elif self.encoder_type == "fullres":
             self.context_encoder = FullResEncoder(in_channels=1, latent_channels=latent_channels)
@@ -826,6 +851,15 @@ class PyramidGridJEPA(nn.Module):
                 raise ValueError(
                     f"mfae_convnext supports mode='image' or mode='pyramid', got mode={self.mode}"
                 )
+        elif self.encoder_type == "cdd_opnet":
+            if self.mode != "pyramid":
+                raise ValueError("cdd_opnet requires mode='pyramid'.")
+            cdd_orig = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
+            cdd_masked = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
+            mask_tokens = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
+            context_map = self.context_encoder(cdd_masked, mask_tokens=mask_tokens)
+            with torch.no_grad():
+                gt_map = self.target_encoder(cdd_orig, mask_tokens=torch.zeros_like(mask_tokens))
         else:
             with torch.no_grad():
                 gt_map = self.target_encoder(enc_target)

@@ -43,12 +43,11 @@
       64,
       128
     ],
-    "max_targets_per_image": 16,
-    "mask_fraction": 0.0,
+    "mask_fraction": 0.2,
     "box_sigma_mult": 4,
     "mask_scale": 1.0,
     "min_mask_scale": 0,
-    "spacing_scale": 2.0,
+    "spacing_scale": 1.0,
     "full_grid": true,
     "global_shift": true,
     "align_scales": true,
@@ -66,11 +65,11 @@
     "ema_momentum": 0.996,
     "normalize_loss": true,
     "predictor_layernorm": true,
-    "mode": "pyramid",
     "encoder_type": "mfae_convnext",
     "encoder_width": 32,
-    "encoder_depth": 6,
+    "encoder_depth": 4,
     "encoder_kernel_size": 7,
+    "mode": "image",
     "mfae_scales": [
       1,
       2,
@@ -83,11 +82,10 @@
       "local_std"
     ],
     "mfae_normalize_attributes": false,
-    "mfae_include_mask_tokens": true,
     "mask_scaling_gaussian": 1.0,
-    "mask_size": 16.0,
+    "mask_size": 0.0,
     "mask_scaling_box": 1.0,
-    "mask_spacing_scaling": 2.0
+    "mask_spacing_scaling": 1.0
   },
   "train": {
     "batch_size": 8,
@@ -113,6 +111,7 @@
       "standardize": false
     },
     "viz_l2_normalize": true,
-    "viz_crop_border": true
+    "viz_crop_border": true,
+    "compute_effective_rank": true
   }
 }

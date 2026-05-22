@@ -43,11 +43,11 @@
       64,
       128
     ],
-    "mask_fraction": 0.0,
+    "mask_fraction": 0.2,
     "box_sigma_mult": 4,
     "mask_scale": 1.0,
     "min_mask_scale": 0,
-    "spacing_scale": 2.0,
+    "spacing_scale": 2.25,
     "full_grid": true,
     "global_shift": true,
     "align_scales": true,
@@ -58,7 +58,7 @@
     "cdd_constrained": true,
     "cdd_sm_mode": "reflect",
     "mask_fill_mode": "gaussian_dip",
-    "dip_sigma_mult": 2.0,
+    "dip_sigma_mult": 1.0,
     "post_log_transform": true,
     "log_eps": 1e-06,
     "cdd_log_std_floor_mult": 0.05,
@@ -82,10 +82,10 @@
       "local_std"
     ],
     "mfae_normalize_attributes": false,
-    "mask_scaling_gaussian": 2.0,
-    "mask_size": 4.0,
+    "mask_scaling_gaussian": 1.0,
+    "mask_size": 0.0,
     "mask_scaling_box": 1.0,
-    "mask_spacing_scaling": 2.0
+    "mask_spacing_scaling": 2.25
   },
   "train": {
     "batch_size": 8,
@@ -111,6 +111,7 @@
       "standardize": false
     },
     "viz_l2_normalize": true,
-    "viz_crop_border": true
+    "viz_crop_border": true,
+    "compute_effective_rank": true
   }
 }

@@ -81,18 +81,34 @@ class ConvNeXtDenseBlock(nn.Module):
         channels: int,
         expansion: int = 4,
         kernel_size: int = 7,
+        dilation: int = 1,
         layer_scale_init: float = 1e-6,
         use_reflect_padding: bool = True,
     ):
         super().__init__()
-        pad = int(kernel_size // 2)
+        self.dilation = int(dilation)
+        pad = (int(kernel_size) // 2) * self.dilation
         if use_reflect_padding:
             self.dwconv = nn.Sequential(
                 nn.ReflectionPad2d(pad),
-                nn.Conv2d(channels, channels, kernel_size=kernel_size, padding=0, groups=channels),
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    kernel_size=kernel_size,
+                    padding=0,
+                    dilation=self.dilation,
+                    groups=channels,
+                ),
             )
         else:
-            self.dwconv = nn.Conv2d(channels, channels, kernel_size=kernel_size, padding=pad, groups=channels)
+            self.dwconv = nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=kernel_size,
+                padding=pad,
+                dilation=self.dilation,
+                groups=channels,
+            )
         self.norm = nn.LayerNorm(channels)
         self.pw1 = nn.Linear(channels, expansion * channels)
         self.act = nn.GELU()
@@ -123,8 +139,21 @@ class ConvNeXtDenseEncoder(nn.Module):
         expansion: int = 4,
         use_reflect_padding: bool = True,
         final_norm: bool = True,
+        dilations=None,
     ):
         super().__init__()
+        depth = int(depth)
+        if dilations is None:
+            dilations = [1] * depth
+        else:
+            dilations = [int(d) for d in dilations]
+            if len(dilations) < depth:
+                reps = (depth + len(dilations) - 1) // len(dilations)
+                dilations = (dilations * reps)[:depth]
+            elif len(dilations) > depth:
+                dilations = dilations[:depth]
+        self.dilations = tuple(dilations)
+
         self.stem = nn.Sequential(
             nn.ReflectionPad2d(1) if use_reflect_padding else nn.Identity(),
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=0 if use_reflect_padding else 1),
@@ -137,9 +166,10 @@ class ConvNeXtDenseEncoder(nn.Module):
                     channels=hidden_channels,
                     expansion=expansion,
                     kernel_size=kernel_size,
+                    dilation=dilations[i],
                     use_reflect_padding=use_reflect_padding,
                 )
-                for _ in range(int(depth))
+                for i in range(depth)
             ]
         )
         self.head = nn.Conv2d(hidden_channels, latent_channels, kernel_size=1)

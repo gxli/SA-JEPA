@@ -333,6 +333,23 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     effective_rank_x.append(ts)
                     effective_rank_y.append(er)
 
+    rank_diag = {}
+    rank_diag_path = os.path.join(session_dir, "rank_diagnostics.json")
+    if os.path.exists(rank_diag_path):
+        try:
+            import json
+
+            with open(rank_diag_path, "r", encoding="utf-8") as f:
+                rank_diag = json.load(f)
+        except Exception:
+            rank_diag = {}
+    def _rd(branch: str, key: str, default: float = np.nan) -> float:
+        try:
+            return float(rank_diag.get(branch, {}).get(key, default))
+        except Exception:
+            return float(default)
+    rd_pred_gt_erank_ratio = float(rank_diag.get("pred_gt_erank_ratio", np.nan)) if isinstance(rank_diag, dict) else np.nan
+
     np.savez_compressed(
         out_npz,
         orig=orig,
@@ -364,6 +381,25 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         loss_jepa=np.asarray(loss_jepa, dtype=np.float32),
         effective_rank_x=np.asarray(effective_rank_x, dtype=np.float64),
         effective_rank_y=np.asarray(effective_rank_y, dtype=np.float32),
+        rank_context_erank=np.asarray([_rd("context", "erank")], dtype=np.float32),
+        rank_pred_erank=np.asarray([_rd("pred", "erank")], dtype=np.float32),
+        rank_gt_erank=np.asarray([_rd("gt", "erank")], dtype=np.float32),
+        rank_context_pr=np.asarray([_rd("context", "participation_rank")], dtype=np.float32),
+        rank_pred_pr=np.asarray([_rd("pred", "participation_rank")], dtype=np.float32),
+        rank_gt_pr=np.asarray([_rd("gt", "participation_rank")], dtype=np.float32),
+        rank_context_dead=np.asarray([_rd("context", "dead_channel_fraction")], dtype=np.float32),
+        rank_pred_dead=np.asarray([_rd("pred", "dead_channel_fraction")], dtype=np.float32),
+        rank_gt_dead=np.asarray([_rd("gt", "dead_channel_fraction")], dtype=np.float32),
+        rank_context_top1=np.asarray([_rd("context", "top1_energy")], dtype=np.float32),
+        rank_pred_top1=np.asarray([_rd("pred", "top1_energy")], dtype=np.float32),
+        rank_gt_top1=np.asarray([_rd("gt", "top1_energy")], dtype=np.float32),
+        rank_context_top4=np.asarray([_rd("context", "top4_energy")], dtype=np.float32),
+        rank_pred_top4=np.asarray([_rd("pred", "top4_energy")], dtype=np.float32),
+        rank_gt_top4=np.asarray([_rd("gt", "top4_energy")], dtype=np.float32),
+        rank_context_top8=np.asarray([_rd("context", "top8_energy")], dtype=np.float32),
+        rank_pred_top8=np.asarray([_rd("pred", "top8_energy")], dtype=np.float32),
+        rank_gt_top8=np.asarray([_rd("gt", "top8_energy")], dtype=np.float32),
+        rank_pred_gt_erank_ratio=np.asarray([rd_pred_gt_erank_ratio], dtype=np.float32),
     )
     return out_npz
 
@@ -491,6 +527,47 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     )
     fig_eff_rank.update_xaxes(title_text="timestamp")
     fig_eff_rank.update_yaxes(title_text="effective_rank")
+    def _scalar(name: str) -> float:
+        if name in data.files:
+            arr = np.asarray(data[name]).reshape(-1)
+            if arr.size > 0 and np.isfinite(arr[0]):
+                return float(arr[0])
+        return float("nan")
+
+    rank_branches = ["context", "pred", "gt"]
+    rank_erank = [_scalar("rank_context_erank"), _scalar("rank_pred_erank"), _scalar("rank_gt_erank")]
+    rank_pr = [_scalar("rank_context_pr"), _scalar("rank_pred_pr"), _scalar("rank_gt_pr")]
+    rank_dead = [_scalar("rank_context_dead"), _scalar("rank_pred_dead"), _scalar("rank_gt_dead")]
+    rank_top1 = [_scalar("rank_context_top1"), _scalar("rank_pred_top1"), _scalar("rank_gt_top1")]
+    rank_top4 = [_scalar("rank_context_top4"), _scalar("rank_pred_top4"), _scalar("rank_gt_top4")]
+    rank_top8 = [_scalar("rank_context_top8"), _scalar("rank_pred_top8"), _scalar("rank_gt_top8")]
+    rank_ratio = _scalar("rank_pred_gt_erank_ratio")
+
+    fig_rank_diag = go.Figure()
+    fig_rank_diag.add_trace(go.Bar(name="erank", x=rank_branches, y=rank_erank))
+    fig_rank_diag.add_trace(go.Bar(name="participation_rank", x=rank_branches, y=rank_pr))
+    fig_rank_diag.add_trace(go.Bar(name="dead_channel_fraction", x=rank_branches, y=rank_dead))
+    subtitle = ""
+    if np.isfinite(rank_ratio):
+        subtitle = f" (pred/gt erank ratio={rank_ratio:.3f})"
+    fig_rank_diag.update_layout(
+        barmode="group",
+        template="plotly_white",
+        title={"text": f"Rank Diagnostics{subtitle}", "x": 0.02},
+        margin=dict(l=42, r=8, t=36, b=36),
+        height=330,
+    )
+    fig_rank_energy = go.Figure()
+    fig_rank_energy.add_trace(go.Bar(name="top1_energy", x=rank_branches, y=rank_top1))
+    fig_rank_energy.add_trace(go.Bar(name="top4_energy", x=rank_branches, y=rank_top4))
+    fig_rank_energy.add_trace(go.Bar(name="top8_energy", x=rank_branches, y=rank_top8))
+    fig_rank_energy.update_layout(
+        barmode="group",
+        template="plotly_white",
+        title={"text": "Rank Energy Concentration (Top-k)", "x": 0.02},
+        margin=dict(l=42, r=8, t=36, b=36),
+        height=330,
+    )
 
     cards: list[dict] = []
     for name, stem in (("Context", "context"), ("Predict", "pred"), ("Target", "gt")):
@@ -507,6 +584,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             {"title": "Input (Log-Norm)", "fig": heat("Input (Log-Norm)", data["orig"], "Viridis"), "group": "input"},
             {"title": "Loss Curve", "fig": fig_loss, "group": "loss"},
             {"title": "Effective Rank", "fig": fig_eff_rank, "group": "eff-rank"},
+            {"title": "Rank Diagnostics", "fig": fig_rank_diag, "group": "rank-diag"},
+            {"title": "Rank Energy Top-k", "fig": fig_rank_energy, "group": "rank-energy"},
             {"title": "Target Locations", "fig": heat("Target Locations", data["target"], "Magma"), "group": "target-loc"},
             {"title": "Target Location Heatmap", "fig": heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma"), "group": "target-heat"},
             {"title": "Energy Map", "fig": heat("Energy Map", data["energy_map"], "Inferno"), "group": "energy"},

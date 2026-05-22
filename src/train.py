@@ -761,6 +761,71 @@ def compute_effective_rank_from_features(z: np.ndarray) -> float:
     return float(np.exp(h))
 
 
+def spectral_rank_stats(fmap: torch.Tensor, eps: float = 1e-12, dead_thresh: float = 1e-5) -> dict:
+    """
+    fmap: C,H,W or B,C,H,W
+    Computes covariance spectral stats over spatial tokens.
+    """
+    if fmap.ndim == 3:
+        z = fmap.permute(1, 2, 0).reshape(-1, fmap.shape[0])
+    elif fmap.ndim == 4:
+        z = fmap.permute(0, 2, 3, 1).reshape(-1, fmap.shape[1])
+    else:
+        raise ValueError(f"Expected C,H,W or B,C,H,W, got {tuple(fmap.shape)}")
+
+    z = z.float()
+    z = z - z.mean(dim=0, keepdim=True)
+
+    ch_std = z.std(dim=0, unbiased=False)
+    dead = ch_std < float(dead_thresh)
+    dead_frac = dead.float().mean().item()
+
+    cov = (z.T @ z) / max(1, z.shape[0] - 1)
+    eig = torch.linalg.eigvalsh(cov).clamp_min(0)
+    eig = torch.flip(eig, dims=(0,))
+
+    total = eig.sum().clamp_min(eps)
+    p = eig / total
+    entropy = -(p * torch.log(p.clamp_min(eps))).sum()
+    erank = torch.exp(entropy)
+
+    top1 = p[:1].sum()
+    top4 = p[:4].sum()
+    top8 = p[:8].sum()
+    participation = total.pow(2) / eig.pow(2).sum().clamp_min(eps)
+
+    return {
+        "erank": float(erank.item()),
+        "participation_rank": float(participation.item()),
+        "top1_energy": float(top1.item()),
+        "top4_energy": float(top4.item()),
+        "top8_energy": float(top8.item()),
+        "dead_channel_fraction": float(dead_frac),
+        "num_dead_channels": int(dead.sum().item()),
+        "mean_channel_std": float(ch_std.mean().item()),
+        "min_channel_std": float(ch_std.min().item()),
+        "max_channel_std": float(ch_std.max().item()),
+        "dead_channel_threshold": float(dead_thresh),
+    }
+
+
+def rank_dashboard(outputs: dict) -> dict:
+    context = outputs.get("context_map")
+    pred = outputs["pred_map"]
+    gt = outputs["gt_map"]
+
+    out = {}
+    if context is not None:
+        out["context"] = spectral_rank_stats(torch.as_tensor(context))
+    out["pred"] = spectral_rank_stats(torch.as_tensor(pred))
+    out["gt"] = spectral_rank_stats(torch.as_tensor(gt))
+    out["pred_gt_erank_ratio"] = out["pred"]["erank"] / max(out["gt"]["erank"], 1e-12)
+    out["pred_gt_participation_ratio"] = out["pred"]["participation_rank"] / max(
+        out["gt"]["participation_rank"], 1e-12
+    )
+    return out
+
+
 def compute_error_by_scale(outputs: dict) -> dict[float, float]:
     pred = outputs["pred_patches"].detach()  # B,K,C,P,P
     gt = outputs["gt_patches"].detach()  # B,K,C,P,P
@@ -837,6 +902,19 @@ def resolve_pipeline_config(data_cfg: dict, model_cfg: dict) -> tuple[bool, bool
     return dataset_apply_cdd, dataset_log_transform, model_post_log
 
 
+def resolve_encoder_type_default(model_cfg: dict) -> str:
+    """
+    Keep old defaults for image mode, but switch pyramid-mode default
+    to the new isolated CDD encoder when encoder_type is not specified.
+    """
+    if "encoder_type" in model_cfg:
+        return str(model_cfg["encoder_type"])
+    mode = str(model_cfg.get("mode", "image"))
+    if mode == "pyramid":
+        return "cdd_opnet"
+    return "fullres"
+
+
 def run_training(config: dict, config_name: str, sessions_root: str = "sessions") -> str:
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -885,6 +963,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         f"model.cdd_mode={model_cfg.get('cdd_mode', 'log')}"
     )
 
+    resolved_encoder_type = resolve_encoder_type_default(model_cfg)
     model = PyramidGridJEPA(
         latent_channels=model_cfg.get("latent_channels", 32),
         predictor_hidden=model_cfg.get("predictor_hidden"),
@@ -916,7 +995,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         normalize_loss=model_cfg.get("normalize_loss", True),
         predictor_layernorm=model_cfg.get("predictor_layernorm", False),
         mode=model_cfg.get("mode", "image"),
-        encoder_type=model_cfg.get("encoder_type", "fullres"),
+        encoder_type=resolved_encoder_type,
         encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
         encoder_depth=model_cfg.get("encoder_depth", 4),
         encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
@@ -927,6 +1006,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
         mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
         mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
+        opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
+        opnet_dilations=model_cfg.get("opnet_dilations"),
+        opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
     ).to(device)
     allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
     resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
@@ -996,7 +1078,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     normalize_loss=model_cfg.get("normalize_loss", True),
                     predictor_layernorm=model_cfg.get("predictor_layernorm", False),
                     mode=model_cfg.get("mode", "image"),
-                    encoder_type=model_cfg.get("encoder_type", "fullres"),
+                    encoder_type=resolved_encoder_type,
                     encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
                     encoder_depth=model_cfg.get("encoder_depth", 4),
                     encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
@@ -1007,6 +1089,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
                     mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
                     mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
+                    opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
+                    opnet_dilations=model_cfg.get("opnet_dilations"),
+                    opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
                 ).to(device)
                 print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
@@ -1060,7 +1145,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 normalize_loss=model_cfg.get("normalize_loss", True),
                 predictor_layernorm=model_cfg.get("predictor_layernorm", False),
                 mode=model_cfg.get("mode", "image"),
-                encoder_type=model_cfg.get("encoder_type", "fullres"),
+                encoder_type=resolved_encoder_type,
                 encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
                 encoder_depth=model_cfg.get("encoder_depth", 4),
                 encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
@@ -1071,6 +1156,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
                 mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
                 mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
+                opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
+                opnet_dilations=model_cfg.get("opnet_dilations"),
+                opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
             ).to(device)
             print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
         else:
@@ -1531,13 +1619,23 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             dash_path = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)
             print(f"[{config_name}] dashboard_saved={dash_path}")
             effective_rank = ""
+            rank_diag = {}
+            try:
+                rank_diag = rank_dashboard(outputs)
+                with open(os.path.join(session_dir, "rank_diagnostics.json"), "w", encoding="utf-8") as f:
+                    json.dump(rank_diag, f, indent=2)
+            except Exception as er:
+                print(f"[{config_name}] warning: rank_diagnostics_failed: {type(er).__name__}: {er}")
             if compute_effective_rank:
                 try:
-                    pred_map = outputs.get("pred_map")
-                    if pred_map is not None:
-                        pm = torch.as_tensor(pred_map)
-                        z = pm[0].detach().cpu().permute(1, 2, 0).reshape(-1, int(pm.shape[1])).numpy()
-                        effective_rank = f"{compute_effective_rank_from_features(z):.8f}"
+                    if "pred" in rank_diag and "erank" in rank_diag["pred"]:
+                        effective_rank = f"{float(rank_diag['pred']['erank']):.8f}"
+                    else:
+                        pred_map = outputs.get("pred_map")
+                        if pred_map is not None:
+                            pm = torch.as_tensor(pred_map)
+                            z = pm[0].detach().cpu().permute(1, 2, 0).reshape(-1, int(pm.shape[1])).numpy()
+                            effective_rank = f"{compute_effective_rank_from_features(z):.8f}"
                 except Exception as er:
                     print(f"[{config_name}] warning: effective_rank_failed: {type(er).__name__}: {er}")
             # Dedicated artifact for simple downstream collection.

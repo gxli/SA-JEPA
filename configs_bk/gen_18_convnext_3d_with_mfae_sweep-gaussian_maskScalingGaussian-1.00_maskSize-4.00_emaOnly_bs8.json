@@ -85,7 +85,7 @@
     "mfae_normalize_attributes": false,
     "mfae_include_mask_tokens": true,
     "mask_scaling_gaussian": 1.0,
-    "mask_size": 2.0,
+    "mask_size": 4.0,
     "mask_scaling_box": 1.0,
     "mask_spacing_scaling": 2.0
   },
@@ -113,6 +113,7 @@
       "standardize": false
     },
     "viz_l2_normalize": true,
-    "viz_crop_border": true
+    "viz_crop_border": true,
+    "compute_effective_rank": true
   }
 }

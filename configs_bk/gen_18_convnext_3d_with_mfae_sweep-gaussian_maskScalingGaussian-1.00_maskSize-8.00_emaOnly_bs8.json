@@ -113,6 +113,7 @@
       "standardize": false
     },
     "viz_l2_normalize": true,
-    "viz_crop_border": true
+    "viz_crop_border": true,
+    "compute_effective_rank": true
   }
 }

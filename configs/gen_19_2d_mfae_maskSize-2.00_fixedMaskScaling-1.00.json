@@ -58,7 +58,7 @@
     "cdd_constrained": true,
     "cdd_sm_mode": "reflect",
     "mask_fill_mode": "gaussian_dip",
-    "dip_sigma_mult": 0.25,
+    "dip_sigma_mult": 1.0,
     "post_log_transform": true,
     "log_eps": 1e-06,
     "cdd_log_std_floor_mult": 0.05,
@@ -82,8 +82,8 @@
       "local_std"
     ],
     "mfae_normalize_attributes": false,
-    "mask_scaling_gaussian": 0.25,
-    "mask_size": 4.0,
+    "mask_scaling_gaussian": 1.0,
+    "mask_size": 2.0,
     "mask_scaling_box": 1.0,
     "mask_spacing_scaling": 2.0
   },
@@ -111,6 +111,7 @@
       "standardize": false
     },
     "viz_l2_normalize": true,
-    "viz_crop_border": true
+    "viz_crop_border": true,
+    "compute_effective_rank": true
   }
 }

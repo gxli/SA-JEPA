@@ -1,24 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SESSIONS_DIR="${1:-sessions}"
-PREFIX="${2:-gen_117}"
-OUT_CSV="${3:-$SESSIONS_DIR/effective_rank_${PREFIX}.csv}"
+if [[ $# -eq 0 ]]; then
+  set -- "sessions"
+fi
 
-mkdir -p "$(dirname "$OUT_CSV")"
-echo "session,effective_rank" > "$OUT_CSV"
+echo "session,effective_rank"
 
-shopt -s nullglob
-for d in "$SESSIONS_DIR"/"$PREFIX"*; do
-  [[ -d "$d" ]] || continue
+emit_session() {
+  local d="$1"
+  local name f rank
+  [[ -d "$d" ]] || return 0
   name="$(basename "$d")"
   f="$d/effective_rank.txt"
   if [[ -f "$f" ]]; then
     rank="$(tr -d '\r\n' < "$f")"
-    echo "$name,$rank" >> "$OUT_CSV"
+    echo "$name,$rank"
   else
-    echo "$name," >> "$OUT_CSV"
+    echo "$name,"
+  fi
+}
+
+for arg in "$@"; do
+  # If arg is already a session dir, emit directly.
+  if [[ -d "$arg" && -f "$arg/config_used.json" ]]; then
+    emit_session "$arg"
+    continue
+  fi
+  # Otherwise treat arg as a root dir and scan one level of session dirs.
+  if [[ -d "$arg" ]]; then
+    shopt -s nullglob
+    for d in "$arg"/*; do
+      [[ -d "$d" ]] || continue
+      emit_session "$d"
+    done
   fi
 done
-
-echo "saved=$OUT_CSV"
