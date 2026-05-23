@@ -12,8 +12,8 @@ def _mask_invalid_targets_from_input(
     *,
     outputs: dict,
     x_input: torch.Tensor,
-    invalid_zero: bool = True,
-    invalid_nan: bool = True,
+    patch_size: int,
+    invalid_values=(0.0, "nan"),
 ) -> int:
     loc = outputs["target_locations"]
     valid = outputs["target_valid"]
@@ -21,6 +21,9 @@ def _mask_invalid_targets_from_input(
         return 0
     bsz, ksz, _ = loc.shape
     h, w = int(x_input.shape[-2]), int(x_input.shape[-1])
+    half_lo = int(patch_size) // 2
+    half_hi = int(patch_size) - half_lo
+    invalid_specs = tuple(invalid_values) if invalid_values is not None else tuple()
     updated = valid.clone()
     n_masked = 0
     for bi in range(bsz):
@@ -29,17 +32,25 @@ def _mask_invalid_targets_from_input(
                 continue
             cy = int(loc[bi, ki, 0].item())
             cx = int(loc[bi, ki, 1].item())
-            if cy < 0 or cx < 0 or cy >= h or cx >= w:
+            y0 = cy - half_lo
+            y1 = cy + half_hi
+            x0 = cx - half_lo
+            x1 = cx + half_hi
+            if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
                 updated[bi, ki] = False
                 n_masked += 1
                 continue
-            v = x_input[bi, 0, cy, cx]
-            bad = False
-            if bool(invalid_nan) and (not torch.isfinite(v)):
-                bad = True
-            if bool(invalid_zero) and torch.isfinite(v) and float(v.item()) == 0.0:
-                bad = True
-            if bad:
+            patch = x_input[bi, 0, y0:y1, x0:x1]
+            invalid_mask = torch.zeros_like(patch, dtype=torch.bool)
+            for spec in invalid_specs:
+                if isinstance(spec, str) and spec.lower() == "nan":
+                    invalid_mask |= ~torch.isfinite(patch)
+                else:
+                    try:
+                        invalid_mask |= torch.isclose(patch, torch.tensor(float(spec), device=patch.device, dtype=patch.dtype))
+                    except (TypeError, ValueError):
+                        continue
+            if bool(torch.all(invalid_mask).item()):
                 updated[bi, ki] = False
                 n_masked += 1
     outputs["target_valid"] = updated
@@ -166,6 +177,9 @@ def run_post_training_inference(
         count_map = None
         total_energy = 0.0
         total_valid = 0
+        invalid_region_skip = bool(getattr(model, "target_invalid_region_skip", False))
+        invalid_region_values = tuple(getattr(model, "target_invalid_region_values", (0.0, "nan")))
+        patch_size = int(getattr(model, "patch_size", 2))
         for pi, shift in enumerate(shifts):
             out_i = model(
                 x_raw,
@@ -174,12 +188,13 @@ def run_post_training_inference(
                 enable_grid_jitter=False,
                 mask_inference=bool(mask_inference),
             )
-            _mask_invalid_targets_from_input(
-                outputs=out_i,
-                x_input=x_raw,
-                invalid_zero=True,
-                invalid_nan=True,
-            )
+            if invalid_region_skip:
+                _mask_invalid_targets_from_input(
+                    outputs=out_i,
+                    x_input=x_raw,
+                    patch_size=patch_size,
+                    invalid_values=invalid_region_values,
+                )
             if outputs is None:
                 outputs = out_i
                 h, w = outputs["x_clean"].shape[-2:]
