@@ -13,18 +13,10 @@ if [[ "$PWD" != "$BASE_LOCAL_ROOT"* ]]; then
 fi
 REL_PATH="${PWD#"$BASE_LOCAL_ROOT"/}"
 REMOTE="gxli@100.73.221.104"
-
-# Resolve remote HOME explicitly (avoid '~' path ambiguity across shells/hosts).
-REMOTE_HOME="$(ssh "$REMOTE" 'printf %s "$HOME"')"
-if [[ -z "${REMOTE_HOME}" ]]; then
-    echo "ERROR: Could not resolve remote HOME for $REMOTE"
-    exit 1
-fi
-
-# Remote destination mirrors local path relative to local ~/proj
-REMOTE_DEST="${REMOTE_HOME}/proj/${REL_PATH}/"
-REMOTE_OUTPUTS_DEST="${REMOTE_HOME}/proj/${REL_PATH}/outputs/"
 LOCAL_RESULTS_DIR="result_local"
+
+# Default version suffix for remote directory (enables versioned parallel workspaces).
+SUFFIX=""
 
 RSYNC_RSH='ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes'
 RSYNC_COMMON=(
@@ -161,7 +153,11 @@ usage() {
     echo "----------------------------------------------------------------"
     echo "Sync Script for: $REL_PATH"
     echo "----------------------------------------------------------------"
-    echo "Usage: $0 {push|push-preview|pull|pull-plots|pull_plots|pull-plot|pull_plot|pull-all} [refresh]"
+    echo "Usage: $0 {push|push-preview|pull|pull-plots|pull_plots|pull-plot|pull_plot|pull-all} [refresh] [suffix]"
+    echo ""
+    echo "Arguments:"
+    echo "  suffix  -> Remote directory version suffix (e.g. _v2)."
+    echo "             Remote path becomes .../proj/<project>_v2/"
     echo ""
     echo "Commands:"
     echo "  push        -> Local to Remote mirror APPLY (ignores sessions/, results/, result_local/)"
@@ -177,25 +173,50 @@ usage() {
     exit 1
 }
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+fi
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
     usage
 fi
 
 REFRESH_ONLY=0
+# Parse optional 2nd arg: refresh
 if [[ "${2:-}" == "refresh" ]]; then
     REFRESH_ONLY=1
 elif [[ -n "${2:-}" ]]; then
-    usage
+    SUFFIX="$2"
 fi
+
+# Parse optional 3rd arg: suffix (only valid when 2nd is refresh)
+if [[ -n "${3:-}" ]]; then
+    if [[ "$REFRESH_ONLY" -eq 0 ]]; then
+        usage
+    fi
+    SUFFIX="$3"
+fi
+
+# Resolve remote HOME explicitly (avoid '~' path ambiguity across shells/hosts).
+REMOTE_HOME="$(ssh "$REMOTE" 'printf %s "$HOME"')"
+if [[ -z "${REMOTE_HOME}" ]]; then
+    echo "ERROR: Could not resolve remote HOME for $REMOTE"
+    exit 1
+fi
+
+# Remote destination with version suffix
+VERSIONED_REL_PATH="${REL_PATH}${SUFFIX}"
+REMOTE_DEST="${REMOTE_HOME}/proj/${VERSIONED_REL_PATH}/"
+REMOTE_OUTPUTS_DEST="${REMOTE_HOME}/proj/${VERSIONED_REL_PATH}/outputs/"
 
 case "$1" in
     push)
         echo "Applying safe mirror push to $REMOTE:$REMOTE_DEST (preserve excluded dirs)"
-        ssh "$REMOTE" "mkdir -p \"$REMOTE_HOME/proj/$REL_PATH\""
+        ssh "$REMOTE" "mkdir -p \"$REMOTE_HOME/proj/$VERSIONED_REL_PATH\""
         changed_code_files=()
         while IFS= read -r _f; do
             [[ -n "$_f" ]] && changed_code_files+=("$_f")
-        done < <(collect_changed_code_files "$REMOTE_HOME/proj/$REL_PATH")
+        done < <(collect_changed_code_files "$REMOTE_HOME/proj/$VERSIONED_REL_PATH")
         if [[ ${#changed_code_files[@]} -eq 0 ]]; then
             echo "changed_code_files=0"
         else
@@ -218,13 +239,13 @@ case "$1" in
             echo "verify skipped: no changed .py/.sh files detected"
         else
             for f in "${changed_code_files[@]}"; do
-                copy_and_verify_file "$f" "$REMOTE_HOME/proj/$REL_PATH/$f"
+                copy_and_verify_file "$f" "$REMOTE_HOME/proj/$VERSIONED_REL_PATH/$f"
             done
         fi
         ;;
     push-preview)
         echo "Previewing safe mirror push (dry-run) to $REMOTE:$REMOTE_DEST (preserve excluded dirs)"
-        ssh "$REMOTE" "mkdir -p \"$REMOTE_HOME/proj/$REL_PATH\""
+        ssh "$REMOTE" "mkdir -p \"$REMOTE_HOME/proj/$VERSIONED_REL_PATH\""
         run_rsync_retry "${RSYNC_COMMON[@]}" \
             ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
             --dry-run \
@@ -252,7 +273,7 @@ case "$1" in
         fi
         echo "Pulling plot files (.html and images) from remote results/ to ./$LOCAL_RESULTS_DIR/ (skip existing local files)"
         mkdir -p "$LOCAL_RESULTS_DIR"
-        d="$REMOTE_HOME/proj/$REL_PATH/results/"
+        d="$REMOTE_HOME/proj/$VERSIONED_REL_PATH/results/"
         local_dst="$LOCAL_RESULTS_DIR/results/"
         echo "  trying: $REMOTE:$d -> ./$local_dst"
         if ssh "$REMOTE" "test -d \"$d\""; then

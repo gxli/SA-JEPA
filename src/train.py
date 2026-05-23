@@ -129,56 +129,17 @@ def resolve_encoder_type_default(model_cfg: dict) -> str:
     return "fullres"
 
 
-def run_training(config: dict, config_name: str, sessions_root: str = "sessions") -> str:
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    mps_available = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
-    print(
-        f"[{config_name}] backend_discovered device={device.type} "
-        f"cuda_available={torch.cuda.is_available()} mps_available={mps_available}"
-    )
-
-    train_cfg = config["train"]
-    model_cfg = config["model"]
-    data_cfg = config["data"]
-
-    session_dir = make_session_dir(sessions_root, config_name)
-    os.makedirs(session_dir, exist_ok=True)
-    model_ckpt_path = os.path.join(session_dir, "model_last.pt")
-    resume_ckpt_path = os.path.join(session_dir, "checkpoint_last.pt")
-    resume_from_existing = os.path.exists(model_ckpt_path)
-
-    with open(os.path.join(session_dir, "config_used.json"), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-
+def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, device: torch.device) -> PyramidGridJEPA:
+    """Construct a PyramidGridJEPA from config dicts, with backward-compatible param aliases."""
     blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
-    # Naming cleanup (backward compatible):
-    # - box scaling: mask_scaling_box (legacy: mask_scale)
-    # - gaussian dip scaling: mask_scaling_gaussian (legacy: dip_sigma_mult)
     mask_scaling_box = float(model_cfg.get("mask_scaling_box", model_cfg.get("mask_scale", 1.0)))
     mask_scaling_gaussian = float(model_cfg.get("mask_scaling_gaussian", model_cfg.get("dip_sigma_mult", 1.0)))
     mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", model_cfg.get("spacing_scale", 1.5)))
     mask_size = float(model_cfg.get("mask_size", 0.0))
-    dataset_apply_cdd, dataset_log_transform, model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
-
-    print(
-        f"[{config_name}] resolved_pipeline "
-        f"blur_mode={blur_mode} "
-        f"dataset_apply_cdd={dataset_apply_cdd} "
-        f"dataset_log_transform={dataset_log_transform} "
-        f"model_post_log_transform={model_post_log} "
-        f"data.log_transform={data_cfg.get('log_transform', True)} "
-        f"model.post_log_transform={model_cfg.get('post_log_transform', '<unset>')} "
-        f"data.cdd_mode={data_cfg.get('cdd_mode', 'log')} "
-        f"model.cdd_mode={model_cfg.get('cdd_mode', 'log')}"
-    )
-
+    _, _, model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
     resolved_encoder_type = resolve_encoder_type_default(model_cfg)
-    model = PyramidGridJEPA(
+
+    return PyramidGridJEPA(
         latent_channels=model_cfg.get("latent_channels", 32),
         predictor_hidden=model_cfg.get("predictor_hidden"),
         patch_size=model_cfg.get("patch_size", 2),
@@ -238,6 +199,47 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", False)),
         target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
     ).to(device)
+
+
+def run_training(config: dict, config_name: str, sessions_root: str = "sessions") -> str:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    mps_available = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+    print(
+        f"[{config_name}] backend_discovered device={device.type} "
+        f"cuda_available={torch.cuda.is_available()} mps_available={mps_available}"
+    )
+
+    train_cfg = config["train"]
+    model_cfg = config["model"]
+    data_cfg = config["data"]
+
+    session_dir = make_session_dir(sessions_root, config_name)
+    os.makedirs(session_dir, exist_ok=True)
+    model_ckpt_path = os.path.join(session_dir, "model_last.pt")
+    resume_ckpt_path = os.path.join(session_dir, "checkpoint_last.pt")
+    resume_from_existing = os.path.exists(model_ckpt_path)
+
+    with open(os.path.join(session_dir, "config_used.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+    dataset_apply_cdd, dataset_log_transform, _ = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
+
+    print(
+        f"[{config_name}] resolved_pipeline "
+        f"dataset_apply_cdd={dataset_apply_cdd} "
+        f"dataset_log_transform={dataset_log_transform} "
+        f"model.post_log_transform={model_cfg.get('post_log_transform', '<unset>')} "
+        f"data.log_transform={data_cfg.get('log_transform', True)} "
+        f"data.cdd_mode={data_cfg.get('cdd_mode', 'log')} "
+        f"model.cdd_mode={model_cfg.get('cdd_mode', 'log')}"
+    )
+
+    model = build_model_from_config(model_cfg, data_cfg, train_cfg, device)
     allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
     resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
     if resume_mismatch_action not in ("skip", "error"):
@@ -280,66 +282,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 )
                 resume_state = None
                 start_epoch = 0
-                model = PyramidGridJEPA(
-                    latent_channels=model_cfg.get("latent_channels", 32),
-                    predictor_hidden=model_cfg.get("predictor_hidden"),
-                    patch_size=model_cfg.get("patch_size", 2),
-                    sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
-                    cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-                    mask_fraction=model_cfg.get("mask_fraction", 1.0),
-                    box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
-                    mask_scale=mask_scaling_box,
-                    min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
-                    spacing_scale=mask_spacing_scaling,
-                    mask_size=mask_size,
-                    full_grid=model_cfg.get("full_grid", True),
-                    global_shift=model_cfg.get("global_shift", True),
-                    align_scales=model_cfg.get("align_scales", True),
-                    constant_mask_box=model_cfg.get("constant_mask_box", True),
-                    mask_box_size=model_cfg.get("mask_box_size", 16),
-                    blur_mode=blur_mode,
-                    cdd_mode=model_cfg.get("cdd_mode", "log"),
-                    cdd_constrained=model_cfg.get("cdd_constrained", True),
-                    cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-                    mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-                    dip_sigma_mult=mask_scaling_gaussian,
-                    constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
-                    cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
-                    post_log_transform=model_cfg.get("post_log_transform", model_post_log),
-                    log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
-                    cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
-                    ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
-                    normalize_loss=model_cfg.get("normalize_loss", True),
-                    predictor_layernorm=model_cfg.get("predictor_layernorm", False),
-                    mode=model_cfg.get("mode", "image"),
-                    encoder_type=resolved_encoder_type,
-                    encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
-                    encoder_depth=model_cfg.get("encoder_depth", 4),
-                    encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
-                    encoder_norm_type=model_cfg.get("encoder_norm_type"),
-                    encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
-                    encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
-                    scaleaware_feat_channels=int(model_cfg.get("scaleaware_feat_channels", 8)),
-                    scaleaware_adapter_kernel_size=int(model_cfg.get("scaleaware_adapter_kernel_size", 3)),
-                    scaleaware_fusion_type=str(model_cfg.get("scaleaware_fusion_type", "concat")),
-                    scaleaware_norm_per_scale=bool(model_cfg.get("scaleaware_norm_per_scale", False)),
-                    mfae_scales=tuple(model_cfg.get("mfae_scales", [1, 2, 4])),
-                    mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
-                    mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
-                    mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
-                    scaleaware_gaussian_ratios=tuple(model_cfg.get("scaleaware_gaussian_ratios", [0.25, 0.5, 1.0, 2.0])),
-                    opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
-                    opnet_dilations=model_cfg.get("opnet_dilations"),
-                    opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
-                    opnet_channel_mode=model_cfg.get("opnet_channel_mode", "multi"),
-                    op_smoothing_mode=model_cfg.get("op_smoothing_mode", "sqrt_scale"),
-                    op_smoothing_mult=float(model_cfg.get("op_smoothing_mult", 1.0)),
-                    op_smoothing_padding_mode=model_cfg.get("op_smoothing_padding_mode", "reflect"),
-                    opnet_cache_primitives=bool(model_cfg.get("opnet_cache_primitives", True)),
-                    opnet_cache_detach=bool(model_cfg.get("opnet_cache_detach", True)),
-                    target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", False)),
-                    target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
-                ).to(device)
+                model = build_model_from_config(model_cfg, data_cfg, train_cfg, device)
                 print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
             start_epoch = int(resume_state.get("epoch", 0))
@@ -366,72 +309,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"[{config_name}] warning: model checkpoint mismatch; "
                 "ignoring model_last and starting fresh model/optimizer/scaler."
             )
-            model = PyramidGridJEPA(
-                latent_channels=model_cfg.get("latent_channels", 32),
-                predictor_hidden=model_cfg.get("predictor_hidden"),
-                patch_size=model_cfg.get("patch_size", 2),
-                sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
-                cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-                mask_fraction=model_cfg.get("mask_fraction", 1.0),
-                box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
-                mask_scale=mask_scaling_box,
-                min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
-                spacing_scale=mask_spacing_scaling,
-                mask_size=mask_size,
-                full_grid=model_cfg.get("full_grid", True),
-                global_shift=model_cfg.get("global_shift", True),
-                align_scales=model_cfg.get("align_scales", True),
-                constant_mask_box=model_cfg.get("constant_mask_box", True),
-                mask_box_size=model_cfg.get("mask_box_size", 16),
-                blur_mode=blur_mode,
-                cdd_mode=model_cfg.get("cdd_mode", "log"),
-                cdd_constrained=model_cfg.get("cdd_constrained", True),
-                cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-                mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-                dip_sigma_mult=mask_scaling_gaussian,
-                constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
-                cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
-                post_log_transform=model_cfg.get("post_log_transform", model_post_log),
-                log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
-                cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
-                ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
-                normalize_loss=model_cfg.get("normalize_loss", True),
-                predictor_layernorm=model_cfg.get("predictor_layernorm", False),
-                mode=model_cfg.get("mode", "image"),
-                encoder_type=resolved_encoder_type,
-                encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
-                encoder_depth=model_cfg.get("encoder_depth", 4),
-                encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
-                encoder_norm_type=model_cfg.get("encoder_norm_type"),
-                encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
-                encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
-                scaleaware_feat_channels=int(model_cfg.get("scaleaware_feat_channels", 8)),
-                scaleaware_adapter_kernel_size=int(model_cfg.get("scaleaware_adapter_kernel_size", 3)),
-                scaleaware_fusion_type=str(model_cfg.get("scaleaware_fusion_type", "concat")),
-                scaleaware_norm_per_scale=bool(model_cfg.get("scaleaware_norm_per_scale", False)),
-                mfae_scales=tuple(model_cfg.get("mfae_scales", [1, 2, 4])),
-                mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
-                mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
-                mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
-                scaleaware_gaussian_ratios=tuple(model_cfg.get("scaleaware_gaussian_ratios", [0.25, 0.5, 1.0, 2.0])),
-                opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
-                opnet_dilations=model_cfg.get("opnet_dilations"),
-                opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
-                opnet_channel_mode=model_cfg.get("opnet_channel_mode", "multi"),
-                op_smoothing_mode=model_cfg.get("op_smoothing_mode", "sqrt_scale"),
-                op_smoothing_mult=float(model_cfg.get("op_smoothing_mult", 1.0)),
-                op_smoothing_padding_mode=model_cfg.get("op_smoothing_padding_mode", "reflect"),
-                opnet_cache_primitives=bool(model_cfg.get("opnet_cache_primitives", True)),
-                opnet_cache_detach=bool(model_cfg.get("opnet_cache_detach", True)),
-                target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", False)),
-                target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
-            ).to(device)
+            model = build_model_from_config(model_cfg, data_cfg, train_cfg, device)
             print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
         else:
             print(f"resume_model={model_ckpt_path}")
 
     scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
-    auto_roll_max = max(1, int(round(scale_max * mask_scaling_box * mask_spacing_scaling)))
+    _msb = float(model_cfg.get("mask_scaling_box", model_cfg.get("mask_scale", 1.0)))
+    _mss = float(model_cfg.get("mask_spacing_scaling", model_cfg.get("spacing_scale", 1.5)))
+    auto_roll_max = max(1, int(round(scale_max * _msb * _mss)))
 
     dataset = JEPADataset(
         num_samples=data_cfg.get("num_samples", 2000),
