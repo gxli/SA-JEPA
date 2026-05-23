@@ -8,6 +8,44 @@ import numpy as np
 import torch
 
 
+def _mask_invalid_targets_from_input(
+    *,
+    outputs: dict,
+    x_input: torch.Tensor,
+    invalid_zero: bool = True,
+    invalid_nan: bool = True,
+) -> int:
+    loc = outputs["target_locations"]
+    valid = outputs["target_valid"]
+    if x_input.dim() != 4 or x_input.shape[1] < 1:
+        return 0
+    bsz, ksz, _ = loc.shape
+    h, w = int(x_input.shape[-2]), int(x_input.shape[-1])
+    updated = valid.clone()
+    n_masked = 0
+    for bi in range(bsz):
+        for ki in range(ksz):
+            if not bool(updated[bi, ki]):
+                continue
+            cy = int(loc[bi, ki, 0].item())
+            cx = int(loc[bi, ki, 1].item())
+            if cy < 0 or cx < 0 or cy >= h or cx >= w:
+                updated[bi, ki] = False
+                n_masked += 1
+                continue
+            v = x_input[bi, 0, cy, cx]
+            bad = False
+            if bool(invalid_nan) and (not torch.isfinite(v)):
+                bad = True
+            if bool(invalid_zero) and torch.isfinite(v) and float(v.item()) == 0.0:
+                bad = True
+            if bad:
+                updated[bi, ki] = False
+                n_masked += 1
+    outputs["target_valid"] = updated
+    return int(n_masked)
+
+
 def _accumulate_point_energy(
     *,
     outputs: dict,
@@ -65,6 +103,7 @@ def run_post_training_inference(
     visit_counts,
     force_recompute_inference: bool,
     inference_mask_passes: int,
+    mask_inference: bool,
     viz_crop_border: bool,
     viz_crop_border_px: int | None,
     compute_jepa_energy_fn: Callable,
@@ -101,14 +140,26 @@ def run_post_training_inference(
         print(f"[{config_name}] post_training_inference loading sample batch")
         x_raw = next(iter(dataloader))
         x_raw = x_raw.to(next(model.parameters()).device)
-        # Deterministic lattice sweep: move mask grid by 1px over one spacing period.
+        # Deterministic lattice sweep is only meaningful when mask inference is enabled.
         largest_sigma = float(max(getattr(model, "sigmas", (16.0,))))
         min_mask_scale = float(getattr(model, "min_mask_scale", 0.0))
         eff_largest_sigma = max(largest_sigma, min_mask_scale)
-        spacing = int(max(1, round(eff_largest_sigma * float(getattr(model, "mask_scale", 1.0)) * float(getattr(model, "spacing_scale", 1.5)))))
-        all_shifts = [(dy, dx) for dy in range(spacing) for dx in range(spacing)]
-        n_passes = max(1, int(inference_mask_passes))
-        shifts = all_shifts if n_passes <= 0 else all_shifts[: min(len(all_shifts), n_passes)]
+        spacing = int(
+            max(
+                1,
+                round(
+                    eff_largest_sigma
+                    * float(getattr(model, "mask_scale", 1.0))
+                    * float(getattr(model, "spacing_scale", 1.5))
+                ),
+            )
+        )
+        if bool(mask_inference):
+            all_shifts = [(dy, dx) for dy in range(spacing) for dx in range(spacing)]
+            n_passes = max(1, int(inference_mask_passes))
+            shifts = all_shifts if n_passes <= 0 else all_shifts[: min(len(all_shifts), n_passes)]
+        else:
+            shifts = [(0, 0)]
         print(f"[{config_name}] post_training_inference model forward deterministic_shifts={len(shifts)} spacing={spacing}")
         outputs = None
         energy_sum = None
@@ -121,6 +172,13 @@ def run_post_training_inference(
                 return_debug=(pi == 0),
                 forced_grid_shift=shift,
                 enable_grid_jitter=False,
+                mask_inference=bool(mask_inference),
+            )
+            _mask_invalid_targets_from_input(
+                outputs=out_i,
+                x_input=x_raw,
+                invalid_zero=True,
+                invalid_nan=True,
             )
             if outputs is None:
                 outputs = out_i
@@ -238,6 +296,7 @@ def run_post_training_inference(
                 "jepa_energy_normalized": float(energy_scalar_norm),
                 "inference_mask_passes": int(len(shifts)),
                 "inference_grid_spacing": int(spacing),
+                "mask_inference": bool(mask_inference),
             },
             f,
             indent=2,

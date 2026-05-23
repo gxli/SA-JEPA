@@ -25,6 +25,7 @@ for cfg in "${configs[@]}"; do
   tmp_cfg="${OVERRIDE_DIR}/$(basename "${cfg}")"
   python3 - "${cfg}" "${tmp_cfg}" "${FORCE_REINFERENCE}" <<'PY'
 import json
+import os
 import sys
 
 src, dst, force_flag = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -32,6 +33,7 @@ with open(src, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 train = cfg.setdefault("train", {})
 train["force_recompute_inference"] = bool(int(force_flag))
+os.makedirs(os.path.dirname(dst), exist_ok=True)
 with open(dst, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")

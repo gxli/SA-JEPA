@@ -8,7 +8,6 @@ from collections import OrderedDict
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
@@ -277,9 +276,8 @@ class JEPADataset(Dataset):
             eps = self._choose_log_eps(arr, self.log_eps)
             arr = np.log(np.clip(arr, a_min=0.0, a_max=None) + eps)
 
-        # Keep original resolution; no forced resize before model input.
-        x = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)  # 1 x H x W
-        return x
+        # Keep native resolution (including non-square fields).
+        return torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)  # 1 x H x W
 
     @staticmethod
     def _normalize01(arr: np.ndarray) -> np.ndarray:
@@ -346,12 +344,11 @@ class JEPADataset(Dataset):
         path, forced_slice_idx = self.sample_index[idx % len(self.sample_index)]
         sample = self._load_sample(path, forced_slice_idx=forced_slice_idx).clone()  # 1 x H x W
         if self.d4_augment:
-            # Uniform random dihedral-4 transform: identity, R90/180/270, and each with mirror.
-            k = int(np.random.randint(0, 4))
-            if k:
-                sample = torch.rot90(sample, k=k, dims=(-2, -1))
+            # Shape-safe augmentation for non-square inputs: random H/V flips only.
             if bool(np.random.randint(0, 2)):
-                sample = torch.flip(sample, dims=(-1,))
+                sample = torch.flip(sample, dims=(-1,))  # horizontal
+            if bool(np.random.randint(0, 2)):
+                sample = torch.flip(sample, dims=(-2,))  # vertical
         if self.random_roll_max > 0:
             # Inclusive, symmetric dithering in [-random_roll_max, random_roll_max].
             dy = int(np.random.randint(-self.random_roll_max, self.random_roll_max + 1))

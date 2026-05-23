@@ -37,6 +37,7 @@ DASH_DATA_REQUIRED = {
     "gt_pca_rgb_flat",
     "gt_umap_rgb",
     "gt_umap_rgb_flat",
+    "pyramid_mask_cube",
 }
 
 
@@ -213,6 +214,26 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     visit_heatmap = np.asarray(np.load(visit_path), dtype=np.float32) if os.path.exists(visit_path) else np.zeros((h, w), dtype=np.float32)
     if visit_heatmap.shape != (h, w):
         visit_heatmap = np.zeros((h, w), dtype=np.float32)
+
+    # Load first-sample pyramid mask cube (S,H,W), save a canonical artifact in session dir.
+    mask_cube = None
+    pmt_path = os.path.join(session_dir, "pyramid_mask_token.npy")
+    if os.path.exists(pmt_path):
+        arr = np.asarray(np.load(pmt_path), dtype=np.float32)
+        # Expected saved inference artifact shape: B,S,H,W
+        if arr.ndim == 4 and arr.shape[0] > 0:
+            mask_cube = arr[0]
+    if mask_cube is None:
+        tok = outputs.get("dip_field_per_channel", outputs.get("pyramid_mask_token"))
+        if tok is not None:
+            tok = _to_np(tok).astype(np.float32)
+            if tok.ndim == 4 and tok.shape[0] > 0:
+                mask_cube = tok[0]
+    if mask_cube is None:
+        mask_cube = np.zeros((1, h, w), dtype=np.float32)
+    else:
+        mask_cube = np.where(np.isfinite(mask_cube), mask_cube, 0.0).astype(np.float32)
+    np.save(os.path.join(session_dir, "example_pyramid_mask_cube.npy"), mask_cube.astype(np.float32, copy=False))
 
     # Load precomputed PCA/UMAP artifacts saved by training-time pipeline.
     results_dir = os.path.join(session_dir, "results")
@@ -400,6 +421,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         rank_pred_top8=np.asarray([_rd("pred", "top8_energy")], dtype=np.float32),
         rank_gt_top8=np.asarray([_rd("gt", "top8_energy")], dtype=np.float32),
         rank_pred_gt_erank_ratio=np.asarray([rd_pred_gt_erank_ratio], dtype=np.float32),
+        pyramid_mask_cube=mask_cube.astype(np.float32),
     )
     return out_npz
 
@@ -490,11 +512,51 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 xaxis_title="dim-1",
                 yaxis_title="dim-2",
                 zaxis_title="dim-3",
-                aspectmode="data",
+                aspectmode="cube",
                 camera=dict(projection=dict(type="orthographic")),
             ),
         )
         return fig, source_n, rendered_n
+
+    def mask3d(title: str, cube: np.ndarray) -> go.Figure:
+        c = np.asarray(cube, dtype=np.float32)
+        if c.ndim != 3:
+            c = np.zeros((1, 1, 1), dtype=np.float32)
+        s, h0, w0 = c.shape
+        zz, yy, xx = np.nonzero(c > 1e-6)
+        if xx.size == 0:
+            xx = np.asarray([0], dtype=np.int32)
+            yy = np.asarray([0], dtype=np.int32)
+            zz = np.asarray([0], dtype=np.int32)
+            vv = np.asarray([0.0], dtype=np.float32)
+        else:
+            vv = c[zz, yy, xx]
+        fig = go.Figure(
+            [
+                go.Scatter3d(
+                    x=xx.astype(np.float32),
+                    y=yy.astype(np.float32),
+                    z=zz.astype(np.float32),
+                    mode="markers",
+                    marker=dict(size=2, opacity=0.7, color=vv, colorscale="Viridis", showscale=True, colorbar=dict(title="mask")),
+                    showlegend=False,
+                )
+            ]
+        )
+        fig.update_layout(
+            template="plotly_white",
+            title={"text": title, "x": 0.02},
+            margin=dict(l=8, r=8, t=36, b=8),
+            height=430,
+            scene=dict(
+                xaxis_title="x",
+                yaxis_title="y",
+                zaxis_title="scale",
+                aspectmode="cube",
+                camera=dict(projection=dict(type="orthographic")),
+            ),
+        )
+        return fig
 
     loss_x = np.asarray(data["loss_x"], dtype=np.float32) if "loss_x" in data.files else np.asarray([], dtype=np.float32)
     loss_total = np.asarray(data["loss_total"], dtype=np.float32) if "loss_total" in data.files else np.asarray([], dtype=np.float32)
@@ -590,6 +652,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             {"title": "Target Location Heatmap", "fig": heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma"), "group": "target-heat"},
             {"title": "Energy Map", "fig": heat("Energy Map", data["energy_map"], "Inferno"), "group": "energy"},
             {"title": "Visit Frequency Heatmap", "fig": heat("Visit Frequency Heatmap", data["visit_heatmap"], "Cividis"), "group": "visit"},
+            {"title": "Pyramid Mask 3D (Sample-0)", "fig": mask3d("Pyramid Mask 3D (Sample-0)", data["pyramid_mask_cube"]), "group": "pyr-mask-3d"},
         ]
     )
 
@@ -602,12 +665,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         if group not in seen_groups and ("-pca" in group or "-umap" in group):
             controls = (
                 f'<div class="controls local-controls" data-group="{group}">'
-                f'<label>xmin <input type="number" step="any" data-k="xmin"></label>'
-                f'<label>xmax <input type="number" step="any" data-k="xmax"></label>'
-                f'<label>ymin <input type="number" step="any" data-k="ymin"></label>'
-                f'<label>ymax <input type="number" step="any" data-k="ymax"></label>'
-                f'<label>zmin <input type="number" step="any" data-k="zmin"></label>'
-                f'<label>zmax <input type="number" step="any" data-k="zmax"></label>'
+                f'<label>xmin <input type="number" step="any" data-k="xmin" placeholder="auto"></label>'
+                f'<label>xmax <input type="number" step="any" data-k="xmax" placeholder="auto"></label>'
+                f'<label>ymin <input type="number" step="any" data-k="ymin" placeholder="auto"></label>'
+                f'<label>ymax <input type="number" step="any" data-k="ymax" placeholder="auto"></label>'
+                f'<label>zmin <input type="number" step="any" data-k="zmin" placeholder="auto"></label>'
+                f'<label>zmax <input type="number" step="any" data-k="zmax" placeholder="auto"></label>'
                 f'<button class="apply-local" type="button" data-group="{group}">Apply</button>'
                 f"</div>"
             )
@@ -667,13 +730,27 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
       const den = Math.max(1e-12, hi - lo);
       return clamp01((v - lo) / den);
     }}
-    function autoRange(arr) {{
-      let lo = Infinity, hi = -Infinity;
+    function percentileRange(arr, loPct, hiPct) {{
+      const vals = [];
       for (let i = 0; i < arr.length; i++) {{
         const v = Number(arr[i]);
-        if (!Number.isFinite(v)) continue;
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
+        if (Number.isFinite(v)) vals.push(v);
+      }}
+      if (vals.length === 0) return [0.0, 1.0];
+      vals.sort((a, b) => a - b);
+      const q = (p) => {{
+        const idx = (vals.length - 1) * p;
+        const i0 = Math.floor(idx);
+        const i1 = Math.ceil(idx);
+        if (i0 === i1) return vals[i0];
+        const t = idx - i0;
+        return vals[i0] * (1 - t) + vals[i1] * t;
+      }};
+      let lo = q(Math.max(0.0, Math.min(1.0, loPct)));
+      let hi = q(Math.max(0.0, Math.min(1.0, hiPct)));
+      if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) {{
+        lo = vals[0];
+        hi = vals[vals.length - 1];
       }}
       if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return [0.0, 1.0];
       return [lo, hi];
@@ -683,6 +760,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
       if (fl.scene) {{
         const rl = {{
           "scene.camera.projection.type": "orthographic",
+          "scene.aspectmode": "cube",
         }};
         if (xmin !== null && xmax !== null) rl["scene.xaxis.range"] = [xmin, xmax];
         if (ymin !== null && ymax !== null) rl["scene.yaxis.range"] = [ymin, ymax];
@@ -693,9 +771,10 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
           const xs = tr.x || [];
           const ys = tr.y || [];
           const zs = tr.z || [];
-          const xr = (xmin !== null && xmax !== null) ? [xmin, xmax] : autoRange(xs);
-          const yr = (ymin !== null && ymax !== null) ? [ymin, ymax] : autoRange(ys);
-          const zr = (zmin !== null && zmax !== null) ? [zmin, zmax] : autoRange(zs);
+          // Robust recoloring from visible-range stats to avoid black collapse.
+          const xr = (xmin !== null && xmax !== null) ? [xmin, xmax] : percentileRange(xs, 0.01, 0.99);
+          const yr = (ymin !== null && ymax !== null) ? [ymin, ymax] : percentileRange(ys, 0.01, 0.99);
+          const zr = (zmin !== null && zmax !== null) ? [zmin, zmax] : percentileRange(zs, 0.01, 0.99);
           const n = Math.min(xs.length || 0, ys.length || 0, zs.length || 0);
           const colors = new Array(n);
           for (let k = 0; k < n; k++) {{
@@ -709,6 +788,28 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
       }}
     }});
   }}
+  function initControlDefaults() {{
+    document.querySelectorAll('.local-controls').forEach((controls) => {{
+      const group = controls.getAttribute("data-group");
+      const gd = document.querySelector('.card[data-group="' + group + '"] .js-plotly-plot');
+      if (!gd || !gd._fullLayout || !gd._fullLayout.scene) return;
+      const s = gd._fullLayout.scene;
+      const defs = {{
+        xmin: s.xaxis && s.xaxis.range ? s.xaxis.range[0] : null,
+        xmax: s.xaxis && s.xaxis.range ? s.xaxis.range[1] : null,
+        ymin: s.yaxis && s.yaxis.range ? s.yaxis.range[0] : null,
+        ymax: s.yaxis && s.yaxis.range ? s.yaxis.range[1] : null,
+        zmin: s.zaxis && s.zaxis.range ? s.zaxis.range[0] : null,
+        zmax: s.zaxis && s.zaxis.range ? s.zaxis.range[1] : null,
+      }};
+      Object.keys(defs).forEach((k) => {{
+        const el = controls.querySelector('input[data-k="' + k + '"]');
+        const v = defs[k];
+        if (el && Number.isFinite(v)) el.value = String(v);
+      }});
+    }});
+  }}
+  window.addEventListener("load", initControlDefaults);
   document.querySelectorAll(".apply-local").forEach((btn) => {{
     btn.addEventListener("click", () => applyRangesForGroup(btn.getAttribute("data-group")));
   }});

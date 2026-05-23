@@ -10,6 +10,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
@@ -27,6 +28,22 @@ def _fmt_metric(v: float) -> str:
     if ax < 1e-3 or ax >= 1e3:
         return f"{x:.3e}"
     return f"{x:.4f}"
+
+
+def _collate_pad_hw(batch: list[torch.Tensor]) -> torch.Tensor:
+    if len(batch) == 0:
+        raise ValueError("Empty batch is not supported")
+    max_h = max(int(x.shape[-2]) for x in batch)
+    max_w = max(int(x.shape[-1]) for x in batch)
+    out = []
+    for x in batch:
+        dh = max_h - int(x.shape[-2])
+        dw = max_w - int(x.shape[-1])
+        if dh > 0 or dw > 0:
+            # Mark padded pixels as invalid so downstream target sampling can reject them.
+            x = F.pad(x, (0, dw, 0, dh), mode="constant", value=float("nan"))
+        out.append(x)
+    return torch.stack(out, dim=0)
 
 
 def _compute_pca_2d(x: np.ndarray) -> np.ndarray:
@@ -75,8 +92,12 @@ def _compute_umap_nd(
     min_dist: float = 0.05,
     metric: str = "cosine",
     random_state: int = 42,
+    init: str = "spectral",
 ) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
+    init_mode = str(init).lower()
+    if init_mode not in ("spectral", "random"):
+        init_mode = "spectral"
     try:
         from cuml.manifold import UMAP as CuMLUMAP
 
@@ -86,6 +107,7 @@ def _compute_umap_nd(
             min_dist=float(min_dist),
             metric=str(metric),
             random_state=int(random_state),
+            init=init_mode,
         ).fit_transform(x)
     except Exception as e:
         print(f"[warning] cuML UMAP failed: {type(e).__name__}: {e}")
@@ -115,6 +137,7 @@ def _compute_umap_nd(
             min_dist=float(min_dist),
             metric=str(metric),
             random_state=int(random_state),
+            init=init_mode,
         ).fit_transform(x)
     except Exception as e:
         print(f"[warning] umap-learn failed: {type(e).__name__}: {e}")
@@ -303,6 +326,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     umap_min_dist = float(umap_cfg.get("min_dist", 0.05))
     umap_metric = str(umap_cfg.get("metric", "cosine"))
     umap_random_state = int(umap_cfg.get("random_state", 42))
+    umap_init = str(umap_cfg.get("init", "spectral")).lower()
     umap_l2_normalize = bool(umap_cfg.get("l2_normalize", False))
     umap_standardize = bool(umap_cfg.get("standardize", False))
 
@@ -360,6 +384,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
                 min_dist=umap_min_dist,
                 metric=umap_metric,
                 random_state=umap_random_state,
+                init=umap_init,
             )
             np.save(umap_cache, umap_3d)
     else:
@@ -370,6 +395,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
             min_dist=umap_min_dist,
             metric=umap_metric,
             random_state=umap_random_state,
+            init=umap_init,
         )
         np.save(umap_cache, umap_3d)
     # Session plot compatibility artifacts.
@@ -399,6 +425,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
             min_dist=umap_min_dist,
             metric=umap_metric,
             random_state=umap_random_state,
+            init=umap_init,
         ).astype(np.float32)
         np.save(os.path.join(results_dir, f"{branch_name}_spatial_shape.npy"), np.asarray([h_map, w_map], dtype=np.int64))
         np.save(os.path.join(results_dir, f"{branch_name}_latent_vectors_full.npy"), z)
@@ -430,6 +457,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         min_dist=umap_min_dist,
         metric=umap_metric,
         random_state=umap_random_state,
+        init=umap_init,
     )
     latent_html_path = _save_latent_overview_html(session_dir, pca0_3d, umap0_3d, pred_map.shape[-2], pred_map.shape[-1])
 
@@ -988,6 +1016,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
         dip_sigma_mult=mask_scaling_gaussian,
         constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
+        cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
         post_log_transform=model_cfg.get("post_log_transform", model_post_log),
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
@@ -1002,13 +1031,26 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         encoder_norm_type=model_cfg.get("encoder_norm_type"),
         encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
         encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
+        scaleaware_feat_channels=int(model_cfg.get("scaleaware_feat_channels", 8)),
+        scaleaware_adapter_kernel_size=int(model_cfg.get("scaleaware_adapter_kernel_size", 3)),
+        scaleaware_fusion_type=str(model_cfg.get("scaleaware_fusion_type", "concat")),
+        scaleaware_norm_per_scale=bool(model_cfg.get("scaleaware_norm_per_scale", False)),
         mfae_scales=tuple(model_cfg.get("mfae_scales", [1, 2, 4])),
         mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
         mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
         mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
+        scaleaware_gaussian_ratios=tuple(model_cfg.get("scaleaware_gaussian_ratios", [0.25, 0.5, 1.0, 2.0])),
         opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
         opnet_dilations=model_cfg.get("opnet_dilations"),
         opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
+        opnet_channel_mode=model_cfg.get("opnet_channel_mode", "multi"),
+        op_smoothing_mode=model_cfg.get("op_smoothing_mode", "sqrt_scale"),
+        op_smoothing_mult=float(model_cfg.get("op_smoothing_mult", 1.0)),
+        op_smoothing_padding_mode=model_cfg.get("op_smoothing_padding_mode", "reflect"),
+        opnet_cache_primitives=bool(model_cfg.get("opnet_cache_primitives", True)),
+        opnet_cache_detach=bool(model_cfg.get("opnet_cache_detach", True)),
+        target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", False)),
+        target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
     ).to(device)
     allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
     resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
@@ -1029,7 +1071,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     if os.path.exists(resume_ckpt_path):
         resume_state = torch.load(resume_ckpt_path, map_location=device)
         if "model_state_dict" in resume_state:
-            missing, unexpected = model.load_state_dict(resume_state["model_state_dict"], strict=False)
+            try:
+                missing, unexpected = model.load_state_dict(resume_state["model_state_dict"], strict=False)
+            except RuntimeError as e:
+                # Common during architecture evolution (e.g. channel-count changes).
+                print(f"[{config_name}] resume_model load_state_dict_failed: {e}")
+                missing, unexpected = ["__load_state_dict_failed__"], []
             print(f"[{config_name}] resume_model missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
             if missing:
                 print(f"[{config_name}] resume_model missing_keys_list={missing}")
@@ -1071,6 +1118,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
                     dip_sigma_mult=mask_scaling_gaussian,
                     constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
+                    cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
                     post_log_transform=model_cfg.get("post_log_transform", model_post_log),
                     log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
                     cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
@@ -1085,20 +1133,38 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     encoder_norm_type=model_cfg.get("encoder_norm_type"),
                     encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
                     encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
+                    scaleaware_feat_channels=int(model_cfg.get("scaleaware_feat_channels", 8)),
+                    scaleaware_adapter_kernel_size=int(model_cfg.get("scaleaware_adapter_kernel_size", 3)),
+                    scaleaware_fusion_type=str(model_cfg.get("scaleaware_fusion_type", "concat")),
+                    scaleaware_norm_per_scale=bool(model_cfg.get("scaleaware_norm_per_scale", False)),
                     mfae_scales=tuple(model_cfg.get("mfae_scales", [1, 2, 4])),
                     mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
                     mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
                     mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
+                    scaleaware_gaussian_ratios=tuple(model_cfg.get("scaleaware_gaussian_ratios", [0.25, 0.5, 1.0, 2.0])),
                     opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
                     opnet_dilations=model_cfg.get("opnet_dilations"),
                     opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
+                    opnet_channel_mode=model_cfg.get("opnet_channel_mode", "multi"),
+                    op_smoothing_mode=model_cfg.get("op_smoothing_mode", "sqrt_scale"),
+                    op_smoothing_mult=float(model_cfg.get("op_smoothing_mult", 1.0)),
+                    op_smoothing_padding_mode=model_cfg.get("op_smoothing_padding_mode", "reflect"),
+                    opnet_cache_primitives=bool(model_cfg.get("opnet_cache_primitives", True)),
+                    opnet_cache_detach=bool(model_cfg.get("opnet_cache_detach", True)),
+                    target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", False)),
+                    target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
                 ).to(device)
                 print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
             start_epoch = int(resume_state.get("epoch", 0))
             print(f"resume_checkpoint={resume_ckpt_path} start_epoch={start_epoch}")
     elif resume_from_existing:
-        missing, unexpected = model.load_state_dict(torch.load(model_ckpt_path, map_location=device), strict=False)
+        try:
+            missing, unexpected = model.load_state_dict(torch.load(model_ckpt_path, map_location=device), strict=False)
+        except RuntimeError as e:
+            # Common during architecture evolution (e.g. channel-count changes).
+            print(f"[{config_name}] resume_model load_state_dict_failed: {e}")
+            missing, unexpected = ["__load_state_dict_failed__"], []
         print(f"[{config_name}] resume_model missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
         if missing:
             print(f"[{config_name}] resume_model missing_keys_list={missing}")
@@ -1138,6 +1204,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
                 dip_sigma_mult=mask_scaling_gaussian,
                 constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
+                cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
                 post_log_transform=model_cfg.get("post_log_transform", model_post_log),
                 log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
                 cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
@@ -1152,13 +1219,26 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 encoder_norm_type=model_cfg.get("encoder_norm_type"),
                 encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
                 encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
+                scaleaware_feat_channels=int(model_cfg.get("scaleaware_feat_channels", 8)),
+                scaleaware_adapter_kernel_size=int(model_cfg.get("scaleaware_adapter_kernel_size", 3)),
+                scaleaware_fusion_type=str(model_cfg.get("scaleaware_fusion_type", "concat")),
+                scaleaware_norm_per_scale=bool(model_cfg.get("scaleaware_norm_per_scale", False)),
                 mfae_scales=tuple(model_cfg.get("mfae_scales", [1, 2, 4])),
                 mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
                 mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
                 mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
+                scaleaware_gaussian_ratios=tuple(model_cfg.get("scaleaware_gaussian_ratios", [0.25, 0.5, 1.0, 2.0])),
                 opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
                 opnet_dilations=model_cfg.get("opnet_dilations"),
                 opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
+                opnet_channel_mode=model_cfg.get("opnet_channel_mode", "multi"),
+                op_smoothing_mode=model_cfg.get("op_smoothing_mode", "sqrt_scale"),
+                op_smoothing_mult=float(model_cfg.get("op_smoothing_mult", 1.0)),
+                op_smoothing_padding_mode=model_cfg.get("op_smoothing_padding_mode", "reflect"),
+                opnet_cache_primitives=bool(model_cfg.get("opnet_cache_primitives", True)),
+                opnet_cache_detach=bool(model_cfg.get("opnet_cache_detach", True)),
+                target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", False)),
+                target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
             ).to(device)
             print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
         else:
@@ -1267,6 +1347,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
+        collate_fn=_collate_pad_hw,
     )
     val_loader = None
     if val_dataset is not None:
@@ -1277,6 +1358,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
+            collate_fn=_collate_pad_hw,
         )
     # Inference must use canonical orientation (no D4 augmentation).
     inference_dataset = JEPADataset(
@@ -1315,6 +1397,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
+        collate_fn=_collate_pad_hw,
     )
 
     optimizer = optim.AdamW(
@@ -1350,6 +1433,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     log_interval = train_cfg.get("log_interval", 10)
     force_recompute_inference = bool(train_cfg.get("force_recompute_inference", False))
     inference_mask_passes = int(train_cfg.get("inference_mask_passes", 1))
+    mask_inference = bool(train_cfg.get("mask_inference", False))
     viz_crop_border = bool(train_cfg.get("viz_crop_border", False))
     viz_crop_border_px = train_cfg.get("viz_crop_border_px")
     umap_cfg = dict(train_cfg.get("umap", {}))
@@ -1605,6 +1689,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         visit_counts=visit_counts,
         force_recompute_inference=force_recompute_inference,
         inference_mask_passes=inference_mask_passes,
+        mask_inference=mask_inference,
         viz_crop_border=viz_crop_border,
         viz_crop_border_px=viz_crop_border_px,
         compute_jepa_energy_fn=compute_jepa_energy,

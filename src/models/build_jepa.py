@@ -22,6 +22,133 @@ from .mfae_convnext import MFAEConvNeXtDenseEncoder
 from .predictor import FullResPredictor
 
 
+class CDDScaleAwareConvNeXtEncoder(nn.Module):
+    """
+    Scale-aware CDD pyramid encoder.
+
+    Input:
+      fields:      B x S x H x W
+      mask_tokens: B x S x H x W
+
+    Per scale:
+      [field_s, mask_s, normalized_log_sigma_s] -> shared adapter
+    Then concatenate scale features and feed ConvNeXt dense encoder.
+    """
+
+    def __init__(
+        self,
+        scales,
+        hidden_channels: int,
+        latent_channels: int,
+        depth: int = 4,
+        kernel_size: int = 7,
+        expansion: int = 4,
+        scale_feat_channels: int = 8,
+        adapter_kernel_size: int = 3,
+        fusion_type: str = "concat",
+        use_reflect_padding: bool = True,
+        final_norm: bool = True,
+    ):
+        super().__init__()
+        self.scales = tuple(float(s) for s in scales)
+        self.num_scales = len(self.scales)
+        self.scale_feat_channels = int(scale_feat_channels)
+        self.fusion_type = str(fusion_type).lower()
+        if self.fusion_type not in ("concat", "topdown"):
+            raise ValueError(
+                f"Unsupported fusion_type={fusion_type}. "
+                "Use 'concat' or 'topdown'."
+            )
+
+        logs = torch.log(torch.tensor(self.scales, dtype=torch.float32))
+        if logs.numel() > 1:
+            logs = (logs - logs.mean()) / logs.std(unbiased=False).clamp_min(1e-6)
+        else:
+            logs = logs * 0.0
+        self.register_buffer("scale_codes", logs.view(1, self.num_scales, 1, 1), persistent=False)
+
+        pad = int(adapter_kernel_size) // 2
+        if use_reflect_padding and pad > 0:
+            self.adapter = nn.Sequential(
+                nn.ReflectionPad2d(pad),
+                nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=0),
+                nn.GroupNorm(num_groups=1, num_channels=self.scale_feat_channels),
+                nn.GELU(),
+                nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1),
+                nn.GroupNorm(num_groups=1, num_channels=self.scale_feat_channels),
+                nn.GELU(),
+            )
+        else:
+            self.adapter = nn.Sequential(
+                nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=pad),
+                nn.GroupNorm(num_groups=1, num_channels=self.scale_feat_channels),
+                nn.GELU(),
+                nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1),
+                nn.GroupNorm(num_groups=1, num_channels=self.scale_feat_channels),
+                nn.GELU(),
+            )
+
+        self.convnext = ConvNeXtDenseEncoder(
+            in_channels=self.num_scales * self.scale_feat_channels,
+            hidden_channels=hidden_channels,
+            latent_channels=latent_channels,
+            depth=depth,
+            kernel_size=kernel_size,
+            expansion=expansion,
+            use_reflect_padding=use_reflect_padding,
+            final_norm=final_norm,
+        )
+        if self.fusion_type == "topdown":
+            self.fusion_proj = nn.ModuleList(
+                [nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1) for _ in range(self.num_scales)]
+            )
+
+    def forward(self, fields: torch.Tensor, mask_tokens: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if fields.ndim != 4:
+            raise ValueError(f"Expected fields B,S,H,W, got {tuple(fields.shape)}")
+        b, s, h, w = fields.shape
+        if s != self.num_scales:
+            raise ValueError(f"Expected {self.num_scales} scales, got {s}")
+
+        if mask_tokens is None:
+            mask_tokens = torch.zeros_like(fields)
+        if mask_tokens.shape != fields.shape:
+            raise ValueError(
+                f"mask_tokens shape must match fields shape. "
+                f"fields={tuple(fields.shape)} mask={tuple(mask_tokens.shape)}"
+            )
+
+        scale_maps = self.scale_codes.to(dtype=fields.dtype, device=fields.device).expand(b, s, h, w)
+        feats = []
+        for i in range(s):
+            xi = torch.stack(
+                [
+                    fields[:, i],
+                    mask_tokens[:, i],
+                    scale_maps[:, i],
+                ],
+                dim=1,
+            )
+            feats.append(self.adapter(xi))
+        if self.fusion_type == "topdown":
+            # Top-down additive fusion: coarse -> fine. Works for any number of scales.
+            # feats are in the original sigma order (typically fine->coarse).
+            fused = [None] * s
+            running = None
+            for rev_i, feat in enumerate(reversed(feats)):
+                idx = s - 1 - rev_i
+                if running is None:
+                    running = feat
+                else:
+                    if running.shape[-2:] != feat.shape[-2:]:
+                        running = F.interpolate(running, size=feat.shape[-2:], mode="bilinear", align_corners=False)
+                    running = feat + running
+                fused[idx] = self.fusion_proj[idx](running)
+            feats = fused
+        x = torch.cat(feats, dim=1)
+        return self.convnext(x)
+
+
 def gaussian_blur_batch(x: torch.Tensor, sigma: float) -> torch.Tensor:
     """
     x: B x 1 x H x W
@@ -40,6 +167,16 @@ def gaussian_blur_batch(x: torch.Tensor, sigma: float) -> torch.Tensor:
     weight = kernel.view(1, 1, size, size).repeat(channels, 1, 1, 1)
 
     return F.conv2d(x, weight, padding=radius, groups=channels)
+
+
+def norm_per_sample_channel(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Normalize each [H,W] map independently per sample+channel.
+    x: B x S x H x W
+    """
+    mean = x.mean(dim=(-2, -1), keepdim=True)
+    std = x.std(dim=(-2, -1), keepdim=True).clamp_min(float(eps))
+    return (x - mean) / std
 
 
 def _shared_grid_centers(
@@ -126,10 +263,15 @@ def make_pyramid_grid_context(
     mask_fill_mode: str = "zero",
     dip_sigma_mult: float = 1.0,
     constant_gaussian_sigma: float = 1.0,
+    scaleaware_gaussian_ratios=None,
+    cdd_append_last_residual: bool = True,
     inner_target_size: int = 2,
     return_debug: bool = False,
     forced_grid_shift: Optional[Tuple[int, int]] = None,
     enable_grid_jitter: bool = True,
+    target_invalid_region_skip: bool = False,
+    target_invalid_region_values=(0.0, "nan"),
+    invalid_pixel_mask: Optional[torch.Tensor] = None,
 ):
     """
     x_clean: B x 1 x H x W
@@ -146,8 +288,9 @@ def make_pyramid_grid_context(
         raise ValueError(f"Expected grayscale input with 1 channel, got {x_clean.shape[1]}")
     if blur_mode not in ("gaussian", "cdd"):
         raise ValueError(f"Unsupported blur_mode: {blur_mode}")
-    if mask_fill_mode not in ("zero", "gaussian_dip", "constant_gaussian"):
+    if mask_fill_mode not in ("zero", "gaussian_dip", "constant_gaussian", "gaussian_scaleaware"):
         raise ValueError(f"Unsupported mask_fill_mode: {mask_fill_mode}")
+    invalid_value_specs = tuple(target_invalid_region_values) if target_invalid_region_values is not None else tuple()
 
     b, _, h, w = x_clean.shape
     x_context = x_clean.clone()
@@ -199,6 +342,9 @@ def make_pyramid_grid_context(
         import constrained_diffusion as cdd
 
         arr = x_clean[bi, 0].detach().cpu().numpy().astype(np.float32)
+        sample_invalid_mask = None
+        if invalid_pixel_mask is not None:
+            sample_invalid_mask = invalid_pixel_mask[bi, 0].detach().cpu().numpy().astype(bool)
         cdd_kwargs = dict(
             mode=cdd_mode,
             constrained=bool(cdd_constrained),
@@ -223,6 +369,12 @@ def make_pyramid_grid_context(
         cdd_residual = np.asarray(cdd_residual, dtype=np.float32)
         # Treat CDD channels as non-negative components.
         cdd_result = np.clip(cdd_result, a_min=0.0, a_max=None)
+        if bool(cdd_append_last_residual) and cdd_result.shape[0] > 0:
+            # Fold decomposition residual back into last scale channel so channel stack
+            # carries the full reconstruction and reduces hard near-zero void regions.
+            residual_map = np.clip(arr - np.sum(cdd_result, axis=0), a_min=0.0, a_max=None).astype(np.float32)
+            cdd_result[-1] = cdd_result[-1] + residual_map
+            cdd_residual = np.zeros_like(cdd_residual, dtype=np.float32)
         cdd_mod = cdd_result.copy()
 
         shared_centers = None
@@ -319,10 +471,16 @@ def make_pyramid_grid_context(
                 if y1 <= y0 or x1 <= x0:
                     continue
                 ch = min(si, cdd_mod.shape[0] - 1)
-                if mask_fill_mode in ("gaussian_dip", "constant_gaussian"):
+                if mask_fill_mode in ("gaussian_dip", "constant_gaussian", "gaussian_scaleaware"):
                     # Constrain gaussian dip to the same local patch footprint as box mode.
                     if mask_fill_mode == "constant_gaussian":
                         blur_sigma = max(1e-6, float(constant_gaussian_sigma))
+                    elif mask_fill_mode == "gaussian_scaleaware":
+                        if scaleaware_gaussian_ratios is None or len(scaleaware_gaussian_ratios) == 0:
+                            ratio = 1.0
+                        else:
+                            ratio = float(scaleaware_gaussian_ratios[min(si, len(scaleaware_gaussian_ratios) - 1)])
+                        blur_sigma = max(1e-6, float(sigma) * float(mask_fraction) * float(dip_sigma_mult) * ratio)
                     else:
                         blur_sigma = max(1e-6, float(sigma) * float(mask_fraction) * float(dip_sigma_mult))
                     yy = np.arange(y0, y1, dtype=np.float32).reshape(-1, 1)
@@ -339,6 +497,12 @@ def make_pyramid_grid_context(
                 else:
                     # "box" mode (mask_fill_mode="zero"): hard zero in selected CDD channel.
                     cdd_mod[ch, y0:y1, x0:x1] = 0.0
+                    # Still emit explicit per-channel mask tokens for hard masking.
+                    dip_field[y0:y1, x0:x1] = 1.0
+                    dip_field_ch[ch, y0:y1, x0:x1] = 1.0
+                    if dip_proto_written[ch] == 0:
+                        dip_proto_ch[ch, y0:y1, x0:x1] = 1.0
+                        dip_proto_written[ch] = 1
                 applied_mask_hard[y0:y1, x0:x1] = 1
                 applied_locations.append((cy, cx))
                 applied_scales.append(float(sigma))
@@ -370,6 +534,28 @@ def make_pyramid_grid_context(
                 continue
             if iy + patch_half_hi > h or ix + patch_half_hi > w:
                 continue
+            if bool(target_invalid_region_skip):
+                py0 = iy - patch_half_lo
+                py1 = iy + patch_half_hi
+                px0 = ix - patch_half_lo
+                px1 = ix + patch_half_hi
+                patch = arr[py0:py1, px0:px1]
+                if patch.size == 0:
+                    continue
+                invalid_mask = np.zeros_like(patch, dtype=bool)
+                if sample_invalid_mask is not None:
+                    invalid_mask |= sample_invalid_mask[py0:py1, px0:px1]
+                for spec in invalid_value_specs:
+                    if isinstance(spec, str) and spec.lower() == "nan":
+                        invalid_mask |= np.isnan(patch)
+                    else:
+                        try:
+                            invalid_mask |= np.isclose(patch, float(spec), equal_nan=False)
+                        except (TypeError, ValueError):
+                            continue
+                # Automatically skip this target region if all pixels are invalid.
+                if np.all(invalid_mask):
+                    continue
             sample_locations.append((iy, ix))
             sample_scales.append(float(unique_loc_to_scale[(cy, cx)]))
         sample_valid = [1] * len(sample_locations)
@@ -512,6 +698,8 @@ class PyramidGridJEPA(nn.Module):
         mask_fill_mode: str = "zero",
         dip_sigma_mult: float = 1.0,
         constant_gaussian_sigma: float = 1.0,
+        scaleaware_gaussian_ratios=(0.25, 0.5, 1.0, 2.0),
+        cdd_append_last_residual: bool = True,
         post_log_transform: bool = True,
         log_eps: float = 1.0,
         cdd_log_std_floor_mult: float = 0.05,
@@ -526,6 +714,10 @@ class PyramidGridJEPA(nn.Module):
         encoder_norm_type: Optional[str] = None,
         encoder_norm_groups: Optional[int] = None,
         encoder_norm_eps: Optional[float] = None,
+        scaleaware_feat_channels: int = 8,
+        scaleaware_adapter_kernel_size: int = 3,
+        scaleaware_fusion_type: str = "concat",
+        scaleaware_norm_per_scale: bool = False,
         mfae_scales=(1, 2, 4),
         mfae_features=("x", "gradmag", "abslap", "local_std"),
         mfae_normalize_attributes: bool = False,
@@ -533,6 +725,14 @@ class PyramidGridJEPA(nn.Module):
         opnet_dilation_mode: str = "half_cdd_scale",
         opnet_dilations=None,
         opnet_max_dilation: int = 16,
+        opnet_channel_mode: str = "multi",
+        op_smoothing_mode: str = "sqrt_scale",
+        op_smoothing_mult: float = 1.0,
+        op_smoothing_padding_mode: str = "reflect",
+        opnet_cache_primitives: bool = True,
+        opnet_cache_detach: bool = True,
+        target_invalid_region_skip: bool = False,
+        target_invalid_region_values=(0.0, "nan"),
     ):
         super().__init__()
 
@@ -557,6 +757,11 @@ class PyramidGridJEPA(nn.Module):
         self.mask_fill_mode = str(mask_fill_mode)
         self.dip_sigma_mult = float(dip_sigma_mult)
         self.constant_gaussian_sigma = float(constant_gaussian_sigma)
+        if scaleaware_gaussian_ratios is None:
+            self.scaleaware_gaussian_ratios = (0.25, 0.5, 1.0, 2.0)
+        else:
+            self.scaleaware_gaussian_ratios = tuple(float(v) for v in scaleaware_gaussian_ratios)
+        self.cdd_append_last_residual = bool(cdd_append_last_residual)
         self.post_log_transform = bool(post_log_transform)
         self.log_eps = float(log_eps)
         self.cdd_log_std_floor_mult = float(cdd_log_std_floor_mult)
@@ -575,9 +780,24 @@ class PyramidGridJEPA(nn.Module):
         self.mfae_features = tuple(mfae_features)
         self.mfae_normalize_attributes = bool(mfae_normalize_attributes)
         self.mfae_include_mask_tokens = bool(mfae_include_mask_tokens)
+        self.scaleaware_feat_channels = int(scaleaware_feat_channels)
+        self.scaleaware_adapter_kernel_size = int(scaleaware_adapter_kernel_size)
+        self.scaleaware_fusion_type = str(scaleaware_fusion_type).lower()
+        self.scaleaware_norm_per_scale = bool(scaleaware_norm_per_scale)
         self.opnet_dilation_mode = str(opnet_dilation_mode)
         self.opnet_dilations = opnet_dilations
         self.opnet_max_dilation = int(opnet_max_dilation)
+        self.opnet_channel_mode = str(opnet_channel_mode)
+        self.op_smoothing_mode = str(op_smoothing_mode)
+        self.op_smoothing_mult = float(op_smoothing_mult)
+        self.op_smoothing_padding_mode = str(op_smoothing_padding_mode)
+        self.target_invalid_region_skip = bool(target_invalid_region_skip)
+        if target_invalid_region_values is None:
+            self.target_invalid_region_values = (0.0, "nan")
+        else:
+            self.target_invalid_region_values = tuple(target_invalid_region_values)
+        self.opnet_cache_primitives = bool(opnet_cache_primitives)
+        self.opnet_cache_detach = bool(opnet_cache_detach)
         if self.mode not in ("image", "pyramid"):
             raise ValueError(f"Unknown mode={self.mode}; expected 'image' or 'pyramid'")
         if self.encoder_type == "pyramid_cnn_res_dilated":
@@ -658,6 +878,28 @@ class PyramidGridJEPA(nn.Module):
                 opnet_dilation_mode=self.opnet_dilation_mode,
                 opnet_dilations=self.opnet_dilations,
                 opnet_max_dilation=self.opnet_max_dilation,
+                opnet_channel_mode=self.opnet_channel_mode,
+                op_smoothing_mode=self.op_smoothing_mode,
+                op_smoothing_mult=self.op_smoothing_mult,
+                op_smoothing_padding_mode=self.op_smoothing_padding_mode,
+                cache_primitives=self.opnet_cache_primitives,
+                cache_detach=self.opnet_cache_detach,
+            )
+        elif self.encoder_type == "cdd_scaleaware_convnext":
+            if self.mode != "pyramid":
+                raise ValueError("cdd_scaleaware_convnext requires mode='pyramid'.")
+            self.context_encoder = CDDScaleAwareConvNeXtEncoder(
+                scales=tuple(float(s) for s in self.sigmas),
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=self.encoder_depth,
+                kernel_size=self.encoder_kernel_size,
+                expansion=4,
+                scale_feat_channels=self.scaleaware_feat_channels,
+                adapter_kernel_size=self.scaleaware_adapter_kernel_size,
+                fusion_type=self.scaleaware_fusion_type,
+                use_reflect_padding=True,
+                final_norm=True,
             )
         elif self.encoder_type == "fullres":
             self.context_encoder = FullResEncoder(in_channels=1, latent_channels=latent_channels)
@@ -740,6 +982,7 @@ class PyramidGridJEPA(nn.Module):
         return_debug: bool = False,
         forced_grid_shift: Optional[Tuple[int, int]] = None,
         enable_grid_jitter: bool = True,
+        mask_inference: bool = True,
     ):
         """
         x_clean: B x 1 x H x W
@@ -749,6 +992,9 @@ class PyramidGridJEPA(nn.Module):
 
         if x_clean.shape[1] != 1:
             raise ValueError(f"Expected grayscale input, got {x_clean.shape[1]} channels")
+        invalid_pixel_mask = ~torch.isfinite(x_clean)
+        if invalid_pixel_mask.any():
+            x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
 
         need_debug_tensors = bool(return_debug or self.mode == "pyramid")
         if need_debug_tensors:
@@ -774,10 +1020,15 @@ class PyramidGridJEPA(nn.Module):
                 mask_fill_mode=self.mask_fill_mode,
                 dip_sigma_mult=self.dip_sigma_mult,
                 constant_gaussian_sigma=self.constant_gaussian_sigma,
+                scaleaware_gaussian_ratios=self.scaleaware_gaussian_ratios,
+                cdd_append_last_residual=self.cdd_append_last_residual,
                 inner_target_size=self.patch_size,
                 return_debug=True,
                 forced_grid_shift=forced_grid_shift,
                 enable_grid_jitter=enable_grid_jitter,
+                target_invalid_region_skip=self.target_invalid_region_skip,
+                target_invalid_region_values=self.target_invalid_region_values,
+                invalid_pixel_mask=invalid_pixel_mask,
             )
         else:
             x_context, target_locations, target_scales, target_valid = make_pyramid_grid_context(
@@ -802,9 +1053,14 @@ class PyramidGridJEPA(nn.Module):
                 mask_fill_mode=self.mask_fill_mode,
                 dip_sigma_mult=self.dip_sigma_mult,
                 constant_gaussian_sigma=self.constant_gaussian_sigma,
+                scaleaware_gaussian_ratios=self.scaleaware_gaussian_ratios,
+                cdd_append_last_residual=self.cdd_append_last_residual,
                 inner_target_size=self.patch_size,
                 forced_grid_shift=forced_grid_shift,
                 enable_grid_jitter=enable_grid_jitter,
+                target_invalid_region_skip=self.target_invalid_region_skip,
+                target_invalid_region_values=self.target_invalid_region_values,
+                invalid_pixel_mask=invalid_pixel_mask,
             )
 
         x_clean_enc = x_clean
@@ -835,16 +1091,23 @@ class PyramidGridJEPA(nn.Module):
             enc_target = torch.cat([cdd_orig, zero_token], dim=1)
             # context: masked per-scale channels + mask token maps
             enc_context = torch.cat([cdd_masked, dip_per_ch], dim=1)
+            if not bool(mask_inference):
+                # In mask-free inference, predictor branch should consume clean features.
+                enc_context = enc_target
         if self.encoder_type == "mfae_convnext":
             if self.mode == "image":
-                context_map = self.context_encoder(x_context_enc)
+                context_input = x_context_enc if bool(mask_inference) else x_clean_enc
+                context_map = self.context_encoder(context_input)
                 with torch.no_grad():
                     gt_map = self.target_encoder(x_clean_enc)
             elif self.mode == "pyramid":
                 cdd_orig = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
                 cdd_masked = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
                 mask_tokens = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
-                context_map = self.context_encoder(cdd_masked, mask_tokens=mask_tokens)
+                if bool(mask_inference):
+                    context_map = self.context_encoder(cdd_masked, mask_tokens=mask_tokens)
+                else:
+                    context_map = self.context_encoder(cdd_orig, mask_tokens=torch.zeros_like(mask_tokens))
                 with torch.no_grad():
                     gt_map = self.target_encoder(cdd_orig, mask_tokens=torch.zeros_like(mask_tokens))
             else:
@@ -857,7 +1120,33 @@ class PyramidGridJEPA(nn.Module):
             cdd_orig = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
             cdd_masked = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
             mask_tokens = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
-            context_map = self.context_encoder(cdd_masked, mask_tokens=mask_tokens)
+            if bool(mask_inference):
+                context_map = self.context_encoder(cdd_masked, mask_tokens=mask_tokens, floor_source=cdd_orig)
+            else:
+                context_map = self.context_encoder(
+                    cdd_orig,
+                    mask_tokens=torch.zeros_like(mask_tokens),
+                    floor_source=cdd_orig,
+                )
+            with torch.no_grad():
+                gt_map = self.target_encoder(
+                    cdd_orig,
+                    mask_tokens=torch.zeros_like(mask_tokens),
+                    floor_source=cdd_orig,
+                )
+        elif self.encoder_type == "cdd_scaleaware_convnext":
+            if self.mode != "pyramid":
+                raise ValueError("cdd_scaleaware_convnext requires mode='pyramid'.")
+            cdd_orig = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
+            cdd_masked = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
+            mask_tokens = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
+            if self.scaleaware_norm_per_scale:
+                cdd_orig = norm_per_sample_channel(cdd_orig)
+                cdd_masked = norm_per_sample_channel(cdd_masked)
+            if bool(mask_inference):
+                context_map = self.context_encoder(cdd_masked, mask_tokens=mask_tokens)
+            else:
+                context_map = self.context_encoder(cdd_orig, mask_tokens=torch.zeros_like(mask_tokens))
             with torch.no_grad():
                 gt_map = self.target_encoder(cdd_orig, mask_tokens=torch.zeros_like(mask_tokens))
         else:

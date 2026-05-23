@@ -57,9 +57,12 @@ class CDDOpNetEncoder(nn.Module):
       1) log_cdd = log(clamp(cdd, min=0) + floor), floor from data std.
       2) gradmag(log_cdd) * scale
       3) lap(log_cdd) * scale^2 (signed, no abs)
-      4) concat features -> ConvNeXt encoder
+      4) grouped per-scale stem (no early cross-scale mixing)
+      5) 1x1 scale fusion
+      6) ConvNeXt encoder
 
-    Optional mask-token channels can be concatenated after feature construction.
+    Mask-token channels are part of the per-scale feature tuple:
+      [log_cdd, grad_scaled, lap_scaled, mask_token]
     """
 
     def __init__(
@@ -84,6 +87,7 @@ class CDDOpNetEncoder(nn.Module):
         opnet_max_dilation: int = 16,
         cache_primitives: bool = True,
         cache_detach: bool = True,
+        opnet_channel_mode: str = "multi",
     ):
         super().__init__()
         self.field_channels = int(field_channels)
@@ -99,6 +103,7 @@ class CDDOpNetEncoder(nn.Module):
             raise ValueError("op_smoothing_padding_mode must be one of: 'reflect', 'replicate', 'constant'")
         self.cache_primitives = bool(cache_primitives)
         self.cache_detach = bool(cache_detach)
+        _ = opnet_channel_mode  # kept for backward config compatibility; currently unused
 
         scales = tuple(float(s) for s in scales)
         if len(scales) != self.field_channels:
@@ -122,12 +127,39 @@ class CDDOpNetEncoder(nn.Module):
             apply_lognorm=False,
         )
 
-        in_ch = 2 * self.field_channels
-        if self.include_mask_tokens:
-            in_ch += self.field_channels
+        # CDD-OpNet v2: keep per-scale channels isolated in the first learned stage.
+        # Per-scale tuple: [log_cdd, grad_scaled, lap_scaled, mask_token]
+        self.per_scale_features = 4
+        self.per_scale_width = int(hidden_channels)
+        stem_in = self.field_channels * self.per_scale_features
+        stem_hidden = self.field_channels * self.per_scale_width
+        self.scale_stem = nn.Sequential(
+            nn.Conv2d(
+                stem_in,
+                stem_hidden,
+                kernel_size=3,
+                padding=1,
+                groups=self.field_channels,
+                padding_mode="reflect",
+            ),
+            nn.GELU(),
+            nn.Conv2d(
+                stem_hidden,
+                stem_hidden,
+                kernel_size=3,
+                padding=1,
+                groups=self.field_channels,
+                padding_mode="reflect",
+            ),
+            nn.GELU(),
+        )
+        self.scale_fuse = nn.Sequential(
+            nn.Conv2d(stem_hidden, hidden_channels, kernel_size=1),
+            nn.GELU(),
+        )
 
         self.encoder = ConvNeXtDenseEncoder(
-            in_channels=in_ch,
+            in_channels=hidden_channels,
             hidden_channels=hidden_channels,
             latent_channels=latent_channels,
             depth=depth,
@@ -161,10 +193,14 @@ class CDDOpNetEncoder(nn.Module):
             "primitives": self.last_primitives,
         }
 
-    def _log_cdd(self, field: torch.Tensor) -> torch.Tensor:
+    def _log_cdd(self, field: torch.Tensor, floor_source: torch.Tensor | None = None) -> torch.Tensor:
         eps = max(1e-30, self.log_eps)
         base = torch.clamp(field, min=0.0)
-        base_std = torch.std(base, dim=(-2, -1), keepdim=True)
+        if floor_source is None:
+            floor_base = base
+        else:
+            floor_base = torch.clamp(floor_source, min=0.0)
+        base_std = torch.std(floor_base, dim=(-2, -1), keepdim=True)
         floor = torch.clamp(base_std * self.log_std_floor_mult, min=eps)
         return torch.log(base + floor)
 
@@ -197,35 +233,52 @@ class CDDOpNetEncoder(nn.Module):
             out[:, i : i + 1] = self._gaussian_blur_single(log_cdd[:, i : i + 1], sigma=sigma)
         return out
 
-    def forward(self, field: torch.Tensor, mask_tokens: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        field: torch.Tensor,
+        mask_tokens: torch.Tensor | None = None,
+        floor_source: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if field.ndim != 4:
             raise ValueError(f"Expected field B,C,H,W, got {tuple(field.shape)}")
         if field.shape[1] != self.field_channels:
             raise ValueError(f"Expected {self.field_channels} field channels, got {field.shape[1]}")
 
-        log_cdd = self._log_cdd(field)
+        log_cdd = self._log_cdd(field, floor_source=floor_source)
         log_cdd_for_ops = self._smooth_for_operators(log_cdd)
         attrs = self.ops(log_cdd_for_ops)
 
         scale_tensor = self.scale_tensor.to(device=field.device, dtype=field.dtype)
         grad_scaled = attrs["gradmag"] * scale_tensor
         lap_scaled = attrs["lap"] * (scale_tensor * scale_tensor)
-        primitives = torch.cat([grad_scaled, lap_scaled], dim=1)
-        x = primitives
+        if mask_tokens is None:
+            mask_tokens = torch.zeros_like(field)
+        if mask_tokens.shape != field.shape:
+            raise ValueError(
+                f"mask_tokens shape must match field shape. "
+                f"field={tuple(field.shape)} mask={tuple(mask_tokens.shape)}"
+            )
+        if not self.include_mask_tokens:
+            mask_tokens = torch.zeros_like(field)
+
+        # Build B,S,F,H,W then flatten to B,(S*F),H,W to preserve scale grouping.
+        per_scale = torch.stack(
+            [
+                log_cdd_for_ops,
+                grad_scaled,
+                lap_scaled,
+                mask_tokens,
+            ],
+            dim=2,
+        )
+        b, s, f, h, w = per_scale.shape
+        primitives = per_scale.reshape(b, s * f, h, w)
         self._cache("last_log_cdd", log_cdd)
         self._cache("last_log_cdd_smooth", log_cdd_for_ops)
         self._cache("last_grad_scaled", grad_scaled)
         self._cache("last_lap_scaled", lap_scaled)
         self._cache("last_primitives", primitives)
 
-        if self.include_mask_tokens:
-            if mask_tokens is None:
-                mask_tokens = torch.zeros_like(field)
-            if mask_tokens.shape != field.shape:
-                raise ValueError(
-                    f"mask_tokens shape must match field shape. "
-                    f"field={tuple(field.shape)} mask={tuple(mask_tokens.shape)}"
-                )
-            x = torch.cat([x, mask_tokens], dim=1)
-
+        x = self.scale_stem(primitives)
+        x = self.scale_fuse(x)
         return self.encoder(x)
