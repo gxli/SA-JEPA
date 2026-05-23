@@ -137,10 +137,20 @@ def _extract_hw_map(src: dict, keys: tuple[str, ...], shape: tuple[int, int]) ->
 
 
 def _rgb_from_xyz(xyz: np.ndarray, h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
-    lo = np.percentile(xyz, 1.0, axis=0)
-    hi = np.percentile(xyz, 99.0, axis=0)
+    # Compute percentiles only on finite (non-NaN) entries so invalid-region
+    # sentinels do not contaminate the colour range.
+    fin = np.isfinite(xyz).all(axis=1)
+    if fin.any():
+        lo = np.percentile(xyz[fin], 1.0, axis=0)
+        hi = np.percentile(xyz[fin], 99.0, axis=0)
+    else:
+        lo = np.zeros(xyz.shape[1], dtype=np.float64)
+        hi = np.ones(xyz.shape[1], dtype=np.float64)
     den = np.clip(hi - lo, 1e-8, None)
-    rgb_flat = np.clip(np.round(np.clip((xyz - lo) / den, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
+    clipped = np.clip((xyz - lo) / den, 0.0, 1.0)
+    # NaN sentinels → black (no-data marker)
+    clipped[~fin] = 0.0
+    rgb_flat = np.clip(np.round(clipped * 255.0), 0, 255).astype(np.uint8)
     rgb = rgb_flat.reshape(h, w, 3)
     return rgb, rgb_flat
 

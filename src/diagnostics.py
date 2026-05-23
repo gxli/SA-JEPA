@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+from collections import defaultdict
+
+import numpy as np
+import torch
+
+
+def compute_effective_rank_from_features(z: np.ndarray) -> float:
+    z = np.asarray(z, dtype=np.float64)
+    if z.ndim != 2 or z.shape[0] < 2 or z.shape[1] < 1:
+        return 0.0
+    z = z - z.mean(axis=0, keepdims=True)
+    cov = (z.T @ z) / max(1, z.shape[0] - 1)
+    evals = np.linalg.eigvalsh(cov)
+    evals = np.clip(evals, 0.0, None)
+    s = float(evals.sum())
+    if s <= 0.0:
+        return 0.0
+    p = evals / s
+    p = p[p > 0]
+    if p.size == 0:
+        return 0.0
+    h = float(-np.sum(p * np.log(p)))
+    return float(np.exp(h))
+
+
+def spectral_rank_stats(fmap: torch.Tensor, eps: float = 1e-12, dead_thresh: float = 1e-5) -> dict:
+    """
+    fmap: C,H,W or B,C,H,W
+    Computes covariance spectral stats over spatial tokens.
+    """
+    if fmap.ndim == 3:
+        z = fmap.permute(1, 2, 0).reshape(-1, fmap.shape[0])
+    elif fmap.ndim == 4:
+        z = fmap.permute(0, 2, 3, 1).reshape(-1, fmap.shape[1])
+    else:
+        raise ValueError(f"Expected C,H,W or B,C,H,W, got {tuple(fmap.shape)}")
+
+    z = z.float()
+    z = z - z.mean(dim=0, keepdim=True)
+
+    ch_std = z.std(dim=0, unbiased=False)
+    dead = ch_std < float(dead_thresh)
+    dead_frac = dead.float().mean().item()
+
+    cov = (z.T @ z) / max(1, z.shape[0] - 1)
+    eig = torch.linalg.eigvalsh(cov).clamp_min(0)
+    eig = torch.flip(eig, dims=(0,))
+
+    total = eig.sum().clamp_min(eps)
+    p = eig / total
+    entropy = -(p * torch.log(p.clamp_min(eps))).sum()
+    erank = torch.exp(entropy)
+
+    top1 = p[:1].sum()
+    top4 = p[:4].sum()
+    top8 = p[:8].sum()
+    participation = total.pow(2) / eig.pow(2).sum().clamp_min(eps)
+
+    return {
+        "erank": float(erank.item()),
+        "participation_rank": float(participation.item()),
+        "top1_energy": float(top1.item()),
+        "top4_energy": float(top4.item()),
+        "top8_energy": float(top8.item()),
+        "dead_channel_fraction": float(dead_frac),
+        "num_dead_channels": int(dead.sum().item()),
+        "mean_channel_std": float(ch_std.mean().item()),
+        "min_channel_std": float(ch_std.min().item()),
+        "max_channel_std": float(ch_std.max().item()),
+        "dead_channel_threshold": float(dead_thresh),
+    }
+
+
+def rank_dashboard(outputs: dict) -> dict:
+    context = outputs.get("context_map")
+    pred = outputs["pred_map"]
+    gt = outputs["gt_map"]
+
+    out = {}
+    if context is not None:
+        out["context"] = spectral_rank_stats(torch.as_tensor(context))
+    out["pred"] = spectral_rank_stats(torch.as_tensor(pred))
+    out["gt"] = spectral_rank_stats(torch.as_tensor(gt))
+    out["pred_gt_erank_ratio"] = out["pred"]["erank"] / max(out["gt"]["erank"], 1e-12)
+    out["pred_gt_participation_ratio"] = out["pred"]["participation_rank"] / max(
+        out["gt"]["participation_rank"], 1e-12
+    )
+    return out
+
+
+def compute_error_by_scale(outputs: dict) -> dict[float, float]:
+    pred = outputs["pred_patches"].detach()  # B,K,C,P,P
+    gt = outputs["gt_patches"].detach()  # B,K,C,P,P
+    scales = outputs["target_scales"].detach()  # B,K
+    valid = outputs["target_valid"].detach()  # B,K
+
+    # Per-target MSE averaged over C,P,P
+    mse_bk = torch.mean((pred - gt) ** 2, dim=(2, 3, 4))  # B,K
+    out = defaultdict(list)
+    b, k = mse_bk.shape
+    for bi in range(b):
+        for ki in range(k):
+            if not bool(valid[bi, ki].item()):
+                continue
+            s = round(float(scales[bi, ki].item()), 6)
+            out[s].append(float(mse_bk[bi, ki].item()))
+    return {float(s): float(np.mean(v)) for s, v in out.items() if len(v) > 0}
+
+

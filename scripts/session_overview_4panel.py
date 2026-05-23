@@ -162,14 +162,17 @@ def make_session_overview_plot(
     def rgb_from_ranges(points: np.ndarray, mins: np.ndarray, maxs: np.ndarray):
         rng = np.maximum(maxs - mins, 1e-12)
         norm = np.clip((points - mins) / rng, 0.0, 1.0)
+        # NaN sentinels → black (no-data marker)
+        nan_mask = ~np.isfinite(norm).all(axis=1)
+        norm[nan_mask] = 0.0
         rgb_u8 = (norm * 255.0).astype(np.uint8)
         rgb_hex = [f"rgb({r},{g},{b})" for r, g, b in rgb_u8]
         return rgb_u8, rgb_hex
 
     umap_raw_all = np.stack([umap_x.reshape(-1), umap_y.reshape(-1), umap_z.reshape(-1)], axis=1).astype(np.float32)
     umap_raw = umap_raw_all if image_umap_points is None else np.asarray(image_umap_points, dtype=np.float32)
-    pca_mins, pca_maxs = pca_points.min(axis=0), pca_points.max(axis=0)
-    umap_mins, umap_maxs = umap_raw.min(axis=0), umap_raw.max(axis=0)
+    pca_mins, pca_maxs = np.nanmin(pca_points, axis=0), np.nanmax(pca_points, axis=0)
+    umap_mins, umap_maxs = np.nanmin(umap_raw, axis=0), np.nanmax(umap_raw, axis=0)
 
     pca_rgb_u8, pca_colors = rgb_from_ranges(pca_points, pca_mins, pca_maxs)
     umap_rgb_u8, umap_colors = rgb_from_ranges(umap_raw, umap_mins, umap_maxs)
