@@ -77,7 +77,7 @@ def build_model(model_cfg: dict, data_cfg: dict, device: torch.device) -> Pyrami
         cdd_constrained=model_cfg.get("cdd_constrained", True),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
         mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-        dip_sigma_mult=model_cfg.get("dip_sigma_mult", 1.0),
+        dip_sigma_mult=1.0,
         constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
         post_log_transform=model_post_log,
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),

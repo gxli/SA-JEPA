@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import csv
 from typing import Callable
 
 import numpy as np
@@ -119,6 +120,8 @@ def run_post_training_inference(
     viz_crop_border_px: int | None,
     compute_jepa_energy_fn: Callable,
     compute_target_energy_map_fn: Callable,
+    inference_visit_batches: int = 32,
+    training_d4_augment: bool = False,
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
     dashboard_html_path = os.path.join(session_dir, "dashboard.html")
@@ -166,6 +169,17 @@ def run_post_training_inference(
             )
         )
         if bool(mask_inference):
+            # TODO(cleanup): lattice sweep is a workaround for Gaussian masking's
+            # inability to produce a dense error map in a single pass. Replace
+            # with discrete block masking (MAE-style) so one forward pass is
+            # enough. Remove this sweep once block masking is validated.
+            import warnings
+            warnings.warn(
+                "Lattice sweep inference is deprecated and will be removed. "
+                "Switch to block masking for single-pass dense energy maps.",
+                FutureWarning,
+                stacklevel=2,
+            )
             all_shifts = [(dy, dx) for dy in range(spacing) for dx in range(spacing)]
             n_passes = max(1, int(inference_mask_passes))
             shifts = all_shifts if n_passes <= 0 else all_shifts[: min(len(all_shifts), n_passes)]
@@ -315,6 +329,60 @@ def run_post_training_inference(
             },
             f,
             indent=2,
+        )
+    # Canonical target-visit heatmap from inference loader (d4_augment is forced off there).
+    # This avoids mirrored-symmetry artefacts from training-time augmentation logs.
+    visit_h = int(inference_outputs["x_clean"].shape[-2])
+    visit_w = int(inference_outputs["x_clean"].shape[-1])
+    canonical_visit_counts = np.zeros((visit_h, visit_w), dtype=np.float32)
+    canonical_rows = []
+    max_visit_batches = int(inference_visit_batches)
+    if max_visit_batches < 0:
+        max_visit_batches = 0
+    dev = next(model.parameters()).device
+    with torch.no_grad():
+        for ib, xb in enumerate(dataloader):
+            if max_visit_batches > 0 and ib >= max_visit_batches:
+                break
+            xb = xb.to(dev)
+            outb = model(
+                xb,
+                return_debug=False,
+                enable_grid_jitter=False,
+                mask_inference=bool(mask_inference),
+            )
+            tloc_b = outb["target_locations"].detach().cpu().numpy()
+            tvalid_b = outb["target_valid"].detach().cpu().numpy().astype(bool)
+            tscale_b = outb["target_scales"].detach().cpu().numpy()
+            for bi in range(tloc_b.shape[0]):
+                for ki in range(tloc_b.shape[1]):
+                    if not bool(tvalid_b[bi, ki]):
+                        continue
+                    yy = int(tloc_b[bi, ki, 0])
+                    xx = int(tloc_b[bi, ki, 1])
+                    if 0 <= yy < visit_h and 0 <= xx < visit_w:
+                        canonical_visit_counts[yy, xx] += 1.0
+                        canonical_rows.append(
+                            [int(ib), int(bi), int(ki), int(yy), int(xx), float(tscale_b[bi, ki])]
+                        )
+    np.save(
+        os.path.join(session_dir, "visited_target_frequency_canonical.npy"),
+        canonical_visit_counts.astype(np.float32),
+    )
+    with open(
+        os.path.join(session_dir, "visited_target_locations_canonical.csv"),
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        w = csv.writer(f)
+        w.writerow(["inference_batch", "sample_idx", "target_idx", "y", "x", "scale"])
+        if canonical_rows:
+            w.writerows(canonical_rows)
+    if bool(training_d4_augment):
+        print(
+            f"[{config_name}] canonical_visit_map_saved "
+            "(built from d4_augment=false inference loader)"
         )
     np.save(os.path.join(session_dir, "pred_map.npy"), inference_outputs["pred_map"].numpy())
     np.save(os.path.join(session_dir, "gt_map.npy"), inference_outputs["gt_map"].numpy())

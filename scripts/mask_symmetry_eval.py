@@ -71,7 +71,7 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
         mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-        dip_sigma_mult=float(model_cfg.get("dip_sigma_mult", 1.0)),
+        dip_sigma_mult=1.0,
         constant_gaussian_sigma=float(model_cfg.get("constant_gaussian_sigma", 1.0)),
         return_debug=True,
     )

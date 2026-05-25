@@ -220,7 +220,9 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         else:
             energy_map = np.zeros((h, w), dtype=np.float32)
 
-    visit_path = os.path.join(session_dir, "visited_target_frequency.npy")
+    visit_path = os.path.join(session_dir, "visited_target_frequency_canonical.npy")
+    if not os.path.exists(visit_path):
+        visit_path = os.path.join(session_dir, "visited_target_frequency.npy")
     visit_heatmap = np.asarray(np.load(visit_path), dtype=np.float32) if os.path.exists(visit_path) else np.zeros((h, w), dtype=np.float32)
     if visit_heatmap.shape != (h, w):
         visit_heatmap = np.zeros((h, w), dtype=np.float32)
@@ -334,6 +336,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
     metrics_path = os.path.join(session_dir, "metrics.csv")
     loss_x, loss_total, loss_jepa = [], [], []
+    loss_sigreg, loss_var, loss_cov = [], [], []
+    weighted_jepa, weighted_sigreg, weighted_var, weighted_cov = [], [], [], []
     if os.path.exists(metrics_path):
         with open(metrics_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -341,14 +345,34 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 try:
                     ep = float(row.get("epoch", "nan"))
                     ba = float(row.get("batch", row.get("step", "nan")))
+                    gs = float(row.get("global_step", "nan"))
                     tl = float(row.get("total_loss", row.get("loss_total", row.get("loss", "nan"))))
                     jl = float(row.get("loss_jepa", row.get("jepa_loss", "nan")))
+                    sl = float(row.get("loss_sigreg", "nan"))
+                    vl = float(row.get("loss_var", "nan"))
+                    cl = float(row.get("loss_cov", "nan"))
+                    wj = float(row.get("weighted_jepa", "nan"))
+                    ws = float(row.get("weighted_sigreg", "nan"))
+                    wv = float(row.get("weighted_var", "nan"))
+                    wc = float(row.get("weighted_cov", "nan"))
                 except Exception:
                     continue
-                if np.isfinite(ep) and np.isfinite(ba):
+                if np.isfinite(gs):
+                    loss_x.append(gs)
+                elif np.isfinite(ep) and np.isfinite(ba):
                     loss_x.append(ep + 0.001 * ba)
+                else:
+                    continue
+                if np.isfinite(tl) and np.isfinite(jl):
                     loss_total.append(tl)
                     loss_jepa.append(jl)
+                    loss_sigreg.append(sl if np.isfinite(sl) else np.nan)
+                    loss_var.append(vl if np.isfinite(vl) else np.nan)
+                    loss_cov.append(cl if np.isfinite(cl) else np.nan)
+                    weighted_jepa.append(wj if np.isfinite(wj) else np.nan)
+                    weighted_sigreg.append(ws if np.isfinite(ws) else np.nan)
+                    weighted_var.append(wv if np.isfinite(wv) else np.nan)
+                    weighted_cov.append(wc if np.isfinite(wc) else np.nan)
     effective_rank_x, effective_rank_y = [], []
     run_results_path = os.path.join(session_dir, "run_results.csv")
     if os.path.exists(run_results_path):
@@ -410,6 +434,13 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         loss_x=np.asarray(loss_x, dtype=np.float32),
         loss_total=np.asarray(loss_total, dtype=np.float32),
         loss_jepa=np.asarray(loss_jepa, dtype=np.float32),
+        loss_sigreg=np.asarray(loss_sigreg, dtype=np.float32),
+        loss_var=np.asarray(loss_var, dtype=np.float32),
+        loss_cov=np.asarray(loss_cov, dtype=np.float32),
+        weighted_jepa=np.asarray(weighted_jepa, dtype=np.float32),
+        weighted_sigreg=np.asarray(weighted_sigreg, dtype=np.float32),
+        weighted_var=np.asarray(weighted_var, dtype=np.float32),
+        weighted_cov=np.asarray(weighted_cov, dtype=np.float32),
         effective_rank_x=np.asarray(effective_rank_x, dtype=np.float64),
         effective_rank_y=np.asarray(effective_rank_y, dtype=np.float32),
         rank_context_erank=np.asarray([_rd("context", "erank")], dtype=np.float32),
@@ -451,14 +482,31 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         compute_dash_data(session_dir, overwrite=True)
         data = np.load(npz_path)
 
-    def heat(title: str, z: np.ndarray, colorscale: str) -> go.Figure:
+    def heat(
+        title: str,
+        z: np.ndarray,
+        colorscale: str,
+        *,
+        percentile_scale: bool = True,
+        log1p_nonzero_nan: bool = False,
+    ) -> go.Figure:
         vals = np.asarray(z, dtype=np.float32)
+        if log1p_nonzero_nan:
+            raw = np.asarray(vals, dtype=np.float32)
+            out = np.full_like(raw, np.nan, dtype=np.float32)
+            m = raw > 0.0
+            if np.any(m):
+                out[m] = np.log1p(raw[m]).astype(np.float32)
+            vals = out
         finite = vals[np.isfinite(vals)]
         if finite.size == 0:
             vals = np.zeros_like(vals)
             zmin, zmax = 0.0, 1.0
         else:
-            zmin, zmax = float(np.percentile(finite, 1)), float(np.percentile(finite, 99))
+            if percentile_scale:
+                zmin, zmax = float(np.percentile(finite, 1)), float(np.percentile(finite, 99))
+            else:
+                zmin, zmax = float(np.min(finite)), float(np.max(finite))
             if zmax <= zmin + 1e-12:
                 zmax = zmin + 1.0
         fig = go.Figure([go.Heatmap(z=vals, colorscale=colorscale, zmin=zmin, zmax=zmax, showscale=False)])
@@ -571,11 +619,31 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     loss_x = np.asarray(data["loss_x"], dtype=np.float32) if "loss_x" in data.files else np.asarray([], dtype=np.float32)
     loss_total = np.asarray(data["loss_total"], dtype=np.float32) if "loss_total" in data.files else np.asarray([], dtype=np.float32)
     loss_jepa = np.asarray(data["loss_jepa"], dtype=np.float32) if "loss_jepa" in data.files else np.asarray([], dtype=np.float32)
+    loss_sigreg = np.asarray(data["loss_sigreg"], dtype=np.float32) if "loss_sigreg" in data.files else np.asarray([], dtype=np.float32)
+    loss_var = np.asarray(data["loss_var"], dtype=np.float32) if "loss_var" in data.files else np.asarray([], dtype=np.float32)
+    loss_cov = np.asarray(data["loss_cov"], dtype=np.float32) if "loss_cov" in data.files else np.asarray([], dtype=np.float32)
+    weighted_jepa = np.asarray(data["weighted_jepa"], dtype=np.float32) if "weighted_jepa" in data.files else np.asarray([], dtype=np.float32)
+    weighted_sigreg = np.asarray(data["weighted_sigreg"], dtype=np.float32) if "weighted_sigreg" in data.files else np.asarray([], dtype=np.float32)
+    weighted_var = np.asarray(data["weighted_var"], dtype=np.float32) if "weighted_var" in data.files else np.asarray([], dtype=np.float32)
+    weighted_cov = np.asarray(data["weighted_cov"], dtype=np.float32) if "weighted_cov" in data.files else np.asarray([], dtype=np.float32)
+    def _smooth(y: np.ndarray, win: int = 25) -> np.ndarray:
+        if y.size < 3 or win <= 1:
+            return y
+        w = min(win, max(3, y.size // 5))
+        if w % 2 == 0:
+            w += 1
+        k = np.ones(w, dtype=np.float32) / float(w)
+        return np.convolve(y, k, mode="same")
     n = min(loss_x.size, loss_total.size, loss_jepa.size) if (loss_x.size and loss_total.size and loss_jepa.size) else 0
     fig_loss = go.Figure()
     if n > 0:
-        fig_loss.add_trace(go.Scattergl(x=loss_x[:n], y=loss_total[:n], mode="lines", name="total_loss"))
-        fig_loss.add_trace(go.Scattergl(x=loss_x[:n], y=loss_jepa[:n], mode="lines", name="loss_jepa"))
+        lx = loss_x[:n]
+        lt = loss_total[:n]
+        lj = loss_jepa[:n]
+        fig_loss.add_trace(go.Scattergl(x=lx, y=lt, mode="lines", name="total_loss(raw)", line=dict(width=1), opacity=0.25))
+        fig_loss.add_trace(go.Scattergl(x=lx, y=_smooth(lt), mode="lines", name="total_loss(smooth)", line=dict(width=2)))
+        fig_loss.add_trace(go.Scattergl(x=lx, y=lj, mode="lines", name="loss_jepa(raw)", line=dict(width=1), opacity=0.2))
+        fig_loss.add_trace(go.Scattergl(x=lx, y=_smooth(lj), mode="lines", name="loss_jepa(smooth)", line=dict(width=2)))
     fig_loss.update_layout(
         template="plotly_white",
         title={"text": "Loss Curve", "x": 0.02},
@@ -583,8 +651,50 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         height=330,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
     )
-    fig_loss.update_xaxes(title_text="epoch+0.001*batch")
+    fig_loss.update_xaxes(title_text="global_step (or epoch+batch fallback)")
     fig_loss.update_yaxes(title_text="loss")
+    fig_loss_components = go.Figure()
+    if n > 0:
+        lx = loss_x[:n]
+        def _add_if(name: str, arr: np.ndarray):
+            if arr.size >= n and np.isfinite(arr[:n]).any():
+                y = np.nan_to_num(arr[:n], nan=0.0)
+                fig_loss_components.add_trace(go.Scattergl(x=lx, y=y, mode="lines", name=f"{name}(raw)", line=dict(width=1), opacity=0.2))
+                fig_loss_components.add_trace(go.Scattergl(x=lx, y=_smooth(y), mode="lines", name=f"{name}(smooth)", line=dict(width=2)))
+        _add_if("loss_sigreg", loss_sigreg)
+        _add_if("loss_var", loss_var)
+        _add_if("loss_cov", loss_cov)
+    fig_loss_components.update_layout(
+        template="plotly_white",
+        title={"text": "Loss Components (Unweighted)", "x": 0.02},
+        margin=dict(l=42, r=8, t=36, b=36),
+        height=330,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
+    )
+    fig_loss_components.update_xaxes(title_text="global_step")
+    fig_loss_components.update_yaxes(title_text="loss")
+    fig_weighted_components = go.Figure()
+    if n > 0:
+        lx = loss_x[:n]
+        for name, arr in (
+            ("weighted_jepa", weighted_jepa),
+            ("weighted_sigreg", weighted_sigreg),
+            ("weighted_var", weighted_var),
+            ("weighted_cov", weighted_cov),
+        ):
+            if arr.size >= n and np.isfinite(arr[:n]).any():
+                y = np.nan_to_num(arr[:n], nan=0.0)
+                fig_weighted_components.add_trace(go.Scattergl(x=lx, y=y, mode="lines", name=f"{name}(raw)", line=dict(width=1), opacity=0.2))
+                fig_weighted_components.add_trace(go.Scattergl(x=lx, y=_smooth(y), mode="lines", name=f"{name}(smooth)", line=dict(width=2)))
+    fig_weighted_components.update_layout(
+        template="plotly_white",
+        title={"text": "Loss Components (Weighted into total_loss)", "x": 0.02},
+        margin=dict(l=42, r=8, t=36, b=36),
+        height=330,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
+    )
+    fig_weighted_components.update_xaxes(title_text="global_step")
+    fig_weighted_components.update_yaxes(title_text="weighted contribution")
     er_x = np.asarray(data["effective_rank_x"], dtype=np.float64) if "effective_rank_x" in data.files else np.asarray([], dtype=np.float64)
     er_y = np.asarray(data["effective_rank_y"], dtype=np.float32) if "effective_rank_y" in data.files else np.asarray([], dtype=np.float32)
     fig_eff_rank = go.Figure()
@@ -654,14 +764,26 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     cards.extend(
         [
             {"title": "Input (Log-Norm)", "fig": heat("Input (Log-Norm)", data["orig"], "Viridis"), "group": "input"},
-            {"title": "Loss Curve", "fig": fig_loss, "group": "loss"},
             {"title": "Effective Rank", "fig": fig_eff_rank, "group": "eff-rank"},
+            {"title": "Loss Curve", "fig": fig_loss, "group": "loss"},
+            {"title": "Loss Components", "fig": fig_loss_components, "group": "loss-components"},
+            {"title": "Weighted Loss Components", "fig": fig_weighted_components, "group": "weighted-loss-components"},
             {"title": "Rank Diagnostics", "fig": fig_rank_diag, "group": "rank-diag"},
             {"title": "Rank Energy Top-k", "fig": fig_rank_energy, "group": "rank-energy"},
             {"title": "Target Locations", "fig": heat("Target Locations", data["target"], "Magma"), "group": "target-loc"},
             {"title": "Target Location Heatmap", "fig": heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma"), "group": "target-heat"},
             {"title": "Energy Map", "fig": heat("Energy Map", data["energy_map"], "Inferno"), "group": "energy"},
-            {"title": "Visit Frequency Heatmap", "fig": heat("Visit Frequency Heatmap", data["visit_heatmap"], "Cividis"), "group": "visit"},
+            {
+                "title": "Visit Frequency Heatmap",
+                "fig": heat(
+                    "Visit Frequency Heatmap (log1p, unvisited=NaN)",
+                    data["visit_heatmap"],
+                    "Cividis",
+                    percentile_scale=False,
+                    log1p_nonzero_nan=True,
+                ),
+                "group": "visit",
+            },
             {"title": "Pyramid Mask 3D (Sample-0)", "fig": mask3d("Pyramid Mask 3D (Sample-0)", data["pyramid_mask_cube"]), "group": "pyr-mask-3d"},
         ]
     )

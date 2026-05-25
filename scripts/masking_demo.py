@@ -133,7 +133,7 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
         mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-        dip_sigma_mult=float(model_cfg.get("dip_sigma_mult", 1.0)),
+        dip_sigma_mult=1.0,
         constant_gaussian_sigma=float(model_cfg.get("constant_gaussian_sigma", 1.0)),
         return_debug=True,
     )
@@ -432,6 +432,7 @@ def plot_dip_proto_per_channel(debug: dict, out_path: str):
 def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
     model_post_log = bool(model_cfg.get("post_log_transform", data_cfg.get("log_transform", True)))
     return PyramidGridJEPA(
+        mode=model_cfg.get("mode", "image"),
         latent_channels=model_cfg.get("latent_channels", 32),
         predictor_hidden=model_cfg.get("predictor_hidden"),
         patch_size=model_cfg.get("patch_size", 2),
@@ -441,6 +442,7 @@ def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
         box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
         mask_scale=model_cfg.get("mask_scale", 1.0),
         min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
+        mask_size=model_cfg.get("mask_size", 0.0),
         spacing_scale=model_cfg.get("spacing_scale", 1.5),
         full_grid=model_cfg.get("full_grid", True),
         global_shift=model_cfg.get("global_shift", True),
@@ -452,8 +454,10 @@ def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
         cdd_constrained=model_cfg.get("cdd_constrained", True),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
         mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-        dip_sigma_mult=model_cfg.get("dip_sigma_mult", 1.0),
+        dip_sigma_mult=1.0,
         constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
+        scaleaware_gaussian_ratios=tuple(model_cfg.get("scaleaware_gaussian_ratios", [0.25, 0.5, 1.0, 2.0])),
+        cdd_append_last_residual=model_cfg.get("cdd_append_last_residual", True),
         post_log_transform=model_post_log,
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
@@ -464,6 +468,10 @@ def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
         encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
         encoder_depth=model_cfg.get("encoder_depth", 4),
         encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
+        scaleaware_feat_channels=model_cfg.get("scaleaware_feat_channels", 8),
+        scaleaware_adapter_kernel_size=model_cfg.get("scaleaware_adapter_kernel_size", 3),
+        scaleaware_fusion_type=model_cfg.get("scaleaware_fusion_type", "concat"),
+        scaleaware_norm_per_scale=model_cfg.get("scaleaware_norm_per_scale", False),
     )
 
 
@@ -554,6 +562,9 @@ def build_overview_figure(
         applied_mask = np.clip(dip_t[0].cpu().numpy().astype(np.float32), 0.0, 1.0)
     else:
         applied_mask = np.clip(mask_map, 0.0, 1.0)
+    # Mask delta and frac to only show differences inside masked regions.
+    delta[applied_mask <= 0] = 0.0
+    frac[applied_mask <= 0] = 0.0
     fig = make_subplots(
         rows=1,
         cols=6,
@@ -636,6 +647,20 @@ def build_overview_figure(
                 row=1,
                 col=col,
             )
+    # Red + markers on fractional diff (col 6) to show target locations.
+    if centers.size > 0:
+        fig.add_trace(
+            go.Scattergl(
+                x=centers[:, 1].tolist(),
+                y=centers[:, 0].tolist(),
+                mode="markers",
+                marker={"size": 7, "color": "red", "symbol": "cross"},
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=1,
+            col=6,
+        )
     fig.update_layout(height=460, width=2450, title=title, margin=dict(l=20, r=20, t=50, b=20))
     return fig
 
@@ -648,10 +673,26 @@ def build_channels_figure(debug: dict, title: str):
     cdd_orig = cdd_orig_t[0].cpu().numpy()
     cdd_mask = cdd_mask_t[0].cpu().numpy()
     n = cdd_orig.shape[0]
+
+    box_sizes_t = debug.get("cdd_box_sizes")
+    blur_sigmas_t = debug.get("cdd_blur_sigmas")
+    box_sizes = box_sizes_t[0].cpu().numpy() if box_sizes_t is not None and box_sizes_t.numel() > 0 else np.full(n, -1)
+    blur_sigmas = blur_sigmas_t[0].cpu().numpy() if blur_sigmas_t is not None and blur_sigmas_t.numel() > 0 else np.zeros(n)
+    chan_labels = []
+    for i in range(n):
+        bs = int(box_sizes[i])
+        sigma = float(blur_sigmas[i])
+        fwhm = 2.355 * sigma
+        if sigma > 0:
+            info = f"box={bs}px σ={sigma:.1f} FWHM={fwhm:.1f}px"
+        else:
+            info = f"box={bs}px"
+        chan_labels.extend([f"Ch{i} {info} orig", f"Ch{i} masked", f"Ch{i} delta"])
+
     fig = make_subplots(
         rows=n,
         cols=3,
-        subplot_titles=sum(([f"Ch {i} orig", f"Ch {i} masked", f"Ch {i} delta"] for i in range(n)), []),
+        subplot_titles=chan_labels,
         horizontal_spacing=0.02,
         vertical_spacing=0.04,
     )
@@ -668,6 +709,22 @@ def build_channels_figure(debug: dict, title: str):
         fig.add_trace(go.Heatmap(z=orig, colorscale="Viridis", zmin=lo, zmax=hi, showscale=False), row=i + 1, col=1)
         fig.add_trace(go.Heatmap(z=masked, colorscale="Viridis", zmin=lo, zmax=hi, showscale=False), row=i + 1, col=2)
         fig.add_trace(go.Heatmap(z=delta, colorscale="RdBu", zmin=-dlim, zmax=dlim, zmid=0.0, showscale=False), row=i + 1, col=3)
+        # Contour overlay on delta to highlight non-zero regions.
+        delta_abs = np.abs(delta)
+        contour_level = max(float(np.percentile(delta_abs, 80.0)), dlim * 0.1)
+        if contour_level > 1e-12 and np.any(delta_abs > contour_level):
+            fig.add_trace(
+                go.Contour(
+                    z=delta_abs,
+                    contours=dict(start=contour_level, end=float(delta_abs.max()), size=contour_level),
+                    contours_coloring="lines",
+                    line=dict(width=1, color="lime"),
+                    showscale=False,
+                    hoverinfo="skip",
+                ),
+                row=i + 1,
+                col=3,
+            )
         c1 = 3 * i + 1
         c2 = 3 * i + 2
         c3 = 3 * i + 3
@@ -843,25 +900,14 @@ def main():
         if centers.size == 0:
             centers = extract_centers_from_targets(target_locations, target_valid)
 
-        # In CDD mode, define "original" for review as sum of CDD channels.
-        x_for_review = x
-        ctx_for_review = ctx
-        if str(model_cfg_run.get("blur_mode", "cdd")) == "cdd":
-            cdd_orig_t = debug.get("cdd_channels_orig")
-            cdd_mask_t = debug.get("cdd_channels_masked")
-            if (
-                cdd_orig_t is not None
-                and cdd_mask_t is not None
-                and cdd_orig_t.numel() > 0
-                and cdd_mask_t.numel() > 0
-            ):
-                # Strict CDD-consistent review: compare channel sums only.
-                x_for_review = cdd_orig_t[0].cpu().numpy().astype(np.float32).sum(axis=0)
-                ctx_for_review = cdd_mask_t[0].cpu().numpy().astype(np.float32).sum(axis=0)
-
-        # For review consistency, compare raw (pre-log) intensities.
-        # This avoids sign confusion introduced by any display-space transform.
-        x_plot, ctx_plot = x_for_review, ctx_for_review
+        # Overview panels use raw data so Original is uncontaminated and
+        # Context-Original / Fractional Diff show the actual masking effect.
+        x_display = x
+        ctx_display = ctx
+        x_diff = x.astype(np.float32)
+        ctx_diff = ctx.astype(np.float32)
+        x_frac = np.clip(x, 0.0, None).astype(np.float32)
+        ctx_frac = np.clip(ctx, 0.0, None).astype(np.float32)
 
         model = build_model(model_cfg_run, data_cfg)
         ckpt_used = load_model_checkpoint_if_available(model, session_dir)
@@ -875,16 +921,16 @@ def main():
 
         html_parts.append(f"<h2>Mode: {mode}</h2>")
         fig_over = build_overview_figure(
-            x_clean_net,
-            x_context_net,
+            x_display,
+            ctx_display,
             centers,
             debug,
             mode,
             title=f"Masking Overview ({mode})",
-            frac_i1=np.clip(x_for_review, 0.0, None).astype(np.float32),
-            frac_i2=np.clip(ctx_for_review, 0.0, None).astype(np.float32),
-            diff_i1=x_for_review.astype(np.float32),
-            diff_i2=ctx_for_review.astype(np.float32),
+            frac_i1=x_frac,
+            frac_i2=ctx_frac,
+            diff_i1=x_diff,
+            diff_i2=ctx_diff,
         )
         html_parts.append("<div class='panel'>")
         html_parts.append(pio.to_html(fig_over, include_plotlyjs="cdn", full_html=False, config={"responsive": True}))
@@ -983,6 +1029,26 @@ def main():
                 f"min(sum_orig - sum_masked): {cdd_summary['sum_diff_min']:.6g}\\n"
                 f"max(sum_orig - sum_masked): {cdd_summary['sum_diff_max']:.6g}"
                 "</pre>"
+            )
+            html_parts.append("</div>")
+
+        # Per-channel mask geometry table.
+        box_sizes_t = debug.get("cdd_box_sizes")
+        blur_sigmas_t = debug.get("cdd_blur_sigmas")
+        if box_sizes_t is not None and box_sizes_t.numel() > 0:
+            box_sizes = box_sizes_t[0].cpu().numpy()
+            blur_sigmas = blur_sigmas_t[0].cpu().numpy() if blur_sigmas_t is not None and blur_sigmas_t.numel() > 0 else np.zeros_like(box_sizes)
+            rows = []
+            for i in range(len(box_sizes)):
+                bs = float(blur_sigmas[i])
+                fwhm = 2.355 * bs if bs > 0 else 0.0
+                rows.append(f"  ch {i}: box={int(box_sizes[i])}px  blur_sigma={bs:.2f}px  FWHM={fwhm:.1f}px  2*FWHM={2*fwhm:.1f}px")
+            html_parts.append("<div class='panel'>")
+            html_parts.append(
+                "<pre style='font-size:13px;background:#f7f7f7;border:1px solid #ddd;padding:10px;'>"
+                f"Mask Geometry ({mode})\\n"
+                + "\\n".join(rows)
+                + "</pre>"
             )
             html_parts.append("</div>")
 

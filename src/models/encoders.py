@@ -16,6 +16,22 @@ class LayerNorm2d(nn.Module):
         return x.permute(0, 3, 1, 2)
 
 
+class GRN(nn.Module):
+    """Global Response Normalization (ConvNeXt V2)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, int(dim)))
+        self.beta = nn.Parameter(torch.zeros(1, 1, 1, int(dim)))
+        self.eps = float(eps)
+
+    def forward(self, x):
+        # x: B,H,W,C
+        gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)
+        nx = gx / (gx.mean(dim=-1, keepdim=True) + self.eps)
+        return self.gamma * (x * nx) + self.beta + x
+
+
 def _valid_groups(channels: int, groups: int) -> int:
     g = max(1, int(groups))
     while channels % g != 0 and g > 1:
@@ -112,6 +128,7 @@ class ConvNeXtDenseBlock(nn.Module):
         self.norm = nn.LayerNorm(channels)
         self.pw1 = nn.Linear(channels, expansion * channels)
         self.act = nn.GELU()
+        self.grn = GRN(expansion * channels)
         self.pw2 = nn.Linear(expansion * channels, channels)
         self.gamma = nn.Parameter(layer_scale_init * torch.ones(channels))
 
@@ -122,6 +139,7 @@ class ConvNeXtDenseBlock(nn.Module):
         x = self.norm(x)
         x = self.pw1(x)
         x = self.act(x)
+        x = self.grn(x)
         x = self.pw2(x)
         x = self.gamma * x
         x = x.permute(0, 3, 1, 2)
@@ -204,10 +222,9 @@ class ResCNNBlock(nn.Module):
             nn.Conv2d(hidden, channels, kernel_size=3, padding=0),
             make_norm2d(channels, norm_type=norm_type, norm_groups=norm_groups, norm_eps=norm_eps),
         )
-        self.act = nn.GELU()
-
     def forward(self, x):
-        return self.act(x + self.net(x))
+        # Keep the residual stream linear to preserve signal propagation.
+        return x + self.net(x)
 
 
 class ResCNNDenseEncoder(nn.Module):
@@ -466,19 +483,19 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
             self.adapter = nn.Sequential(
                 nn.ReflectionPad2d(pad),
                 nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=0),
-                nn.GroupNorm(num_groups=1, num_channels=self.scale_feat_channels),
+                LayerNorm2d(self.scale_feat_channels),
                 nn.GELU(),
                 nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1),
-                nn.GroupNorm(num_groups=1, num_channels=self.scale_feat_channels),
+                LayerNorm2d(self.scale_feat_channels),
                 nn.GELU(),
             )
         else:
             self.adapter = nn.Sequential(
                 nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=pad),
-                nn.GroupNorm(num_groups=1, num_channels=self.scale_feat_channels),
+                LayerNorm2d(self.scale_feat_channels),
                 nn.GELU(),
                 nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1),
-                nn.GroupNorm(num_groups=1, num_channels=self.scale_feat_channels),
+                LayerNorm2d(self.scale_feat_channels),
                 nn.GELU(),
             )
 
@@ -508,6 +525,8 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
             if s > self.num_scales:
                 n_extra = s - self.num_scales
                 if self.cdd_append_last_residual:
+                    # Protect autograd graph from in-place view mutation.
+                    fields = fields.clone()
                     extra = fields[:, self.num_scales:, :, :]
                     fields[:, self.num_scales - 1, :, :] = fields[:, self.num_scales - 1, :, :] + extra.sum(dim=1)
                 fields = fields[:, :self.num_scales, :, :]

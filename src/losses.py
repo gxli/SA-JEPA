@@ -11,6 +11,31 @@ def _offdiag(x: torch.Tensor) -> torch.Tensor:
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 
+def _flatten_vicreg_samples(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    valid: torch.Tensor,
+    spatial_mode: str = "dense",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    b, k, c, p, _ = pred.shape
+    mode = str(spatial_mode).lower()
+    if mode == "pooled":
+        pred_v = pred.mean(dim=(3, 4))  # B,K,C
+        gt_v = gt.mean(dim=(3, 4))  # B,K,C
+        vm = valid.reshape(-1)
+        z1 = pred_v.reshape(-1, c)[vm]
+        z2 = gt_v.reshape(-1, c)[vm]
+        return z1, z2
+    if mode != "dense":
+        raise ValueError(f"Unsupported spatial_mode={spatial_mode}. Use 'dense' or 'pooled'.")
+    pred_v = pred.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
+    gt_v = gt.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
+    vm = valid.unsqueeze(-1).unsqueeze(-1).expand(b, k, p * p, 1).reshape(-1)
+    z1 = pred_v.reshape(-1, c)[vm]
+    z2 = gt_v.reshape(-1, c)[vm]
+    return z1, z2
+
+
 def extract_valid_pooled_embeddings(outputs: dict, key: str = "pred_patches") -> torch.Tensor:
     patches = outputs[key]  # B,K,C,P,P
     valid = outputs["target_valid"]  # B,K
@@ -43,18 +68,72 @@ def sketched_sigreg_loss(z: torch.Tensor, sketch_dim: int = 64) -> torch.Tensor:
     return mean_loss + var_loss
 
 
-def compute_sim_var_cov(outputs: dict) -> tuple[float, float, float]:
+def hard_negative_jepa_contrast_loss(
+    outputs: dict,
+    temperature: float = 0.10,
+    same_scale: bool = True,
+    same_sample: bool = True,
+    min_candidates: int = 2,
+) -> torch.Tensor:
+    pred = outputs["pred_patches"]  # B,K,C,P,P
+    gt = outputs["gt_patches"].detach()  # B,K,C,P,P
+    valid = outputs["target_valid"].bool()  # B,K
+    scales = outputs["target_scales"]  # B,K
+
+    bsz, ksz = valid.shape
+    device = pred.device
+
+    if not bool(valid.any().item()):
+        return pred.sum() * 0.0
+
+    pred_flat = pred.permute(0, 1, 3, 4, 2).reshape(bsz, ksz, -1)
+    gt_flat = gt.permute(0, 1, 3, 4, 2).reshape(bsz, ksz, -1)
+
+    pred_tok = pred_flat[valid]  # N,D
+    gt_tok = gt_flat[valid]  # N,D
+
+    if pred_tok.shape[0] <= 1:
+        return pred.sum() * 0.0
+
+    pred_tok = F.normalize(pred_tok, dim=-1)
+    gt_tok = F.normalize(gt_tok, dim=-1)
+
+    batch_ids = torch.arange(bsz, device=device).view(bsz, 1).expand(bsz, ksz)[valid]
+    scale_vals = scales[valid]
+
+    n = pred_tok.shape[0]
+    logits = (pred_tok @ gt_tok.T) / float(temperature)
+
+    candidate = torch.ones((n, n), dtype=torch.bool, device=device)
+    if same_sample:
+        candidate &= batch_ids[:, None].eq(batch_ids[None, :])
+    if same_scale:
+        candidate &= torch.isclose(
+            scale_vals[:, None],
+            scale_vals[None, :],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+    diag = torch.eye(n, dtype=torch.bool, device=device)
+    candidate |= diag
+
+    row_counts = candidate.sum(dim=1)
+    weak_rows = row_counts < int(min_candidates)
+    if bool(weak_rows.any().item()):
+        candidate[weak_rows, :] = True
+
+    logits = logits.masked_fill(~candidate, -1e4)
+    labels = torch.arange(n, device=device)
+    return F.cross_entropy(logits, labels)
+
+
+def compute_sim_var_cov(outputs: dict, spatial_mode: str = "dense") -> tuple[float, float, float]:
     pred = outputs["pred_patches"].detach()  # B,K,C,P,P
     gt = outputs["gt_patches"].detach()  # B,K,C,P,P
     valid = outputs["target_valid"].detach()  # B,K
 
-    b, k, c, p, _ = pred.shape
-    # Pool spatial dimensions so VICReg acts on patch-level concepts, not adjacent pixels.
-    pred_v = pred.mean(dim=(3, 4))  # B,K,C
-    gt_v = gt.mean(dim=(3, 4))  # B,K,C
-    vm = valid.reshape(-1)
-    z1 = pred_v.reshape(-1, c)[vm]
-    z2 = gt_v.reshape(-1, c)[vm]
+    z1, z2 = _flatten_vicreg_samples(pred, gt, valid, spatial_mode=spatial_mode)
     if z1.numel() == 0 or z2.numel() == 0:
         return 0.0, 0.0, 0.0
 
@@ -79,18 +158,12 @@ def compute_sim_var_cov(outputs: dict) -> tuple[float, float, float]:
     return float(sim.item()), float(var_term.item()), float(cov_term.item())
 
 
-def compute_sim_var_cov_torch(outputs: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def compute_sim_var_cov_torch(outputs: dict, spatial_mode: str = "dense") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     pred = outputs["pred_patches"]  # keep graph
     gt = outputs["gt_patches"]  # keep graph (target branch already no-grad in forward)
     valid = outputs["target_valid"]
 
-    b, k, c, p, _ = pred.shape
-    # Pool spatial dimensions so VICReg acts on patch-level concepts, not adjacent pixels.
-    pred_v = pred.mean(dim=(3, 4))  # B,K,C
-    gt_v = gt.mean(dim=(3, 4))  # B,K,C
-    vm = valid.reshape(-1)
-    z1 = pred_v.reshape(-1, c)[vm]
-    z2 = gt_v.reshape(-1, c)[vm]
+    z1, z2 = _flatten_vicreg_samples(pred, gt, valid, spatial_mode=spatial_mode)
     if z1.numel() == 0 or z2.numel() == 0:
         z = pred.sum() * 0.0
         return z, z, z
@@ -155,5 +228,3 @@ def compute_target_energy_map(outputs: dict, image_size: tuple[int, int]) -> tor
     if energy_lat.shape[-2:] != (h, w):
         energy_lat = F.interpolate(energy_lat, size=(h, w), mode="bilinear", align_corners=False)
     return energy_lat
-
-

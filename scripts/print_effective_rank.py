@@ -16,7 +16,6 @@ def _read_model_inputs(session_dir: str) -> dict:
             "mode": "NA",
             "mask_fraction": "NA",
             "mask_size": "NA",
-            "mask_scaling_gaussian": "NA",
         }
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -26,14 +25,12 @@ def _read_model_inputs(session_dir: str) -> dict:
             "mode": str(m.get("mode", "NA")),
             "mask_fraction": str(m.get("mask_fraction", "NA")),
             "mask_size": str(m.get("mask_size", "NA")),
-            "mask_scaling_gaussian": str(m.get("mask_scaling_gaussian", m.get("dip_sigma_mult", "NA"))),
         }
     except Exception:
         return {
             "mode": "NA",
             "mask_fraction": "NA",
             "mask_size": "NA",
-            "mask_scaling_gaussian": "NA",
         }
 
 
@@ -172,7 +169,6 @@ def main() -> int:
                 inputs["mode"],
                 inputs["mask_fraction"],
                 inputs["mask_size"],
-                inputs["mask_scaling_gaussian"],
                 rank,
                 c_er,
                 p_er,
@@ -194,19 +190,18 @@ def main() -> int:
     print("Effective Rank Summary (sorted by session filename A->Z)")
     session_w = 62
     print(
-        f"{'session':<{session_w}} {'mode':<8} {'mfrac':>6} {'msize':>6} {'gscale':>6} "
+        f"{'session':<{session_w}} {'mode':<8} {'mfrac':>6} {'msize':>6} "
         f"{'erank':>9} {'ctx_er':>9} {'pred_er':>9} {'gt_er':>9} "
         f"{'t1':>7} {'t4':>7} {'t8':>7} {'pred_pr':>9} {'gt_pr':>9} "
         f"{'dead_f':>8} {'dead_n':>6} {'er_ratio':>9} {'pr_ratio':>9}"
     )
-    print("-" * 222)
+    print("-" * 214)
     for row in rows_sorted:
         (
             s,
             mode,
             mf,
             ms,
-            gs,
             rk,
             c_er,
             p_er,
@@ -223,15 +218,15 @@ def main() -> int:
         ) = row
         dead_n_str = p_dead_n if p_dead_n != "" else "-"
         print(
-            f"{_clip(s, session_w)} {mode:<8} {_fmt_float(mf,6,2)} {_fmt_float(ms,6,2)} {_fmt_float(gs,6,2)} "
+            f"{_clip(s, session_w)} {mode:<8} {_fmt_float(mf,6,2)} {_fmt_float(ms,6,2)} "
             f"{_fmt_float(rk,9,4)} {_fmt_float(c_er,9,4)} {_fmt_float(p_er,9,4)} {_fmt_float(g_er,9,4)} "
             f"{_fmt_float(p_t1,7,3)} {_fmt_float(p_t4,7,3)} {_fmt_float(p_t8,7,3)} {_fmt_float(p_pr,9,4)} {_fmt_float(g_pr,9,4)} "
             f"{_fmt_float(p_dead,8,3)} {dead_n_str:>6} {_fmt_float(ratio_er,9,4)} {_fmt_float(ratio_pr,9,4)}"
         )
 
     n_total = len(rows_sorted)
-    n_rank = sum(1 for r in rows_sorted if r[5] != "")
-    print("-" * 222)
+    n_rank = sum(1 for r in rows_sorted if r[4] != "")
+    print("-" * 214)
     print(f"sessions={n_total} with_rank={n_rank} missing_rank={n_total - n_rank}")
     return 0
 

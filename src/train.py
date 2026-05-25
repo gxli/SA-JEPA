@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import time
 from collections import defaultdict
@@ -22,6 +23,7 @@ from src.diagnostics import (
 from src.inference import run_post_training_inference
 from src.losses import (
     compute_jepa_energy,
+    hard_negative_jepa_contrast_loss,
     compute_raw_mse_and_norm_err,
     compute_sim_var_cov,
     compute_sim_var_cov_torch,
@@ -30,6 +32,7 @@ from src.losses import (
     sketched_sigreg_loss,
 )
 from src.models.build_jepa import PyramidGridJEPA
+from src.models.masking import prepare_context_batch
 from src.viz import save_inference_dashboard, save_loss_curve
 
 def _fmt_metric(v: float) -> str:
@@ -58,21 +61,119 @@ def _collate_pad_hw(batch: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(out, dim=0)
 
 
+def _make_masking_collate(model: PyramidGridJEPA):
+    """Return a collate function that runs masking in the DataLoader worker.
+
+    Extracts scalar/lightweight masking params from *model* so the closure
+    does not capture the full nn.Module (avoids expensive pickling).
+    """
+    params = {
+        "sigmas": model.sigmas,
+        "cell_sizes": model.cell_sizes,
+        "mask_fraction": model.mask_fraction,
+        "box_sigma_mult": model.box_sigma_mult,
+        "mask_scale": model.mask_scale,
+        "min_mask_scale": model.min_mask_scale,
+        "spacing_scale": model.spacing_scale,
+        "mask_size": model.mask_size,
+        "full_grid": model.full_grid,
+        "global_shift": model.global_shift,
+        "align_scales": model.align_scales,
+        "constant_mask_box": model.constant_mask_box,
+        "mask_box_size": model.mask_box_size,
+        "blur_mode": model.blur_mode,
+        "cdd_mode": model.cdd_mode,
+        "cdd_constrained": model.cdd_constrained,
+        "cdd_sm_mode": model.cdd_sm_mode,
+        "mask_fill_mode": model.mask_fill_mode,
+        "dip_sigma_mult": model.dip_sigma_mult,
+        "constant_gaussian_sigma": model.constant_gaussian_sigma,
+        "scaleaware_gaussian_ratios": model.scaleaware_gaussian_ratios,
+        "cdd_append_last_residual": model.cdd_append_last_residual,
+        "patch_size": model.patch_size,
+        "need_debug": (model.mode == "pyramid"),
+        "target_invalid_region_skip": model.target_invalid_region_skip,
+        "target_invalid_region_values": model.target_invalid_region_values,
+        "target_sampling_mode": model.target_sampling_mode,
+        "priority_top_percent": model.priority_top_percent,
+        "priority_n_target": model.priority_n_target,
+        "target_dithering_pixels": model.target_dithering_pixels,
+    }
+
+    def collate_fn(batch):
+        x_clean = _collate_pad_hw(batch)
+        result = prepare_context_batch(
+            x_clean=x_clean,
+            sigmas=params["sigmas"],
+            cell_sizes=params["cell_sizes"],
+            mask_fraction=params["mask_fraction"],
+            box_sigma_mult=params["box_sigma_mult"],
+            mask_scale=params["mask_scale"],
+            min_mask_scale=params["min_mask_scale"],
+            spacing_scale=params["spacing_scale"],
+            mask_size=params["mask_size"],
+            full_grid=params["full_grid"],
+            global_shift=params["global_shift"],
+            align_scales=params["align_scales"],
+            constant_mask_box=params["constant_mask_box"],
+            mask_box_size=params["mask_box_size"],
+            blur_mode=params["blur_mode"],
+            cdd_mode=params["cdd_mode"],
+            cdd_constrained=params["cdd_constrained"],
+            cdd_sm_mode=params["cdd_sm_mode"],
+            mask_fill_mode=params["mask_fill_mode"],
+            dip_sigma_mult=params["dip_sigma_mult"],
+            constant_gaussian_sigma=params["constant_gaussian_sigma"],
+            scaleaware_gaussian_ratios=params["scaleaware_gaussian_ratios"],
+            cdd_append_last_residual=params["cdd_append_last_residual"],
+            patch_size=params["patch_size"],
+            return_debug=params["need_debug"],
+            target_invalid_region_skip=params["target_invalid_region_skip"],
+            target_invalid_region_values=params["target_invalid_region_values"],
+            target_sampling_mode=params["target_sampling_mode"],
+            priority_top_percent=params["priority_top_percent"],
+            priority_n_target=params["priority_n_target"],
+            target_dithering_pixels=params["target_dithering_pixels"],
+        )
+        if params["need_debug"]:
+            x_context, tloc, tscale, tvalid, debug_tensors = result
+            return x_clean, x_context, tloc, tscale, tvalid, debug_tensors
+        else:
+            x_context, tloc, tscale, tvalid = result
+            return x_clean, x_context, tloc, tscale, tvalid, {}
+
+    return collate_fn
+
+
 
 @torch.no_grad()
-def evaluate_validation(model: PyramidGridJEPA, val_loader: DataLoader, device: torch.device, max_batches: int | None = None) -> dict:
+def evaluate_validation(
+    model: PyramidGridJEPA,
+    val_loader: DataLoader,
+    device: torch.device,
+    max_batches: int | None = None,
+    vicreg_spatial_mode: str = "dense",
+) -> dict:
     model.eval()
     n = 0
     loss_sum = 0.0
     sim_sum = 0.0
     scale_mse = defaultdict(list)
-    for batch_idx, x_raw in enumerate(val_loader):
+    for batch_idx, batch in enumerate(val_loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
-        x_raw = x_raw.to(device, non_blocking=True)
-        outputs = model(x_raw)
+        x_clean, x_context, tloc, tscale, tvalid, debug = batch
+        x_clean = x_clean.to(device, non_blocking=True)
+        x_context = x_context.to(device, non_blocking=True)
+        tloc = tloc.to(device, non_blocking=True)
+        tscale = tscale.to(device, non_blocking=True)
+        tvalid = tvalid.to(device, non_blocking=True)
+        if debug:
+            debug = {k: v.to(device, non_blocking=True) for k, v in debug.items()}
+        context_data = (x_context, tloc, tscale, tvalid, debug)
+        outputs = model(x_clean, context_data=context_data)
         loss = model.compute_loss(outputs)
-        sim_val, _, _ = compute_sim_var_cov(outputs)
+        sim_val, _, _ = compute_sim_var_cov(outputs, spatial_mode=vicreg_spatial_mode)
         ebs = compute_error_by_scale(outputs)
         for s, v in ebs.items():
             scale_mse[s].append(float(v))
@@ -133,7 +234,8 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
     """Construct a PyramidGridJEPA from config dicts, with backward-compatible param aliases."""
     blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
     mask_scaling_box = float(model_cfg.get("mask_scaling_box", model_cfg.get("mask_scale", 1.0)))
-    mask_scaling_gaussian = float(model_cfg.get("mask_scaling_gaussian", model_cfg.get("dip_sigma_mult", 1.0)))
+    # gscale is deprecated: gaussian width is now controlled by mask_fraction only.
+    mask_scaling_gaussian = 1.0
     mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", model_cfg.get("spacing_scale", 1.5)))
     mask_size = float(model_cfg.get("mask_size", 0.0))
     _, _, model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
@@ -198,6 +300,10 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         opnet_cache_detach=bool(model_cfg.get("opnet_cache_detach", True)),
         target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", False)),
         target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
+        target_sampling_mode=str(model_cfg.get("target_sampling_mode", "grid")),
+        priority_top_percent=float(model_cfg.get("priority_top_percent", 5.0)),
+        priority_n_target=int(model_cfg.get("priority_n_target", 20)),
+        target_dithering_pixels=int(model_cfg.get("target_dithering_pixels", 6)),
     ).to(device)
 
 
@@ -341,10 +447,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         d4_augment=bool(data_cfg.get("d4_augment", False)),
         cache_cdd=bool(data_cfg.get("cache_cdd", True)),
         cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
-        cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
         cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
         precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
-        cache_cdd_in_ram_all=bool(data_cfg.get("cache_cdd_in_ram_all", False)),
     )
     val_fraction = float(train_cfg.get("val_fraction", 0.1))
     val_fraction = min(max(val_fraction, 0.0), 0.95)
@@ -385,10 +489,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             d4_augment=False,
             cache_cdd=bool(data_cfg.get("cache_cdd", True)),
             cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
-            cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
             cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
             precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
-            cache_cdd_in_ram_all=bool(data_cfg.get("cache_cdd_in_ram_all", False)),
         )
         val_dataset.sample_index = val_idx
     print(
@@ -412,6 +514,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         f"pin_memory={pin_memory} persistent_workers={persistent_workers}"
     )
 
+    masking_collate = _make_masking_collate(model)
     dataloader = DataLoader(
         train_dataset,
         batch_size=train_cfg.get("batch_size", 32),
@@ -419,7 +522,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
-        collate_fn=_collate_pad_hw,
+        collate_fn=masking_collate,
     )
     val_loader = None
     if val_dataset is not None:
@@ -430,7 +533,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
-            collate_fn=_collate_pad_hw,
+            collate_fn=masking_collate,
         )
     # Inference must use canonical orientation (no D4 augmentation).
     inference_dataset = JEPADataset(
@@ -455,10 +558,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         d4_augment=False,
         cache_cdd=bool(data_cfg.get("cache_cdd", True)),
         cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
-        cdd_mem_cache_max=int(data_cfg.get("cdd_mem_cache_max", 64)),
         cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
         precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
-        cache_cdd_in_ram_all=bool(data_cfg.get("cache_cdd_in_ram_all", False)),
     )
     inference_dataset.sample_index = list(train_idx)
     inference_dataset.num_samples = train_dataset.num_samples
@@ -510,12 +611,24 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     viz_crop_border_px = train_cfg.get("viz_crop_border_px")
     umap_cfg = dict(train_cfg.get("umap", {}))
     compute_effective_rank = bool(train_cfg.get("compute_effective_rank", False))
+    inference_visit_batches = int(train_cfg.get("inference_visit_batches", 32))
     print(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
     jepa_loss_weight = float(train_cfg.get("jepa_loss_weight", 100.0))
     vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", 1.0))
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", 0.1))
     sigreg_weight = float(train_cfg.get("sigreg_weight", 0.0))
     sigreg_sketch_dim = int(train_cfg.get("sigreg_sketch_dim", 64))
+    sharp_contrast_weight = float(train_cfg.get("sharp_contrast_weight", 0.0))
+    sharp_contrast_temperature = float(train_cfg.get("sharp_contrast_temperature", 0.10))
+    sharp_contrast_same_scale = bool(train_cfg.get("sharp_contrast_same_scale", True))
+    sharp_contrast_same_sample = bool(train_cfg.get("sharp_contrast_same_sample", True))
+    vicreg_spatial_mode = str(train_cfg.get("vicreg_spatial_mode", "dense")).lower()
+    if vicreg_spatial_mode not in ("dense", "pooled"):
+        raise ValueError(
+            f"Unsupported train.vicreg_spatial_mode={vicreg_spatial_mode}. Use 'dense' or 'pooled'."
+        )
+    ema_base = float(train_cfg.get("ema_momentum_base", model.ema_momentum))
+    ema_final = float(train_cfg.get("ema_momentum_final", 1.0))
 
     metrics_path = os.path.join(session_dir, "metrics.csv")
     if not os.path.exists(metrics_path):
@@ -525,9 +638,20 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 [
                     "epoch",
                     "batch",
+                    "global_step",
                     "total_loss",
                     "loss_jepa",
                     "loss_pixel",
+                    "loss_sigreg",
+                    "loss_sharp_contrast",
+                    "loss_var",
+                    "loss_cov",
+                    "weighted_jepa",
+                    "weighted_sigreg",
+                    "weighted_sharp_contrast",
+                    "weighted_var",
+                    "weighted_cov",
+                    "ema_momentum",
                     "sim",
                     "var",
                     "cov",
@@ -566,24 +690,43 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         epoch_var = 0.0
         epoch_cov = 0.0
         epoch_sigreg = 0.0
+        epoch_sharp = 0.0
         epoch_valid_frac = 0.0
         epoch_batches = 0
         metrics_rows = []
         masked_scale_rows = []
         visited_rows = []
-        for batch_idx, x_raw in enumerate(dataloader):
-            x_raw = x_raw.to(device, non_blocking=True)
+        for batch_idx, batch in enumerate(dataloader):
+            x_clean, x_context, tloc, tscale, tvalid, debug = batch
+            x_clean = x_clean.to(device, non_blocking=True)
+            x_context = x_context.to(device, non_blocking=True)
+            tloc = tloc.to(device, non_blocking=True)
+            tscale = tscale.to(device, non_blocking=True)
+            tvalid = tvalid.to(device, non_blocking=True)
+            if debug:
+                debug = {k: v.to(device, non_blocking=True) for k, v in debug.items()}
+            context_data = (x_context, tloc, tscale, tvalid, debug)
 
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(device_type=device.type, enabled=use_amp):
-                outputs = model(x_raw)
+                outputs = model(x_clean, context_data=context_data)
                 loss_jepa = model.compute_loss(outputs)
-                _, var_term_t, cov_term_t = compute_sim_var_cov_torch(outputs)
+                _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
+                    outputs,
+                    spatial_mode=vicreg_spatial_mode,
+                )
                 z_pred = extract_valid_pooled_embeddings(outputs, key="pred_patches")
                 loss_sigreg = sketched_sigreg_loss(z_pred, sketch_dim=sigreg_sketch_dim)
+                loss_sharp = hard_negative_jepa_contrast_loss(
+                    outputs,
+                    temperature=sharp_contrast_temperature,
+                    same_scale=sharp_contrast_same_scale,
+                    same_sample=sharp_contrast_same_sample,
+                )
                 total_loss = (
                     (jepa_loss_weight * loss_jepa)
+                    + (sharp_contrast_weight * loss_sharp)
                     + (vicreg_var_weight * var_term_t)
                     + (vicreg_cov_weight * cov_term_t)
                     + (sigreg_weight * loss_sigreg)
@@ -593,9 +736,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
-
+            current_step = epoch * max(1, len(dataloader)) + batch_idx
+            total_steps = max(1, int(epochs) * max(1, len(dataloader)))
+            progress = min(1.0, max(0.0, float(current_step) / float(total_steps)))
+            # Cosine EMA schedule from base momentum toward final momentum.
+            new_momentum = float(
+                ema_final - 0.5 * (ema_final - ema_base) * (1.0 + math.cos(math.pi * progress))
+            )
+            model.ema_momentum = new_momentum
             model.update_target_encoder()
-            sim_val, var_val, cov_val = compute_sim_var_cov(outputs)
+            sim_val, var_val, cov_val = compute_sim_var_cov(
+                outputs,
+                spatial_mode=vicreg_spatial_mode,
+            )
             raw_mse_val, norm_err_val = compute_raw_mse_and_norm_err(outputs)
             valid_frac = float(outputs["target_valid"].float().mean().item())
 
@@ -604,9 +757,20 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 [
                     epoch + 1,
                     batch_idx,
+                    epoch * max(1, len(dataloader)) + batch_idx,
                     float(total_loss.item()),
                     float(loss_jepa.item()),
                     float(loss_pixel_val),
+                    float(loss_sigreg.item()),
+                    float(loss_sharp.item()),
+                    float(var_term_t.item()),
+                    float(cov_term_t.item()),
+                    float((jepa_loss_weight * loss_jepa).item()),
+                    float((sigreg_weight * loss_sigreg).item()),
+                    float((sharp_contrast_weight * loss_sharp).item()),
+                    float((vicreg_var_weight * var_term_t).item()),
+                    float((vicreg_cov_weight * cov_term_t).item()),
+                    float(new_momentum),
                     float(sim_val),
                     float(var_val),
                     float(cov_val),
@@ -668,6 +832,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     f"[{config_name}] Epoch {epoch + 1}/{epochs} Batch {batch_idx}/{len(dataloader)} "
                     f"total={_fmt_metric(total_loss.item())} jepa={_fmt_metric(loss_jepa.item())} pixel={_fmt_metric(loss_pixel_val)} "
                     f"sigreg={_fmt_metric(loss_sigreg.item())} "
+                    f"sharp={_fmt_metric(loss_sharp.item())} "
                     f"sim={_fmt_metric(sim_val)} var={_fmt_metric(var_val)} cov={_fmt_metric(cov_val)} "
                     f"raw_mse={_fmt_metric(raw_mse_val)} norm_err={_fmt_metric(norm_err_val)} "
                     f"valid_frac={_fmt_metric(valid_frac)}"
@@ -679,6 +844,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_var += float(var_val)
             epoch_cov += float(cov_val)
             epoch_sigreg += float(loss_sigreg.item())
+            epoch_sharp += float(loss_sharp.item())
             epoch_valid_frac += float(valid_frac)
             epoch_batches += 1
 
@@ -701,6 +867,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"avg_jepa={_fmt_metric(epoch_jepa/epoch_batches)} "
                 f"avg_pixel={_fmt_metric(epoch_pixel/epoch_batches)} "
                 f"avg_sigreg={_fmt_metric(epoch_sigreg/epoch_batches)} "
+                f"avg_sharp={_fmt_metric(epoch_sharp/epoch_batches)} "
                 f"avg_sim={_fmt_metric(epoch_sim/epoch_batches)} "
                 f"avg_var={_fmt_metric(epoch_var/epoch_batches)} "
                 f"avg_cov={_fmt_metric(epoch_cov/epoch_batches)} "
@@ -715,6 +882,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 val_loader=val_loader,
                 device=device,
                 max_batches=train_cfg.get("val_max_batches"),
+                vicreg_spatial_mode=vicreg_spatial_mode,
             )
             val_loss = float(v["val_loss"])
             val_sim = float(v["val_sim"])
@@ -766,6 +934,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         viz_crop_border_px=viz_crop_border_px,
         compute_jepa_energy_fn=compute_jepa_energy,
         compute_target_energy_map_fn=compute_target_energy_map,
+        inference_visit_batches=inference_visit_batches,
+        training_d4_augment=bool(data_cfg.get("d4_augment", False)),
     )
     # Keep dashboard artifacts in sync with inference outputs for all runs.
     # This writes session/results/* embedding files required by session_to_dash.py.

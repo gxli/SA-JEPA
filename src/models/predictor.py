@@ -17,6 +17,9 @@ class FullResPredictor(nn.Module):
             nn.GELU(),
             nn.Conv2d(hidden, channels, kernel_size=1),
         )
+        nn.init.zeros_(self.net[-1].weight)
+        if self.net[-1].bias is not None:
+            nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, x):
-        return self.net(x)
+        return x + self.net(x)

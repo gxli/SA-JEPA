@@ -20,6 +20,56 @@ fi
 
 for cfg in "${configs[@]}"; do
   printf "\nRunning config: %s\n" "${cfg}"
+  config_name="$(basename "${cfg}")"
+  config_name="${config_name%.json}"
+  session_dir="${SESSIONS_DIR}/${config_name}"
+  model_ckpt="${session_dir}/model_last.pt"
+  inference_pt="${session_dir}/inference_outputs.pt"
+  epoch_summary_csv="${session_dir}/epoch_summary.csv"
+
+  # Skip as early as possible, but only when training actually completed.
+  # Require:
+  #  1) model checkpoint exists
+  #  2) inference outputs exist
+  #  3) epoch_summary indicates max(epoch) >= configured train.epochs
+  if [[ "${FORCE_REINFERENCE}" != "1" && -f "${model_ckpt}" && -f "${inference_pt}" && -f "${epoch_summary_csv}" ]]; then
+    skip_ok="$(
+      python3 - "${cfg}" "${epoch_summary_csv}" <<'PY'
+import csv, json, sys
+cfg_path, epoch_csv = sys.argv[1], sys.argv[2]
+try:
+    cfg = json.load(open(cfg_path, "r", encoding="utf-8"))
+    target_epochs = int(cfg.get("train", {}).get("epochs", 0))
+except Exception:
+    print("0")
+    raise SystemExit(0)
+if target_epochs <= 0:
+    print("0")
+    raise SystemExit(0)
+max_epoch = 0
+try:
+    with open(epoch_csv, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            try:
+                e = int(float(row.get("epoch", "0")))
+            except Exception:
+                continue
+            if e > max_epoch:
+                max_epoch = e
+except Exception:
+    print("0")
+    raise SystemExit(0)
+print("1" if max_epoch >= target_epochs else "0")
+PY
+    )"
+    if [[ "${skip_ok}" == "1" ]]; then
+      echo "skip_complete_session config=${config_name} reason=epochs_and_inference_complete"
+      continue
+    else
+      echo "resume_session config=${config_name} reason=incomplete_epochs_or_missing_summary"
+    fi
+  fi
+
   # Use a stable override path so config_name (derived from basename) stays
   # identical to the original config and sessions resume correctly.
   tmp_cfg="${OVERRIDE_DIR}/$(basename "${cfg}")"

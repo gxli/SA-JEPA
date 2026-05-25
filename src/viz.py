@@ -540,8 +540,11 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     latent_html_path = _save_latent_overview_html(session_dir, pca0_3d, umap0_3d, pred_map.shape[-2], pred_map.shape[-1])
 
     # Historical target-location heatmap loaded from session CSV log.
-    hist_vis = np.zeros_like(orig, dtype=np.float32)
-    hist_path = os.path.join(session_dir, "visited_target_locations.csv")
+    # Keep raw integer-like counts and expose a log-scaled NaN-masked view.
+    hist_counts = np.zeros_like(orig, dtype=np.float32)
+    hist_path = os.path.join(session_dir, "visited_target_locations_canonical.csv")
+    if not os.path.exists(hist_path):
+        hist_path = os.path.join(session_dir, "visited_target_locations.csv")
     if os.path.exists(hist_path):
         try:
             with open(hist_path, "r", encoding="utf-8") as f:
@@ -549,18 +552,27 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
                 for row in reader:
                     cy = int(float(row["y"]))
                     cx = int(float(row["x"]))
-                    if 0 <= cy < hist_vis.shape[0] and 0 <= cx < hist_vis.shape[1]:
-                        hist_vis[cy, cx] += 1.0
+                    if 0 <= cy < hist_counts.shape[0] and 0 <= cx < hist_counts.shape[1]:
+                        hist_counts[cy, cx] += 1.0
         except Exception as e:
             print(f"[warning] failed to read {hist_path}: {type(e).__name__}: {e}")
-    if float(hist_vis.max()) > 0.0:
-        hist_vis = hist_vis / float(hist_vis.max())
+    # NaN where never visited so "holes" stay explicit.
+    hist_log = np.full_like(hist_counts, np.nan, dtype=np.float32)
+    visited = hist_counts > 0.0
+    if np.any(visited):
+        hist_log[visited] = np.log1p(hist_counts[visited]).astype(np.float32)
+        vmax = float(np.nanmax(hist_log))
+        if vmax > 0.0:
+            hist_log[visited] = hist_log[visited] / vmax
     np.save(os.path.join(results_dir, "target_locations_vis.npy"), target_vis.astype(np.float32))
-    np.save(os.path.join(results_dir, "target_locations_hist_vis.npy"), hist_vis.astype(np.float32))
+    np.save(os.path.join(results_dir, "target_locations_hist_vis.npy"), hist_log.astype(np.float32))
+    np.save(os.path.join(results_dir, "target_locations_hist_counts.npy"), hist_counts.astype(np.float32))
     target_vis_img = os.path.join(results_dir, "target_locations_vis.png")
     hist_vis_img = os.path.join(results_dir, "target_locations_hist_vis.png")
+    hist_cmap = plt.get_cmap("viridis").copy()
+    hist_cmap.set_bad(color=(0.0, 0.0, 0.0, 1.0))
     plt.imsave(target_vis_img, target_vis, cmap="magma")
-    plt.imsave(hist_vis_img, hist_vis, cmap="viridis")
+    plt.imsave(hist_vis_img, hist_log, cmap=hist_cmap)
 
     # Build a single assembled dashboard entrypoint for this session.
     dashboard_path = os.path.join(session_dir, "dashboard.html")
@@ -626,7 +638,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     <h2>Target Sampling Diagnostics</h2>
     <div class="grid">
       <div class="card"><p>Current Sample Target Locations</p><img src="{target_vis_rel}" alt="target_locations_vis" /></div>
-      <div class="card"><p>Historical Target Visit Heatmap</p><img src="{hist_vis_rel}" alt="target_locations_hist_vis" /></div>
+      <div class="card"><p>Historical Target Visit Heatmap (log1p, unvisited=NaN/black)</p><img src="{hist_vis_rel}" alt="target_locations_hist_vis" /></div>
     </div>
   </div>
   <div class="section">
@@ -693,5 +705,3 @@ def save_loss_curve(session_dir: str):
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     return out_path
-
-

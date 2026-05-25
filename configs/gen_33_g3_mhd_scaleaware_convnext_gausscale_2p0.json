@@ -18,7 +18,7 @@
     "cdd_mode": "log",
     "cdd_constrained": true,
     "cdd_sm_mode": "reflect",
-    "cube_slice_strategy": "auto",
+    "cube_slice_strategy": "center",
     "cube_slice_axis": 0,
     "cube_slice_index": 0,
     "random_roll_max": 0,
@@ -53,7 +53,7 @@
     "spacing_scale": 2.0,
     "mask_size": 0.0,
     "full_grid": true,
-    "global_shift": true,
+    "global_shift": false,
     "align_scales": true,
     "constant_mask_box": false,
     "mask_box_size": 16,
@@ -61,7 +61,7 @@
     "cdd_constrained": true,
     "cdd_sm_mode": "reflect",
     "mask_fill_mode": "gaussian_dip",
-    "dip_sigma_mult": 0.5,
+    "dip_sigma_mult": 2.0,
     "scaleaware_gaussian_ratios": [
       0.25,
       0.5,
@@ -74,10 +74,14 @@
     "ema_momentum": 0.996,
     "normalize_loss": false,
     "predictor_layernorm": true,
-    "mask_scaling_gaussian": 0.5,
+    "mask_scaling_gaussian": 2.0,
     "mask_scaling_box": 1.0,
     "mask_spacing_scaling": 2.0,
-    "target_invalid_region_skip": false
+    "target_invalid_region_skip": false,
+    "target_sampling_mode": "priority_sampling",
+    "priority_top_percent": 15.0,
+    "priority_n_target": 20,
+    "target_dithering_pixels": 6
   },
   "train": {
     "batch_size": 8,
@@ -86,10 +90,10 @@
     "weight_decay": 1e-05,
     "num_workers": 0,
     "log_interval": 1,
-    "jepa_loss_weight": 1,
-    "vicreg_var_weight": 0,
-    "vicreg_cov_weight": 0,
-    "sigreg_weight": 0,
+    "jepa_loss_weight": 100.0,
+    "vicreg_var_weight": 0.0,
+    "vicreg_cov_weight": 0.0,
+    "sigreg_weight": 1.0,
     "sigreg_sketch_dim": 64,
     "force_recompute_inference": true,
     "umap": {
@@ -101,6 +105,9 @@
       "standardize": false
     },
     "viz_crop_border": true,
-    "compute_effective_rank": true
+    "compute_effective_rank": true,
+    "vicreg_spatial_mode": "dense",
+    "ema_momentum_base": 0.996,
+    "ema_momentum_final": 1.0
   }
 }

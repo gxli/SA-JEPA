@@ -4,8 +4,6 @@ import glob
 import hashlib
 import os
 import tempfile
-from collections import OrderedDict
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -35,10 +33,8 @@ class JEPADataset(Dataset):
         d4_augment: bool = False,
         cache_cdd: bool = True,
         cdd_cache_dir: str | None = None,
-        cdd_mem_cache_max: int = 64,
         cache_random_slices: bool = False,
         precompute_cdd_cache_all_slices: bool = False,
-        cache_cdd_in_ram_all: bool = False,
     ):
         self.cube_slice_strategy = str(cube_slice_strategy).lower()
         allowed_strategies = {"auto", "random", "center", "fixed", "all"}
@@ -65,12 +61,8 @@ class JEPADataset(Dataset):
         self.d4_augment = bool(d4_augment)
         self.cache_cdd = bool(cache_cdd)
         self.cdd_cache_dir = cdd_cache_dir
-        self.cdd_mem_cache_max = int(cdd_mem_cache_max)
         self.cache_random_slices = bool(cache_random_slices)
         self.precompute_cdd_cache_all_slices = bool(precompute_cdd_cache_all_slices)
-        self.cache_cdd_in_ram_all = bool(cache_cdd_in_ram_all)
-        self._sample_cache = OrderedDict()
-        self._ram_cache = {}
         if self.cache_cdd and self.cdd_cache_dir:
             os.makedirs(self.cdd_cache_dir, exist_ok=True)
         if self.precompute_cdd_cache_all_slices and not self.cache_random_slices:
@@ -91,8 +83,6 @@ class JEPADataset(Dataset):
             self.num_samples = len(self.sample_index)
         if self.precompute_cdd_cache_all_slices:
             self._precompute_cdd_cache_all_slices()
-        if self.cache_cdd_in_ram_all:
-            self._build_ram_cdd_cache()
 
     def _preprocess_arr2d(self, arr2d: np.ndarray) -> np.ndarray:
         arr = np.asarray(arr2d, dtype=np.float32)
@@ -102,32 +92,6 @@ class JEPADataset(Dataset):
             arr = self._apply_cdd(arr)
             arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         return arr.astype(np.float32, copy=False)
-
-    def _build_ram_cdd_cache(self) -> None:
-        if not self.apply_cdd:
-            print("[JEPADataset] cache_cdd_in_ram_all=True but apply_cdd=False; RAM CDD cache skipped.")
-            return
-        n_cached = 0
-        axis = self.cube_slice_axis % 3
-        for path in self.npy_files:
-            arr_mm = np.load(path, mmap_mode="r")
-            if arr_mm.ndim == 2:
-                key = (os.path.abspath(path), None)
-                if key not in self._ram_cache:
-                    self._ram_cache[key] = self._preprocess_arr2d(arr_mm)
-                    n_cached += 1
-                continue
-            if arr_mm.ndim != 3:
-                continue
-            depth = int(arr_mm.shape[axis])
-            for sidx in range(depth):
-                key = (os.path.abspath(path), int(sidx))
-                if key in self._ram_cache:
-                    continue
-                arr2d, _ = self._extract_2d_from_array(arr_mm, forced_slice_idx=sidx)
-                self._ram_cache[key] = self._preprocess_arr2d(arr2d)
-                n_cached += 1
-        print(f"[JEPADataset] RAM CDD cache ready entries={len(self._ram_cache)} newly_cached={n_cached}")
 
     def _build_sample_index(self):
         index = []
@@ -241,36 +205,24 @@ class JEPADataset(Dataset):
         )
 
     def _load_sample(self, path: str, forced_slice_idx=None) -> torch.Tensor:
-        arr_mm = np.load(path, mmap_mode="r")
+        with open(path, "rb") as f:
+            arr_mm = np.load(f)
         arr2d, sidx = self._extract_2d_from_array(arr_mm, forced_slice_idx=forced_slice_idx)
-        cache_key = (os.path.abspath(path), sidx)
-        if self.cache_cdd_in_ram_all and cache_key in self._ram_cache:
-            arr = self._ram_cache[cache_key]
-        else:
-            arr = None
 
         is_3d_random_slice = (arr_mm.ndim == 3) and (self.cube_slice_strategy in ("random", "auto"))
-        use_cache = self.apply_cdd and self.cache_cdd and (self.cache_random_slices or not is_3d_random_slice)
-        if arr is None and use_cache and cache_key in self._sample_cache:
-            arr = self._sample_cache.pop(cache_key).copy()
-            # LRU touch.
-            self._sample_cache[cache_key] = arr.copy()
-        elif arr is None and use_cache and self.cdd_cache_dir:
-            cpath = self._cache_file_path(path, sidx)
-            if os.path.exists(cpath):
-                arr = np.load(cpath).astype(np.float32, copy=False)
+        arr = None
+        if self.apply_cdd and self.cache_cdd and (self.cache_random_slices or not is_3d_random_slice):
+            if self.cdd_cache_dir:
+                cpath = self._cache_file_path(path, sidx)
+                if os.path.exists(cpath):
+                    arr = np.load(cpath).astype(np.float32, copy=False)
 
         if arr is None:
             arr = self._preprocess_arr2d(arr2d)
-            if use_cache and self.apply_cdd:
-                self._sample_cache[cache_key] = arr.astype(np.float32, copy=True)
-                # Enforce LRU bound to avoid unbounded memory growth.
-                while self.cdd_mem_cache_max >= 0 and len(self._sample_cache) > self.cdd_mem_cache_max:
-                    self._sample_cache.popitem(last=False)
-                if self.cdd_cache_dir:
-                    cpath = self._cache_file_path(path, sidx)
-                    if not os.path.exists(cpath):
-                        self._atomic_save_npy(cpath, arr.astype(np.float32, copy=False))
+            if self.apply_cdd and self.cache_cdd and self.cdd_cache_dir and (self.cache_random_slices or not is_3d_random_slice):
+                cpath = self._cache_file_path(path, sidx)
+                if not os.path.exists(cpath):
+                    self._atomic_save_npy(cpath, arr.astype(np.float32, copy=False))
 
         if self.log_transform:
             eps = self._choose_log_eps(arr, self.log_eps)
