@@ -26,13 +26,26 @@ def _mask_invalid_targets_from_input(
     half_hi = int(patch_size) - half_lo
     invalid_specs = tuple(invalid_values) if invalid_values is not None else tuple()
     updated = valid.clone()
+    # Avoid per-target GPU sync from repeated .item() calls.
+    loc_cpu = loc.detach().to("cpu").numpy()
+    valid_cpu = valid.detach().to("cpu").numpy()
+    numeric_specs = []
+    check_nan = False
+    for spec in invalid_specs:
+        if isinstance(spec, str) and spec.lower() == "nan":
+            check_nan = True
+        else:
+            try:
+                numeric_specs.append(float(spec))
+            except (TypeError, ValueError):
+                continue
     n_masked = 0
     for bi in range(bsz):
         for ki in range(ksz):
-            if not bool(updated[bi, ki]):
+            if not bool(valid_cpu[bi, ki]):
                 continue
-            cy = int(loc[bi, ki, 0].item())
-            cx = int(loc[bi, ki, 1].item())
+            cy = int(loc_cpu[bi, ki, 0])
+            cx = int(loc_cpu[bi, ki, 1])
             y0 = cy - half_lo
             y1 = cy + half_hi
             x0 = cx - half_lo
@@ -43,14 +56,10 @@ def _mask_invalid_targets_from_input(
                 continue
             patch = x_input[bi, 0, y0:y1, x0:x1]
             invalid_mask = torch.zeros_like(patch, dtype=torch.bool)
-            for spec in invalid_specs:
-                if isinstance(spec, str) and spec.lower() == "nan":
-                    invalid_mask |= ~torch.isfinite(patch)
-                else:
-                    try:
-                        invalid_mask |= torch.isclose(patch, torch.tensor(float(spec), device=patch.device, dtype=patch.dtype))
-                    except (TypeError, ValueError):
-                        continue
+            if check_nan:
+                invalid_mask |= ~torch.isfinite(patch)
+            for spec in numeric_specs:
+                invalid_mask |= torch.isclose(patch, torch.tensor(spec, device=patch.device, dtype=patch.dtype))
             if bool(torch.all(invalid_mask).item()):
                 updated[bi, ki] = False
                 n_masked += 1
@@ -71,17 +80,21 @@ def _accumulate_point_energy(
     valid = outputs["target_valid"]
     h, w = int(image_size[0]), int(image_size[1])
     err = (pred - gt).pow(2).mean(dim=(2, 3, 4))  # B,K
+    # Avoid per-target GPU sync from repeated .item() calls.
+    loc_cpu = loc.detach().to("cpu").numpy()
+    valid_cpu = valid.detach().to("cpu").numpy()
+    err_cpu = err.detach().to("cpu").numpy()
     total = 0.0
     n_valid = 0
     bsz, ksz = err.shape
     for bi in range(bsz):
         for ki in range(ksz):
-            if not bool(valid[bi, ki]):
+            if not bool(valid_cpu[bi, ki]):
                 continue
-            cy = int(loc[bi, ki, 0].item())
-            cx = int(loc[bi, ki, 1].item())
+            cy = int(loc_cpu[bi, ki, 0])
+            cx = int(loc_cpu[bi, ki, 1])
             if 0 <= cy < h and 0 <= cx < w:
-                v = float(err[bi, ki].item())
+                v = float(err_cpu[bi, ki])
                 energy_sum[bi, 0, cy, cx] += v
                 count_map[bi, 0, cy, cx] += 1.0
                 total += v
@@ -156,16 +169,13 @@ def run_post_training_inference(
         x_raw = x_raw.to(next(model.parameters()).device)
         # Deterministic lattice sweep is only meaningful when mask inference is enabled.
         largest_sigma = float(max(getattr(model, "sigmas", (16.0,))))
-        min_mask_scale = float(getattr(model, "min_mask_scale", 0.0))
-        eff_largest_sigma = max(largest_sigma, min_mask_scale)
+        mask_scale = float(getattr(model, "mask_scale", 1.0))
+        mask_box_size = int(getattr(model, "mask_box_size", 16))
+        max_box = round(largest_sigma * mask_scale + mask_box_size)
         spacing = int(
             max(
                 1,
-                round(
-                    eff_largest_sigma
-                    * float(getattr(model, "mask_scale", 1.0))
-                    * float(getattr(model, "spacing_scale", 1.5))
-                ),
+                round(float(max_box) * float(getattr(model, "spacing_scale", 1.5))),
             )
         )
         if bool(mask_inference):
@@ -396,4 +406,55 @@ def run_post_training_inference(
         f"[{config_name}] post_training_artifacts_saved session_dir={session_dir} "
         f"(run scripts/session_to_dash.py to generate plots/dashboards)"
     )
+    return session_dir
+
+
+def run_post_training_inference_3d(
+    *,
+    model,
+    dataloader,
+    session_dir: str,
+    config_name: str,
+    force_recompute_inference: bool,
+) -> str:
+    inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
+    if (not force_recompute_inference) and os.path.exists(inference_outputs_path):
+        return session_dir
+
+    model.eval()
+    with torch.no_grad():
+        x = next(iter(dataloader))
+        x = x.to(next(model.parameters()).device)
+        outputs = model(x)
+
+    pred_map = outputs["pred_map"][:1].detach().cpu()
+    gt_map = outputs["gt_map"][:1].detach().cpu()
+    context_map = outputs["context_map"][:1].detach().cpu()
+    x_clean = outputs["x_clean"][:1].detach().cpu()
+
+    mid = int(pred_map.shape[2] // 2)
+    energy_map_mid = (pred_map[:, :, mid] - gt_map[:, :, mid]).pow(2).mean(dim=1, keepdim=True)
+
+    inference_outputs = {
+        "x_clean": x_clean,
+        "x_context": x_clean,
+        "pred_map": pred_map,
+        "gt_map": gt_map,
+        "context_map": context_map,
+        "target_locations": outputs["target_locations"][:1].detach().cpu(),
+        "target_valid": outputs["target_valid"][:1].detach().cpu(),
+        "target_scales": outputs.get("target_scales", torch.ones_like(outputs["target_valid"], dtype=x_clean.dtype))[:1].detach().cpu(),
+        "pred_patches": outputs["pred_patches"][:1].detach().cpu(),
+        "gt_patches": outputs["gt_patches"][:1].detach().cpu(),
+        "target_energy_map": energy_map_mid,
+        "middle_slice_index": torch.tensor(mid, dtype=torch.int64),
+    }
+    torch.save(inference_outputs, inference_outputs_path)
+
+    np.save(os.path.join(session_dir, "network_input_clean_3d.npy"), x_clean.numpy())
+    np.save(os.path.join(session_dir, "pred_map_3d.npy"), pred_map.numpy())
+    np.save(os.path.join(session_dir, "gt_map_3d.npy"), gt_map.numpy())
+    np.save(os.path.join(session_dir, "context_map_3d.npy"), context_map.numpy())
+    np.save(os.path.join(session_dir, "target_energy_map_mid_slice.npy"), energy_map_mid.numpy())
+    print(f"[{config_name}] saved 3D inference artifacts")
     return session_dir

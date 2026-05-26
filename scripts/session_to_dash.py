@@ -4,6 +4,8 @@ import argparse
 import csv
 import os
 import shutil
+import subprocess
+import sys
 from typing import Any
 
 import numpy as np
@@ -12,6 +14,8 @@ import torch
 
 
 DASHBOARD_VERSION = "scatter3d-v1"
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DASH_DATA_REQUIRED = {
     "orig",
@@ -39,6 +43,67 @@ DASH_DATA_REQUIRED = {
     "gt_umap_rgb_flat",
     "pyramid_mask_cube",
 }
+
+
+def _find_session_config(session_dir: str) -> str | None:
+    name = os.path.basename(os.path.abspath(session_dir))
+    candidates = [
+        os.path.join(session_dir, "config_used.json"),
+        os.path.join(ROOT_DIR, "configs", f"{name}.json"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return os.path.abspath(path)
+    return None
+
+
+def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
+    cfg_path = _find_session_config(session_dir)
+    if cfg_path is None:
+        print(f"dashboard_masking_demo_skip={session_dir} reason=no_config")
+        return None
+
+    out_html = os.path.join(session_dir, "masking_demo_plotly_dashboard.html")
+    script_path = os.path.join(SCRIPT_DIR, "generate_masking_diagnostics_plotly.py")
+    cmd = [
+        sys.executable,
+        script_path,
+        "--config",
+        cfg_path,
+        "--sample-index",
+        "0",
+        "--crop",
+        "16",
+        "--binarize-mask",
+        "--cols",
+        "3",
+        "--panel-px",
+        "220",
+        "--out",
+        out_html,
+    ]
+    env = os.environ.copy()
+    env.setdefault("MPLCONFIGDIR", "/private/tmp/mpl-cache")
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=ROOT_DIR,
+            env=env,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    except Exception as e:
+        print(f"dashboard_masking_demo_failed={session_dir} reason={type(e).__name__}: {e}")
+        return None
+
+    for line in proc.stdout.splitlines():
+        if line.strip():
+            print(f"dashboard_masking_demo={line.strip()}")
+    for line in proc.stderr.splitlines():
+        if line.strip():
+            print(f"dashboard_masking_demo_stderr={line.strip()}")
+    return out_html
 
 
 def _verbose_artifact_report(session_dir: str) -> list[str]:
@@ -481,6 +546,17 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         print(f"dash_data_stale_recompute={npz_path} missing={','.join(missing)}")
         compute_dash_data(session_dir, overwrite=True)
         data = np.load(npz_path)
+    model_mode = "unknown"
+    cfg_used_path = os.path.join(session_dir, "config_used.json")
+    if os.path.exists(cfg_used_path):
+        try:
+            import json
+
+            with open(cfg_used_path, "r", encoding="utf-8") as f:
+                cfg_used = json.load(f)
+            model_mode = str(cfg_used.get("model", {}).get("mode", "unknown")).lower()
+        except Exception:
+            model_mode = "unknown"
 
     def heat(
         title: str,
@@ -784,9 +860,16 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 ),
                 "group": "visit",
             },
-            {"title": "Pyramid Mask 3D (Sample-0)", "fig": mask3d("Pyramid Mask 3D (Sample-0)", data["pyramid_mask_cube"]), "group": "pyr-mask-3d"},
         ]
     )
+    if model_mode in ("pyramid", "pyramid3d") and "pyramid_mask_cube" in data.files:
+        cards.append(
+            {
+                "title": "Pyramid Mask 3D (Sample-0)",
+                "fig": mask3d("Pyramid Mask 3D (Sample-0)", data["pyramid_mask_cube"]),
+                "group": "pyr-mask-3d",
+            }
+        )
 
     rendered = []
     seen_groups: set[str] = set()
@@ -816,6 +899,22 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     if len(rendered) % 2 == 1:
         rendered.append('<section class="card card-dummy" aria-hidden="true"></section>')
 
+    masking_demo_html = _generate_masking_diagnostic_for_dashboard(session_dir)
+    masking_demo_section = ""
+    if masking_demo_html is not None:
+        masking_demo_name = os.path.basename(masking_demo_html)
+        masking_demo_section = f"""
+  <section class="masking-demo" data-mask-demo-auto="true">
+    <h2>Masking Diagnostic: Real Target/Mask Overlay (16x16)</h2>
+    <p class="masking-demo-note">
+      Built from this session config via <code>prepare_context_batch</code> and
+      <code>make_pyramid_grid_context</code>. The red contour and -2 pixels are the
+      real target patch from <code>target_locations</code>/<code>target_valid</code>.
+    </p>
+    <iframe src="{masking_demo_name}" title="masking_demo_plotly_dashboard"></iframe>
+  </section>
+"""
+
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -833,12 +932,17 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     .local-controls {{ margin: 2px 2px 8px 2px; padding: 6px; background: #f7f9ff; border: 1px solid #dde3f0; border-radius: 6px; }}
     .card {{ background: #fff; border: 1px solid #d9deea; border-radius: 10px; box-shadow: 0 1px 2px rgba(10,20,40,0.08); padding: 6px; overflow: hidden; }}
     .card-dummy {{ visibility: hidden; min-height: 340px; }}
+    .masking-demo {{ margin-top: 14px; background: #fff; border: 1px solid #d9deea; border-radius: 10px; box-shadow: 0 1px 2px rgba(10,20,40,0.08); padding: 10px; }}
+    .masking-demo h2 {{ margin: 2px 0 6px 2px; font-size: 19px; }}
+    .masking-demo-note {{ margin: 0 0 8px 2px; color: #596275; font-size: 13px; }}
+    .masking-demo iframe {{ width: 100%; height: 620px; border: 1px solid #d9deea; border-radius: 8px; background: #fff; }}
     @media (max-width: 1120px) {{ .grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
   <h1>JEPA Session Dashboard: {os.path.basename(session_dir)} <span class="version">{DASHBOARD_VERSION}</span></h1>
   <div class="grid">{''.join(rendered)}</div>
+  {masking_demo_section}
   <script>
   function num(el) {{
     const v = parseFloat(el.value);
@@ -1011,11 +1115,13 @@ def plot_dash(session_dir: str, overwrite: bool = False) -> str:
 
 
 def _preferred_html_for_export(session_dir: str, fallback_html: str) -> str:
+    with open(fallback_html, "r", encoding="utf-8") as f:
+        html = f.read()
+    if 'data-mask-demo-auto="true"' in html:
+        return fallback_html
     demo_files = sorted([fn for fn in os.listdir(session_dir) if fn.startswith("masking_demo_") and fn.endswith(".html")])
     if not demo_files:
         return fallback_html
-    with open(fallback_html, "r", encoding="utf-8") as f:
-        html = f.read()
     parts = ["<hr/>", "<h2 style='font-family:sans-serif;margin:16px 0 8px 0;'>Masking Demo Panels</h2>"]
     for fn in demo_files:
         parts.append(

@@ -525,11 +525,13 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
             if s > self.num_scales:
                 n_extra = s - self.num_scales
                 if self.cdd_append_last_residual:
-                    # Protect autograd graph from in-place view mutation.
-                    fields = fields.clone()
+                    # Avoid in-place view mutation: rebuild channels out-of-place.
+                    base = fields[:, :self.num_scales, :, :]
                     extra = fields[:, self.num_scales:, :, :]
-                    fields[:, self.num_scales - 1, :, :] = fields[:, self.num_scales - 1, :, :] + extra.sum(dim=1)
-                fields = fields[:, :self.num_scales, :, :]
+                    last = base[:, self.num_scales - 1 : self.num_scales, :, :] + extra.sum(dim=1, keepdim=True)
+                    fields = torch.cat([base[:, : self.num_scales - 1, :, :], last], dim=1)
+                else:
+                    fields = fields[:, :self.num_scales, :, :]
                 print(
                     f"[{self.__class__.__name__}] WARNING: "
                     f"Truncated {n_extra} extra channel(s) "

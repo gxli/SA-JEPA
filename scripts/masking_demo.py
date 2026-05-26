@@ -126,7 +126,6 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         full_grid=bool(model_cfg.get("full_grid", True)),
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
-        constant_mask_box=bool(model_cfg.get("constant_mask_box", True)),
         mask_box_size=int(model_cfg.get("mask_box_size", 16)),
         blur_mode=model_cfg.get("blur_mode", "cdd"),
         cdd_mode=model_cfg.get("cdd_mode", "log"),
@@ -441,13 +440,11 @@ def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
         mask_fraction=model_cfg.get("mask_fraction", 1.0),
         box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
         mask_scale=model_cfg.get("mask_scale", 1.0),
-        min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
         mask_size=model_cfg.get("mask_size", 0.0),
         spacing_scale=model_cfg.get("spacing_scale", 1.5),
         full_grid=model_cfg.get("full_grid", True),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
-        constant_mask_box=model_cfg.get("constant_mask_box", True),
         mask_box_size=model_cfg.get("mask_box_size", 16),
         blur_mode=model_cfg.get("blur_mode", "cdd"),
         cdd_mode=model_cfg.get("cdd_mode", "log"),
@@ -888,9 +885,10 @@ def main():
         if args.force_blur_mode is not None:
             model_cfg_run["blur_mode"] = args.force_blur_mode
         # Default demo behavior: adaptive per-scale box masks.
-        model_cfg_run["constant_mask_box"] = bool(model_cfg.get("constant_mask_box", True))
-        if not args.rigid_mask_box:
-            model_cfg_run["constant_mask_box"] = False
+        if args.rigid_mask_box:
+            model_cfg_run["mask_scale"] = 0.0
+        else:
+            model_cfg_run["mask_scale"] = float(model_cfg.get("mask_scale", 1.0))
         suffix = f"_{mode}"
 
         x_ctx, target_locations, target_scales, target_valid, debug = make_context_and_debug(x_t, model_cfg_run, int(args.seed))

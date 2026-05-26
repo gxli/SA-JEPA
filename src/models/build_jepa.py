@@ -31,19 +31,17 @@ class PyramidGridJEPA(nn.Module):
         self,
         latent_channels: int = 32,
         predictor_hidden: int = None,
-        patch_size: int = 2,
+        patch_size: int = 3,
         sigmas=(2, 4, 8, 16),
         cell_sizes=(16, 32, 64, 128),
         mask_fraction: float = 1.0,
         box_sigma_mult: float = 4.0,
         mask_scale: float = 1.0,
-        min_mask_scale: float = 0.0,
         spacing_scale: float = 1.5,
         mask_size: float = 0.0,
         full_grid: bool = True,
         global_shift: bool = True,
         align_scales: bool = True,
-        constant_mask_box: bool = True,
         mask_box_size: int = 16,
         blur_mode: str = "gaussian",
         cdd_mode: str = "log",
@@ -58,8 +56,9 @@ class PyramidGridJEPA(nn.Module):
         log_eps: float = 1.0,
         cdd_log_std_floor_mult: float = 0.05,
         ema_momentum: float = 0.996,
-        normalize_loss: bool = True,
+        normalize_loss: bool = False,
         predictor_layernorm: bool = False,
+        use_image_mask_token: bool = False,
         mode: str = "image",
         encoder_type: str = "fullres",
         encoder_width: int = 32,
@@ -94,19 +93,22 @@ class PyramidGridJEPA(nn.Module):
     ):
         super().__init__()
 
-        self.patch_size = patch_size
+        p = int(patch_size)
+        if p <= 0:
+            p = 3
+        if p % 2 == 0:
+            p = p + 1
+        self.patch_size = p
         self.sigmas = tuple(sigmas)
         self.cell_sizes = tuple(cell_sizes)
         self.mask_fraction = float(mask_fraction)
         self.box_sigma_mult = float(box_sigma_mult)
         self.mask_scale = float(mask_scale)
-        self.min_mask_scale = float(min_mask_scale)
         self.spacing_scale = float(spacing_scale)
         self.mask_size = float(mask_size)
         self.full_grid = bool(full_grid)
         self.global_shift = bool(global_shift)
         self.align_scales = bool(align_scales)
-        self.constant_mask_box = bool(constant_mask_box)
         self.mask_box_size = int(mask_box_size)
         self.blur_mode = str(blur_mode)
         self.cdd_mode = str(cdd_mode)
@@ -126,6 +128,7 @@ class PyramidGridJEPA(nn.Module):
         self.ema_momentum = float(ema_momentum)
         self.normalize_loss = bool(normalize_loss)
         self.predictor_layernorm = bool(predictor_layernorm)
+        self.use_image_mask_token = bool(use_image_mask_token)
         self.mode = str(mode)
         self.encoder_type = str(encoder_type)
         self.encoder_width = int(encoder_width)
@@ -162,6 +165,21 @@ class PyramidGridJEPA(nn.Module):
         self.opnet_cache_detach = bool(opnet_cache_detach)
         if self.mode not in ("image", "pyramid"):
             raise ValueError(f"Unknown mode={self.mode}; expected 'image' or 'pyramid'")
+        if self.use_image_mask_token:
+            if self.mode != "image":
+                raise ValueError("use_image_mask_token is supported only in mode='image'.")
+            if self.encoder_type != "rescnn_dense":
+                raise ValueError("use_image_mask_token requires encoder_type='rescnn_dense'.")
+            if self.mask_fill_mode != "zero":
+                raise ValueError("use_image_mask_token requires model.mask_fill_mode='zero'.")
+        image_in_channels = 2 if self.use_image_mask_token else 1
+        if self.encoder_type == "convnext_dense_masktoken":
+            if self.mode != "image":
+                raise ValueError("convnext_dense_masktoken requires mode='image'.")
+            if self.mask_fill_mode != "zero":
+                raise ValueError(
+                    "convnext_dense_masktoken accepts box masking only; set model.mask_fill_mode='zero'."
+                )
         if self.encoder_type == "pyramid_cnn_res_dilated":
             norm_type = self.encoder_norm_type if self.encoder_norm_type is not None else "layernorm"
             norm_groups = self.encoder_norm_groups if self.encoder_norm_groups is not None else 8
@@ -277,6 +295,18 @@ class PyramidGridJEPA(nn.Module):
                 use_reflect_padding=True,
                 final_norm=True,
             )
+        elif self.encoder_type == "convnext_dense_masktoken":
+            # 2D ConvNeXt image mode with explicit hard-mask token channel.
+            self.context_encoder = ConvNeXtDenseEncoder(
+                in_channels=2,
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=self.encoder_depth,
+                kernel_size=self.encoder_kernel_size,
+                expansion=4,
+                use_reflect_padding=True,
+                final_norm=True,
+            )
         elif self.encoder_type == "mfae_convnext":
             if self.mode == "pyramid":
                 field_channels = len(self.sigmas)
@@ -315,7 +345,7 @@ class PyramidGridJEPA(nn.Module):
             norm_groups = self.encoder_norm_groups if self.encoder_norm_groups is not None else 1
             norm_eps = self.encoder_norm_eps if self.encoder_norm_eps is not None else 1e-5
             self.context_encoder = ResCNNDenseEncoder(
-                in_channels=1,
+                in_channels=image_in_channels,
                 hidden_channels=self.encoder_width,
                 latent_channels=latent_channels,
                 depth=self.encoder_depth,
@@ -339,6 +369,9 @@ class PyramidGridJEPA(nn.Module):
             nn.GELU(),
             nn.Conv2d(int(predictor_hidden), latent_channels, kernel_size=1),
         )
+        self.target_projector = copy.deepcopy(self.projector)
+        for p in self.target_projector.parameters():
+            p.requires_grad = False
         self.predictor = FullResPredictor(
             channels=latent_channels,
             hidden=int(predictor_hidden),
@@ -380,7 +413,21 @@ class PyramidGridJEPA(nn.Module):
             if invalid_pixel_mask.any():
                 x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
 
-            need_debug_tensors = bool(return_debug or self.mode == "pyramid")
+            debug_encoder_types = {
+                "cdd_scaleaware_convnext",
+                "cdd_opnet",
+                "convnext_dense_pyramid",
+                "rescnn_dense_pyramid",
+                "pyramid_convnext_dilated",
+                "pyramid_cnn_res_dilated",
+                "mfae_convnext",
+                "convnext_dense_masktoken",
+            }
+            need_debug_tensors = bool(
+                return_debug
+                or self.encoder_type in debug_encoder_types
+                or self.use_image_mask_token
+            )
             if need_debug_tensors:
                 x_context, target_locations, target_scales, target_valid, debug = make_pyramid_grid_context(
                     x_clean=x_clean,
@@ -389,13 +436,11 @@ class PyramidGridJEPA(nn.Module):
                     mask_fraction=self.mask_fraction,
                     box_sigma_mult=self.box_sigma_mult,
                     mask_scale=self.mask_scale,
-                    min_mask_scale=self.min_mask_scale,
                     spacing_scale=self.spacing_scale,
                     mask_size=self.mask_size,
                     full_grid=self.full_grid,
                     global_shift=self.global_shift,
                     align_scales=self.align_scales,
-                    constant_mask_box=self.constant_mask_box,
                     mask_box_size=self.mask_box_size,
                     blur_mode=self.blur_mode,
                     cdd_mode=self.cdd_mode,
@@ -426,13 +471,11 @@ class PyramidGridJEPA(nn.Module):
                     mask_fraction=self.mask_fraction,
                     box_sigma_mult=self.box_sigma_mult,
                     mask_scale=self.mask_scale,
-                    min_mask_scale=self.min_mask_scale,
                     spacing_scale=self.spacing_scale,
                     mask_size=self.mask_size,
                     full_grid=self.full_grid,
                     global_shift=self.global_shift,
                     align_scales=self.align_scales,
-                    constant_mask_box=self.constant_mask_box,
                     mask_box_size=self.mask_box_size,
                     blur_mode=self.blur_mode,
                     cdd_mode=self.cdd_mode,
@@ -470,7 +513,32 @@ class PyramidGridJEPA(nn.Module):
                 x_clean_enc = torch.log(torch.clamp(x_clean, min=0.0) + eps)
                 x_context_enc = torch.log(torch.clamp(x_context, min=0.0) + eps)
 
-        # Optional pyramid-mode path: encode multiscale channel cubes directly.
+        if self.use_image_mask_token:
+            if "mask_map" not in debug:
+                raise RuntimeError(
+                    "use_image_mask_token=True requires debug['mask_map']; "
+                    "call make_pyramid_grid_context with return_debug=True."
+                )
+
+            mask_token = debug["mask_map"].to(device=x_clean_enc.device, dtype=x_clean_enc.dtype)
+            if mask_token.ndim == 3:
+                mask_token = mask_token.unsqueeze(1)
+            if mask_token.ndim != 4:
+                raise RuntimeError(f"Expected mask_map Bx1xHxW or BxHxW, got {tuple(mask_token.shape)}")
+            if mask_token.shape[1] != 1:
+                mask_token = mask_token[:, :1]
+            mask_token = mask_token.clamp(0.0, 1.0)
+            zero_token = torch.zeros_like(mask_token)
+            clean_image = x_clean_enc
+            masked_image = clean_image * (1.0 - mask_token)
+
+            # ResCNN mask-token mode (token-first channels):
+            # context = [mask token, zero-filled masked image]
+            # target  = [zero token, clean image]
+            x_context_enc = torch.cat([mask_token, masked_image], dim=1)
+            x_clean_enc = torch.cat([zero_token, clean_image], dim=1)
+
+        # Optional multiscale CDD path: encode channel cubes directly.
         # Keep x_clean/x_context image outputs for backward-compatible diagnostics.
         enc_target = x_clean_enc
         enc_context = x_context_enc
@@ -479,7 +547,15 @@ class PyramidGridJEPA(nn.Module):
         dip_per_ch = None
         cdd_orig_enc = None
         cdd_masked_enc = None
-        if self.mode == "pyramid":
+        needs_cdd_cube = self.encoder_type in {
+            "cdd_scaleaware_convnext",
+            "cdd_opnet",
+            "convnext_dense_pyramid",
+            "rescnn_dense_pyramid",
+            "pyramid_convnext_dilated",
+            "pyramid_cnn_res_dilated",
+        }
+        if needs_cdd_cube:
             cdd_orig = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
             cdd_masked = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
             dip_per_ch = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
@@ -570,6 +646,37 @@ class PyramidGridJEPA(nn.Module):
             with torch.no_grad():
                 gt_map = self.target_encoder(enc_target)
             context_map = self.context_encoder(enc_context)
+        elif self.encoder_type == "convnext_dense_masktoken":
+            if self.mode != "image":
+                raise ValueError("convnext_dense_masktoken requires mode='image'.")
+            if "mask_map" not in debug:
+                raise RuntimeError(
+                    "convnext_dense_masktoken requires debug['mask_map']; "
+                    "call make_pyramid_grid_context with return_debug=True."
+                )
+            mask_token = debug["mask_map"].to(device=x_clean_enc.device, dtype=x_clean_enc.dtype)
+            if mask_token.ndim == 3:
+                mask_token = mask_token.unsqueeze(1)
+            if mask_token.ndim != 4:
+                raise RuntimeError(f"Expected mask_map Bx1xHxW or BxHxW, got {tuple(mask_token.shape)}")
+            if mask_token.shape[1] != 1:
+                mask_token = mask_token[:, :1]
+            mask_token = mask_token.clamp(0.0, 1.0)
+            zero_token = torch.zeros_like(mask_token)
+
+            # Fixed image ConvNeXt contract:
+            # context  = [zero-filled masked image, binary mask map]
+            # target   = [clean image, zero mask map]
+            clean_image = x_clean_enc
+            masked_image = clean_image * (1.0 - mask_token)
+            if bool(mask_inference):
+                context_in = torch.cat([masked_image, mask_token], dim=1)
+            else:
+                context_in = torch.cat([clean_image, zero_token], dim=1)
+            target_in = torch.cat([clean_image, zero_token], dim=1)
+            with torch.no_grad():
+                gt_map = self.target_encoder(target_in)
+            context_map = self.context_encoder(context_in)
         else:
             with torch.no_grad():
                 gt_map = self.target_encoder(enc_target)
@@ -579,7 +686,7 @@ class PyramidGridJEPA(nn.Module):
         context_proj = self.projector(context_base)
         pred_map = self.predictor(context_proj)
         with torch.no_grad():
-            gt_map = self.projector(gt_base)
+            gt_map = self.target_projector(gt_base)
 
         pred_patches = extract_location_patches(pred_map, target_locations, patch_size=self.patch_size)
         gt_patches = extract_location_patches(gt_map, target_locations, patch_size=self.patch_size)
@@ -600,7 +707,7 @@ class PyramidGridJEPA(nn.Module):
             "pred_map": pred_map,
             "gt_map": gt_map,
         }
-        if return_debug or self.mode == "pyramid":
+        if return_debug or needs_cdd_cube:
             # Exact applied hard mask footprint from make_pyramid_grid_context.
             if return_debug:
                 out["target_mask_map"] = debug["mask_map"].unsqueeze(1).to(dtype=x_clean.dtype)
@@ -631,3 +738,5 @@ class PyramidGridJEPA(nn.Module):
     def update_target_encoder(self):
         for p_context, p_target in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
             p_target.mul_(self.ema_momentum).add_(p_context.detach(), alpha=1.0 - self.ema_momentum)
+        for p_proj, p_target_proj in zip(self.projector.parameters(), self.target_projector.parameters()):
+            p_target_proj.mul_(self.ema_momentum).add_(p_proj.detach(), alpha=1.0 - self.ema_momentum)

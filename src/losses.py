@@ -17,20 +17,31 @@ def _flatten_vicreg_samples(
     valid: torch.Tensor,
     spatial_mode: str = "dense",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    b, k, c, p, _ = pred.shape
+    if pred.dim() not in (5, 6):
+        raise ValueError(f"Expected pred/gt rank 5 (2D patches) or 6 (3D cubes), got pred.rank={pred.dim()}")
+    b, k, c = pred.shape[:3]
+    spatial_shape = pred.shape[3:]
+    spatial_n = 1
+    for s in spatial_shape:
+        spatial_n *= int(s)
     mode = str(spatial_mode).lower()
     if mode == "pooled":
-        pred_v = pred.mean(dim=(3, 4))  # B,K,C
-        gt_v = gt.mean(dim=(3, 4))  # B,K,C
+        reduce_dims = tuple(range(3, pred.dim()))
+        pred_v = pred.mean(dim=reduce_dims)  # B,K,C
+        gt_v = gt.mean(dim=reduce_dims)  # B,K,C
         vm = valid.reshape(-1)
         z1 = pred_v.reshape(-1, c)[vm]
         z2 = gt_v.reshape(-1, c)[vm]
         return z1, z2
     if mode != "dense":
         raise ValueError(f"Unsupported spatial_mode={spatial_mode}. Use 'dense' or 'pooled'.")
-    pred_v = pred.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
-    gt_v = gt.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
-    vm = valid.unsqueeze(-1).unsqueeze(-1).expand(b, k, p * p, 1).reshape(-1)
+    if pred.dim() == 5:
+        pred_v = pred.permute(0, 1, 3, 4, 2).reshape(b, k, spatial_n, c)
+        gt_v = gt.permute(0, 1, 3, 4, 2).reshape(b, k, spatial_n, c)
+    else:
+        pred_v = pred.permute(0, 1, 3, 4, 5, 2).reshape(b, k, spatial_n, c)
+        gt_v = gt.permute(0, 1, 3, 4, 5, 2).reshape(b, k, spatial_n, c)
+    vm = valid.unsqueeze(-1).unsqueeze(-1).expand(b, k, spatial_n, 1).reshape(-1)
     z1 = pred_v.reshape(-1, c)[vm]
     z2 = gt_v.reshape(-1, c)[vm]
     return z1, z2
@@ -39,8 +50,8 @@ def _flatten_vicreg_samples(
 def extract_valid_pooled_embeddings(outputs: dict, key: str = "pred_patches") -> torch.Tensor:
     patches = outputs[key]  # B,K,C,P,P
     valid = outputs["target_valid"]  # B,K
-    _, _, c, _, _ = patches.shape
-    pooled = patches.mean(dim=(3, 4))  # B,K,C
+    _, _, c = patches.shape[:3]
+    pooled = patches.mean(dim=tuple(range(3, patches.dim())))  # B,K,C
     vm = valid.reshape(-1)
     z = pooled.reshape(-1, c)[vm]
     return z
@@ -86,8 +97,14 @@ def hard_negative_jepa_contrast_loss(
     if not bool(valid.any().item()):
         return pred.sum() * 0.0
 
-    pred_flat = pred.permute(0, 1, 3, 4, 2).reshape(bsz, ksz, -1)
-    gt_flat = gt.permute(0, 1, 3, 4, 2).reshape(bsz, ksz, -1)
+    if pred.dim() == 5:
+        pred_flat = pred.permute(0, 1, 3, 4, 2).reshape(bsz, ksz, -1)
+        gt_flat = gt.permute(0, 1, 3, 4, 2).reshape(bsz, ksz, -1)
+    elif pred.dim() == 6:
+        pred_flat = pred.permute(0, 1, 3, 4, 5, 2).reshape(bsz, ksz, -1)
+        gt_flat = gt.permute(0, 1, 3, 4, 5, 2).reshape(bsz, ksz, -1)
+    else:
+        raise ValueError(f"Expected pred/gt rank 5 or 6, got {pred.dim()}")
 
     pred_tok = pred_flat[valid]  # N,D
     gt_tok = gt_flat[valid]  # N,D
@@ -190,10 +207,20 @@ def compute_raw_mse_and_norm_err(outputs: dict) -> tuple[float, float]:
     gt = outputs["gt_patches"].detach()  # B,K,C,P,P
     valid = outputs["target_valid"].detach()  # B,K
 
-    b, k, c, p, _ = pred.shape
-    pred_v = pred.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
-    gt_v = gt.permute(0, 1, 3, 4, 2).reshape(b, k, p * p, c)
-    vm = valid.unsqueeze(-1).unsqueeze(-1).expand(b, k, p * p, 1).reshape(-1)
+    if pred.dim() not in (5, 6):
+        raise ValueError(f"Expected pred/gt rank 5 or 6, got {pred.dim()}")
+    b, k, c = pred.shape[:3]
+    spatial_shape = pred.shape[3:]
+    spatial_n = 1
+    for s in spatial_shape:
+        spatial_n *= int(s)
+    if pred.dim() == 5:
+        pred_v = pred.permute(0, 1, 3, 4, 2).reshape(b, k, spatial_n, c)
+        gt_v = gt.permute(0, 1, 3, 4, 2).reshape(b, k, spatial_n, c)
+    else:
+        pred_v = pred.permute(0, 1, 3, 4, 5, 2).reshape(b, k, spatial_n, c)
+        gt_v = gt.permute(0, 1, 3, 4, 5, 2).reshape(b, k, spatial_n, c)
+    vm = valid.unsqueeze(-1).unsqueeze(-1).expand(b, k, spatial_n, 1).reshape(-1)
     z1 = pred_v.reshape(-1, c)[vm]
     z2 = gt_v.reshape(-1, c)[vm]
     if z1.numel() == 0 or z2.numel() == 0:
@@ -211,7 +238,8 @@ def compute_jepa_energy(outputs: dict, normalize: bool = False) -> float:
     if normalize:
         pred = torch.nn.functional.normalize(pred, dim=2)
         gt = torch.nn.functional.normalize(gt, dim=2)
-    energy_per_target = (pred - gt).pow(2).mean(dim=(2, 3, 4))
+    reduce_dims = tuple(range(2, pred.dim()))
+    energy_per_target = (pred - gt).pow(2).mean(dim=reduce_dims)
     if bool(valid.any()):
         return float(energy_per_target[valid].mean().item())
     return 0.0

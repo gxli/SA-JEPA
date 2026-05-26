@@ -76,28 +76,37 @@ class MFAE2D(nn.Module):
         if k <= 1:
             return x, torch.zeros_like(x)
         pad = k // 2
+        eps = self._effective_eps(x)
         mean = F.avg_pool2d(self._pad2d(x, pad), kernel_size=k, stride=1)
         mean2 = F.avg_pool2d(self._pad2d(x * x, pad), kernel_size=k, stride=1)
         var = torch.clamp(mean2 - mean * mean, min=0.0)
-        std = torch.sqrt(var + self.eps)
+        std = torch.sqrt(var + eps)
         return mean, std
 
     def _normalize_per_channel(self, x: torch.Tensor) -> torch.Tensor:
+        eps = self._effective_eps(x)
         mu = x.mean(dim=(-2, -1), keepdim=True)
         sd = x.std(dim=(-2, -1), keepdim=True, unbiased=False)
-        return (x - mu) / sd.clamp_min(self.eps)
+        return (x - mu) / sd.clamp_min(eps)
+
+    def _effective_eps(self, x: torch.Tensor) -> float:
+        # AMP-safe floor for reduced-precision dtypes to avoid underflowed eps.
+        if x.dtype in (torch.float16, torch.bfloat16):
+            return float(max(self.eps, 1e-4))
+        return float(self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"MFAE2D expects B,C,H,W input, got {tuple(x.shape)}")
 
         outs = []
+        eps = self._effective_eps(x)
         for s in self.scales:
             xs = self._smooth_for_scale(x, s)
 
             gx = self._depthwise_filter(xs, self.kx)
             gy = self._depthwise_filter(xs, self.ky)
-            gradmag = torch.sqrt(gx * gx + gy * gy + self.eps)
+            gradmag = torch.sqrt(gx * gx + gy * gy + eps)
             abslap = self._depthwise_filter(xs, self.lap).abs()
 
             local_k = 2 * int(s) + 1

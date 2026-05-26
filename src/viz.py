@@ -1,14 +1,55 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from collections import defaultdict
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
+
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
+    cfg_path = os.path.join(session_dir, "config_used.json")
+    if not os.path.exists(cfg_path):
+        return None
+    script_path = os.path.join(ROOT_DIR, "scripts", "generate_masking_diagnostics_plotly.py")
+    if not os.path.exists(script_path):
+        return None
+    out_html = os.path.join(session_dir, "masking_demo_plotly_dashboard.html")
+    cmd = [
+        sys.executable,
+        script_path,
+        "--config",
+        cfg_path,
+        "--sample-index",
+        "0",
+        "--crop",
+        "16",
+        "--binarize-mask",
+        "--cols",
+        "3",
+        "--panel-px",
+        "220",
+        "--out",
+        out_html,
+    ]
+    env = os.environ.copy()
+    env.setdefault("MPLCONFIGDIR", "/private/tmp/mpl-cache")
+    try:
+        subprocess.run(cmd, cwd=ROOT_DIR, env=env, check=True, text=True, capture_output=True)
+    except Exception as e:
+        print(f"[warning] masking diagnostic dashboard generation failed: {type(e).__name__}: {e}")
+        return None
+    return os.path.basename(out_html)
 
 
 def _compute_pca_2d(x: np.ndarray) -> np.ndarray:
@@ -279,9 +320,9 @@ def save_blurred_debug_images(
         clean = x_clean_raw[i, 0].detach().cpu().numpy().astype(np.float32)
         ctx = x_context_raw[i, 0].detach().cpu().numpy().astype(np.float32)
         delta = clean - ctx
-        plt.imsave(os.path.join(out_dir, f"{i:03d}_clean.png"), clean, cmap="gray")
-        plt.imsave(os.path.join(out_dir, f"{i:03d}_context_blurred.png"), ctx, cmap="gray")
-        plt.imsave(os.path.join(out_dir, f"{i:03d}_clean_minus_context.png"), delta, cmap="coolwarm")
+        _save_png(os.path.join(out_dir, f"{i:03d}_clean.png"), clean, cmap="gray")
+        _save_png(os.path.join(out_dir, f"{i:03d}_context_blurred.png"), ctx, cmap="gray")
+        _save_png(os.path.join(out_dir, f"{i:03d}_clean_minus_context.png"), delta, cmap="coolwarm")
     return out_dir
 
 
@@ -291,9 +332,9 @@ def save_blurred_reference_images(session_dir: str, x_clean_raw: torch.Tensor, x
     clean = x_clean_raw[0, 0].detach().cpu().numpy().astype(np.float32)
     ctx = x_context_raw[0, 0].detach().cpu().numpy().astype(np.float32)
     delta = clean - ctx
-    plt.imsave(os.path.join(out_dir, "reference_000_clean.png"), clean, cmap="gray")
-    plt.imsave(os.path.join(out_dir, "reference_000_context_blurred.png"), ctx, cmap="gray")
-    plt.imsave(os.path.join(out_dir, "reference_000_clean_minus_context.png"), delta, cmap="coolwarm")
+    _save_png(os.path.join(out_dir, "reference_000_clean.png"), clean, cmap="gray")
+    _save_png(os.path.join(out_dir, "reference_000_context_blurred.png"), ctx, cmap="gray")
+    _save_png(os.path.join(out_dir, "reference_000_clean_minus_context.png"), delta, cmap="coolwarm")
     return out_dir
 
 
@@ -569,10 +610,46 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     np.save(os.path.join(results_dir, "target_locations_hist_counts.npy"), hist_counts.astype(np.float32))
     target_vis_img = os.path.join(results_dir, "target_locations_vis.png")
     hist_vis_img = os.path.join(results_dir, "target_locations_hist_vis.png")
-    hist_cmap = plt.get_cmap("viridis").copy()
-    hist_cmap.set_bad(color=(0.0, 0.0, 0.0, 1.0))
-    plt.imsave(target_vis_img, target_vis, cmap="magma")
-    plt.imsave(hist_vis_img, hist_log, cmap=hist_cmap)
+    _save_png(target_vis_img, target_vis, cmap="magma")
+    _save_png(hist_vis_img, hist_log, cmap="viridis", nan_black=True)
+
+    # Optional channel-wise masking demo (16x16 center crop), 4 panels per row:
+    # [orig, masked, delta, abs-delta]. This is a quick visual reference.
+    mask_demo_rel = None
+    cdd_orig_t = outputs.get("cdd_channels_orig")
+    cdd_mask_t = outputs.get("cdd_channels_masked")
+    if cdd_orig_t is not None and cdd_mask_t is not None and cdd_orig_t.numel() > 0 and cdd_mask_t.numel() > 0:
+        cdd_orig = cdd_orig_t[0].detach().cpu().numpy().astype(np.float32)  # C,H,W
+        cdd_mask = cdd_mask_t[0].detach().cpu().numpy().astype(np.float32)  # C,H,W
+        if cdd_orig.ndim == 3 and cdd_mask.ndim == 3 and cdd_orig.shape == cdd_mask.shape:
+            c, h0, w0 = cdd_orig.shape
+            crop = 16
+            y0 = max(0, (h0 - crop) // 2)
+            x0 = max(0, (w0 - crop) // 2)
+            y1 = min(h0, y0 + crop)
+            x1 = min(w0, x0 + crop)
+            # Back-adjust to keep exact crop size when possible.
+            y0 = max(0, y1 - crop)
+            x0 = max(0, x1 - crop)
+
+            mask_demo_path = os.path.join(results_dir, "mask_demo_channels_16x16.png")
+            rows = []
+            for ch in range(c):
+                a = cdd_orig[ch, y0:y1, x0:x1]
+                b = cdd_mask[ch, y0:y1, x0:x1]
+                d = b - a
+                ad = np.abs(d)
+                pa = _apply_cmap(a, cmap="viridis")
+                pb = _apply_cmap(b, cmap="viridis")
+                pd = _apply_cmap(d, cmap="coolwarm")
+                pad = _apply_cmap(ad, cmap="magma")
+                rows.append(np.concatenate([pa, pb, pd, pad], axis=1))
+            canvas = np.concatenate(rows, axis=0)
+            scale = 12
+            Image.fromarray(canvas, mode="RGB").resize(
+                (canvas.shape[1] * scale, canvas.shape[0] * scale), resample=Image.Resampling.NEAREST
+            ).save(mask_demo_path)
+            mask_demo_rel = os.path.join("results", "mask_demo_channels_16x16.png")
 
     # Build a single assembled dashboard entrypoint for this session.
     dashboard_path = os.path.join(session_dir, "dashboard.html")
@@ -603,6 +680,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         if len(loss_x) > 0
         else "<p>Loss data not available yet.</p>"
     )
+    masking_plotly_rel = _generate_masking_diagnostic_for_dashboard(session_dir)
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -618,6 +696,8 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     .card {{ border: 1px solid #ddd; padding: 8px; border-radius: 6px; background: #fff; }}
     img {{ width: 100%; height: auto; display: block; }}
     iframe {{ width: 100%; height: 920px; border: 1px solid #ddd; border-radius: 6px; }}
+    .masking-demo iframe {{ height: 620px; }}
+    .note {{ color: #555; font-size: 13px; margin: 0 0 8px 0; }}
   </style>
 </head>
 <body>
@@ -645,6 +725,28 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     <h2>Latent Overview</h2>
     <iframe src="{latent_name}" title="latent_overview_4panel"></iframe>
   </div>
+  {
+    f'''
+  <div class="section masking-demo" data-mask-demo-auto="true">
+    <h2>Masking Diagnostic: Real Target/Mask Overlay (16x16)</h2>
+    <p class="note">
+      Built from this session config via prepare_context_batch and make_pyramid_grid_context.
+      The red contour and -2 pixels are the real target patch from target_locations/target_valid.
+    </p>
+    <iframe src="{masking_plotly_rel}" title="masking_demo_plotly_dashboard"></iframe>
+  </div>
+''' if masking_plotly_rel is not None else ""
+  }
+  {
+    f'''
+  <div class="section">
+    <h2>Mask Demo (16x16 Channel Crops)</h2>
+    <div class="card">
+      <img src="{mask_demo_rel}" alt="mask_demo_channels_16x16" />
+    </div>
+  </div>
+''' if mask_demo_rel is not None else ""
+  }
 </body>
 </html>
 """
@@ -674,6 +776,71 @@ Plotly.newPlot('loss-plot', [
     return dashboard_path
 
 
+def save_volumetric_umap_embeddings(session_dir: str, outputs: dict, umap_cfg: dict | None = None) -> str:
+    """Train UMAP on a random fraction of volumetric latent voxels and save artifacts."""
+    umap_cfg = dict(umap_cfg or {})
+    umap_n_neighbors = int(umap_cfg.get("n_neighbors", 15))
+    umap_min_dist = float(umap_cfg.get("min_dist", 0.05))
+    umap_metric = str(umap_cfg.get("metric", "cosine"))
+    umap_random_state = int(umap_cfg.get("random_state", 42))
+    umap_init = str(umap_cfg.get("init", "spectral")).lower()
+    umap_l2_normalize = bool(umap_cfg.get("l2_normalize", False))
+    umap_standardize = bool(umap_cfg.get("standardize", False))
+    sample_fraction = float(umap_cfg.get("volumetric_sample_fraction", 0.05))
+    sample_fraction = min(max(sample_fraction, 0.0), 1.0)
+    max_points = int(max(128, umap_cfg.get("volumetric_max_points", 50000)))
+    sample_seed = int(umap_cfg.get("volumetric_sample_seed", umap_random_state))
+
+    fmap = outputs.get("context_map")
+    if fmap is None:
+        fmap = outputs["pred_map"]
+    if fmap.dim() != 5:
+        raise ValueError(f"Expected 3D map B,C,D,H,W, got shape={tuple(fmap.shape)}")
+
+    z = fmap[0].detach().cpu().permute(1, 2, 3, 0).reshape(-1, fmap.shape[1]).numpy().astype(np.float32)
+    n_total = int(z.shape[0])
+    rng = np.random.default_rng(sample_seed)
+    n_pick = int(round(n_total * sample_fraction)) if sample_fraction < 1.0 else n_total
+    n_pick = max(128, min(n_total, n_pick, max_points))
+    idx = rng.choice(n_total, size=n_pick, replace=False)
+    z_sub = z[idx]
+
+    z_sub_umap = _preprocess_latents_for_umap(
+        z_sub,
+        l2_normalize=umap_l2_normalize,
+        standardize=umap_standardize,
+    )
+    umap3 = _compute_umap_nd(
+        z_sub_umap,
+        n_components=3,
+        n_neighbors=umap_n_neighbors,
+        min_dist=umap_min_dist,
+        metric=umap_metric,
+        random_state=umap_random_state,
+        init=umap_init,
+    ).astype(np.float32)
+    pca3 = _compute_pca_3d(z_sub).astype(np.float32)
+
+    results_dir = os.path.join(session_dir, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    np.save(os.path.join(results_dir, "volumetric_umap_indices.npy"), idx.astype(np.int64))
+    np.save(os.path.join(results_dir, "volumetric_umap_latents.npy"), z_sub.astype(np.float32))
+    np.save(os.path.join(results_dir, "volumetric_umap_xyz.npy"), umap3)
+    np.save(os.path.join(results_dir, "volumetric_pca_xyz.npy"), pca3)
+
+    meta = {
+        "n_total_voxels": n_total,
+        "n_sampled": int(n_pick),
+        "sample_fraction": float(sample_fraction),
+        "max_points": int(max_points),
+        "sample_seed": int(sample_seed),
+    }
+    meta_path = os.path.join(session_dir, "volumetric_umap_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    return meta_path
+
+
 def save_loss_curve(session_dir: str):
     metrics_path = os.path.join(session_dir, "metrics.csv")
     if not os.path.exists(metrics_path):
@@ -691,17 +858,64 @@ def save_loss_curve(session_dir: str):
             pixel.append(float(row["loss_pixel"]))
     if len(x_ep) == 0:
         return None
-    fig, ax = plt.subplots(1, 1, figsize=(8, 4.5))
-    ax.plot(x_ep, total, label="total_loss")
-    ax.plot(x_ep, jepa, label="loss_jepa")
-    ax.plot(x_ep, pixel, label="loss_pixel")
-    ax.set_title("Training Loss Curve")
-    ax.set_xlabel("epoch + 0.001*batch")
-    ax.set_ylabel("loss")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best")
-    out_path = os.path.join(session_dir, "loss_curve.png")
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
+    # Matplotlib-free lightweight output for compatibility.
+    out_path = os.path.join(session_dir, "loss_curve.csv")
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["x", "total_loss", "loss_jepa", "loss_pixel"])
+        for x, t, j, p in zip(x_ep, total, jepa, pixel):
+            w.writerow([x, t, j, p])
     return out_path
+def _normalize01(x: np.ndarray) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float32)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    lo = float(np.min(arr))
+    hi = float(np.max(arr))
+    if hi <= lo:
+        return np.zeros_like(arr, dtype=np.float32)
+    return (arr - lo) / (hi - lo)
+
+
+def _apply_cmap(x: np.ndarray, cmap: str = "gray") -> np.ndarray:
+    z = _normalize01(x)
+    if cmap == "gray":
+        g = np.clip(np.round(z * 255.0), 0, 255).astype(np.uint8)
+        return np.stack([g, g, g], axis=-1)
+    if cmap == "coolwarm":
+        # Simple blue-white-red diverging map for signed deltas.
+        v = np.nan_to_num(np.asarray(x, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        m = float(max(1e-12, np.percentile(np.abs(v), 99.0)))
+        t = np.clip(v / m, -1.0, 1.0)
+        r = np.where(t >= 0, 255, 255 * (1.0 + t))
+        g = 255 * (1.0 - np.abs(t))
+        b = np.where(t <= 0, 255, 255 * (1.0 - t))
+        return np.stack([r, g, b], axis=-1).clip(0, 255).astype(np.uint8)
+    if cmap in ("magma", "viridis"):
+        # Lightweight perceptual ramps (approximate) without matplotlib.
+        if cmap == "magma":
+            anchors = np.array(
+                [[0.00, 0, 0, 4], [0.25, 59, 15, 112], [0.50, 182, 54, 121], [0.75, 251, 140, 60], [1.00, 252, 253, 191]],
+                dtype=np.float32,
+            )
+        else:
+            anchors = np.array(
+                [[0.00, 68, 1, 84], [0.25, 59, 82, 139], [0.50, 33, 145, 140], [0.75, 94, 201, 98], [1.00, 253, 231, 37]],
+                dtype=np.float32,
+            )
+        flat = z.reshape(-1)
+        out = np.zeros((flat.shape[0], 3), dtype=np.float32)
+        xs = anchors[:, 0]
+        for c in range(3):
+            out[:, c] = np.interp(flat, xs, anchors[:, c + 1])
+        return out.reshape(z.shape + (3,)).clip(0, 255).astype(np.uint8)
+    g = np.clip(np.round(z * 255.0), 0, 255).astype(np.uint8)
+    return np.stack([g, g, g], axis=-1)
+
+
+def _save_png(path: str, arr: np.ndarray, cmap: str = "gray", nan_black: bool = False) -> None:
+    a = np.asarray(arr)
+    mask = np.isnan(a)
+    rgb = _apply_cmap(a, cmap=cmap)
+    if nan_black and mask.any():
+        rgb[mask] = 0
+    Image.fromarray(rgb, mode="RGB").save(path)

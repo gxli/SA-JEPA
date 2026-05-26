@@ -64,7 +64,6 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         full_grid=bool(model_cfg.get("full_grid", True)),
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
-        constant_mask_box=bool(model_cfg.get("constant_mask_box", True)),
         mask_box_size=int(model_cfg.get("mask_box_size", 16)),
         blur_mode=model_cfg.get("blur_mode", "cdd"),
         cdd_mode=model_cfg.get("cdd_mode", "log"),
@@ -160,9 +159,10 @@ def main():
     model_cfg["mask_fill_mode"] = mode
     if args.force_blur_mode is not None:
         model_cfg["blur_mode"] = args.force_blur_mode
-    model_cfg["constant_mask_box"] = bool(model_cfg.get("constant_mask_box", True))
-    if not args.rigid_mask_box:
-        model_cfg["constant_mask_box"] = False
+    if args.rigid_mask_box:
+        model_cfg["mask_scale"] = 0.0
+    else:
+        model_cfg["mask_scale"] = float(model_cfg.get("mask_scale", 1.0))
     if args.no_align_scales:
         model_cfg["align_scales"] = False
     if args.no_full_grid:

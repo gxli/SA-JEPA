@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import os
+import random
 import time
 from collections import defaultdict
 
@@ -15,15 +16,15 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from src.dataset import JEPADataset
+from src.dataset3d import JEPA3DCropDataset
 from src.diagnostics import (
     compute_effective_rank_from_features,
     compute_error_by_scale,
     rank_dashboard,
 )
-from src.inference import run_post_training_inference
+from src.inference import run_post_training_inference, run_post_training_inference_3d
 from src.losses import (
     compute_jepa_energy,
-    hard_negative_jepa_contrast_loss,
     compute_raw_mse_and_norm_err,
     compute_sim_var_cov,
     compute_sim_var_cov_torch,
@@ -32,8 +33,9 @@ from src.losses import (
     sketched_sigreg_loss,
 )
 from src.models.build_jepa import PyramidGridJEPA
+from src.models.build_jepa3d import PyramidGridJEPA3D
 from src.models.masking import prepare_context_batch
-from src.viz import save_inference_dashboard, save_loss_curve
+from src.viz import save_inference_dashboard, save_loss_curve, save_volumetric_umap_embeddings
 
 def _fmt_metric(v: float) -> str:
     x = float(v)
@@ -61,88 +63,59 @@ def _collate_pad_hw(batch: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(out, dim=0)
 
 
-def _make_masking_collate(model: PyramidGridJEPA):
-    """Return a collate function that runs masking in the DataLoader worker.
-
-    Extracts scalar/lightweight masking params from *model* so the closure
-    does not capture the full nn.Module (avoids expensive pickling).
-    """
-    params = {
-        "sigmas": model.sigmas,
-        "cell_sizes": model.cell_sizes,
-        "mask_fraction": model.mask_fraction,
-        "box_sigma_mult": model.box_sigma_mult,
-        "mask_scale": model.mask_scale,
-        "min_mask_scale": model.min_mask_scale,
-        "spacing_scale": model.spacing_scale,
-        "mask_size": model.mask_size,
-        "full_grid": model.full_grid,
-        "global_shift": model.global_shift,
-        "align_scales": model.align_scales,
-        "constant_mask_box": model.constant_mask_box,
-        "mask_box_size": model.mask_box_size,
-        "blur_mode": model.blur_mode,
-        "cdd_mode": model.cdd_mode,
-        "cdd_constrained": model.cdd_constrained,
-        "cdd_sm_mode": model.cdd_sm_mode,
-        "mask_fill_mode": model.mask_fill_mode,
-        "dip_sigma_mult": model.dip_sigma_mult,
-        "constant_gaussian_sigma": model.constant_gaussian_sigma,
-        "scaleaware_gaussian_ratios": model.scaleaware_gaussian_ratios,
-        "cdd_append_last_residual": model.cdd_append_last_residual,
-        "patch_size": model.patch_size,
-        "need_debug": (model.mode == "pyramid"),
-        "target_invalid_region_skip": model.target_invalid_region_skip,
-        "target_invalid_region_values": model.target_invalid_region_values,
-        "target_sampling_mode": model.target_sampling_mode,
-        "priority_top_percent": model.priority_top_percent,
-        "priority_n_target": model.priority_n_target,
-        "target_dithering_pixels": model.target_dithering_pixels,
+def _prepare_context_from_model(
+    model: PyramidGridJEPA,
+    x_clean: torch.Tensor,
+    return_debug: bool = False,
+):
+    enc_type = str(getattr(model, "encoder_type", "")).lower()
+    debug_encoder_types = {
+        "cdd_scaleaware_convnext",
+        "cdd_opnet",
+        "convnext_dense_pyramid",
+        "rescnn_dense_pyramid",
+        "pyramid_convnext_dilated",
+        "pyramid_cnn_res_dilated",
+        "mfae_convnext",
+        "convnext_dense_masktoken",
     }
-
-    def collate_fn(batch):
-        x_clean = _collate_pad_hw(batch)
-        result = prepare_context_batch(
-            x_clean=x_clean,
-            sigmas=params["sigmas"],
-            cell_sizes=params["cell_sizes"],
-            mask_fraction=params["mask_fraction"],
-            box_sigma_mult=params["box_sigma_mult"],
-            mask_scale=params["mask_scale"],
-            min_mask_scale=params["min_mask_scale"],
-            spacing_scale=params["spacing_scale"],
-            mask_size=params["mask_size"],
-            full_grid=params["full_grid"],
-            global_shift=params["global_shift"],
-            align_scales=params["align_scales"],
-            constant_mask_box=params["constant_mask_box"],
-            mask_box_size=params["mask_box_size"],
-            blur_mode=params["blur_mode"],
-            cdd_mode=params["cdd_mode"],
-            cdd_constrained=params["cdd_constrained"],
-            cdd_sm_mode=params["cdd_sm_mode"],
-            mask_fill_mode=params["mask_fill_mode"],
-            dip_sigma_mult=params["dip_sigma_mult"],
-            constant_gaussian_sigma=params["constant_gaussian_sigma"],
-            scaleaware_gaussian_ratios=params["scaleaware_gaussian_ratios"],
-            cdd_append_last_residual=params["cdd_append_last_residual"],
-            patch_size=params["patch_size"],
-            return_debug=params["need_debug"],
-            target_invalid_region_skip=params["target_invalid_region_skip"],
-            target_invalid_region_values=params["target_invalid_region_values"],
-            target_sampling_mode=params["target_sampling_mode"],
-            priority_top_percent=params["priority_top_percent"],
-            priority_n_target=params["priority_n_target"],
-            target_dithering_pixels=params["target_dithering_pixels"],
-        )
-        if params["need_debug"]:
-            x_context, tloc, tscale, tvalid, debug_tensors = result
-            return x_clean, x_context, tloc, tscale, tvalid, debug_tensors
-        else:
-            x_context, tloc, tscale, tvalid = result
-            return x_clean, x_context, tloc, tscale, tvalid, {}
-
-    return collate_fn
+    need_debug = bool(
+        return_debug
+        or enc_type in debug_encoder_types
+        or bool(getattr(model, "use_image_mask_token", False))
+    )
+    return prepare_context_batch(
+        x_clean=x_clean,
+        sigmas=model.sigmas,
+        cell_sizes=model.cell_sizes,
+        mask_fraction=model.mask_fraction,
+        box_sigma_mult=model.box_sigma_mult,
+        mask_scale=model.mask_scale,
+        spacing_scale=model.spacing_scale,
+        mask_size=model.mask_size,
+        full_grid=model.full_grid,
+        global_shift=model.global_shift,
+        align_scales=model.align_scales,
+        mask_box_size=model.mask_box_size,
+        blur_mode=model.blur_mode,
+        cdd_mode=model.cdd_mode,
+        cdd_constrained=model.cdd_constrained,
+        cdd_sm_mode=model.cdd_sm_mode,
+        mask_fill_mode=model.mask_fill_mode,
+        dip_sigma_mult=model.dip_sigma_mult,
+        constant_gaussian_sigma=model.constant_gaussian_sigma,
+        scaleaware_gaussian_ratios=model.scaleaware_gaussian_ratios,
+        cdd_append_last_residual=model.cdd_append_last_residual,
+        patch_size=model.patch_size,
+        return_debug=need_debug,
+        target_invalid_region_skip=model.target_invalid_region_skip,
+        target_invalid_region_values=model.target_invalid_region_values,
+        target_sampling_mode=model.target_sampling_mode,
+        priority_top_percent=model.priority_top_percent,
+        priority_n_target=model.priority_n_target,
+        target_dithering_pixels=model.target_dithering_pixels,
+        cdd_use_gpu=(x_clean.device.type == "cuda"),
+    )
 
 
 
@@ -153,6 +126,7 @@ def evaluate_validation(
     device: torch.device,
     max_batches: int | None = None,
     vicreg_spatial_mode: str = "dense",
+    debug_context: bool = False,
 ) -> dict:
     model.eval()
     n = 0
@@ -162,14 +136,14 @@ def evaluate_validation(
     for batch_idx, batch in enumerate(val_loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
-        x_clean, x_context, tloc, tscale, tvalid, debug = batch
-        x_clean = x_clean.to(device, non_blocking=True)
-        x_context = x_context.to(device, non_blocking=True)
-        tloc = tloc.to(device, non_blocking=True)
-        tscale = tscale.to(device, non_blocking=True)
-        tvalid = tvalid.to(device, non_blocking=True)
-        if debug:
-            debug = {k: v.to(device, non_blocking=True) for k, v in debug.items()}
+        x_clean = batch.to(device, non_blocking=True)
+        x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
+        context_result = _prepare_context_from_model(model, x_clean, return_debug=debug_context)
+        if debug_context:
+            x_context, tloc, tscale, tvalid, debug = context_result
+        else:
+            x_context, tloc, tscale, tvalid = context_result
+            debug = {}
         context_data = (x_context, tloc, tscale, tvalid, debug)
         outputs = model(x_clean, context_data=context_data)
         loss = model.compute_loss(outputs)
@@ -219,44 +193,139 @@ def resolve_pipeline_config(data_cfg: dict, model_cfg: dict) -> tuple[bool, bool
 
 def resolve_encoder_type_default(model_cfg: dict) -> str:
     """
-    Keep old defaults for image mode, but switch pyramid-mode default
-    to the new isolated CDD encoder when encoder_type is not specified.
+    Restricted defaults aligned to the supported encoder matrix.
     """
+    # Official key: model_key. Keep encoder_type as legacy fallback.
+    if "model_key" in model_cfg:
+        return str(model_cfg["model_key"])
     if "encoder_type" in model_cfg:
         return str(model_cfg["encoder_type"])
-    mode = str(model_cfg.get("mode", "image"))
+    mode = str(model_cfg.get("mode", "image")).lower()
     if mode == "pyramid":
-        return "cdd_opnet"
-    return "fullres"
+        return "cdd_scaleaware_convnext"
+    return "convnext_dense_masktoken"
+
+
+def _resolve_encoder_alias_2d(name: str) -> str:
+    key = str(name).lower()
+    alias = {
+        # Preferred naming convention (image / image_pyramid prefixes).
+        "convnext_image_dense_masked": "convnext_dense_masktoken",
+        "rescnn-image-plain": "rescnn_dense",
+        "cdd_opnet-pyramid-opnet": "cdd_opnet",
+        "cdd_scaleaware_convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
+        "image_rescnn_dense": "rescnn_dense",
+        "image_pyramid_cdd_opnet": "cdd_opnet",
+        "image_pyramid_cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
+        # Backward-compatible typo alias.
+        "imge_pyramid_cdd_opnet": "cdd_opnet",
+        "imge_pyramid_cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
+        # Supported canonical names.
+        "rescnn_dense": "rescnn_dense",
+        "cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
+        "cdd_opnet": "cdd_opnet",
+        # Supported aliases.
+        "rescnn-image-base": "rescnn_dense",
+        "convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
+        "opnet-image-scaleaware": "cdd_opnet",
+        # REVIEW-LATER (deletion candidates): temporary legacy aliases.
+        "image_convnext": "convnext_dense",
+        "nofusion": "cdd_scaleaware_convnext",
+        "convnext-image-base": "convnext_dense",
+        "convnext-image-boxmask-token": "convnext_dense_masktoken",
+        "convnext-image-scaleaware": "cdd_scaleaware_convnext",
+        "convnext-image-grad_laplace-mfae": "mfae_convnext",
+        "convnext-pyramid-base": "convnext_dense_pyramid",
+        "convnext-pyramid_dilated-base": "pyramid_convnext_dilated",
+        "mfae-image-grad_laplace": "mfae_convnext",
+        "rescnn-image-pyramid": "rescnn_dense_pyramid",
+        "resnet-image-pyramid_dilated": "pyramid_cnn_res_dilated",
+        "unet-image-dense_small": "dense_unet_small",
+        "fullres-image-base": "fullres",
+        "convnext-image-pyramid": "convnext_dense_pyramid",
+        "convnext-image-pyramid_dilated": "pyramid_convnext_dilated",
+        "convnext_dense": "convnext_dense",
+        "convnext_dense_masktoken": "convnext_dense_masktoken",
+        "mfae_convnext": "mfae_convnext",
+        "rescnn_dense_pyramid": "rescnn_dense_pyramid",
+        "pyramid_cnn_res_dilated": "pyramid_cnn_res_dilated",
+        "dense_unet_small": "dense_unet_small",
+        "fullres": "fullres",
+        "convnext_dense_pyramid": "convnext_dense_pyramid",
+        "pyramid_convnext_dilated": "pyramid_convnext_dilated",
+    }
+    return alias.get(key, str(name))
+
+
+def _resolve_encoder_alias_3d(name: str) -> str:
+    key = str(name).lower()
+    alias = {
+        # Preferred naming convention (cube / cube_pyramid prefixes).
+        "cube_dense": "convnext_dense3d",
+        "cube_pyramid_scaleaware": "cdd_scaleaware_convnext3d",
+        # New human-readable labels (v1).
+        "volume_dense": "convnext_dense3d",
+        "volume_scaleaware": "cdd_scaleaware_convnext3d",
+        # New keyword-style labels (v2).
+        "convnext-volume-base": "convnext_dense3d",
+        "convnext-volume-scaleaware": "cdd_scaleaware_convnext3d",
+        # Canonical passthroughs.
+        "convnext_dense3d": "convnext_dense3d",
+        "cdd_scaleaware_convnext3d": "cdd_scaleaware_convnext3d",
+    }
+    return alias.get(key, str(name))
 
 
 def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, device: torch.device) -> PyramidGridJEPA:
     """Construct a PyramidGridJEPA from config dicts, with backward-compatible param aliases."""
     blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
     mask_scaling_box = float(model_cfg.get("mask_scaling_box", model_cfg.get("mask_scale", 1.0)))
-    # gscale is deprecated: gaussian width is now controlled by mask_fraction only.
+    # gscale is deprecated.
     mask_scaling_gaussian = 1.0
     mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", model_cfg.get("spacing_scale", 1.5)))
     mask_size = float(model_cfg.get("mask_size", 0.0))
     _, _, model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
-    resolved_encoder_type = resolve_encoder_type_default(model_cfg)
+    resolved_encoder_type = _resolve_encoder_alias_2d(resolve_encoder_type_default(model_cfg))
+    resolved_mode = str(model_cfg.get("mode", "image")).lower()
+    use_image_mask_token = bool(model_cfg.get("use_image_mask_token", False))
+    if resolved_mode == "image":
+        allowed_image = {"rescnn_dense", "convnext_dense_masktoken"}
+        if resolved_encoder_type not in allowed_image:
+            raise ValueError(
+                f"Unsupported image-mode encoder_type={resolved_encoder_type}. "
+                "Allowed: rescnn_dense, convnext_dense_masktoken."
+            )
+    elif resolved_mode == "pyramid":
+        allowed_pyramid = {"cdd_scaleaware_convnext", "cdd_opnet"}
+        if resolved_encoder_type not in allowed_pyramid:
+            raise ValueError(
+                f"Unsupported pyramid-mode encoder_type={resolved_encoder_type}. "
+                "Allowed: cdd_scaleaware_convnext, cdd_opnet."
+            )
+    else:
+        raise ValueError(f"Unsupported mode={resolved_mode}. Allowed: image, pyramid.")
+
+    patch_size = int(model_cfg.get("patch_size", 3))
+    if patch_size <= 0:
+        patch_size = 3
+    if patch_size % 2 == 0:
+        patch_size = patch_size + 1
+        print(f"[warning] even patch_size requested; using odd patch_size={patch_size}")
 
     return PyramidGridJEPA(
         latent_channels=model_cfg.get("latent_channels", 32),
         predictor_hidden=model_cfg.get("predictor_hidden"),
-        patch_size=model_cfg.get("patch_size", 2),
+        patch_size=patch_size,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-        mask_fraction=model_cfg.get("mask_fraction", 1.0),
+        mask_fraction=float(model_cfg.get("mask_fraction", 1.0)),
         box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
         mask_scale=mask_scaling_box,
-        min_mask_scale=model_cfg.get("min_mask_scale", 0.0),
         spacing_scale=mask_spacing_scaling,
         mask_size=mask_size,
         full_grid=model_cfg.get("full_grid", True),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
-        constant_mask_box=model_cfg.get("constant_mask_box", True),
         mask_box_size=model_cfg.get("mask_box_size", 16),
         blur_mode=blur_mode,
         cdd_mode=model_cfg.get("cdd_mode", "log"),
@@ -270,9 +339,10 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
         ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
-        normalize_loss=model_cfg.get("normalize_loss", True),
+        normalize_loss=model_cfg.get("normalize_loss", False),
         predictor_layernorm=model_cfg.get("predictor_layernorm", False),
-        mode=model_cfg.get("mode", "image"),
+        use_image_mask_token=use_image_mask_token,
+        mode=resolved_mode,
         encoder_type=resolved_encoder_type,
         encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
         encoder_depth=model_cfg.get("encoder_depth", 4),
@@ -307,6 +377,35 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
     ).to(device)
 
 
+def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.device) -> PyramidGridJEPA3D:
+    enc_type = _resolve_encoder_alias_3d(model_cfg.get("encoder_type", "cdd_scaleaware_convnext3d")).lower()
+    allowed_3d = {"convnext_dense3d", "cdd_scaleaware_convnext3d"}
+    if enc_type not in allowed_3d:
+        raise ValueError(
+            f"Unsupported 3D encoder_type={enc_type}. "
+            "Allowed: convnext_dense3d, cdd_scaleaware_convnext3d."
+        )
+    fusion = str(model_cfg.get("scaleaware_fusion_type", "gate"))
+    if "dense" in enc_type:
+        fusion = "concat"
+    return PyramidGridJEPA3D(
+        latent_channels=int(model_cfg.get("latent_channels", 16)),
+        scale_channels=int(model_cfg.get("scale_channels", model_cfg.get("encoder_width", 8))),
+        sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
+        patch_size=int(model_cfg.get("patch_size", 2)),
+        num_targets=int(model_cfg.get("num_targets", 32)),
+        encoder_depth=int(model_cfg.get("encoder_depth", 3)),
+        encoder_kernel_size=int(model_cfg.get("encoder_kernel_size", 5)),
+        encoder_stride=int(model_cfg.get("encoder_stride", 1)),
+        ema_momentum=float(model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996))),
+        normalize_loss=bool(model_cfg.get("normalize_loss", False)),
+        fusion=fusion,
+        constant_mask_box=bool(model_cfg.get("constant_mask_box", False)),
+        mask_box_size=int(model_cfg.get("mask_box_size", 8)),
+        num_mask_boxes=int(model_cfg.get("num_mask_boxes", 8)),
+    ).to(device)
+
+
 def run_training(config: dict, config_name: str, sessions_root: str = "sessions") -> str:
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -323,6 +422,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     train_cfg = config["train"]
     model_cfg = config["model"]
     data_cfg = config["data"]
+    is_3d_mode = str(model_cfg.get("mode", "image")).lower() == "pyramid3d"
 
     session_dir = make_session_dir(sessions_root, config_name)
     os.makedirs(session_dir, exist_ok=True)
@@ -345,7 +445,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         f"model.cdd_mode={model_cfg.get('cdd_mode', 'log')}"
     )
 
-    model = build_model_from_config(model_cfg, data_cfg, train_cfg, device)
+    model = build_model3d_from_config(model_cfg, train_cfg, device) if is_3d_mode else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
     allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
     resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
     if resume_mismatch_action not in ("skip", "error"):
@@ -422,53 +522,156 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
     _msb = float(model_cfg.get("mask_scaling_box", model_cfg.get("mask_scale", 1.0)))
+    _mb = int(model_cfg.get("mask_box_size", 16))
     _mss = float(model_cfg.get("mask_spacing_scaling", model_cfg.get("spacing_scale", 1.5)))
-    auto_roll_max = max(1, int(round(scale_max * _msb * _mss)))
+    max_box = round(scale_max * _msb + _mb)
+    auto_roll_max = max(1, int(round(float(max_box) * _mss)))
 
-    dataset = JEPADataset(
-        num_samples=data_cfg.get("num_samples", 2000),
-        image_size=data_cfg.get("image_size", 256),
-        data_root=data_cfg.get("data_root", "data"),
-        npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-        log_transform=dataset_log_transform,
-        log_eps=data_cfg.get("log_eps", 1.0),
-        cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8, 16]),
-        cdd_strength=data_cfg.get("cdd_strength", 1.0),
-        cdd_clip=data_cfg.get("cdd_clip", True),
-        norm_before_cdd=data_cfg.get("norm_before_cdd", True),
-        cdd_mode=data_cfg.get("cdd_mode", "log"),
-        cdd_constrained=data_cfg.get("cdd_constrained", True),
-        cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-        apply_cdd=dataset_apply_cdd,
-        cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
-        cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
-        cube_slice_index=data_cfg.get("cube_slice_index", 0),
-        random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
-        d4_augment=bool(data_cfg.get("d4_augment", False)),
-        cache_cdd=bool(data_cfg.get("cache_cdd", True)),
-        cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
-        cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
-        precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
+    if is_3d_mode:
+        dataset = JEPA3DCropDataset(
+            data_root=data_cfg.get("data_root", "data"),
+            npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+            num_samples=int(data_cfg.get("num_samples", 2000)),
+            crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
+            log_transform=bool(data_cfg.get("log_transform", True)),
+            log_eps=float(data_cfg.get("log_eps", 1.0)),
+            normalize=bool(data_cfg.get("normalize", True)),
+            crop_strategy=str(data_cfg.get("crop_strategy", "random")),
+        )
+        val_dataset = None
+        train_dataset = dataset
+        inference_dataset = JEPA3DCropDataset(
+            data_root=data_cfg.get("data_root", "data"),
+            npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+            num_samples=max(1, int(train_cfg.get("inference_num_samples", 8))),
+            crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
+            log_transform=bool(data_cfg.get("log_transform", True)),
+            log_eps=float(data_cfg.get("log_eps", 1.0)),
+            normalize=bool(data_cfg.get("normalize", True)),
+            crop_strategy="center",
+        )
+        train_idx = []
+        val_idx = []
+        n_total = len(dataset.npy_files)
+        val_fraction = 0.0
+    else:
+        dataset = JEPADataset(
+            num_samples=data_cfg.get("num_samples", 2000),
+            image_size=data_cfg.get("image_size", 256),
+            data_root=data_cfg.get("data_root", "data"),
+            npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+            log_transform=dataset_log_transform,
+            log_eps=data_cfg.get("log_eps", 1.0),
+            cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8, 16]),
+            cdd_strength=data_cfg.get("cdd_strength", 1.0),
+            cdd_clip=data_cfg.get("cdd_clip", True),
+            norm_before_cdd=data_cfg.get("norm_before_cdd", True),
+            cdd_mode=data_cfg.get("cdd_mode", "log"),
+            cdd_constrained=data_cfg.get("cdd_constrained", True),
+            cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
+            apply_cdd=dataset_apply_cdd,
+            cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
+            cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
+            cube_slice_index=data_cfg.get("cube_slice_index", 0),
+            random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
+            d4_augment=bool(data_cfg.get("d4_augment", False)),
+            cache_cdd=bool(data_cfg.get("cache_cdd", True)),
+            cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
+            cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
+            precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
+        )
+        val_fraction = float(train_cfg.get("val_fraction", 0.1))
+        val_fraction = min(max(val_fraction, 0.0), 0.95)
+        total_idx = list(dataset.sample_index)
+        split_seed = int(train_cfg.get("split_seed", 42))
+        random.Random(split_seed).shuffle(total_idx)
+        n_total = len(total_idx)
+        n_val_idx = int(round(n_total * val_fraction)) if n_total > 1 else 0
+        if val_fraction > 0.0 and n_val_idx == 0 and n_total > 1:
+            n_val_idx = 1
+        n_train_idx = max(1, n_total - n_val_idx)
+        train_idx = total_idx[:n_train_idx]
+        val_idx = total_idx[n_train_idx:] if n_val_idx > 0 else []
+
+        train_dataset = dataset
+        train_dataset.sample_index = train_idx
+        train_dataset.num_samples = int(train_cfg.get("num_samples", data_cfg.get("num_samples", 2000)))
+
+        val_dataset = None
+        if len(val_idx) > 0:
+            val_dataset = JEPADataset(
+                num_samples=max(1, int(train_cfg.get("val_num_samples", max(16, int(0.25 * train_dataset.num_samples))))),
+                image_size=data_cfg.get("image_size", 256),
+                data_root=data_cfg.get("data_root", "data"),
+                npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+                log_transform=dataset_log_transform,
+                log_eps=data_cfg.get("log_eps", 1.0),
+                cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8, 16]),
+                cdd_strength=data_cfg.get("cdd_strength", 1.0),
+                cdd_clip=data_cfg.get("cdd_clip", True),
+                norm_before_cdd=data_cfg.get("norm_before_cdd", True),
+                cdd_mode=data_cfg.get("cdd_mode", "log"),
+                cdd_constrained=data_cfg.get("cdd_constrained", True),
+                cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
+                apply_cdd=dataset_apply_cdd,
+                cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
+                cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
+                cube_slice_index=data_cfg.get("cube_slice_index", 0),
+                random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
+                d4_augment=False,
+                cache_cdd=bool(data_cfg.get("cache_cdd", True)),
+                cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
+                cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
+                precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
+            )
+            val_dataset.sample_index = val_idx
+    print(
+        f"[{config_name}] dataset_split total_index={n_total} train_index={len(train_idx)} "
+        f"val_index={len(val_idx)} val_fraction={val_fraction:.3f}"
     )
-    val_fraction = float(train_cfg.get("val_fraction", 0.1))
-    val_fraction = min(max(val_fraction, 0.0), 0.95)
-    total_idx = list(dataset.sample_index)
-    n_total = len(total_idx)
-    n_val_idx = int(round(n_total * val_fraction)) if n_total > 1 else 0
-    if val_fraction > 0.0 and n_val_idx == 0 and n_total > 1:
-        n_val_idx = 1
-    n_train_idx = max(1, n_total - n_val_idx)
-    train_idx = total_idx[:n_train_idx]
-    val_idx = total_idx[n_train_idx:] if n_val_idx > 0 else []
+    if hasattr(dataset, "random_roll_max"):
+        print(
+            f"[{config_name}] data_jitter random_roll_max={dataset.random_roll_max} "
+            f"(symmetric inclusive roll in [-max,+max])"
+        )
+    requested_workers = int(train_cfg.get("num_workers", 4))
+    # macOS/MPS-safe default: avoid multiprocessing worker hangs unless explicitly set.
+    if "num_workers" in train_cfg:
+        num_workers = requested_workers
+    else:
+        num_workers = 4 if device.type == "cuda" else 0
+    pin_memory = bool(device.type == "cuda")
+    persistent_workers = bool(num_workers > 0)
+    print(
+        f"[{config_name}] dataloader_setup num_workers={num_workers} "
+        f"pin_memory={pin_memory} persistent_workers={persistent_workers}"
+    )
 
-    train_dataset = dataset
-    train_dataset.sample_index = train_idx
-    train_dataset.num_samples = int(train_cfg.get("num_samples", data_cfg.get("num_samples", 2000)))
-
-    val_dataset = None
-    if len(val_idx) > 0:
-        val_dataset = JEPADataset(
-            num_samples=max(1, int(train_cfg.get("val_num_samples", max(16, int(0.25 * train_dataset.num_samples))))),
+    masking_collate = None if is_3d_mode else _collate_pad_hw
+    dataloader = DataLoader(
+        train_dataset,
+        batch_size=train_cfg.get("batch_size", 32),
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        collate_fn=masking_collate,
+    )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=train_cfg.get("batch_size", 32),
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            collate_fn=masking_collate,
+        )
+    # Inference must use canonical orientation (no D4 augmentation).
+    if not is_3d_mode:
+        inference_dataset = JEPADataset(
+            num_samples=train_dataset.num_samples,
             image_size=data_cfg.get("image_size", 256),
             data_root=data_cfg.get("data_root", "data"),
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
@@ -492,77 +695,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
             precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
         )
-        val_dataset.sample_index = val_idx
-    print(
-        f"[{config_name}] dataset_split total_index={n_total} train_index={len(train_idx)} "
-        f"val_index={len(val_idx)} val_fraction={val_fraction:.3f}"
-    )
-    print(
-        f"[{config_name}] data_jitter random_roll_max={dataset.random_roll_max} "
-        f"(symmetric inclusive roll in [-max,+max])"
-    )
-    requested_workers = int(train_cfg.get("num_workers", 4))
-    # macOS/MPS-safe default: avoid multiprocessing worker hangs unless explicitly set.
-    if "num_workers" in train_cfg:
-        num_workers = requested_workers
-    else:
-        num_workers = 4 if device.type == "cuda" else 0
-    pin_memory = bool(device.type == "cuda")
-    persistent_workers = bool(num_workers > 0)
-    print(
-        f"[{config_name}] dataloader_setup num_workers={num_workers} "
-        f"pin_memory={pin_memory} persistent_workers={persistent_workers}"
-    )
-
-    masking_collate = _make_masking_collate(model)
-    dataloader = DataLoader(
-        train_dataset,
-        batch_size=train_cfg.get("batch_size", 32),
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        collate_fn=masking_collate,
-    )
-    val_loader = None
-    if val_dataset is not None:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=train_cfg.get("batch_size", 32),
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-            collate_fn=masking_collate,
-        )
-    # Inference must use canonical orientation (no D4 augmentation).
-    inference_dataset = JEPADataset(
-        num_samples=train_dataset.num_samples,
-        image_size=data_cfg.get("image_size", 256),
-        data_root=data_cfg.get("data_root", "data"),
-        npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-        log_transform=dataset_log_transform,
-        log_eps=data_cfg.get("log_eps", 1.0),
-        cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8, 16]),
-        cdd_strength=data_cfg.get("cdd_strength", 1.0),
-        cdd_clip=data_cfg.get("cdd_clip", True),
-        norm_before_cdd=data_cfg.get("norm_before_cdd", True),
-        cdd_mode=data_cfg.get("cdd_mode", "log"),
-        cdd_constrained=data_cfg.get("cdd_constrained", True),
-        cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-        apply_cdd=dataset_apply_cdd,
-        cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
-        cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
-        cube_slice_index=data_cfg.get("cube_slice_index", 0),
-        random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
-        d4_augment=False,
-        cache_cdd=bool(data_cfg.get("cache_cdd", True)),
-        cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
-        cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
-        precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
-    )
-    inference_dataset.sample_index = list(train_idx)
-    inference_dataset.num_samples = train_dataset.num_samples
+        inference_dataset.sample_index = list(train_idx)
+        inference_dataset.num_samples = train_dataset.num_samples
     inference_loader = DataLoader(
         inference_dataset,
         batch_size=train_cfg.get("batch_size", 32),
@@ -570,7 +704,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
-        collate_fn=_collate_pad_hw,
+        collate_fn=(None if is_3d_mode else _collate_pad_hw),
     )
 
     optimizer = optim.AdamW(
@@ -618,7 +752,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", 0.1))
     sigreg_weight = float(train_cfg.get("sigreg_weight", 0.0))
     sigreg_sketch_dim = int(train_cfg.get("sigreg_sketch_dim", 64))
-    sharp_contrast_weight = float(train_cfg.get("sharp_contrast_weight", 0.0))
+    # DEPRECATED: JEPA contrastive loss path is marked for removal and is disabled.
+    sharp_contrast_weight = 0.0
     sharp_contrast_temperature = float(train_cfg.get("sharp_contrast_temperature", 0.10))
     sharp_contrast_same_scale = bool(train_cfg.get("sharp_contrast_same_scale", True))
     sharp_contrast_same_sample = bool(train_cfg.get("sharp_contrast_same_sample", True))
@@ -697,20 +832,26 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         masked_scale_rows = []
         visited_rows = []
         for batch_idx, batch in enumerate(dataloader):
-            x_clean, x_context, tloc, tscale, tvalid, debug = batch
-            x_clean = x_clean.to(device, non_blocking=True)
-            x_context = x_context.to(device, non_blocking=True)
-            tloc = tloc.to(device, non_blocking=True)
-            tscale = tscale.to(device, non_blocking=True)
-            tvalid = tvalid.to(device, non_blocking=True)
-            if debug:
-                debug = {k: v.to(device, non_blocking=True) for k, v in debug.items()}
-            context_data = (x_context, tloc, tscale, tvalid, debug)
+            if is_3d_mode:
+                x_clean = batch.to(device, non_blocking=True)
+                x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
+                context_data = None
+            else:
+                x_clean = batch.to(device, non_blocking=True)
+                x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
+                debug_context = bool(train_cfg.get("debug_masking_tensors", False))
+                context_result = _prepare_context_from_model(model, x_clean, return_debug=debug_context)
+                if len(context_result) == 5:
+                    x_context, tloc, tscale, tvalid, debug = context_result
+                else:
+                    x_context, tloc, tscale, tvalid = context_result
+                    debug = {}
+                context_data = (x_context, tloc, tscale, tvalid, debug)
 
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(device_type=device.type, enabled=use_amp):
-                outputs = model(x_clean, context_data=context_data)
+                outputs = model(x_clean, context_data=context_data) if not is_3d_mode else model(x_clean)
                 loss_jepa = model.compute_loss(outputs)
                 _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
                     outputs,
@@ -718,12 +859,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 )
                 z_pred = extract_valid_pooled_embeddings(outputs, key="pred_patches")
                 loss_sigreg = sketched_sigreg_loss(z_pred, sketch_dim=sigreg_sketch_dim)
-                loss_sharp = hard_negative_jepa_contrast_loss(
-                    outputs,
-                    temperature=sharp_contrast_temperature,
-                    same_scale=sharp_contrast_same_scale,
-                    same_sample=sharp_contrast_same_sample,
-                )
+                # DEPRECATED: to be removed; kept as zero-valued placeholder for logging compatibility.
+                loss_sharp = torch.zeros((), device=x_clean.device, dtype=loss_jepa.dtype)
                 total_loss = (
                     (jepa_loss_weight * loss_jepa)
                     + (sharp_contrast_weight * loss_sharp)
@@ -799,7 +936,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             tloc = outputs["target_locations"].detach().cpu().numpy()
             tvalid = outputs["target_valid"].detach().cpu().numpy().astype(bool)
             tscale = outputs["target_scales"].detach().cpu().numpy()
-            if visit_counts is None:
+            if (not is_3d_mode) and visit_counts is None:
                 hh, ww = int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])
                 visit_counts = np.zeros((hh, ww), dtype=np.float32)
             for bi in range(tloc.shape[0]):
@@ -808,7 +945,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         continue
                     yy = int(tloc[bi, ki, 0])
                     xx = int(tloc[bi, ki, 1])
-                    if 0 <= yy < visit_counts.shape[0] and 0 <= xx < visit_counts.shape[1]:
+                    if (visit_counts is not None) and 0 <= yy < visit_counts.shape[0] and 0 <= xx < visit_counts.shape[1]:
                         visit_counts[yy, xx] += 1.0
             bsz = tloc.shape[0]
             ksz = tloc.shape[1]
@@ -883,6 +1020,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 device=device,
                 max_batches=train_cfg.get("val_max_batches"),
                 vicreg_spatial_mode=vicreg_spatial_mode,
+                debug_context=bool(train_cfg.get("debug_masking_tensors", False)),
             )
             val_loss = float(v["val_loss"])
             val_sim = float(v["val_sim"])
@@ -921,26 +1059,35 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     torch.save(model.state_dict(), os.path.join(session_dir, "model_last.pt"))
 
-    session_dir = run_post_training_inference(
-        model=model,
-        dataloader=inference_loader,
-        session_dir=session_dir,
-        config_name=config_name,
-        visit_counts=visit_counts,
-        force_recompute_inference=force_recompute_inference,
-        inference_mask_passes=inference_mask_passes,
-        mask_inference=mask_inference,
-        viz_crop_border=viz_crop_border,
-        viz_crop_border_px=viz_crop_border_px,
-        compute_jepa_energy_fn=compute_jepa_energy,
-        compute_target_energy_map_fn=compute_target_energy_map,
-        inference_visit_batches=inference_visit_batches,
-        training_d4_augment=bool(data_cfg.get("d4_augment", False)),
-    )
+    if is_3d_mode:
+        session_dir = run_post_training_inference_3d(
+            model=model,
+            dataloader=inference_loader,
+            session_dir=session_dir,
+            config_name=config_name,
+            force_recompute_inference=force_recompute_inference,
+        )
+    else:
+        session_dir = run_post_training_inference(
+            model=model,
+            dataloader=inference_loader,
+            session_dir=session_dir,
+            config_name=config_name,
+            visit_counts=visit_counts,
+            force_recompute_inference=force_recompute_inference,
+            inference_mask_passes=inference_mask_passes,
+            mask_inference=mask_inference,
+            viz_crop_border=viz_crop_border,
+            viz_crop_border_px=viz_crop_border_px,
+            compute_jepa_energy_fn=compute_jepa_energy,
+            compute_target_energy_map_fn=compute_target_energy_map,
+            inference_visit_batches=inference_visit_batches,
+            training_d4_augment=bool(data_cfg.get("d4_augment", False)),
+        )
     # Keep dashboard artifacts in sync with inference outputs for all runs.
     # This writes session/results/* embedding files required by session_to_dash.py.
     inf_path = os.path.join(session_dir, "inference_outputs.pt")
-    if os.path.exists(inf_path):
+    if (not is_3d_mode) and os.path.exists(inf_path):
         try:
             outputs = torch.load(inf_path, map_location="cpu")
             dash_path = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)
@@ -989,5 +1136,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         except Exception as e:
             print(f"[{config_name}] warning: dashboard generation failed: {type(e).__name__}: {e}")
     else:
-        print(f"[{config_name}] warning: inference_outputs.pt missing; skip dashboard generation")
+        if is_3d_mode and os.path.exists(inf_path):
+            try:
+                outputs = torch.load(inf_path, map_location="cpu")
+                umap_meta_path = save_volumetric_umap_embeddings(session_dir, outputs, umap_cfg=umap_cfg)
+                print(f"[{config_name}] volumetric_umap_saved={umap_meta_path}")
+            except Exception as e:
+                print(f"[{config_name}] warning: volumetric UMAP generation failed: {type(e).__name__}: {e}")
+        else:
+            print(f"[{config_name}] warning: inference_outputs.pt missing; skip dashboard generation")
     return session_dir

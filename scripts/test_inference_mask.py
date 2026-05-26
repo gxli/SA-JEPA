@@ -78,11 +78,11 @@ def main():
 
     sigmas = tuple(float(v) for v in model_cfg.get("sigmas", [2, 4, 8, 16]))
     largest_sigma = float(max(sigmas))
-    min_mask_scale = float(model_cfg.get("min_mask_scale", 0.0))
-    eff_largest_sigma = max(largest_sigma, min_mask_scale)
     mask_scale = float(model_cfg.get("mask_scale", 1.0))
     spacing_scale = float(model_cfg.get("spacing_scale", 1.5))
-    spacing = int(max(1, round(eff_largest_sigma * mask_scale * spacing_scale)))
+    mask_box_size = int(model_cfg.get("mask_box_size", 16))
+    max_box = round(largest_sigma * mask_scale + mask_box_size)
+    spacing = int(max(1, round(float(max_box) * spacing_scale)))
 
     half = spacing // 2
     # Centered pixel shifts over one lattice period:
@@ -105,13 +105,11 @@ def main():
             mask_fraction=float(model_cfg.get("mask_fraction", 1.0)),
             box_sigma_mult=float(model_cfg.get("box_sigma_mult", 4.0)),
             mask_scale=mask_scale,
-            min_mask_scale=min_mask_scale,
             spacing_scale=spacing_scale,
             full_grid=bool(model_cfg.get("full_grid", True)),
             global_shift=bool(model_cfg.get("global_shift", True)),
             align_scales=bool(model_cfg.get("align_scales", True)),
-            constant_mask_box=bool(model_cfg.get("constant_mask_box", True)),
-            mask_box_size=int(model_cfg.get("mask_box_size", 16)),
+            mask_box_size=mask_box_size,
             blur_mode=blur_mode,
             cdd_mode=model_cfg.get("cdd_mode", "log"),
             cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
