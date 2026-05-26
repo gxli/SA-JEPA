@@ -470,6 +470,37 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             return float(default)
     rd_pred_gt_erank_ratio = float(rank_diag.get("pred_gt_erank_ratio", np.nan)) if isinstance(rank_diag, dict) else np.nan
 
+    # Compute mask sizes per sigma from config
+    cfg_used_path = os.path.join(session_dir, "config_used.json")
+    mask_sigma_names: list[str] = []
+    mask_sigma_sizes: list[int] = []
+    mask_config_summary: list[str] = []
+    if os.path.exists(cfg_used_path):
+        try:
+            with open(cfg_used_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            mc = cfg.get("model", {})
+            _sigmas = mc.get("sigmas", [2, 4, 8, 16])
+            _ms = float(mc.get("mask_scale", 1.0))
+            _mb = int(mc.get("mask_box_size", 0))
+            _mf = float(mc.get("mask_fraction", 1.0))
+            _ps = int(mc.get("patch_size", 3))
+            mask_config_summary = [
+                f"mask_scale={_ms}",
+                f"mask_box_size={_mb}",
+                f"mask_fraction={_mf}",
+                f"patch_size={_ps}",
+            ]
+            for s in _sigmas:
+                box = max(_ps, round(float(s) * _ms + _mb))
+                mask_sigma_names.append(f"σ={s}")
+                mask_sigma_sizes.append(box)
+            # Add overall summary
+            _computed = ", ".join(f"σ={s}→{max(_ps, round(float(s)*_ms+_mb))}px" for s in _sigmas)
+            mask_config_summary.append(f"computed: {_computed}")
+        except Exception:
+            pass
+
     np.savez_compressed(
         out_npz,
         orig=orig,
@@ -528,6 +559,9 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         rank_gt_top8=np.asarray([_rd("gt", "top8_energy")], dtype=np.float32),
         rank_pred_gt_erank_ratio=np.asarray([rd_pred_gt_erank_ratio], dtype=np.float32),
         pyramid_mask_cube=mask_cube.astype(np.float32),
+        mask_sigma_names=np.array(mask_sigma_names, dtype=str),
+        mask_sigma_sizes=np.asarray(mask_sigma_sizes, dtype=np.int32),
+        mask_config_summary=np.array(mask_config_summary, dtype=str),
     )
     return out_npz
 
@@ -826,6 +860,26 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         margin=dict(l=42, r=8, t=36, b=36),
         height=330,
     )
+    energy_vals = np.asarray(data["energy_map"], dtype=np.float32).reshape(-1)
+    energy_vals = energy_vals[np.isfinite(energy_vals)]
+    fig_energy_dist = go.Figure()
+    fig_energy_dist.add_trace(
+        go.Histogram(
+            x=energy_vals.tolist(),
+            nbinsx=90,
+            marker=dict(color="#F58518"),
+            name="energy",
+            showlegend=False,
+        )
+    )
+    fig_energy_dist.update_layout(
+        template="plotly_white",
+        title={"text": "Energy Map Distribution (0-1.5)", "x": 0.02},
+        margin=dict(l=42, r=8, t=36, b=36),
+        height=330,
+        xaxis=dict(title="energy value", range=[0.0, 1.5]),
+        yaxis=dict(title="count"),
+    )
 
     cards: list[dict] = []
     for name, stem in (("Context", "context"), ("Predict", "pred"), ("Target", "gt")):
@@ -846,6 +900,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             {"title": "Weighted Loss Components", "fig": fig_weighted_components, "group": "weighted-loss-components"},
             {"title": "Rank Diagnostics", "fig": fig_rank_diag, "group": "rank-diag"},
             {"title": "Rank Energy Top-k", "fig": fig_rank_energy, "group": "rank-energy"},
+            {"title": "Energy Distribution", "fig": fig_energy_dist, "group": "energy-dist"},
             {"title": "Target Locations", "fig": heat("Target Locations", data["target"], "Magma"), "group": "target-loc"},
             {"title": "Target Location Heatmap", "fig": heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma"), "group": "target-heat"},
             {"title": "Energy Map", "fig": heat("Energy Map", data["energy_map"], "Inferno"), "group": "energy"},
@@ -899,21 +954,19 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     if len(rendered) % 2 == 1:
         rendered.append('<section class="card card-dummy" aria-hidden="true"></section>')
 
-    masking_demo_html = _generate_masking_diagnostic_for_dashboard(session_dir)
-    masking_demo_section = ""
-    if masking_demo_html is not None:
-        masking_demo_name = os.path.basename(masking_demo_html)
-        masking_demo_section = f"""
-  <section class="masking-demo" data-mask-demo-auto="true">
-    <h2>Masking Diagnostic: Real Target/Mask Overlay (16x16)</h2>
-    <p class="masking-demo-note">
-      Built from this session config via <code>prepare_context_batch</code> and
-      <code>make_pyramid_grid_context</code>. The red contour and -2 pixels are the
-      real target patch from <code>target_locations</code>/<code>target_valid</code>.
-    </p>
-    <iframe src="{masking_demo_name}" title="masking_demo_plotly_dashboard"></iframe>
-  </section>
-"""
+    # Build mask config summary from NPZ data
+    ms_names = data.get("mask_sigma_names", np.array([], dtype=str))
+    ms_sizes = data.get("mask_sigma_sizes", np.array([], dtype=np.int32))
+    ms_summary = data.get("mask_config_summary", np.array([], dtype=str))
+    er_y = data.get("effective_rank_y", np.array([], dtype=np.float32))
+    latest_er = float(er_y[-1]) if len(er_y) > 0 and np.isfinite(er_y[-1]) else None
+
+    summary_parts = []
+    for s in ms_summary:
+        summary_parts.append(f'<span class="val">{s}</span>')
+    if latest_er is not None:
+        summary_parts.append(f'<span class="erank"><span class="erank-label">erank</span> <span class="erank-value">{latest_er:.3f}</span></span>')
+    mask_summary_html = " ".join(summary_parts) if summary_parts else "(mask config unavailable)"
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -926,23 +979,24 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     body {{ margin: 14px; background: #f4f6fa; color: #0d1527; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     h1 {{ margin: 0 0 12px 2px; font-size: 24px; font-weight: 650; }}
     .version {{ color: #596275; font-size: 13px; font-weight: 500; margin-left: 8px; }}
+    .mask-summary {{ margin: 0 0 18px 2px; padding: 14px 18px; background: #fff; border: 1px solid #d9deea; border-radius: 8px; font-size: 15px; line-height: 1.8; }}
+    .mask-summary .val {{ color: #3a4055; margin-right: 20px; }}
+    .mask-summary .erank {{ display: inline-block; margin-left: 8px; padding: 4px 14px; background: #1a1a2e; color: #fde725; border-radius: 6px; font-weight: 700; font-size: 17px; }}
+    .mask-summary .erank-label {{ color: #7a7d8a; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
+    .mask-summary .erank-value {{ font-size: 24px; margin-left: 4px; }}
     .grid {{ display: grid; grid-template-columns: repeat(2, minmax(420px, 1fr)); gap: 12px; }}
     .controls {{ display:flex; flex-wrap:wrap; gap:8px; margin: 0 0 12px 2px; align-items:center; }}
     .controls input {{ width:88px; }}
     .local-controls {{ margin: 2px 2px 8px 2px; padding: 6px; background: #f7f9ff; border: 1px solid #dde3f0; border-radius: 6px; }}
     .card {{ background: #fff; border: 1px solid #d9deea; border-radius: 10px; box-shadow: 0 1px 2px rgba(10,20,40,0.08); padding: 6px; overflow: hidden; }}
     .card-dummy {{ visibility: hidden; min-height: 340px; }}
-    .masking-demo {{ margin-top: 14px; background: #fff; border: 1px solid #d9deea; border-radius: 10px; box-shadow: 0 1px 2px rgba(10,20,40,0.08); padding: 10px; }}
-    .masking-demo h2 {{ margin: 2px 0 6px 2px; font-size: 19px; }}
-    .masking-demo-note {{ margin: 0 0 8px 2px; color: #596275; font-size: 13px; }}
-    .masking-demo iframe {{ width: 100%; height: 620px; border: 1px solid #d9deea; border-radius: 8px; background: #fff; }}
     @media (max-width: 1120px) {{ .grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
   <h1>JEPA Session Dashboard: {os.path.basename(session_dir)} <span class="version">{DASHBOARD_VERSION}</span></h1>
+  <div class="mask-summary">{mask_summary_html}</div>
   <div class="grid">{''.join(rendered)}</div>
-  {masking_demo_section}
   <script>
   function num(el) {{
     const v = parseFloat(el.value);

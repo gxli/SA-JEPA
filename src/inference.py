@@ -7,6 +7,7 @@ from typing import Callable
 
 import numpy as np
 import torch
+from src.losses import representation_dense_energy
 
 
 def _mask_invalid_targets_from_input(
@@ -249,6 +250,10 @@ def run_post_training_inference(
         "pred_patches": outputs["pred_patches"][:2].detach().cpu(),
         "gt_patches": outputs["gt_patches"][:2].detach().cpu(),
     }
+    if "network_context_in" in outputs:
+        inference_outputs["network_context_in"] = outputs["network_context_in"][:8].detach().cpu()
+    if "network_target_in" in outputs:
+        inference_outputs["network_target_in"] = outputs["network_target_in"][:8].detach().cpu()
     if "target_mask_map" in outputs:
         inference_outputs["target_mask_map"] = outputs["target_mask_map"][:8].detach().cpu()
     if "cdd_channels_orig" in outputs:
@@ -268,7 +273,10 @@ def run_post_training_inference(
     e_map_points = energy_sum / count_map.clamp_min(1.0)
     inference_outputs["jepa_energy"] = torch.tensor(energy_scalar, dtype=torch.float32)
     inference_outputs["jepa_energy_normalized"] = torch.tensor(energy_scalar_norm, dtype=torch.float32)
-    inference_outputs["target_energy_map"] = e_map_dense[:8].detach().cpu()
+    inference_outputs["target_energy_map"] = e_map_dense["energy_rel_sym"][:8].detach().cpu()
+    inference_outputs["target_energy_raw_map"] = e_map_dense["energy_raw"][:8].detach().cpu()
+    inference_outputs["target_energy_rel_gt_map"] = e_map_dense["energy_rel_gt"][:8].detach().cpu()
+    inference_outputs["target_energy_cosine_map"] = e_map_dense["energy_cosine"][:8].detach().cpu()
     inference_outputs["target_energy_point_map"] = e_map_points[:8].detach().cpu()
     inference_outputs["target_energy_count_map"] = count_map[:8].detach().cpu()
 
@@ -279,6 +287,15 @@ def run_post_training_inference(
             auto_border = int(max(0, viz_crop_border_px))
         inference_outputs["target_energy_map"] = _apply_nan_boundary_frame(
             inference_outputs["target_energy_map"], auto_border
+        )
+        inference_outputs["target_energy_raw_map"] = _apply_nan_boundary_frame(
+            inference_outputs["target_energy_raw_map"], auto_border
+        )
+        inference_outputs["target_energy_rel_gt_map"] = _apply_nan_boundary_frame(
+            inference_outputs["target_energy_rel_gt_map"], auto_border
+        )
+        inference_outputs["target_energy_cosine_map"] = _apply_nan_boundary_frame(
+            inference_outputs["target_energy_cosine_map"], auto_border
         )
         inference_outputs["target_energy_point_map"] = _apply_nan_boundary_frame(
             inference_outputs["target_energy_point_map"], auto_border
@@ -309,6 +326,16 @@ def run_post_training_inference(
     np.save(os.path.join(session_dir, "network_input_context.npy"), inference_outputs["x_context"].numpy())
     np.save(os.path.join(session_dir, "network_input_clean_raw.npy"), inference_outputs["x_clean_raw"].numpy())
     np.save(os.path.join(session_dir, "network_input_context_raw.npy"), inference_outputs["x_context_raw"].numpy())
+    if "network_context_in" in inference_outputs:
+        np.save(
+            os.path.join(session_dir, "network_context_in.npy"),
+            inference_outputs["network_context_in"].numpy(),
+        )
+    if "network_target_in" in inference_outputs:
+        np.save(
+            os.path.join(session_dir, "network_target_in.npy"),
+            inference_outputs["network_target_in"].numpy(),
+        )
     np.save(os.path.join(session_dir, "target_valid.npy"), inference_outputs["target_valid"].numpy())
     if "target_mask_map" in inference_outputs:
         np.save(os.path.join(session_dir, "target_mask_map.npy"), inference_outputs["target_mask_map"].numpy())
@@ -326,6 +353,9 @@ def run_post_training_inference(
     if visit_counts is not None:
         np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
     np.save(os.path.join(session_dir, "target_energy_map.npy"), inference_outputs["target_energy_map"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_raw_map.npy"), inference_outputs["target_energy_raw_map"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_rel_gt_map.npy"), inference_outputs["target_energy_rel_gt_map"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_cosine_map.npy"), inference_outputs["target_energy_cosine_map"].numpy())
     np.save(os.path.join(session_dir, "target_energy_point_map.npy"), inference_outputs["target_energy_point_map"].numpy())
     np.save(os.path.join(session_dir, "target_energy_count_map.npy"), inference_outputs["target_energy_count_map"].numpy())
     with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
@@ -429,11 +459,27 @@ def run_post_training_inference_3d(
 
     pred_map = outputs["pred_map"][:1].detach().cpu()
     gt_map = outputs["gt_map"][:1].detach().cpu()
-    context_map = outputs["context_map"][:1].detach().cpu()
+    context_key = "context_map"
+    if "context_map_3d" in outputs and outputs["context_map_3d"].dim() == 5:
+        context_key = "context_map_3d"
+    context_map = outputs[context_key][:1].detach().cpu()
     x_clean = outputs["x_clean"][:1].detach().cpu()
+    model_mode = str(getattr(model, "mode", "3d")).strip().lower().replace(" ", "_")
+    middle_slice_index = -1
 
-    mid = int(pred_map.shape[2] // 2)
-    energy_map_mid = (pred_map[:, :, mid] - gt_map[:, :, mid]).pow(2).mean(dim=1, keepdim=True)
+    if pred_map.dim() == 4:
+        # 2D/slice path already collapsed depth; evaluate directly.
+        e_maps_mid = representation_dense_energy(pred_map, gt_map)
+    elif pred_map.dim() == 5 and model_mode == "3d_slab":
+        # Slab mode keeps a compact depth chunk; evaluate over whole slab.
+        e_maps_mid = representation_dense_energy(pred_map, gt_map)
+        middle_slice_index = int(pred_map.shape[2] // 2)
+    elif pred_map.dim() == 5:
+        # Default backward-compatible full-volume inference summary on center slice.
+        middle_slice_index = int(pred_map.shape[2] // 2)
+        e_maps_mid = representation_dense_energy(pred_map[:, :, middle_slice_index], gt_map[:, :, middle_slice_index])
+    else:
+        raise ValueError(f"Unexpected pred_map shape in 3D inference: {tuple(pred_map.shape)}")
 
     inference_outputs = {
         "x_clean": x_clean,
@@ -446,15 +492,27 @@ def run_post_training_inference_3d(
         "target_scales": outputs.get("target_scales", torch.ones_like(outputs["target_valid"], dtype=x_clean.dtype))[:1].detach().cpu(),
         "pred_patches": outputs["pred_patches"][:1].detach().cpu(),
         "gt_patches": outputs["gt_patches"][:1].detach().cpu(),
-        "target_energy_map": energy_map_mid,
-        "middle_slice_index": torch.tensor(mid, dtype=torch.int64),
+        "target_energy_map": e_maps_mid["energy_rel_sym"],
+        "target_energy_raw_map": e_maps_mid["energy_raw"],
+        "target_energy_rel_gt_map": e_maps_mid["energy_rel_gt"],
+        "target_energy_cosine_map": e_maps_mid["energy_cosine"],
+        "middle_slice_index": torch.tensor(middle_slice_index, dtype=torch.int64),
     }
+    if "selected_slice_index" in outputs:
+        inference_outputs["selected_slice_index"] = outputs["selected_slice_index"][:1].detach().cpu()
+    if "selected_slab_start_index" in outputs:
+        inference_outputs["selected_slab_start_index"] = outputs["selected_slab_start_index"][:1].detach().cpu()
+    if "selected_slab_depth" in outputs:
+        inference_outputs["selected_slab_depth"] = outputs["selected_slab_depth"][:1].detach().cpu()
     torch.save(inference_outputs, inference_outputs_path)
 
     np.save(os.path.join(session_dir, "network_input_clean_3d.npy"), x_clean.numpy())
     np.save(os.path.join(session_dir, "pred_map_3d.npy"), pred_map.numpy())
     np.save(os.path.join(session_dir, "gt_map_3d.npy"), gt_map.numpy())
     np.save(os.path.join(session_dir, "context_map_3d.npy"), context_map.numpy())
-    np.save(os.path.join(session_dir, "target_energy_map_mid_slice.npy"), energy_map_mid.numpy())
+    np.save(os.path.join(session_dir, "target_energy_map_mid_slice.npy"), e_maps_mid["energy_rel_sym"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_raw_map_mid_slice.npy"), e_maps_mid["energy_raw"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_rel_gt_map_mid_slice.npy"), e_maps_mid["energy_rel_gt"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_cosine_map_mid_slice.npy"), e_maps_mid["energy_cosine"].numpy())
     print(f"[{config_name}] saved 3D inference artifacts")
     return session_dir

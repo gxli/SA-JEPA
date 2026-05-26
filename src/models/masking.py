@@ -218,10 +218,8 @@ def make_pyramid_grid_context(
     sigmas=(2, 4, 8, 16),
     cell_sizes=(16, 32, 64, 128),
     mask_fraction: float = 1.0,
-    box_sigma_mult: float = 4.0,
     mask_scale: float = 1.0,
     spacing_scale: float = 1.5,
-    mask_size: float = 0.0,
     full_grid: bool = True,
     global_shift: bool = True,
     align_scales: bool = True,
@@ -230,11 +228,8 @@ def make_pyramid_grid_context(
     cdd_mode: str = "log",
     cdd_constrained: bool = True,
     cdd_sm_mode: str = "reflect",
-    mask_fill_mode: str = "zero",
-    dip_sigma_mult: float = 1.0,
-    constant_gaussian_sigma: float = 1.0,
-    scaleaware_gaussian_ratios=None,
     cdd_append_last_residual: bool = True,
+    mask_fill_mode: str = "zero",
     inner_target_size: int = 2,
     return_debug: bool = False,
     forced_grid_shift: Optional[Tuple[int, int]] = None,
@@ -275,8 +270,6 @@ def make_pyramid_grid_context(
             "Only 'zero' is supported."
         )
     sampling_mode = str(target_sampling_mode).strip().lower()
-    if sampling_mode == "priority_sampliyg":
-        sampling_mode = "priority_sampling"
     # Safeguard: global_shift is a lattice/grid concept only.
     # Priority sampling selects targets from ranked pixels, so disable it.
     effective_global_shift = bool(global_shift) if sampling_mode != "priority_sampling" else False
@@ -465,11 +458,11 @@ def make_pyramid_grid_context(
 
             cdd_orig = np.clip(np.asarray(cdd_channels_arr, dtype=np.float32), a_min=0.0, a_max=None)
 
-            cdd_mod = cdd_channels_arr.copy()
-
             if cdd_append_last_residual:
                 cdd_orig[-1] = cdd_orig[-1] + cdd_residual
-                cdd_mod[-1] = cdd_mod[-1] + cdd_residual
+
+            # Context branch starts from the exact same clipped+residual base as target.
+            cdd_mod = cdd_orig.copy()
 
             all_cdd_orig.append(torch.from_numpy(cdd_orig.copy()))
 
@@ -484,8 +477,10 @@ def make_pyramid_grid_context(
                 )
                 if len(priority_catalogue) > 0:
                     perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
-                    # Explicit target-count control only.
-                    base_targets = max(0, int(round(float(priority_n_target) * float(total_fraction))))
+                    if mask_box_size > 0:
+                        base_targets = max(0, int(round(float(priority_n_target))))
+                    else:
+                        base_targets = max(0, int(round(float(priority_n_target) * float(total_fraction))))
                     k_sel = min(base_targets, len(priority_catalogue))
                     priority_catalogue = [priority_catalogue[int(i)] for i in perm[:k_sel]]
             # Dither once per selected priority seed and reuse across scales.
@@ -589,11 +584,12 @@ def make_pyramid_grid_context(
                     applied_locations.append((cy, cx))
                     applied_scales.append(float(sigma))
 
-            recon = np.sum(cdd_mod, axis=0) + cdd_residual
+            # If residual is already baked into cdd_mod[-1], don't double-add it.
+            if cdd_append_last_residual:
+                recon = np.sum(cdd_mod, axis=0)
+            else:
+                recon = np.sum(cdd_mod, axis=0) + cdd_residual
             recon = np.clip(recon, a_min=0.0, a_max=None)
-            # Masking must not introduce signal: clamp reconstruction to never
-            # exceed the pre-CDD image (arr is clean for zero, dipped for gaussian).
-            recon = np.minimum(recon, arr)
             x_context[bi, 0] = torch.from_numpy(recon).to(device=x_clean.device, dtype=x_clean.dtype)
 
             # IMPORTANT:
@@ -660,7 +656,7 @@ def make_pyramid_grid_context(
                         uniq.append((cy, cx))
                 all_unique_centers.append(torch.tensor(uniq, dtype=torch.long))
             all_mask_maps.append(torch.from_numpy(applied_mask_hard.copy()))
-            all_cdd_masked.append(torch.from_numpy(np.clip(cdd_mod, a_min=0.0, a_max=None)))
+            all_cdd_masked.append(torch.from_numpy(cdd_mod.copy()))
             all_dip_fields.append(torch.from_numpy(dip_field))
             all_dip_fields_per_channel.append(torch.from_numpy(dip_field_ch))
             all_dip_proto_per_channel.append(torch.from_numpy(dip_proto_ch))
@@ -788,10 +784,8 @@ def prepare_context_batch(
     sigmas,
     cell_sizes,
     mask_fraction: float = 1.0,
-    box_sigma_mult: float = 4.0,
     mask_scale: float = 1.0,
     spacing_scale: float = 1.5,
-    mask_size: float = 0.0,
     full_grid: bool = True,
     global_shift: bool = True,
     align_scales: bool = True,
@@ -800,10 +794,6 @@ def prepare_context_batch(
     cdd_mode: str = "log",
     cdd_constrained: bool = True,
     cdd_sm_mode: str = "reflect",
-    mask_fill_mode: str = "zero",
-    dip_sigma_mult: float = 1.0,
-    constant_gaussian_sigma: float = 1.0,
-    scaleaware_gaussian_ratios=None,
     cdd_append_last_residual: bool = True,
     patch_size: int = 2,
     return_debug: bool = False,
@@ -832,10 +822,8 @@ def prepare_context_batch(
         sigmas=sigmas,
         cell_sizes=cell_sizes,
         mask_fraction=mask_fraction,
-        box_sigma_mult=box_sigma_mult,
         mask_scale=mask_scale,
         spacing_scale=spacing_scale,
-        mask_size=mask_size,
         full_grid=full_grid,
         global_shift=global_shift,
         align_scales=align_scales,
@@ -844,10 +832,6 @@ def prepare_context_batch(
         cdd_mode=cdd_mode,
         cdd_constrained=cdd_constrained,
         cdd_sm_mode=cdd_sm_mode,
-        mask_fill_mode=mask_fill_mode,
-        dip_sigma_mult=dip_sigma_mult,
-        constant_gaussian_sigma=constant_gaussian_sigma,
-        scaleaware_gaussian_ratios=scaleaware_gaussian_ratios,
         cdd_append_last_residual=cdd_append_last_residual,
         inner_target_size=patch_size,
         return_debug=return_debug,

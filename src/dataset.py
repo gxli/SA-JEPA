@@ -247,7 +247,7 @@ class JEPADataset(Dataset):
         import constrained_diffusion as cdd
 
         arr_in = arr01.astype(np.float32, copy=True)
-        # Policy: linear normalize only to keep values in a reasonable range before CDD.
+        # Policy: Linearly normalize only to keep values in a reasonable range before CDD.
         if self.norm_before_cdd:
             arr_in = self._normalize01(arr_in)
 
@@ -302,10 +302,14 @@ class JEPADataset(Dataset):
             if bool(np.random.randint(0, 2)):
                 sample = torch.flip(sample, dims=(-2,))  # vertical
         if self.random_roll_max > 0:
-            # Inclusive, symmetric dithering in [-random_roll_max, random_roll_max].
             dy = int(np.random.randint(-self.random_roll_max, self.random_roll_max + 1))
             dx = int(np.random.randint(-self.random_roll_max, self.random_roll_max + 1))
-            sample = torch.roll(sample, shifts=(dy, dx), dims=(-2, -1))
+            pad_val = self.random_roll_max
+            padded = torch.nn.functional.pad(sample, (pad_val, pad_val, pad_val, pad_val), mode='reflect')
+            h, w = sample.shape[-2], sample.shape[-1]
+            y0 = pad_val - dy
+            x0 = pad_val - dx
+            sample = padded[..., y0:y0+h, x0:x0+w]
         return sample
 
     @staticmethod

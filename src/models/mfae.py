@@ -84,7 +84,7 @@ class MFAE2D(nn.Module):
         return mean, std
 
     def _normalize_per_channel(self, x: torch.Tensor) -> torch.Tensor:
-        eps = self._effective_eps(x)
+        eps = max(self._effective_eps(x), 0.01)
         mu = x.mean(dim=(-2, -1), keepdim=True)
         sd = x.std(dim=(-2, -1), keepdim=True, unbiased=False)
         return (x - mu) / sd.clamp_min(eps)

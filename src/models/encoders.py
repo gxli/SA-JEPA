@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 
 
@@ -199,6 +200,47 @@ class ConvNeXtDenseEncoder(nn.Module):
         x = self.head(x)
         x = self.final_norm(x)
         return x
+
+
+class D4InvariantWrapper(nn.Module):
+    """
+    Enforce exact 4-way rotational invariance by shared-weight test-time group pooling.
+
+    For each k in {0,1,2,3}:
+      1) rotate input(s) by 90*k
+      2) run base encoder
+      3) inverse-rotate output by -90*k
+    Then pool across the 4 responses (max or mean).
+    """
+
+    def __init__(self, base_encoder: nn.Module, pool: str = "max"):
+        super().__init__()
+        self.base_encoder = base_encoder
+        self.pool = str(pool).lower()
+        if self.pool not in ("max", "mean"):
+            raise ValueError(f"Unsupported D4 pool={pool}. Use 'max' or 'mean'.")
+
+    @staticmethod
+    def _rot(x: torch.Tensor, k: int) -> torch.Tensor:
+        return torch.rot90(x, k=k, dims=(-2, -1))
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        outs = []
+        for k in range(4):
+            xk = self._rot(x, k)
+            kw = {}
+            for name, val in kwargs.items():
+                if torch.is_tensor(val) and val.ndim >= 3 and val.shape[-2:] == x.shape[-2:]:
+                    kw[name] = self._rot(val, k)
+                else:
+                    kw[name] = val
+            yk = self.base_encoder(xk, **kw)
+            outs.append(self._rot(yk, -k))
+        y = torch.stack(outs, dim=2)  # B,C,4,H,W
+        if self.pool == "max":
+            y, _ = torch.max(y, dim=2)
+            return y
+        return torch.mean(y, dim=2)
 
 
 class ResCNNBlock(nn.Module):
@@ -595,3 +637,146 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
             feats = fused
         x = torch.cat(feats, dim=1)
         return self.convnext(x)
+
+
+class CDDScaleAwareResCNNEncoder(nn.Module):
+    """
+    Scale-aware CDD pyramid encoder using ResCNN blocks.
+
+    Input:
+      fields:      B x S x H x W
+      mask_tokens: B x S x H x W
+
+    Per scale:
+      [field_s, mask_s, normalized_log_sigma_s] -> shared adapter
+    Then fuse scale features and feed ResCNN dense encoder.
+    """
+
+    def __init__(
+        self,
+        scales,
+        hidden_channels: int,
+        latent_channels: int,
+        depth: int = 4,
+        scale_feat_channels: int = 8,
+        adapter_kernel_size: int = 3,
+        fusion_type: str = "concat",
+        final_norm: bool = True,
+        norm_type: str = "groupnorm",
+        norm_groups: int = 1,
+        norm_eps: float = 1e-5,
+        cdd_append_last_residual: bool = True,
+    ):
+        super().__init__()
+        self.scales = tuple(float(s) for s in scales)
+        self.num_scales = len(self.scales)
+        self.scale_feat_channels = int(scale_feat_channels)
+        self.fusion_type = str(fusion_type).lower()
+        self.cdd_append_last_residual = bool(cdd_append_last_residual)
+        if self.fusion_type not in ("concat", "topdown"):
+            raise ValueError(f"Unsupported fusion_type={fusion_type}. Use 'concat' or 'topdown'.")
+
+        logs = torch.log(torch.tensor(self.scales, dtype=torch.float32))
+        if logs.numel() > 1:
+            logs = (logs - logs.mean()) / logs.std(unbiased=False).clamp_min(1e-6)
+        else:
+            logs = logs * 0.0
+        self.register_buffer("scale_codes", logs.view(1, self.num_scales, 1, 1), persistent=False)
+
+        pad = int(adapter_kernel_size) // 2
+        self.adapter = nn.Sequential(
+            nn.ReflectionPad2d(pad),
+            nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=0),
+            make_norm2d(self.scale_feat_channels, norm_type=norm_type, norm_groups=norm_groups, norm_eps=norm_eps),
+            nn.GELU(),
+            nn.ReflectionPad2d(pad),
+            nn.Conv2d(
+                self.scale_feat_channels,
+                self.scale_feat_channels,
+                kernel_size=int(adapter_kernel_size),
+                padding=0,
+            ),
+            make_norm2d(self.scale_feat_channels, norm_type=norm_type, norm_groups=norm_groups, norm_eps=norm_eps),
+            nn.GELU(),
+        )
+        if self.fusion_type == "topdown":
+            self.fusion_proj = nn.ModuleList(
+                [nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1) for _ in range(self.num_scales)]
+            )
+
+        self.rescnn = ResCNNDenseEncoder(
+            in_channels=self.num_scales * self.scale_feat_channels,
+            hidden_channels=hidden_channels,
+            latent_channels=latent_channels,
+            depth=depth,
+            final_norm=final_norm,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            norm_eps=norm_eps,
+        )
+
+    def forward(self, fields: torch.Tensor, mask_tokens=None) -> torch.Tensor:
+        if fields.ndim != 4:
+            raise ValueError(f"Expected fields B,S,H,W, got {tuple(fields.shape)}")
+        b, s, h, w = fields.shape
+        if mask_tokens is None:
+            mask_tokens = torch.zeros_like(fields)
+
+        if s != self.num_scales:
+            if s > self.num_scales:
+                n_extra = s - self.num_scales
+                if self.cdd_append_last_residual:
+                    base = fields[:, :self.num_scales, :, :]
+                    extra = fields[:, self.num_scales:, :, :]
+                    last = base[:, self.num_scales - 1 : self.num_scales, :, :] + extra.sum(dim=1, keepdim=True)
+                    fields = torch.cat([base[:, : self.num_scales - 1, :, :], last], dim=1)
+                else:
+                    fields = fields[:, :self.num_scales, :, :]
+                print(
+                    f"[{self.__class__.__name__}] WARNING: Truncated {n_extra} extra channel(s) "
+                    f"(append_last_residual={self.cdd_append_last_residual})."
+                )
+            else:
+                n_missing = self.num_scales - s
+                if self.cdd_append_last_residual:
+                    residual = fields[:, -1:, :, :]
+                    res_mask = mask_tokens[:, -1:, :, :]
+                    split = residual / n_missing
+                    fields = torch.cat([fields[:, :-1, :, :], split.expand(-1, n_missing, -1, -1)], dim=1)
+                    mask_tokens = torch.cat([mask_tokens[:, :-1, :, :], res_mask.expand(-1, n_missing, -1, -1)], dim=1)
+                else:
+                    zeros = torch.zeros(b, n_missing, h, w, dtype=fields.dtype, device=fields.device)
+                    fields = torch.cat([fields, zeros], dim=1)
+                    mask_tokens = torch.cat([mask_tokens, zeros], dim=1)
+                print(
+                    f"[{self.__class__.__name__}] WARNING: Padded {n_missing} missing channel(s) "
+                    f"(append_last_residual={self.cdd_append_last_residual})."
+                )
+            s = self.num_scales
+
+        mask_tokens = mask_tokens[:, :s, :, :]
+        if mask_tokens.shape != fields.shape:
+            raise ValueError(
+                f"mask_tokens shape must match fields shape. fields={tuple(fields.shape)} mask={tuple(mask_tokens.shape)}"
+            )
+
+        scale_maps = self.scale_codes.to(dtype=fields.dtype, device=fields.device).expand(b, s, h, w)
+        feats = []
+        for i in range(s):
+            xi = torch.stack([fields[:, i], mask_tokens[:, i], scale_maps[:, i]], dim=1)
+            feats.append(self.adapter(xi))
+        if self.fusion_type == "topdown":
+            fused = [None] * s
+            running = None
+            for rev_i, feat in enumerate(reversed(feats)):
+                idx = s - 1 - rev_i
+                if running is None:
+                    running = feat
+                else:
+                    if running.shape[-2:] != feat.shape[-2:]:
+                        running = F.interpolate(running, size=feat.shape[-2:], mode="bilinear", align_corners=False)
+                    running = feat + running
+                fused[idx] = self.fusion_proj[idx](running)
+            feats = fused
+        x = torch.cat(feats, dim=1)
+        return self.rescnn(x)

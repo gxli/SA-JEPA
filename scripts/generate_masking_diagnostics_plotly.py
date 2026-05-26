@@ -62,10 +62,8 @@ def build_context(x_t: torch.Tensor, cfg: dict):
         sigmas=tuple(m.get("sigmas", [2, 4, 8, 16])),
         cell_sizes=tuple(m.get("cell_sizes", [16, 32, 64, 128])),
         mask_fraction=float(m.get("mask_fraction", 1.0)),
-        box_sigma_mult=float(m.get("box_sigma_mult", 4.0)),
         mask_scale=float(m.get("mask_scaling_box", m.get("mask_scale", 1.0))),
         spacing_scale=float(m.get("mask_spacing_scaling", m.get("spacing_scale", 1.5))),
-        mask_size=float(m.get("mask_size", 0.0)),
         full_grid=bool(m.get("full_grid", True)),
         global_shift=bool(m.get("global_shift", True)),
         align_scales=bool(m.get("align_scales", True)),
@@ -74,10 +72,6 @@ def build_context(x_t: torch.Tensor, cfg: dict):
         cdd_mode=str(m.get("cdd_mode", "log")),
         cdd_constrained=bool(m.get("cdd_constrained", True)),
         cdd_sm_mode=str(m.get("cdd_sm_mode", "reflect")),
-        mask_fill_mode=str(m.get("mask_fill_mode", "zero")),
-        dip_sigma_mult=1.0,
-        constant_gaussian_sigma=float(m.get("constant_gaussian_sigma", 1.0)),
-        scaleaware_gaussian_ratios=tuple(m.get("scaleaware_gaussian_ratios", [0.25, 0.5, 1.0, 2.0])),
         cdd_append_last_residual=bool(m.get("cdd_append_last_residual", True)),
         patch_size=int(m.get("patch_size", 3)),
         return_debug=True,
@@ -261,8 +255,9 @@ def main():
         zmin=-2.0,
         zmax=1.0,
     )
-    for i in range(n_ch):
-        add(dip_plot[i], target_contour, i + 1, box_sizes[i], colorscale=energy_marker_colorscale, zmin=-2.0, zmax=1.0)
+    # Channel plots disabled (gaussian dip removed).
+    # for i in range(n_ch):
+    #     add(dip_plot[i], target_contour, i + 1, box_sizes[i], colorscale=energy_marker_colorscale, zmin=-2.0, zmax=1.0)
 
     title = (
         f"Mask Diagnostic: {os.path.basename(args.config)} | "

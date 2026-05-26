@@ -71,6 +71,8 @@ def _prepare_context_from_model(
     enc_type = str(getattr(model, "encoder_type", "")).lower()
     debug_encoder_types = {
         "cdd_scaleaware_convnext",
+        "cdd_scaleaware_convnext_d4",
+        "cdd_scaleaware_rescnn",
         "cdd_opnet",
         "convnext_dense_pyramid",
         "rescnn_dense_pyramid",
@@ -78,6 +80,7 @@ def _prepare_context_from_model(
         "pyramid_cnn_res_dilated",
         "mfae_convnext",
         "convnext_dense_masktoken",
+        "convnext_dense_masktoken_d4",
     }
     need_debug = bool(
         return_debug
@@ -89,10 +92,8 @@ def _prepare_context_from_model(
         sigmas=model.sigmas,
         cell_sizes=model.cell_sizes,
         mask_fraction=model.mask_fraction,
-        box_sigma_mult=model.box_sigma_mult,
         mask_scale=model.mask_scale,
         spacing_scale=model.spacing_scale,
-        mask_size=model.mask_size,
         full_grid=model.full_grid,
         global_shift=model.global_shift,
         align_scales=model.align_scales,
@@ -101,10 +102,6 @@ def _prepare_context_from_model(
         cdd_mode=model.cdd_mode,
         cdd_constrained=model.cdd_constrained,
         cdd_sm_mode=model.cdd_sm_mode,
-        mask_fill_mode=model.mask_fill_mode,
-        dip_sigma_mult=model.dip_sigma_mult,
-        constant_gaussian_sigma=model.constant_gaussian_sigma,
-        scaleaware_gaussian_ratios=model.scaleaware_gaussian_ratios,
         cdd_append_last_residual=model.cdd_append_last_residual,
         patch_size=model.patch_size,
         return_debug=need_debug,
@@ -206,53 +203,51 @@ def resolve_encoder_type_default(model_cfg: dict) -> str:
     return "convnext_dense_masktoken"
 
 
+def _is_3d_jepa_mode(mode: str) -> bool:
+    mode_norm = str(mode).strip().lower().replace(" ", "_")
+    return mode_norm in {"pyramid3d", "3d", "2d", "3d_slice", "3d_slab"}
+
+
 def _resolve_encoder_alias_2d(name: str) -> str:
     key = str(name).lower()
     alias = {
         # Preferred naming convention (image / image_pyramid prefixes).
         "convnext_image_dense_masked": "convnext_dense_masktoken",
+        "convnext_image_dense_masked_d4": "convnext_dense_masktoken_d4",
         "rescnn-image-plain": "rescnn_dense",
         "cdd_opnet-pyramid-opnet": "cdd_opnet",
         "cdd_scaleaware_convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
+        "cdd_scaleaware_convnext-pyramid-scaleaware-d4": "cdd_scaleaware_convnext_d4",
+        "rescnn-pyramid-scaleaware": "cdd_scaleaware_rescnn",
         "image_rescnn_dense": "rescnn_dense",
         "image_pyramid_cdd_opnet": "cdd_opnet",
         "image_pyramid_cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
+        "image_pyramid_cdd_scaleaware_convnext_d4": "cdd_scaleaware_convnext_d4",
+        "image_pyramid_cdd_scaleaware_rescnn": "cdd_scaleaware_rescnn",
         # Backward-compatible typo alias.
         "imge_pyramid_cdd_opnet": "cdd_opnet",
         "imge_pyramid_cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
         # Supported canonical names.
         "rescnn_dense": "rescnn_dense",
+        "convnext_dense_masktoken": "convnext_dense_masktoken",
+        "convnext_dense_masktoken_d4": "convnext_dense_masktoken_d4",
         "cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
+        "cdd_scaleaware_convnext_d4": "cdd_scaleaware_convnext_d4",
+        "cdd_scaleaware_rescnn": "cdd_scaleaware_rescnn",
         "cdd_opnet": "cdd_opnet",
         # Supported aliases.
         "rescnn-image-base": "rescnn_dense",
         "convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
         "opnet-image-scaleaware": "cdd_opnet",
-        # REVIEW-LATER (deletion candidates): temporary legacy aliases.
-        "image_convnext": "convnext_dense",
-        "nofusion": "cdd_scaleaware_convnext",
-        "convnext-image-base": "convnext_dense",
-        "convnext-image-boxmask-token": "convnext_dense_masktoken",
-        "convnext-image-scaleaware": "cdd_scaleaware_convnext",
-        "convnext-image-grad_laplace-mfae": "mfae_convnext",
-        "convnext-pyramid-base": "convnext_dense_pyramid",
-        "convnext-pyramid_dilated-base": "pyramid_convnext_dilated",
-        "mfae-image-grad_laplace": "mfae_convnext",
-        "rescnn-image-pyramid": "rescnn_dense_pyramid",
-        "resnet-image-pyramid_dilated": "pyramid_cnn_res_dilated",
-        "unet-image-dense_small": "dense_unet_small",
-        "fullres-image-base": "fullres",
-        "convnext-image-pyramid": "convnext_dense_pyramid",
-        "convnext-image-pyramid_dilated": "pyramid_convnext_dilated",
-        "convnext_dense": "convnext_dense",
-        "convnext_dense_masktoken": "convnext_dense_masktoken",
-        "mfae_convnext": "mfae_convnext",
-        "rescnn_dense_pyramid": "rescnn_dense_pyramid",
-        "pyramid_cnn_res_dilated": "pyramid_cnn_res_dilated",
-        "dense_unet_small": "dense_unet_small",
-        "fullres": "fullres",
-        "convnext_dense_pyramid": "convnext_dense_pyramid",
-        "pyramid_convnext_dilated": "pyramid_convnext_dilated",
+        # --- STALE encoders (no masked-token support) ---
+        # "convnext_dense": "convnext_dense",
+        # "mfae_convnext": "mfae_convnext",
+        # "dense_unet_small": "dense_unet_small",
+        # "fullres": "fullres",
+        # "rescnn_dense_pyramid": "rescnn_dense_pyramid",
+        # "convnext_dense_pyramid": "convnext_dense_pyramid",
+        # "pyramid_cnn_res_dilated": "pyramid_cnn_res_dilated",
+        # "pyramid_convnext_dilated": "pyramid_convnext_dilated",
     }
     return alias.get(key, str(name))
 
@@ -280,23 +275,20 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
     """Construct a PyramidGridJEPA from config dicts, with backward-compatible param aliases."""
     blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
     mask_scaling_box = float(model_cfg.get("mask_scaling_box", model_cfg.get("mask_scale", 1.0)))
-    # gscale is deprecated.
-    mask_scaling_gaussian = 1.0
     mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", model_cfg.get("spacing_scale", 1.5)))
-    mask_size = float(model_cfg.get("mask_size", 0.0))
     _, _, model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
     resolved_encoder_type = _resolve_encoder_alias_2d(resolve_encoder_type_default(model_cfg))
     resolved_mode = str(model_cfg.get("mode", "image")).lower()
     use_image_mask_token = bool(model_cfg.get("use_image_mask_token", False))
     if resolved_mode == "image":
-        allowed_image = {"rescnn_dense", "convnext_dense_masktoken"}
+        allowed_image = {"rescnn_dense", "convnext_dense_masktoken", "convnext_dense_masktoken_d4"}
         if resolved_encoder_type not in allowed_image:
             raise ValueError(
                 f"Unsupported image-mode encoder_type={resolved_encoder_type}. "
                 "Allowed: rescnn_dense, convnext_dense_masktoken."
             )
     elif resolved_mode == "pyramid":
-        allowed_pyramid = {"cdd_scaleaware_convnext", "cdd_opnet"}
+        allowed_pyramid = {"cdd_scaleaware_convnext", "cdd_scaleaware_convnext_d4", "cdd_scaleaware_rescnn", "cdd_opnet"}
         if resolved_encoder_type not in allowed_pyramid:
             raise ValueError(
                 f"Unsupported pyramid-mode encoder_type={resolved_encoder_type}. "
@@ -319,10 +311,8 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
         mask_fraction=float(model_cfg.get("mask_fraction", 1.0)),
-        box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
         mask_scale=mask_scaling_box,
         spacing_scale=mask_spacing_scaling,
-        mask_size=mask_size,
         full_grid=model_cfg.get("full_grid", True),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
@@ -332,8 +322,6 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         cdd_constrained=model_cfg.get("cdd_constrained", True),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
         mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-        dip_sigma_mult=mask_scaling_gaussian,
-        constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
         cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
         post_log_transform=model_cfg.get("post_log_transform", model_post_log),
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
@@ -354,11 +342,6 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         scaleaware_adapter_kernel_size=int(model_cfg.get("scaleaware_adapter_kernel_size", 3)),
         scaleaware_fusion_type=str(model_cfg.get("scaleaware_fusion_type", "concat")),
         scaleaware_norm_per_scale=bool(model_cfg.get("scaleaware_norm_per_scale", False)),
-        mfae_scales=tuple(model_cfg.get("mfae_scales", [1, 2, 4])),
-        mfae_features=tuple(model_cfg.get("mfae_features", ["x", "gradmag", "abslap", "local_std"])),
-        mfae_normalize_attributes=bool(model_cfg.get("mfae_normalize_attributes", False)),
-        mfae_include_mask_tokens=bool(model_cfg.get("mfae_include_mask_tokens", True)),
-        scaleaware_gaussian_ratios=tuple(model_cfg.get("scaleaware_gaussian_ratios", [0.25, 0.5, 1.0, 2.0])),
         opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
         opnet_dilations=model_cfg.get("opnet_dilations"),
         opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
@@ -388,6 +371,8 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
     fusion = str(model_cfg.get("scaleaware_fusion_type", "gate"))
     if "dense" in enc_type:
         fusion = "concat"
+    mode_key = str(model_cfg.get("mode", "pyramid3d")).strip().lower().replace(" ", "_")
+    model_mode = str(model_cfg.get("volumetric_mode", "2d")) if mode_key == "pyramid3d" else mode_key
     return PyramidGridJEPA3D(
         latent_channels=int(model_cfg.get("latent_channels", 16)),
         scale_channels=int(model_cfg.get("scale_channels", model_cfg.get("encoder_width", 8))),
@@ -403,6 +388,9 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         constant_mask_box=bool(model_cfg.get("constant_mask_box", False)),
         mask_box_size=int(model_cfg.get("mask_box_size", 8)),
         num_mask_boxes=int(model_cfg.get("num_mask_boxes", 8)),
+        mode=model_mode,
+        slab_depth=int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
+        slab_boundary_margin=int(model_cfg.get("slab_boundary_margin", model_cfg.get("encoder_depth", 3))),
     ).to(device)
 
 
@@ -415,14 +403,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         device = torch.device("cpu")
     mps_available = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
     print(
-        f"[{config_name}] backend_discovered device={device.type} "
-        f"cuda_available={torch.cuda.is_available()} mps_available={mps_available}"
+        f"[{config_name}] Backend discovered: device={device.type}, "
+        f"cuda_available={torch.cuda.is_available()}, mps_available={mps_available}"
     )
 
     train_cfg = config["train"]
     model_cfg = config["model"]
     data_cfg = config["data"]
-    is_3d_mode = str(model_cfg.get("mode", "image")).lower() == "pyramid3d"
+    is_3d_mode = _is_3d_jepa_mode(model_cfg.get("mode", "image"))
 
     session_dir = make_session_dir(sessions_root, config_name)
     os.makedirs(session_dir, exist_ok=True)
@@ -436,12 +424,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     dataset_apply_cdd, dataset_log_transform, _ = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
 
     print(
-        f"[{config_name}] resolved_pipeline "
-        f"dataset_apply_cdd={dataset_apply_cdd} "
-        f"dataset_log_transform={dataset_log_transform} "
-        f"model.post_log_transform={model_cfg.get('post_log_transform', '<unset>')} "
-        f"data.log_transform={data_cfg.get('log_transform', True)} "
-        f"data.cdd_mode={data_cfg.get('cdd_mode', 'log')} "
+        f"[{config_name}] Resolved pipeline: "
+        f"dataset_apply_cdd={dataset_apply_cdd}, "
+        f"dataset_log_transform={dataset_log_transform}, "
+        f"model.post_log_transform={model_cfg.get('post_log_transform', '<unset>')}, "
+        f"data.log_transform={data_cfg.get('log_transform', True)}, "
+        f"data.cdd_mode={data_cfg.get('cdd_mode', 'log')}, "
         f"model.cdd_mode={model_cfg.get('cdd_mode', 'log')}"
     )
 
@@ -471,7 +459,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 # Common during architecture evolution (e.g. channel-count changes).
                 print(f"[{config_name}] resume_model load_state_dict_failed: {e}")
                 missing, unexpected = ["__load_state_dict_failed__"], []
-            print(f"[{config_name}] resume_model missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
+            print(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
             if missing:
                 print(f"[{config_name}] resume_model missing_keys_list={missing}")
             if unexpected:
@@ -483,12 +471,16 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         "Set train.allow_partial_resume=true to permit partial model resume."
                     )
                 print(
-                    f"[{config_name}] warning: checkpoint model-state mismatch; "
+                    f"[{config_name}] Warning: checkpoint model-state mismatch; "
                     "skipping resume checkpoint and starting fresh model/optimizer/scaler."
                 )
                 resume_state = None
                 start_epoch = 0
-                model = build_model_from_config(model_cfg, data_cfg, train_cfg, device)
+                model = (
+                    build_model3d_from_config(model_cfg, train_cfg, device)
+                    if is_3d_mode
+                    else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
+                )
                 print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
             start_epoch = int(resume_state.get("epoch", 0))
@@ -500,7 +492,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             # Common during architecture evolution (e.g. channel-count changes).
             print(f"[{config_name}] resume_model load_state_dict_failed: {e}")
             missing, unexpected = ["__load_state_dict_failed__"], []
-        print(f"[{config_name}] resume_model missing_keys={len(missing)} unexpected_keys={len(unexpected)}")
+        print(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
         if missing:
             print(f"[{config_name}] resume_model missing_keys_list={missing}")
         if unexpected:
@@ -515,7 +507,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"[{config_name}] warning: model checkpoint mismatch; "
                 "ignoring model_last and starting fresh model/optimizer/scaler."
             )
-            model = build_model_from_config(model_cfg, data_cfg, train_cfg, device)
+            model = (
+                build_model3d_from_config(model_cfg, train_cfg, device)
+                if is_3d_mode
+                else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
+            )
             print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
         else:
             print(f"resume_model={model_ckpt_path}")
@@ -626,13 +622,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             )
             val_dataset.sample_index = val_idx
     print(
-        f"[{config_name}] dataset_split total_index={n_total} train_index={len(train_idx)} "
-        f"val_index={len(val_idx)} val_fraction={val_fraction:.3f}"
+        f"[{config_name}] Dataset split: total_index={n_total}, train_index={len(train_idx)}, "
+        f"val_index={len(val_idx)}, val_fraction={val_fraction:.3f}"
     )
     if hasattr(dataset, "random_roll_max"):
         print(
-            f"[{config_name}] data_jitter random_roll_max={dataset.random_roll_max} "
-            f"(symmetric inclusive roll in [-max,+max])"
+            f"[{config_name}] Data jitter: random_roll_max={dataset.random_roll_max} "
+            f"(symmetric inclusive roll in [-max, +max])"
         )
     requested_workers = int(train_cfg.get("num_workers", 4))
     # macOS/MPS-safe default: avoid multiprocessing worker hangs unless explicitly set.
@@ -643,8 +639,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     pin_memory = bool(device.type == "cuda")
     persistent_workers = bool(num_workers > 0)
     print(
-        f"[{config_name}] dataloader_setup num_workers={num_workers} "
-        f"pin_memory={pin_memory} persistent_workers={persistent_workers}"
+        f"[{config_name}] Dataloader setup: num_workers={num_workers}, "
+        f"pin_memory={pin_memory}, persistent_workers={persistent_workers}"
     )
 
     masking_collate = None if is_3d_mode else _collate_pad_hw
@@ -1102,8 +1098,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 print(f"[{config_name}] warning: rank_diagnostics_failed: {type(er).__name__}: {er}")
             if compute_effective_rank:
                 try:
-                    if "pred" in rank_diag and "erank" in rank_diag["pred"]:
-                        effective_rank = f"{float(rank_diag['pred']['erank']):.8f}"
+                    # Use target-branch rank as the primary effective-rank signal.
+                    # pred.erank can be confounded by predictor weakness/noise.
+                    if "gt" in rank_diag and "erank" in rank_diag["gt"]:
+                        effective_rank = f"{float(rank_diag['gt']['erank']):.8f}"
                     else:
                         pred_map = outputs.get("pred_map")
                         if pred_map is not None:

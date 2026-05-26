@@ -9,7 +9,7 @@ class FullResPredictor3D(nn.Module):
         self.net = nn.Sequential(
             nn.Conv3d(channels, hidden, 1),
             nn.GELU(),
-            nn.Conv3d(hidden, hidden, 3, padding=1),
+            nn.Conv3d(hidden, hidden, 3, padding=1, padding_mode="replicate"),
             nn.GELU(),
             nn.Conv3d(hidden, channels, 1),
         )

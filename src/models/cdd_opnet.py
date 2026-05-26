@@ -201,7 +201,8 @@ class CDDOpNetEncoder(nn.Module):
         else:
             floor_base = torch.clamp(floor_source, min=0.0)
         base_std = torch.std(floor_base, dim=(-2, -1), keepdim=True)
-        floor = torch.clamp(base_std * self.log_std_floor_mult, min=eps)
+        structural_std_floor = torch.clamp(base_std, min=1e-3)
+        floor = torch.clamp(structural_std_floor * self.log_std_floor_mult, min=eps)
         return torch.log(base + floor)
 
     def _gaussian_blur_single(self, x: torch.Tensor, sigma: float) -> torch.Tensor:

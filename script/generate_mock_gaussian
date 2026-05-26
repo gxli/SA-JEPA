@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Generate mock Gaussian fields and PNG previews.
+
+Creates two 512x512 datasets in data/:
+1) v1: amplitude~U(1,3), width~U(3,9)
+2) v2: amplitude~U(1,3), width=amplitude*3
+
+Each dataset uses 100 randomly placed 2D Gaussians.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def generate_field(size: int, n_gaussians: int, mode: str, rng: np.random.Generator) -> np.ndarray:
+    y = np.arange(size, dtype=np.float32)
+    x = np.arange(size, dtype=np.float32)
+    xx, yy = np.meshgrid(x, y)
+
+    field = np.zeros((size, size), dtype=np.float32)
+
+    for _ in range(n_gaussians):
+        cx = rng.uniform(0, size)
+        cy = rng.uniform(0, size)
+
+        amp = rng.uniform(1.0, 3.0)
+        if mode == "v1":
+            sigma = rng.uniform(3.0, 9.0)
+        elif mode == "v2":
+            sigma = amp * 3.0
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        r2 = (xx - cx) ** 2 + (yy - cy) ** 2
+        field += amp * np.exp(-r2 / (2.0 * sigma * sigma))
+
+    return field
+
+
+def save_outputs(arr: np.ndarray, out_npy: Path, out_png: Path) -> None:
+    np.save(out_npy, arr)
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(arr, cmap="viridis", origin="lower")
+    plt.colorbar(fraction=0.046, pad=0.04)
+    plt.title(out_npy.stem)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate mock Gaussian datasets")
+    parser.add_argument("--size", type=int, default=512, help="Image size (size x size)")
+    parser.add_argument("--count", type=int, default=100, help="Number of Gaussians")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--outdir", type=Path, default=Path("data"), help="Output directory")
+    args = parser.parse_args()
+
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
+
+    field_v1 = generate_field(args.size, args.count, mode="v1", rng=rng)
+    save_outputs(
+        field_v1,
+        args.outdir / "mock_gaussians_v1.npy",
+        args.outdir / "mock_gaussians_v1.png",
+    )
+
+    field_v2 = generate_field(args.size, args.count, mode="v2", rng=rng)
+    save_outputs(
+        field_v2,
+        args.outdir / "mock_gaussians_v2.npy",
+        args.outdir / "mock_gaussians_v2.png",
+    )
+
+    print("Generated:")
+    print(args.outdir / "mock_gaussians_v1.npy")
+    print(args.outdir / "mock_gaussians_v1.png")
+    print(args.outdir / "mock_gaussians_v2.npy")
+    print(args.outdir / "mock_gaussians_v2.png")
+
+
+if __name__ == "__main__":
+    main()

@@ -245,14 +245,63 @@ def compute_jepa_energy(outputs: dict, normalize: bool = False) -> float:
     return 0.0
 
 
-def compute_target_energy_map(outputs: dict, image_size: tuple[int, int]) -> torch.Tensor:
-    # Dense full-image energy from latent map reconstruction error.
-    # This intentionally does NOT depend on sparse target points.
+def representation_dense_energy(pred_map: torch.Tensor, gt_map: torch.Tensor, eps: float = 1e-8) -> dict[str, torch.Tensor]:
+    diff = pred_map - gt_map
+    diff2 = diff.pow(2)
+
+    raw = diff2.mean(dim=1, keepdim=True)
+
+    gt_norm2 = gt_map.pow(2).sum(dim=1, keepdim=True)
+    pred_norm2 = pred_map.pow(2).sum(dim=1, keepdim=True)
+
+    rel_gt = diff2.sum(dim=1, keepdim=True) / gt_norm2.clamp_min(eps)
+    rel_sym = diff2.sum(dim=1, keepdim=True) / (0.5 * (gt_norm2 + pred_norm2)).clamp_min(eps)
+
+    cos = 1.0 - F.cosine_similarity(pred_map, gt_map, dim=1, eps=eps).unsqueeze(1)
+
+    return {
+        "energy_raw": raw,
+        "energy_rel_gt": rel_gt,
+        "energy_rel_sym": rel_sym,
+        "energy_cosine": cos,
+    }
+
+
+def representation_patch_energy(pred_patches: torch.Tensor, gt_patches: torch.Tensor, eps: float = 1e-8) -> dict[str, torch.Tensor]:
+    diff = pred_patches - gt_patches
+
+    raw = diff.pow(2).mean(dim=(2, 3, 4))
+
+    diff2 = diff.pow(2).sum(dim=(2, 3, 4))
+    gt2 = gt_patches.pow(2).sum(dim=(2, 3, 4))
+    pred2 = pred_patches.pow(2).sum(dim=(2, 3, 4))
+
+    rel_gt = diff2 / gt2.clamp_min(eps)
+    rel_sym = diff2 / (0.5 * (gt2 + pred2)).clamp_min(eps)
+
+    cos = 1.0 - F.cosine_similarity(
+        pred_patches.flatten(2),
+        gt_patches.flatten(2),
+        dim=2,
+        eps=eps,
+    )
+
+    return {
+        "energy_raw": raw,
+        "energy_rel_gt": rel_gt,
+        "energy_rel_sym": rel_sym,
+        "energy_cosine": cos,
+    }
+
+
+def compute_target_energy_map(outputs: dict, image_size: tuple[int, int]) -> dict[str, torch.Tensor]:
     pred_map = outputs["pred_map"]
     gt_map = outputs["gt_map"].detach()
     h, w = int(image_size[0]), int(image_size[1])
-    # Per-pixel latent MSE across channels -> Bx1xH_latxW_lat
-    energy_lat = (pred_map - gt_map).pow(2).mean(dim=1, keepdim=True)
-    if energy_lat.shape[-2:] != (h, w):
-        energy_lat = F.interpolate(energy_lat, size=(h, w), mode="bilinear", align_corners=False)
-    return energy_lat
+
+    result = representation_dense_energy(pred_map, gt_map)
+
+    for key in result:
+        if result[key].shape[-2:] != (h, w):
+            result[key] = F.interpolate(result[key], size=(h, w), mode="bilinear", align_corners=False)
+    return result

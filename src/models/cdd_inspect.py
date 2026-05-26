@@ -129,7 +129,8 @@ class CDDOperatorFeatures2D(nn.Module):
     def _normalize_per_channel(self, x: torch.Tensor) -> torch.Tensor:
         mu = x.mean(dim=(-2, -1), keepdim=True)
         sd = x.std(dim=(-2, -1), keepdim=True, unbiased=False)
-        return (x - mu) / sd.clamp_min(self.eps)
+        structural_eps = max(self.eps, 0.01)
+        return (x - mu) / sd.clamp_min(structural_eps)
 
     def _lognorm_positive(self, x: torch.Tensor) -> torch.Tensor:
         eps = max(1e-30, float(self.log_eps))

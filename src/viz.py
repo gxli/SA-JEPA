@@ -326,13 +326,16 @@ def save_blurred_debug_images(
     return out_dir
 
 
-def save_blurred_reference_images(session_dir: str, x_clean_raw: torch.Tensor, x_context_raw: torch.Tensor) -> str:
+def save_context_reference_images(session_dir: str, x_clean_raw: torch.Tensor, x_context_input: torch.Tensor) -> str:
     out_dir = os.path.join(session_dir, "results")
     os.makedirs(out_dir, exist_ok=True)
     clean = x_clean_raw[0, 0].detach().cpu().numpy().astype(np.float32)
-    ctx = x_context_raw[0, 0].detach().cpu().numpy().astype(np.float32)
+    ctx = x_context_input[0, 0].detach().cpu().numpy().astype(np.float32)
     delta = clean - ctx
     _save_png(os.path.join(out_dir, "reference_000_clean.png"), clean, cmap="gray")
+    _save_png(os.path.join(out_dir, "reference_000_context_input.png"), ctx, cmap="gray")
+    _save_png(os.path.join(out_dir, "reference_000_clean_minus_context_input.png"), delta, cmap="coolwarm")
+    # Backward compatibility for downstream scripts still expecting old filenames.
     _save_png(os.path.join(out_dir, "reference_000_context_blurred.png"), ctx, cmap="gray")
     _save_png(os.path.join(out_dir, "reference_000_clean_minus_context.png"), delta, cmap="coolwarm")
     return out_dir
@@ -405,7 +408,11 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     context_map = outputs.get("context_map")
 
     orig = x_clean_raw[0, 0].detach().cpu().numpy()
-    ctx = x_context_raw[0, 0].detach().cpu().numpy()
+    # Prefer the real 2-channel ConvNeXt input (e.g. convnext_dense_masktoken).
+    # Fallback to shared transformed x_context, not x_context_raw from
+    # prepare_context_batch, to avoid a misleading blurred/drop-shadow look.
+    x_context_display = outputs.get("network_context_in", x_context)
+    ctx = x_context_display[0, 0].detach().cpu().numpy()
 
     # Build input-validity mask at latent-map resolution (shared by all branches).
     h_lat = int(pred_map.shape[-2])
@@ -472,7 +479,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     # Session plot compatibility artifacts.
     results_dir = os.path.join(session_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
-    save_blurred_reference_images(session_dir, x_clean_raw, x_context_raw)
+    save_context_reference_images(session_dir, x_clean_raw, x_context_display)
     np.save(os.path.join(results_dir, "latent_vectors_full.npy"), x.astype(np.float32))
     np.save(os.path.join(results_dir, "umap_x.npy"), umap_3d[:, 0].astype(np.float32))
     np.save(os.path.join(results_dir, "umap_y.npy"), umap_3d[:, 1].astype(np.float32))
@@ -671,8 +678,12 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         except Exception as e:
             print(f"[warning] failed to read {metrics_path}: {type(e).__name__}: {e}")
     ref_clean = os.path.join("results", "reference_000_clean.png")
-    ref_ctx = os.path.join("results", "reference_000_context_blurred.png")
-    ref_delta = os.path.join("results", "reference_000_clean_minus_context.png")
+    ref_ctx_new = os.path.join("results", "reference_000_context_input.png")
+    ref_delta_new = os.path.join("results", "reference_000_clean_minus_context_input.png")
+    ref_ctx_old = os.path.join("results", "reference_000_context_blurred.png")
+    ref_delta_old = os.path.join("results", "reference_000_clean_minus_context.png")
+    ref_ctx = ref_ctx_new if os.path.exists(os.path.join(session_dir, ref_ctx_new)) else ref_ctx_old
+    ref_delta = ref_delta_new if os.path.exists(os.path.join(session_dir, ref_delta_new)) else ref_delta_old
     target_vis_rel = os.path.join("results", "target_locations_vis.png")
     hist_vis_rel = os.path.join("results", "target_locations_hist_vis.png")
     loss_html = (
@@ -680,7 +691,6 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         if len(loss_x) > 0
         else "<p>Loss data not available yet.</p>"
     )
-    masking_plotly_rel = _generate_masking_diagnostic_for_dashboard(session_dir)
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -696,7 +706,6 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     .card {{ border: 1px solid #ddd; padding: 8px; border-radius: 6px; background: #fff; }}
     img {{ width: 100%; height: auto; display: block; }}
     iframe {{ width: 100%; height: 920px; border: 1px solid #ddd; border-radius: 6px; }}
-    .masking-demo iframe {{ height: 620px; }}
     .note {{ color: #555; font-size: 13px; margin: 0 0 8px 0; }}
   </style>
 </head>
@@ -725,18 +734,6 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     <h2>Latent Overview</h2>
     <iframe src="{latent_name}" title="latent_overview_4panel"></iframe>
   </div>
-  {
-    f'''
-  <div class="section masking-demo" data-mask-demo-auto="true">
-    <h2>Masking Diagnostic: Real Target/Mask Overlay (16x16)</h2>
-    <p class="note">
-      Built from this session config via prepare_context_batch and make_pyramid_grid_context.
-      The red contour and -2 pixels are the real target patch from target_locations/target_valid.
-    </p>
-    <iframe src="{masking_plotly_rel}" title="masking_demo_plotly_dashboard"></iframe>
-  </div>
-''' if masking_plotly_rel is not None else ""
-  }
   {
     f'''
   <div class="section">

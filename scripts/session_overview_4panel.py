@@ -211,8 +211,8 @@ def make_session_overview_plot(
         ]
     )
     if have_energy:
-        specs.append([{"type": "heatmap"}, {"type": "heatmap"}])
-        titles.extend(["JEPA Target Energy Map", "JEPA Target Energy Map (log1p)"])
+        specs.append([{"type": "heatmap"}, {"type": "xy"}])
+        titles.extend(["JEPA Target Energy Map", "JEPA Target Energy Histogram"])
     fig = make_subplots(
         rows=n_rows,
         cols=2,
@@ -298,13 +298,33 @@ def make_session_overview_plot(
     if have_energy:
         em = np.asarray(energy_map, dtype=np.float32)
         e_row = 4 + row_offset
-        fig.add_trace(go.Heatmap(z=em, colorscale="Magma", showscale=True), row=e_row, col=1)
-        fig.add_trace(go.Heatmap(z=np.log1p(em), colorscale="Cividis", showscale=True), row=e_row, col=2)
+        fig.add_trace(
+            go.Heatmap(
+                z=em,
+                colorscale="Magma",
+                showscale=True,
+                colorbar={"title": "energy", "x": 0.47, "len": 0.2},
+            ),
+            row=e_row,
+            col=1,
+        )
+        em_valid = em[np.isfinite(em)].reshape(-1)
+        fig.add_trace(
+            go.Histogram(
+                x=em_valid.tolist(),
+                nbinsx=80,
+                marker={"color": "#4C78A8"},
+                name="energy_hist",
+                showlegend=False,
+            ),
+            row=e_row,
+            col=2,
+        )
         eh, ew = int(em.shape[0]), int(em.shape[1])
         fig.update_xaxes(range=[0, ew], constrain="domain", row=e_row, col=1)
         fig.update_yaxes(range=[eh, 0], scaleanchor="x5", scaleratio=1, constrain="domain", row=e_row, col=1)
-        fig.update_xaxes(range=[0, ew], constrain="domain", row=e_row, col=2)
-        fig.update_yaxes(range=[eh, 0], scaleanchor="x6", scaleratio=1, constrain="domain", row=e_row, col=2)
+        fig.update_xaxes(title_text="energy value", row=e_row, col=2)
+        fig.update_yaxes(title_text="count", row=e_row, col=2)
     pio.write_html(fig, str(out_path), include_plotlyjs="cdn")
 
 
