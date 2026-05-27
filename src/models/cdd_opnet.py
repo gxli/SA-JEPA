@@ -180,6 +180,8 @@ class CDDOpNetEncoder(nn.Module):
     def _cache(self, name: str, tensor: torch.Tensor) -> None:
         if not self.cache_primitives:
             return
+        if not bool(getattr(self, "_symmetric_cache_pass", True)):
+            return
         value = tensor.detach() if self.cache_detach else tensor
         setattr(self, name, value)
 

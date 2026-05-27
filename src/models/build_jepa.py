@@ -37,10 +37,12 @@ class PyramidGridJEPA(nn.Module):
         sigmas=(2, 4, 8, 16),
         mask_fraction: float = 1.0,
         mask_scale: float = 1.0,
+        mask_scale_range=None,
         spacing_scale: float = 1.5,
         global_shift: bool = True,
         align_scales: bool = True,
         mask_box_size: int = 16,
+        mask_box_size_range=None,
         blur_mode: str = "gaussian",
         cdd_mode: str = "log",
         cdd_constrained: bool = True,
@@ -50,8 +52,7 @@ class PyramidGridJEPA(nn.Module):
         log_eps: float = 1.0,
         cdd_log_std_floor_mult: float = 0.05,
         ema_momentum: float = 0.996,
-        normalize_loss: bool = False,
-        normalize_loss_l2: Optional[bool] = None,
+        normalize_loss_l2: bool = False,
         predictor_layernorm: bool = False,
         use_image_mask_token: bool = False,
         mode: str = "image",
@@ -94,11 +95,29 @@ class PyramidGridJEPA(nn.Module):
         self.patch_size = p
         self.sigmas = tuple(sigmas)
         self.mask_fraction = float(mask_fraction)
-        self.mask_scale = float(mask_scale)
+        mask_scale_value, inline_mask_scale_range = self._split_float_param(mask_scale, 1.0, "mask_scale")
+        if mask_scale_range is not None and inline_mask_scale_range is not None:
+            raise ValueError("Specify either mask_scale as a range or mask_scale_range, not both.")
+        self.mask_scale = mask_scale_value
+        self.mask_scale_range = self._coerce_float_range(
+            mask_scale_range if mask_scale_range is not None else inline_mask_scale_range,
+            "mask_scale_range",
+        )
         self.spacing_scale = float(spacing_scale)
         self.global_shift = bool(global_shift)
         self.align_scales = bool(align_scales)
-        self.mask_box_size = int(mask_box_size)
+        mask_box_size_value, inline_mask_box_size_range = self._split_int_param(
+            mask_box_size,
+            16,
+            "mask_box_size",
+        )
+        if mask_box_size_range is not None and inline_mask_box_size_range is not None:
+            raise ValueError("Specify either mask_box_size as a range or mask_box_size_range, not both.")
+        self.mask_box_size = mask_box_size_value
+        self.mask_box_size_range = self._coerce_int_range(
+            mask_box_size_range if mask_box_size_range is not None else inline_mask_box_size_range,
+            "mask_box_size_range",
+        )
         self.blur_mode = str(blur_mode)
         self.cdd_mode = str(cdd_mode)
         self.cdd_constrained = bool(cdd_constrained)
@@ -108,8 +127,7 @@ class PyramidGridJEPA(nn.Module):
         self.log_eps = float(log_eps)
         self.cdd_log_std_floor_mult = float(cdd_log_std_floor_mult)
         self.ema_momentum = float(ema_momentum)
-        self.normalize_loss_l2 = bool(normalize_loss if normalize_loss_l2 is None else normalize_loss_l2)
-        self.normalize_loss = self.normalize_loss_l2
+        self.normalize_loss_l2 = bool(normalize_loss_l2)
         self.predictor_layernorm = bool(predictor_layernorm)
         self.use_image_mask_token = bool(use_image_mask_token)
         self.mode = str(mode)
@@ -147,6 +165,11 @@ class PyramidGridJEPA(nn.Module):
         self.opnet_cache_detach = bool(opnet_cache_detach)
         if self.mode not in ("image", "pyramid"):
             raise ValueError(f"Unknown mode={self.mode}; expected 'image' or 'pyramid'")
+        if self.use_symmetric_feature_loss and self.encoder_type.endswith("_d4"):
+            raise ValueError(
+                "Configuration Error: use_symmetric_feature_loss and a _d4 encoder type both apply "
+                "4-way symmetry. Please choose only one to avoid a 16x encoder-forward trap."
+            )
         if self.use_image_mask_token:
             if self.mode != "image":
                 raise ValueError("use_image_mask_token is supported only in mode='image'.")
@@ -371,6 +394,65 @@ class PyramidGridJEPA(nn.Module):
             kernel_size=pred_ks,
         )
 
+    @staticmethod
+    def _coerce_float_range(value, name: str):
+        if value is None:
+            return None
+        if len(value) != 2:
+            raise ValueError(f"{name} must contain exactly two values, got {value!r}")
+        lo, hi = sorted((float(value[0]), float(value[1])))
+        return lo, hi
+
+    @classmethod
+    def _split_float_param(cls, value, default: float, name: str):
+        if value is None:
+            return float(default), None
+        if isinstance(value, (list, tuple)):
+            lo, hi = cls._coerce_float_range(value, name)
+            return float((lo + hi) / 2.0), (lo, hi)
+        return float(value), None
+
+    @staticmethod
+    def _coerce_int_range(value, name: str):
+        if value is None:
+            return None
+        if len(value) != 2:
+            raise ValueError(f"{name} must contain exactly two values, got {value!r}")
+        lo, hi = sorted((int(round(float(value[0]))), int(round(float(value[1])))))
+        if lo < 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        return lo, hi
+
+    @classmethod
+    def _split_int_param(cls, value, default: int, name: str):
+        if value is None:
+            return int(default), None
+        if isinstance(value, (list, tuple)):
+            lo, hi = cls._coerce_int_range(value, name)
+            return int(round((lo + hi) / 2.0)), (lo, hi)
+        return int(round(float(value))), None
+
+    def sample_mask_params(self, device=None) -> tuple[float, int]:
+        """Return effective mask scale and box size for this masking call."""
+        rand_device = device if device is not None else torch.device("cpu")
+        mask_scale = self.mask_scale
+        if self.mask_scale_range is not None:
+            lo, hi = self.mask_scale_range
+            if hi > lo:
+                mask_scale = lo + (hi - lo) * float(torch.rand((), device=rand_device).item())
+            else:
+                mask_scale = lo
+
+        mask_box_size = self.mask_box_size
+        if self.mask_box_size_range is not None:
+            lo, hi = self.mask_box_size_range
+            if hi > lo:
+                mask_box_size = int(torch.randint(lo, hi + 1, (), device=rand_device).item())
+            else:
+                mask_box_size = lo
+
+        return float(mask_scale), int(mask_box_size)
+
     def forward(
         self,
         x_clean,
@@ -422,16 +504,17 @@ class PyramidGridJEPA(nn.Module):
                 or self.encoder_type in debug_encoder_types
                 or self.use_image_mask_token
             )
+            effective_mask_scale, effective_mask_box_size = self.sample_mask_params(device=x_clean.device)
             if need_debug_tensors:
                 x_context, target_locations, target_scales, target_valid, debug = make_pyramid_grid_context(
                     x_clean=x_clean,
                     sigmas=self.sigmas,
                     mask_fraction=self.mask_fraction,
-                    mask_scale=self.mask_scale,
+                    mask_scale=effective_mask_scale,
                     spacing_scale=self.spacing_scale,
                     global_shift=self.global_shift,
                     align_scales=self.align_scales,
-                    mask_box_size=self.mask_box_size,
+                    mask_box_size=effective_mask_box_size,
                     blur_mode=self.blur_mode,
                     cdd_mode=self.cdd_mode,
                     cdd_constrained=self.cdd_constrained,
@@ -454,11 +537,11 @@ class PyramidGridJEPA(nn.Module):
                     x_clean=x_clean,
                     sigmas=self.sigmas,
                     mask_fraction=self.mask_fraction,
-                    mask_scale=self.mask_scale,
+                    mask_scale=effective_mask_scale,
                     spacing_scale=self.spacing_scale,
                     global_shift=self.global_shift,
                     align_scales=self.align_scales,
-                    mask_box_size=self.mask_box_size,
+                    mask_box_size=effective_mask_box_size,
                     blur_mode=self.blur_mode,
                     cdd_mode=self.cdd_mode,
                     cdd_constrained=self.cdd_constrained,
@@ -654,8 +737,14 @@ class PyramidGridJEPA(nn.Module):
                 enc_context = torch.cat([cdd_orig_enc, torch.zeros_like(mask_tokens)], dim=1)
             enc_target = torch.cat([cdd_orig_enc, torch.zeros_like(mask_tokens)], dim=1)
             with torch.no_grad():
-                gt_map = self.target_encoder(enc_target)
-            context_map = self.context_encoder(enc_context)
+                if self.use_symmetric_feature_loss:
+                    gt_map = symmetric_forward_2d(self.target_encoder, enc_target)
+                else:
+                    gt_map = self.target_encoder(enc_target)
+            if self.use_symmetric_feature_loss:
+                context_map = symmetric_forward_2d(self.context_encoder, enc_context)
+            else:
+                context_map = self.context_encoder(enc_context)
         elif self.encoder_type in ("convnext_dense_masktoken", "convnext_dense_masktoken_d4"):
             if self.mode != "image":
                 raise ValueError(f"{self.encoder_type} requires mode='image'.")

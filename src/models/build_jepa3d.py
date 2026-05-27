@@ -27,8 +27,7 @@ class PyramidGridJEPA3D(nn.Module):
         encoder_kernel_size=5,
         encoder_stride=1,
         ema_momentum=0.996,
-        normalize_loss=False,
-        normalize_loss_l2=None,
+        normalize_loss_l2=False,
         fusion="gate",
         constant_mask_box: bool = False,
         mask_box_size: int = 8,
@@ -43,8 +42,7 @@ class PyramidGridJEPA3D(nn.Module):
         self.patch_size = int(patch_size)
         self.num_targets = int(num_targets)
         self.ema_momentum = float(ema_momentum)
-        self.normalize_loss_l2 = bool(normalize_loss if normalize_loss_l2 is None else normalize_loss_l2)
-        self.normalize_loss = self.normalize_loss_l2
+        self.normalize_loss_l2 = bool(normalize_loss_l2)
         self.constant_mask_box = bool(constant_mask_box)
         self.mask_box_size = int(mask_box_size)
         self.num_mask_boxes = int(num_mask_boxes)

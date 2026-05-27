@@ -78,7 +78,7 @@ def build_model(model_cfg: dict, data_cfg: dict, device: torch.device) -> Pyrami
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
         ema_momentum=model_cfg.get("ema_momentum", 0.996),
-        normalize_loss_l2=model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", True)),
+        normalize_loss_l2=model_cfg.get("normalize_loss_l2", True),
         predictor_layernorm=model_cfg.get("predictor_layernorm", False),
         encoder_type=model_cfg.get("encoder_type", "convnext_dense_masktoken"),
         encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),

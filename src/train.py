@@ -86,15 +86,16 @@ def _prepare_context_from_model(
         or enc_type in debug_encoder_types
         or bool(getattr(model, "use_image_mask_token", False))
     )
+    mask_scale, mask_box_size = model.sample_mask_params(device=x_clean.device)
     return prepare_context_batch(
         x_clean=x_clean,
         sigmas=model.sigmas,
         mask_fraction=model.mask_fraction,
-        mask_scale=model.mask_scale,
+        mask_scale=mask_scale,
         spacing_scale=model.spacing_scale,
         global_shift=model.global_shift,
         align_scales=model.align_scales,
-        mask_box_size=model.mask_box_size,
+        mask_box_size=mask_box_size,
         blur_mode=model.blur_mode,
         cdd_mode=model.cdd_mode,
         cdd_constrained=model.cdd_constrained,
@@ -107,6 +108,7 @@ def _prepare_context_from_model(
         target_sampling_mode=model.target_sampling_mode,
         priority_top_percent=model.priority_top_percent,
         priority_n_target=model.priority_n_target,
+        priority_min_targets_per_map=model.priority_min_targets_per_map,
         priority_dithering_pixels=model.priority_dithering_pixels,
         cdd_use_gpu=(x_clean.device.type == "cuda"),
     )
@@ -288,7 +290,6 @@ def _resolve_encoder_alias_3d(name: str) -> str:
 def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, device: torch.device) -> PyramidGridJEPA:
     """Construct a PyramidGridJEPA from config dicts."""
     blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
-    mask_size_scaling = float(model_cfg.get("mask_size_scaling", 1.0))
     mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", 1.5))
     _, _, model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
     resolved_encoder_type = _resolve_encoder_alias_2d(resolve_encoder_type_default(model_cfg))
@@ -302,7 +303,13 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
                 "Allowed: rescnn_dense, convnext_dense_masktoken."
             )
     elif resolved_mode == "pyramid":
-        allowed_pyramid = {"cdd_scaleaware_convnext", "cdd_scaleaware_convnext_d4", "cdd_scaleaware_rescnn", "cdd_opnet"}
+        allowed_pyramid = {
+            "cdd_scaleaware_convnext",
+            "cdd_scaleaware_convnext_d4",
+            "cdd_scaleaware_rescnn",
+            "cdd_opnet",
+            "convnext_dense_pyramid",
+        }
         if resolved_encoder_type not in allowed_pyramid:
             raise ValueError(
                 f"Unsupported pyramid-mode encoder_type={resolved_encoder_type}. "
@@ -326,11 +333,13 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         patch_size=patch_size,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=active_target_fraction,
-        mask_scale=mask_size_scaling,
+        mask_scale=model_cfg.get("mask_size_scaling", 1.0),
+        mask_scale_range=model_cfg.get("mask_size_scaling_range", model_cfg.get("mask_scale_range")),
         spacing_scale=mask_spacing_scaling,
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
         mask_box_size=model_cfg.get("mask_box_size", 16),
+        mask_box_size_range=model_cfg.get("mask_box_size_range"),
         blur_mode=blur_mode,
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=model_cfg.get("cdd_constrained", True),
@@ -534,8 +543,16 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             print(f"resume_model={model_ckpt_path}")
 
     scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
-    _msb = float(model_cfg.get("mask_size_scaling", 1.0))
-    _mb = int(model_cfg.get("mask_box_size", 16))
+    def _param_or_range_max(value_key: str, range_key: str, default: float) -> float:
+        values = model_cfg.get(range_key, model_cfg.get(value_key, default))
+        if isinstance(values, (list, tuple)):
+            if len(values) != 2:
+                raise ValueError(f"{value_key} range must contain exactly two values, got {values!r}")
+            return float(max(values))
+        return float(values)
+
+    _msb = _param_or_range_max("mask_size_scaling", "mask_size_scaling_range", 1.0)
+    _mb = int(round(_param_or_range_max("mask_box_size", "mask_box_size_range", 16)))
     _mss = float(model_cfg.get("mask_spacing_scaling", 1.5))
     max_box = round(scale_max * _msb + _mb)
     auto_roll_max = max(1, int(round(float(max_box) * _mss)))

@@ -1,9 +1,24 @@
 from __future__ import annotations
 
 import itertools
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
+
+
+@contextmanager
+def _symmetric_cache_pass(module: nn.Module, enabled: bool):
+    sentinel = object()
+    old = getattr(module, "_symmetric_cache_pass", sentinel)
+    setattr(module, "_symmetric_cache_pass", bool(enabled))
+    try:
+        yield
+    finally:
+        if old is sentinel:
+            delattr(module, "_symmetric_cache_pass")
+        else:
+            setattr(module, "_symmetric_cache_pass", old)
 
 
 def _transform_tensor_kwargs(
@@ -37,7 +52,8 @@ def symmetric_forward_2d(encoder: nn.Module, x: torch.Tensor, **kwargs) -> torch
         rot = lambda t, kk=k: torch.rot90(t, k=kk, dims=(-2, -1))
         x_rot = rot(x)
         kw = _transform_tensor_kwargs(kwargs, spatial_shape, rot)
-        feat = encoder(x_rot, **kw)
+        with _symmetric_cache_pass(encoder, enabled=(k == 0)):
+            feat = encoder(x_rot, **kw)
         feat = torch.rot90(feat, k=-k, dims=(-2, -1))
         accum = feat if accum is None else accum + feat
     return accum / 4.0

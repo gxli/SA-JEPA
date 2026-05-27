@@ -92,7 +92,7 @@ BASE_MODEL_COMMON = {
     "log_eps": 1e-06,
     "cdd_log_std_floor_mult": 0.05,
     "ema_momentum": 0.996,
-    "normalize_loss": False,
+    "normalize_loss_l2": False,
     "predictor_layernorm": True,
     "mask_size_scaling": 1.0,
     "mask_spacing_scaling": 2.0,

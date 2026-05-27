@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate gen_65 MHD symmetric configs with L2 JEPA loss + SIGReg."""
+"""Generate gen_66 MHD symmetric pattern-separation configs."""
 from __future__ import annotations
 
 import json
@@ -29,6 +29,7 @@ def _base_config(mscale: float, mask_box_size: int) -> dict:
             "mask_box_size": int(mask_box_size),
             "normalize_loss_l2": True,
             "use_symmetric_feature_loss": True,
+            "scaleaware_norm_per_scale": True,
             "target_sampling_mode": "priority_sampling",
             "priority_top_percent": 15.0,
             "priority_n_target": "auto",
@@ -39,10 +40,11 @@ def _base_config(mscale: float, mask_box_size: int) -> dict:
             "epochs": 10,
             "log_interval": 1,
             "jepa_loss_weight": 100.0,
-            "vicreg_var_weight": 0.0,
-            "vicreg_cov_weight": 0.0,
-            "sigreg_weight": 1.0,
+            "vicreg_var_weight": 15.0,
+            "vicreg_cov_weight": 15.0,
+            "sigreg_weight": 5.0,
             "sigreg_sketch_dim": 64,
+            "vicreg_spatial_mode": "pooled",
             "inference_tta_enabled": True,
             "inference_tta_mode": "flip4",
         },
@@ -59,45 +61,13 @@ def write_config(name: str, cfg: dict) -> str:
 
 def write_scale_config(mscale: float) -> str:
     cfg = _base_config(mscale=mscale, mask_box_size=0)
-    name = f"gen_65_run_1_mhd_convnext_scaleaware_symmetric_sigreg_l2_mss_{_fmt(mscale)}"
+    name = f"gen_66_run_1_mhd_symmetric_patternsep_priority_l2_mss_{_fmt(mscale)}"
     return write_config(name, cfg)
 
 
 def write_box_config(mask_box_size: int) -> str:
     cfg = _base_config(mscale=0.0, mask_box_size=mask_box_size)
-    name = f"gen_65_run_2_mhd_convnext_scaleaware_symmetric_sigreg_l2_mss_0p0_mbox_{mask_box_size:02d}"
-    return write_config(name, cfg)
-
-
-def _image_config(mscale: float, mask_box_size: int) -> dict:
-    cfg = _base_config(mscale=mscale, mask_box_size=mask_box_size)
-    cfg["model"]["mode"] = "image"
-    cfg["model"]["model_key"] = "convnext_dense_masktoken"
-    cfg["model"].pop("use_symmetric_feature_loss", None)
-    return cfg
-
-
-def write_image_box_config(mask_box_size: int) -> str:
-    cfg = _image_config(mscale=0.0, mask_box_size=mask_box_size)
-    name = f"gen_65_run_3_mhd_convnext_dense_masktoken_sigreg_l2_mss_0p0_mbox_{mask_box_size:02d}"
-    return write_config(name, cfg)
-
-
-def _pyramid_dense_config(mscale: float, mask_box_size: int) -> dict:
-    cfg = _base_config(mscale=mscale, mask_box_size=mask_box_size)
-    cfg["model"]["model_key"] = "convnext_dense_pyramid"
-    return cfg
-
-
-def write_pyramid_dense_scale_config(mscale: float) -> str:
-    cfg = _pyramid_dense_config(mscale=mscale, mask_box_size=0)
-    name = f"gen_65_run_4_mhd_convnext_dense_pyramid_symmetric_sigreg_l2_mss_{_fmt(mscale)}"
-    return write_config(name, cfg)
-
-
-def write_pyramid_dense_box_config(mask_box_size: int) -> str:
-    cfg = _pyramid_dense_config(mscale=0.0, mask_box_size=mask_box_size)
-    name = f"gen_65_run_4_mhd_convnext_dense_pyramid_symmetric_sigreg_l2_mss_0p0_mbox_{mask_box_size:02d}"
+    name = f"gen_66_run_2_mhd_symmetric_patternsep_priority_l2_mss_0p0_mbox_{mask_box_size:02d}"
     return write_config(name, cfg)
 
 
@@ -105,9 +75,6 @@ def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
     paths = [write_scale_config(mscale) for mscale in MASK_SIZE_SCALINGS]
     paths.extend(write_box_config(mask_box_size) for mask_box_size in BOX_SIZES)
-    paths.extend(write_image_box_config(mask_box_size) for mask_box_size in BOX_SIZES)
-    paths.extend(write_pyramid_dense_scale_config(mscale) for mscale in MASK_SIZE_SCALINGS)
-    paths.extend(write_pyramid_dense_box_config(mask_box_size) for mask_box_size in BOX_SIZES)
     for path in paths:
         print(os.path.relpath(path, ROOT))
     print(f"\nTotal: {len(paths)} configs written to {os.path.relpath(OUT_DIR, ROOT)}")
