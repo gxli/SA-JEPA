@@ -19,6 +19,12 @@ if ROOT_DIR not in sys.path:
 from src.dataset import JEPADataset
 from src.models.build_jepa import PyramidGridJEPA, make_pyramid_grid_context
 
+DEMO_BOX_SIGMA_MULT = 4.0
+DEMO_MASK_SIZE = 0.0
+DEMO_DIP_SIGMA_MULT = 1.0
+DEMO_SCALEAWARE_GAUSSIAN_RATIOS = (0.25, 0.5, 1.0, 2.0)
+DEMO_MASK_FILL_MODE = "zero"
+
 
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -118,12 +124,10 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
     return make_pyramid_grid_context(
         x_clean=x,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
-        cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-        mask_fraction=float(model_cfg.get("mask_fraction", 1.0)),
-        box_sigma_mult=float(model_cfg.get("box_sigma_mult", 4.0)),
-        mask_scale=float(model_cfg.get("mask_scale", 1.0)),
-        spacing_scale=float(model_cfg.get("spacing_scale", 1.5)),
-        full_grid=bool(model_cfg.get("full_grid", True)),
+        mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
+        box_sigma_mult=DEMO_BOX_SIGMA_MULT,
+        mask_scale=float(model_cfg.get("mask_size_scaling", 1.0)),
+        spacing_scale=float(model_cfg.get("mask_spacing_scaling", 1.5)),
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
         mask_box_size=int(model_cfg.get("mask_box_size", 16)),
@@ -131,8 +135,7 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-        mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-        dip_sigma_mult=1.0,
+        dip_sigma_mult=DEMO_DIP_SIGMA_MULT,
         constant_gaussian_sigma=float(model_cfg.get("constant_gaussian_sigma", 1.0)),
         return_debug=True,
     )
@@ -436,13 +439,11 @@ def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
         predictor_hidden=model_cfg.get("predictor_hidden"),
         patch_size=model_cfg.get("patch_size", 2),
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
-        cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-        mask_fraction=model_cfg.get("mask_fraction", 1.0),
-        box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
-        mask_scale=model_cfg.get("mask_scale", 1.0),
-        mask_size=model_cfg.get("mask_size", 0.0),
-        spacing_scale=model_cfg.get("spacing_scale", 1.5),
-        full_grid=model_cfg.get("full_grid", True),
+        mask_fraction=model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0)),
+        box_sigma_mult=DEMO_BOX_SIGMA_MULT,
+        mask_scale=model_cfg.get("mask_size_scaling", 1.0),
+        mask_size=DEMO_MASK_SIZE,
+        spacing_scale=model_cfg.get("mask_spacing_scaling", 1.5),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
         mask_box_size=model_cfg.get("mask_box_size", 16),
@@ -450,18 +451,17 @@ def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=model_cfg.get("cdd_constrained", True),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-        mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-        dip_sigma_mult=1.0,
+        dip_sigma_mult=DEMO_DIP_SIGMA_MULT,
         constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
-        scaleaware_gaussian_ratios=tuple(model_cfg.get("scaleaware_gaussian_ratios", [0.25, 0.5, 1.0, 2.0])),
+        scaleaware_gaussian_ratios=DEMO_SCALEAWARE_GAUSSIAN_RATIOS,
         cdd_append_last_residual=model_cfg.get("cdd_append_last_residual", True),
         post_log_transform=model_post_log,
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
         ema_momentum=model_cfg.get("ema_momentum", 0.996),
-        normalize_loss=model_cfg.get("normalize_loss", True),
+        normalize_loss_l2=model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", True)),
         predictor_layernorm=model_cfg.get("predictor_layernorm", False),
-        encoder_type=model_cfg.get("encoder_type", "fullres"),
+        encoder_type=model_cfg.get("encoder_type", "convnext_dense_masktoken"),
         encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
         encoder_depth=model_cfg.get("encoder_depth", 4),
         encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
@@ -805,7 +805,7 @@ def evaluate_mask_symmetry(
         x_t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
         _, _, _, _, debug = make_context_and_debug(x_t, model_cfg_run, int(base_seed + i))
         dip_t = debug.get("dip_field")
-        if str(model_cfg_run.get("mask_fill_mode", "zero")) == "gaussian_dip" and dip_t is not None and dip_t.numel() > 0:
+        if str(model_cfg_run.get("mask_fill_mode", DEMO_MASK_FILL_MODE)) == "gaussian_dip" and dip_t is not None and dip_t.numel() > 0:
             mask = np.clip(dip_t[0].cpu().numpy().astype(np.float32), 0.0, 1.0)
         else:
             mask = np.clip(debug["mask_map"][0].cpu().numpy().astype(np.float32), 0.0, 1.0)
@@ -859,7 +859,7 @@ def main():
     if args.mask_mode == "both":
         modes = ["zero", "gaussian_dip"]
     elif args.mask_mode == "config":
-        modes = [str(model_cfg.get("mask_fill_mode", "zero"))]
+        modes = [DEMO_MASK_FILL_MODE]
     else:
         modes = [args.mask_mode]
 
@@ -886,9 +886,9 @@ def main():
             model_cfg_run["blur_mode"] = args.force_blur_mode
         # Default demo behavior: adaptive per-scale box masks.
         if args.rigid_mask_box:
-            model_cfg_run["mask_scale"] = 0.0
+            model_cfg_run["mask_size_scaling"] = 0.0
         else:
-            model_cfg_run["mask_scale"] = float(model_cfg.get("mask_scale", 1.0))
+            model_cfg_run["mask_size_scaling"] = float(model_cfg.get("mask_size_scaling", 1.0))
         suffix = f"_{mode}"
 
         x_ctx, target_locations, target_scales, target_valid, debug = make_context_and_debug(x_t, model_cfg_run, int(args.seed))
@@ -1055,9 +1055,9 @@ def main():
             "blur_mode": str(model_cfg_run.get("blur_mode", "cdd")),
             "checkpoint_used": ckpt_used,
             "use_cdd": bool(data_cfg.get("use_cdd", True)),
-            "mask_fraction": float(model_cfg_run.get("mask_fraction", 1.0)),
-            "mask_scale": float(model_cfg_run.get("mask_scale", 1.0)),
-            "spacing_scale": float(model_cfg_run.get("spacing_scale", 1.5)),
+            "mask_fraction": float(model_cfg_run.get("active_target_fraction", model_cfg_run.get("mask_fraction", 1.0))),
+            "mask_size_scaling": float(model_cfg_run.get("mask_size_scaling", 1.0)),
+            "mask_spacing_scaling": float(model_cfg_run.get("mask_spacing_scaling", 1.5)),
             "sigmas": list(model_cfg_run.get("sigmas", [2, 4, 8, 16])),
             "global_realized_fraction": float(mask.mean()),
             "unique_centers": [[int(y), int(x)] for y, x in centers.tolist()],

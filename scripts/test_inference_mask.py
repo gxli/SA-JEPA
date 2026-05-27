@@ -17,6 +17,9 @@ if ROOT_DIR not in sys.path:
 from src.dataset import JEPADataset
 from src.models.build_jepa import make_pyramid_grid_context
 
+DEMO_BOX_SIGMA_MULT = 4.0
+DEMO_DIP_SIGMA_MULT = 1.0
+
 
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -78,8 +81,8 @@ def main():
 
     sigmas = tuple(float(v) for v in model_cfg.get("sigmas", [2, 4, 8, 16]))
     largest_sigma = float(max(sigmas))
-    mask_scale = float(model_cfg.get("mask_scale", 1.0))
-    spacing_scale = float(model_cfg.get("spacing_scale", 1.5))
+    mask_scale = float(model_cfg.get("mask_size_scaling", 1.0))
+    spacing_scale = float(model_cfg.get("mask_spacing_scaling", 1.5))
     mask_box_size = int(model_cfg.get("mask_box_size", 16))
     max_box = round(largest_sigma * mask_scale + mask_box_size)
     spacing = int(max(1, round(float(max_box) * spacing_scale)))
@@ -101,12 +104,10 @@ def main():
         _, tloc, _, tvalid, debug = make_pyramid_grid_context(
             x_clean=x_t,
             sigmas=sigmas,
-            cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-            mask_fraction=float(model_cfg.get("mask_fraction", 1.0)),
-            box_sigma_mult=float(model_cfg.get("box_sigma_mult", 4.0)),
+            mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
+            box_sigma_mult=DEMO_BOX_SIGMA_MULT,
             mask_scale=mask_scale,
             spacing_scale=spacing_scale,
-            full_grid=bool(model_cfg.get("full_grid", True)),
             global_shift=bool(model_cfg.get("global_shift", True)),
             align_scales=bool(model_cfg.get("align_scales", True)),
             mask_box_size=mask_box_size,
@@ -114,12 +115,10 @@ def main():
             cdd_mode=model_cfg.get("cdd_mode", "log"),
             cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
             cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-            mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-            dip_sigma_mult=1.0,
+            dip_sigma_mult=DEMO_DIP_SIGMA_MULT,
             constant_gaussian_sigma=float(model_cfg.get("constant_gaussian_sigma", 1.0)),
             inner_target_size=int(model_cfg.get("patch_size", 2)),
             return_debug=True,
-            forced_grid_shift=(int(dy), int(dx)),
             enable_grid_jitter=False,
         )
         pts = tloc[0].cpu().numpy()

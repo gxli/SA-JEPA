@@ -23,7 +23,7 @@ def _read_model_inputs(session_dir: str) -> dict:
         m = cfg.get("model", {})
         return {
             "mode": str(m.get("mode", "NA")),
-            "mask_fraction": str(m.get("mask_fraction", "NA")),
+            "mask_fraction": str(m.get("active_target_fraction", m.get("mask_fraction", "NA"))),
             "mask_size": str(m.get("mask_size", "NA")),
         }
     except Exception:

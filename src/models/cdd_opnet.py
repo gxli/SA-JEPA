@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,11 +42,7 @@ def resolve_opnet_dilations(
                 "Use 'none', 'half_cdd_scale', 'cdd_scale', or 'powers_of_two'."
             )
 
-    if len(dilations) < depth:
-        reps = (depth + len(dilations) - 1) // len(dilations)
-        dilations = (dilations * reps)[:depth]
-    elif len(dilations) > depth:
-        dilations = dilations[:depth]
+    dilations = (dilations * math.ceil(depth / len(dilations)))[:depth]
     return tuple(int(d) for d in dilations)
 
 
@@ -128,8 +125,8 @@ class CDDOpNetEncoder(nn.Module):
         )
 
         # CDD-OpNet v2: keep per-scale channels isolated in the first learned stage.
-        # Per-scale tuple: [log_cdd, grad_scaled, lap_scaled, mask_token]
-        self.per_scale_features = 4
+        # Per-scale tuple: [log_cdd, grad_scaled, lap_scaled, (optional) mask_token]
+        self.per_scale_features = 4 if self.include_mask_tokens else 3
         self.per_scale_width = int(hidden_channels)
         stem_in = self.field_channels * self.per_scale_features
         stem_hidden = self.field_channels * self.per_scale_width
@@ -142,6 +139,7 @@ class CDDOpNetEncoder(nn.Module):
                 groups=self.field_channels,
                 padding_mode="reflect",
             ),
+            nn.GroupNorm(num_groups=self.field_channels, num_channels=stem_hidden),
             nn.GELU(),
             nn.Conv2d(
                 stem_hidden,
@@ -151,10 +149,12 @@ class CDDOpNetEncoder(nn.Module):
                 groups=self.field_channels,
                 padding_mode="reflect",
             ),
+            nn.GroupNorm(num_groups=self.field_channels, num_channels=stem_hidden),
             nn.GELU(),
         )
         self.scale_fuse = nn.Sequential(
             nn.Conv2d(stem_hidden, hidden_channels, kernel_size=1),
+            nn.BatchNorm2d(hidden_channels),
             nn.GELU(),
         )
 
@@ -175,6 +175,7 @@ class CDDOpNetEncoder(nn.Module):
         self.last_grad_scaled = None
         self.last_lap_scaled = None
         self.last_primitives = None
+        self._precompute_blur_kernels(scales)
 
     def _cache(self, name: str, tensor: torch.Tensor) -> None:
         if not self.cache_primitives:
@@ -205,34 +206,50 @@ class CDDOpNetEncoder(nn.Module):
         floor = torch.clamp(structural_std_floor * self.log_std_floor_mult, min=eps)
         return torch.log(base + floor)
 
-    def _gaussian_blur_single(self, x: torch.Tensor, sigma: float) -> torch.Tensor:
-        if sigma <= 0.0:
-            return x
-        radius = max(1, int(round(3.0 * float(sigma))))
-        size = 2 * radius + 1
-        coords = torch.arange(size, dtype=x.dtype, device=x.device) - radius
-        g = torch.exp(-(coords * coords) / (2.0 * float(sigma) * float(sigma)))
-        g = g / g.sum().clamp_min(1e-30)
-        kernel = torch.outer(g, g)
-        kernel = kernel / kernel.sum().clamp_min(1e-30)
-        weight = kernel.view(1, 1, size, size)
-        x_pad = F.pad(x, (radius, radius, radius, radius), mode=self.op_smoothing_padding_mode)
-        return F.conv2d(x_pad, weight, padding=0)
+    def _get_sigma(self, scale: float) -> float:
+        if self.op_smoothing_mode == "scale":
+            return self.op_smoothing_mult * float(scale)
+        return self.op_smoothing_mult * (float(scale) ** 0.5)
+
+    def _precompute_blur_kernels(self, scales: tuple[float, ...]) -> None:
+        if self.op_smoothing_mode == "none":
+            self.blur_radius = 0
+            return
+        sigmas = [self._get_sigma(s) for s in scales]
+        max_sigma = max(sigmas) if len(sigmas) > 0 else 0.0
+        if max_sigma <= 0.0:
+            self.blur_radius = 0
+            return
+        self.blur_radius = max(1, int(round(3.0 * float(max_sigma))))
+        max_size = 2 * self.blur_radius + 1
+        weight = torch.zeros((self.field_channels, 1, max_size, max_size), dtype=torch.float32)
+        for i, sigma in enumerate(sigmas):
+            if sigma <= 0.0:
+                weight[i, 0, self.blur_radius, self.blur_radius] = 1.0
+                continue
+            radius = max(1, int(round(3.0 * float(sigma))))
+            size = 2 * radius + 1
+            coords = torch.arange(size, dtype=torch.float32) - radius
+            g = torch.exp(-(coords * coords) / (2.0 * float(sigma) * float(sigma)))
+            g = g / g.sum().clamp_min(1e-30)
+            kernel = torch.outer(g, g)
+            kernel = kernel / kernel.sum().clamp_min(1e-30)
+            pad_size = self.blur_radius - radius
+            if pad_size > 0:
+                kernel = F.pad(kernel, (pad_size, pad_size, pad_size, pad_size), mode="constant", value=0.0)
+            weight[i, 0] = kernel
+        self.register_buffer("blur_weight", weight)
 
     def _smooth_for_operators(self, log_cdd: torch.Tensor) -> torch.Tensor:
-        if self.op_smoothing_mode == "none":
+        if self.op_smoothing_mode == "none" or (not hasattr(self, "blur_weight")) or int(getattr(self, "blur_radius", 0)) <= 0:
             return log_cdd
-        b, s, h, w = log_cdd.shape
-        out = torch.empty_like(log_cdd)
-        scales = self.scale_tensor.to(device=log_cdd.device, dtype=log_cdd.dtype).view(-1)
-        for i in range(s):
-            scale_i = float(scales[i].item())
-            if self.op_smoothing_mode == "scale":
-                sigma = self.op_smoothing_mult * scale_i
-            else:
-                sigma = self.op_smoothing_mult * (scale_i ** 0.5)
-            out[:, i : i + 1] = self._gaussian_blur_single(log_cdd[:, i : i + 1], sigma=sigma)
-        return out
+        x_pad = F.pad(
+            log_cdd,
+            (self.blur_radius, self.blur_radius, self.blur_radius, self.blur_radius),
+            mode=self.op_smoothing_padding_mode,
+        )
+        w = self.blur_weight.to(device=log_cdd.device, dtype=log_cdd.dtype)
+        return F.conv2d(x_pad, w, padding=0, groups=self.field_channels)
 
     def forward(
         self,
@@ -249,29 +266,24 @@ class CDDOpNetEncoder(nn.Module):
         log_cdd_for_ops = self._smooth_for_operators(log_cdd)
         attrs = self.ops(log_cdd_for_ops)
 
-        scale_tensor = self.scale_tensor.to(device=field.device, dtype=field.dtype)
+        scale_tensor = self.scale_tensor.to(dtype=field.dtype)
         grad_scaled = attrs["gradmag"] * scale_tensor
         lap_scaled = attrs["lap"] * (scale_tensor * scale_tensor)
-        if mask_tokens is None:
-            mask_tokens = torch.zeros_like(field)
-        if mask_tokens.shape != field.shape:
-            raise ValueError(
-                f"mask_tokens shape must match field shape. "
-                f"field={tuple(field.shape)} mask={tuple(mask_tokens.shape)}"
-            )
-        if not self.include_mask_tokens:
-            mask_tokens = torch.zeros_like(field)
+        grad_scaled = torch.arcsinh(grad_scaled)
+        lap_scaled = torch.arcsinh(lap_scaled)
+        per_scale_list = [log_cdd_for_ops, grad_scaled, lap_scaled]
+        if self.include_mask_tokens:
+            if mask_tokens is None:
+                mask_tokens = torch.zeros_like(field)
+            if mask_tokens.shape != field.shape:
+                raise ValueError(
+                    f"mask_tokens shape must match field shape. "
+                    f"field={tuple(field.shape)} mask={tuple(mask_tokens.shape)}"
+                )
+            per_scale_list.append(mask_tokens)
 
         # Build B,S,F,H,W then flatten to B,(S*F),H,W to preserve scale grouping.
-        per_scale = torch.stack(
-            [
-                log_cdd_for_ops,
-                grad_scaled,
-                lap_scaled,
-                mask_tokens,
-            ],
-            dim=2,
-        )
+        per_scale = torch.stack(per_scale_list, dim=2)
         b, s, f, h, w = per_scale.shape
         primitives = per_scale.reshape(b, s * f, h, w)
         self._cache("last_log_cdd", log_cdd)

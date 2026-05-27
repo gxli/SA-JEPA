@@ -5,16 +5,22 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_DIR="${ROOT_DIR}/configs"
 SESSIONS_DIR="${ROOT_DIR}/sessions"
 FORCE_REINFERENCE="${FORCE_REINFERENCE:-0}"
-CONFIG_GLOB="${CONFIG_GLOB:-*.json}"
+CONFIG_GLOB="${CONFIG_GLOB:-experiments/*.json}"
+CONFIG_SEARCH_ROOT="${CONFIG_SEARCH_ROOT:-${CONFIG_DIR}}"
 OVERRIDE_DIR="${ROOT_DIR}/.run_all_overrides"
 
 mkdir -p "${SESSIONS_DIR}"
 mkdir -p "${OVERRIDE_DIR}"
 
-shopt -s nullglob
-configs=("${CONFIG_DIR}"/${CONFIG_GLOB})
+mapfile -t configs < <(find "${CONFIG_SEARCH_ROOT}" -type f -path "${CONFIG_SEARCH_ROOT}/${CONFIG_GLOB}" | sort)
+if [[ ${#configs[@]} -eq 0 && "${CONFIG_GLOB}" == "experiments/*.json" ]]; then
+  # Backward-compat for legacy misspelled folder name.
+  mapfile -t configs < <(find "${CONFIG_SEARCH_ROOT}" -type f -path "${CONFIG_SEARCH_ROOT}/exeriments/*.json" | sort)
+fi
 if [[ ${#configs[@]} -eq 0 ]]; then
-  echo "No config files found in ${CONFIG_DIR} matching ${CONFIG_GLOB}" >&2
+  echo "No config files found in ${CONFIG_SEARCH_ROOT} matching ${CONFIG_GLOB}" >&2
+  echo "Hint: default expects configs under ${CONFIG_DIR}/experiments/*.json (or legacy ${CONFIG_DIR}/exeriments/*.json)." >&2
+  echo "You can override with CONFIG_SEARCH_ROOT and/or CONFIG_GLOB." >&2
   exit 1
 fi
 
@@ -36,9 +42,37 @@ for cfg in "${configs[@]}"; do
     skip_ok="$(
       python3 - "${cfg}" "${epoch_summary_csv}" <<'PY'
 import csv, json, sys
-cfg_path, epoch_csv = sys.argv[1], sys.argv[2]
+import os
+
+cfg_path, epoch_csv = os.path.abspath(sys.argv[1]), sys.argv[2]
+
+def deep_merge(base, override):
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+def load_with_base(path, seen=None):
+    seen = seen or set()
+    if path in seen:
+        return {}
+    seen.add(path)
+    cfg = json.load(open(path, "r", encoding="utf-8"))
+    base_ref = cfg.pop("base_config", None)
+    if base_ref is None:
+        seen.remove(path)
+        return cfg
+    if not os.path.isabs(base_ref):
+        base_ref = os.path.abspath(os.path.join(os.path.dirname(path), base_ref))
+    base_cfg = load_with_base(base_ref, seen)
+    seen.remove(path)
+    return deep_merge(base_cfg, cfg)
+
 try:
-    cfg = json.load(open(cfg_path, "r", encoding="utf-8"))
+    cfg = load_with_base(cfg_path)
     target_epochs = int(cfg.get("train", {}).get("epochs", 0))
 except Exception:
     print("0")
@@ -81,6 +115,12 @@ import sys
 src, dst, force_flag = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(src, "r", encoding="utf-8") as f:
     cfg = json.load(f)
+# Preserve base-config inheritance when writing to override dir by
+# converting relative base_config paths to absolute paths.
+base_ref = cfg.get("base_config")
+if isinstance(base_ref, str) and base_ref:
+    if not os.path.isabs(base_ref):
+        cfg["base_config"] = os.path.abspath(os.path.join(os.path.dirname(src), base_ref))
 train = cfg.setdefault("train", {})
 train["force_recompute_inference"] = bool(int(force_flag))
 os.makedirs(os.path.dirname(dst), exist_ok=True)

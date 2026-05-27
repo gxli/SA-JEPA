@@ -10,6 +10,32 @@ import torch
 from src.losses import representation_dense_energy
 
 
+def _tta_views_2d(x: torch.Tensor, mode: str) -> list[tuple[str, torch.Tensor]]:
+    m = str(mode).lower().strip()
+    if m in ("none", "", "off"):
+        return [("id", x)]
+    if m in ("flip4", "4fold", "4-fold"):
+        return [
+            ("id", x),
+            ("fx", torch.flip(x, dims=(-1,))),
+            ("fy", torch.flip(x, dims=(-2,))),
+            ("fxy", torch.flip(x, dims=(-2, -1))),
+        ]
+    raise ValueError(f"Unsupported inference TTA mode: {mode}")
+
+
+def _invert_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
+    if name == "id":
+        return z
+    if name == "fx":
+        return torch.flip(z, dims=(-1,))
+    if name == "fy":
+        return torch.flip(z, dims=(-2,))
+    if name == "fxy":
+        return torch.flip(z, dims=(-2, -1))
+    raise ValueError(name)
+
+
 def _mask_invalid_targets_from_input(
     *,
     outputs: dict,
@@ -136,6 +162,8 @@ def run_post_training_inference(
     compute_target_energy_map_fn: Callable,
     inference_visit_batches: int = 32,
     training_d4_augment: bool = False,
+    inference_tta_enabled: bool = False,
+    inference_tta_mode: str = "flip4",
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
     dashboard_html_path = os.path.join(session_dir, "dashboard.html")
@@ -205,14 +233,30 @@ def run_post_training_inference(
         invalid_region_skip = bool(getattr(model, "target_invalid_region_skip", False))
         invalid_region_values = tuple(getattr(model, "target_invalid_region_values", (0.0, "nan")))
         patch_size = int(getattr(model, "patch_size", 2))
+        tta_views = _tta_views_2d(x_raw, inference_tta_mode) if bool(inference_tta_enabled) else [("id", x_raw)]
+        first_out_by_shift: list[dict] = []
         for pi, shift in enumerate(shifts):
-            out_i = model(
-                x_raw,
-                return_debug=(pi == 0),
-                forced_grid_shift=shift,
-                enable_grid_jitter=False,
-                mask_inference=bool(mask_inference),
-            )
+            per_view = []
+            for vi, (vname, xv) in enumerate(tta_views):
+                out_v = model(
+                    xv,
+                    return_debug=(pi == 0 and vi == 0),
+                    mask_inference=bool(mask_inference),
+                )
+                out_v["pred_map"] = _invert_tta_2d(vname, out_v["pred_map"])
+                out_v["gt_map"] = _invert_tta_2d(vname, out_v["gt_map"])
+                if "context_map" in out_v:
+                    out_v["context_map"] = _invert_tta_2d(vname, out_v["context_map"])
+                per_view.append(out_v)
+            out_i = per_view[0]
+            if len(per_view) > 1:
+                out_i["pred_map"] = torch.stack([vv["pred_map"] for vv in per_view], dim=0).mean(dim=0)
+                out_i["gt_map"] = torch.stack([vv["gt_map"] for vv in per_view], dim=0).mean(dim=0)
+                if "context_map" in out_i:
+                    out_i["context_map"] = torch.stack(
+                        [vv.get("context_map", vv["pred_map"]) for vv in per_view], dim=0
+                    ).mean(dim=0)
+            first_out_by_shift.append(out_i)
             if invalid_region_skip:
                 _mask_invalid_targets_from_input(
                     outputs=out_i,
@@ -235,6 +279,14 @@ def run_post_training_inference(
             total_energy += float(e_tot_i)
             total_valid += int(n_val_i)
         assert outputs is not None and energy_sum is not None and count_map is not None
+        # Average aligned maps across deterministic shifts to stabilize dashboard embeddings.
+        if len(first_out_by_shift) > 1:
+            outputs["pred_map"] = torch.stack([o["pred_map"] for o in first_out_by_shift], dim=0).mean(dim=0)
+            outputs["gt_map"] = torch.stack([o["gt_map"] for o in first_out_by_shift], dim=0).mean(dim=0)
+            if "context_map" in outputs:
+                outputs["context_map"] = torch.stack(
+                    [o.get("context_map", o["pred_map"]) for o in first_out_by_shift], dim=0
+                ).mean(dim=0)
 
     inference_outputs = {
         "x_clean_raw": outputs.get("x_clean_raw", outputs["x_clean"])[:8].detach().cpu(),
@@ -262,6 +314,14 @@ def run_post_training_inference(
         inference_outputs["cdd_channels_masked"] = outputs["cdd_channels_masked"][:8].detach().cpu()
     if "pyramid_mask_token" in outputs:
         inference_outputs["pyramid_mask_token"] = outputs["pyramid_mask_token"][:8].detach().cpu()
+    for k in (
+        "priority_good_candidates",
+        "priority_nonzero_mean",
+        "priority_auto_base_targets",
+        "priority_effective_targets",
+    ):
+        if k in outputs:
+            inference_outputs[k] = outputs[k][:8].detach().cpu()
     energy_scalar = float(total_energy / max(1, total_valid))
     energy_scalar_norm = compute_jepa_energy_fn(outputs, normalize=True)
     # Dense full-image energy from lattice prediction/target maps.
@@ -366,10 +426,35 @@ def run_post_training_inference(
                 "inference_mask_passes": int(len(shifts)),
                 "inference_grid_spacing": int(spacing),
                 "mask_inference": bool(mask_inference),
+                "inference_tta_enabled": bool(inference_tta_enabled),
+                "inference_tta_mode": str(inference_tta_mode),
+                "inference_tta_views": int(len(tta_views)),
             },
             f,
             indent=2,
         )
+    if "priority_effective_targets" in inference_outputs:
+        active_target_fraction = float(getattr(model, "mask_fraction", 1.0))
+        priority_n_target_cfg = getattr(model, "priority_n_target", 20)
+        summary = {
+            "active_target_fraction": float(active_target_fraction),
+            "priority_n_target_config": priority_n_target_cfg,
+            "priority_min_targets_per_map_config": int(getattr(model, "priority_min_targets_per_map", 0)),
+            "priority_good_candidates_mean": float(inference_outputs.get("priority_good_candidates", torch.tensor([])).float().mean().item())
+            if inference_outputs.get("priority_good_candidates", None) is not None and inference_outputs["priority_good_candidates"].numel() > 0
+            else 0.0,
+            "priority_nonzero_mean_mean": float(inference_outputs.get("priority_nonzero_mean", torch.tensor([])).float().mean().item())
+            if inference_outputs.get("priority_nonzero_mean", None) is not None and inference_outputs["priority_nonzero_mean"].numel() > 0
+            else 1.0,
+            "priority_auto_base_targets_mean": float(inference_outputs.get("priority_auto_base_targets", torch.tensor([])).float().mean().item())
+            if inference_outputs.get("priority_auto_base_targets", None) is not None and inference_outputs["priority_auto_base_targets"].numel() > 0
+            else 0.0,
+            "priority_effective_targets_mean": float(inference_outputs.get("priority_effective_targets", torch.tensor([])).float().mean().item())
+            if inference_outputs.get("priority_effective_targets", None) is not None and inference_outputs["priority_effective_targets"].numel() > 0
+            else 0.0,
+        }
+        with open(os.path.join(session_dir, "target_selection_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
     # Canonical target-visit heatmap from inference loader (d4_augment is forced off there).
     # This avoids mirrored-symmetry artefacts from training-time augmentation logs.
     visit_h = int(inference_outputs["x_clean"].shape[-2])

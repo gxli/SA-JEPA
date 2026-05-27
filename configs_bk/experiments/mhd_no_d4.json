@@ -1,0 +1,17 @@
+{
+  "base_config": "../base_pyramid_scaleaware_convnext.json",
+  "data": {
+    "d4_augment": false
+  },
+  "train": {
+    "epochs": 10,
+    "log_interval": 1,
+    "jepa_loss_weight": 100.0,
+    "vicreg_var_weight": 0.0,
+    "vicreg_cov_weight": 0.0,
+    "sigreg_weight": 1.0,
+    "sigreg_sketch_dim": 64,
+    "vicreg_spatial_mode": "dense",
+    "force_recompute_inference": true
+  }
+}

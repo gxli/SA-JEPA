@@ -5,27 +5,6 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-
-
-def gaussian_blur_batch(x: torch.Tensor, sigma: float) -> torch.Tensor:
-    """
-    x: B x 1 x H x W
-    """
-    radius = max(1, int(round(3.0 * sigma)))
-    size = 2 * radius + 1
-
-    coords = torch.arange(size, dtype=x.dtype, device=x.device) - radius
-    g = torch.exp(-(coords**2) / (2.0 * sigma * sigma))
-    g = g / g.sum()
-
-    kernel = torch.outer(g, g)
-    kernel = kernel / kernel.sum()
-
-    channels = x.shape[1]
-    weight = kernel.view(1, 1, size, size).repeat(channels, 1, 1, 1)
-
-    return F.conv2d(x, weight, padding=radius, groups=channels)
 
 
 def norm_per_sample_channel(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -45,16 +24,11 @@ def _shared_grid_centers(
     spacing_px: int,
     global_shift: bool,
     device: torch.device,
-    forced_shift_y: Optional[int] = None,
-    forced_shift_x: Optional[int] = None,
     enable_grid_jitter: bool = True,
 ):
     """Generate one globally-shifted full-image lattice, then boundary-mask it."""
     spacing_px = int(max(1, spacing_px))
-    if forced_shift_y is not None and forced_shift_x is not None:
-        shift_y = int(forced_shift_y)
-        shift_x = int(forced_shift_x)
-    elif global_shift:
+    if global_shift:
         shift_y = int(torch.randint(0, spacing_px, (1,), device=device).item())
         shift_x = int(torch.randint(0, spacing_px, (1,), device=device).item())
     else:
@@ -216,11 +190,9 @@ def _ensure_target_patches_masked(
 def make_pyramid_grid_context(
     x_clean: torch.Tensor,
     sigmas=(2, 4, 8, 16),
-    cell_sizes=(16, 32, 64, 128),
     mask_fraction: float = 1.0,
     mask_scale: float = 1.0,
     spacing_scale: float = 1.5,
-    full_grid: bool = True,
     global_shift: bool = True,
     align_scales: bool = True,
     mask_box_size: int = 16,
@@ -229,18 +201,17 @@ def make_pyramid_grid_context(
     cdd_constrained: bool = True,
     cdd_sm_mode: str = "reflect",
     cdd_append_last_residual: bool = True,
-    mask_fill_mode: str = "zero",
     inner_target_size: int = 2,
     return_debug: bool = False,
-    forced_grid_shift: Optional[Tuple[int, int]] = None,
     enable_grid_jitter: bool = True,
     target_invalid_region_skip: bool = False,
     target_invalid_region_values=(0.0, "nan"),
     invalid_pixel_mask: Optional[torch.Tensor] = None,
     target_sampling_mode: str = "grid",
     priority_top_percent: float = 5.0,
-    priority_n_target: int = 20,
-    target_dithering_pixels: int = 6,
+    priority_n_target: int | str = 20,
+    priority_min_targets_per_map: int = 0,
+    priority_dithering_pixels: Optional[int] = None,
     cdd_use_gpu: bool = False,
 ):
     """
@@ -259,30 +230,21 @@ def make_pyramid_grid_context(
         inner_target_size = 3
     if inner_target_size % 2 == 0:
         inner_target_size = inner_target_size + 1
-
     if x_clean.shape[1] != 1:
         raise ValueError(f"Expected grayscale input with 1 channel, got {x_clean.shape[1]}")
     if blur_mode not in ("gaussian", "cdd"):
         raise ValueError(f"Unsupported blur_mode: {blur_mode}")
-    if mask_fill_mode != "zero":
-        raise ValueError(
-            f"Unsupported mask_fill_mode: {mask_fill_mode}. "
-            "Only 'zero' is supported."
-        )
     sampling_mode = str(target_sampling_mode).strip().lower()
+    if priority_dithering_pixels is None or priority_dithering_pixels <= 0:
+        priority_dithering_pixels = inner_target_size
+    else:
+        priority_dithering_pixels = int(priority_dithering_pixels)
     # Safeguard: global_shift is a lattice/grid concept only.
     # Priority sampling selects targets from ranked pixels, so disable it.
     effective_global_shift = bool(global_shift) if sampling_mode != "priority_sampling" else False
 
     b, _, h, w = x_clean.shape
     active_sigmas = tuple(float(s) for s in sigmas)
-    active_cells = tuple(int(c) for c in cell_sizes)
-    if len(active_cells) < len(active_sigmas):
-        reps = (len(active_sigmas) + len(active_cells) - 1) // len(active_cells)
-        active_cells = (active_cells * reps)[:len(active_sigmas)]
-    elif len(active_cells) > len(active_sigmas):
-        active_cells = active_cells[:len(active_sigmas)]
-
     n_sigmas = len(active_sigmas)
     total_fraction = max(0.0, float(mask_fraction))
     per_scale_fraction = total_fraction / max(1, n_sigmas)
@@ -303,10 +265,18 @@ def make_pyramid_grid_context(
     all_dip_proto_per_channel = []
     all_cdd_box_sizes = []
     all_cdd_blur_sigmas = []
+    all_priority_good_candidates = []
+    all_priority_nonzero_mean = []
+    all_priority_auto_base_targets = []
+    all_priority_effective_targets = []
 
     for bi in range(b):
         arr = x_context_np[bi, 0].copy()
         sample_invalid_mask = invalid_pixel_mask[bi, 0].cpu().numpy() if invalid_pixel_mask is not None else None
+        priority_good_candidates_bi = 0.0
+        priority_nonzero_mean_bi = 1.0
+        priority_auto_base_targets_bi = 0.0
+        priority_effective_targets_bi = 0.0
 
         applied_locations = []
         applied_scales = []
@@ -324,8 +294,6 @@ def make_pyramid_grid_context(
             spacing_px=spacing_px,
             global_shift=effective_global_shift,
             device=x_clean.device,
-            forced_shift_y=(None if forced_grid_shift is None else int(forced_grid_shift[0])),
-            forced_shift_x=(None if forced_grid_shift is None else int(forced_grid_shift[1])),
             enable_grid_jitter=bool(enable_grid_jitter),
         )
         shared_centers_dithered = None
@@ -349,7 +317,8 @@ def make_pyramid_grid_context(
                     w=w,
                     half_lo=max_half_lo,
                     half_hi=max_half_hi,
-                    dithering_pixels=target_dithering_pixels,
+                    # Grid/lattice mode always dithers by lattice spacing.
+                    dithering_pixels=spacing_px,
                     device=x_clean.device,
                 )
                 shared_centers_dithered.append((int(cy1), int(cx1)))
@@ -396,12 +365,8 @@ def make_pyramid_grid_context(
                 max_count = max(0, base_count + extra)
                 if max_count <= 0:
                     continue
-                if forced_grid_shift is not None:
-                    shift_y = int(forced_grid_shift[0]) % max(1, spacing)
-                    shift_x = int(forced_grid_shift[1]) % max(1, spacing)
-                else:
-                    shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
-                    shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
+                shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
+                shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
                 y_start = margin + shift_y
                 x_start = margin + shift_x
                 y_centers = list(range(y_start, max(y_start + 1, h - margin), spacing))
@@ -420,7 +385,8 @@ def make_pyramid_grid_context(
                         w=w,
                         half_lo=half_lo,
                         half_hi=half_hi,
-                        dithering_pixels=target_dithering_pixels,
+                        # Grid/lattice mode always dithers by lattice spacing.
+                        dithering_pixels=spacing,
                         device=x_clean.device,
                     )
                 y0 = max(0, cy - half_lo)
@@ -476,13 +442,64 @@ def make_pyramid_grid_context(
                     w=w,
                 )
                 if len(priority_catalogue) > 0:
-                    perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
-                    if mask_box_size > 0:
-                        base_targets = max(0, int(round(float(priority_n_target))))
+                    # Reject candidates too close to boundary for the largest
+                    # possible mask footprint across pyramid scales.
+                    max_box = _effective_mask_box_size(
+                        sigma=max(float(s) for s in active_sigmas),
+                        mask_scale=mask_scale,
+                        mask_box_size=mask_box_size,
+                        inner_target_size=inner_target_size,
+                    )
+                    max_half_lo = max_box // 2
+                    max_half_hi = max_box - max_half_lo
+                    good_candidates = []
+                    for cy, cx in priority_catalogue:
+                        y0 = int(cy) - int(max_half_lo)
+                        y1 = int(cy) + int(max_half_hi)
+                        x0 = int(cx) - int(max_half_lo)
+                        x1 = int(cx) + int(max_half_hi)
+                        if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
+                            continue
+                        good_candidates.append((int(cy), int(cx)))
+                    priority_catalogue = good_candidates
+
+                    # Auto target-count estimate from overlap density:
+                    # N_auto = (#good_candidates) / mean(nonzero(dummy_map)).
+                    dummy = np.zeros((h, w), dtype=np.float32)
+                    for cy, cx in priority_catalogue:
+                        y0 = max(0, int(cy) - int(max_half_lo))
+                        y1 = min(h, int(cy) + int(max_half_hi))
+                        x0 = max(0, int(cx) - int(max_half_lo))
+                        x1 = min(w, int(cx) + int(max_half_hi))
+                        if y1 <= y0 or x1 <= x0:
+                            continue
+                        dummy[y0:y1, x0:x1] += 1.0
+                    nonzero = dummy[dummy > 0]
+                    nonzero_mean = float(nonzero.mean()) if nonzero.size > 0 else 1.0
+                    auto_base = (
+                        int(round(float(len(priority_catalogue)) / max(nonzero_mean, 1e-6)))
+                        if len(priority_catalogue) > 0
+                        else 0
+                    )
+
+                    priority_n_raw = priority_n_target
+                    if isinstance(priority_n_raw, str) and priority_n_raw.strip().lower() == "auto":
+                        base_targets_unscaled = auto_base
                     else:
-                        base_targets = max(0, int(round(float(priority_n_target) * float(total_fraction))))
+                        try:
+                            base_targets_unscaled = int(round(float(priority_n_raw)))
+                        except (TypeError, ValueError):
+                            base_targets_unscaled = int(round(float(priority_n_target))) if priority_n_target is not None else 0
+                    min_targets = max(0, int(priority_min_targets_per_map))
+                    base_targets_scaled = max(0, int(round(float(base_targets_unscaled) * float(total_fraction))))
+                    base_targets = max(min_targets, base_targets_scaled)
+                    perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
                     k_sel = min(base_targets, len(priority_catalogue))
                     priority_catalogue = [priority_catalogue[int(i)] for i in perm[:k_sel]]
+                    priority_good_candidates_bi = float(len(good_candidates))
+                    priority_nonzero_mean_bi = float(nonzero_mean)
+                    priority_auto_base_targets_bi = float(auto_base)
+                    priority_effective_targets_bi = float(k_sel)
             # Dither once per selected priority seed and reuse across scales.
             # This avoids per-scale micro-clusters around the same logical target.
             priority_centers_dithered: list[tuple[int, int]] = []
@@ -497,7 +514,7 @@ def make_pyramid_grid_context(
                         w=w,
                         half_lo=patch_half_lo,
                         half_hi=patch_half_hi,
-                        dithering_pixels=target_dithering_pixels,
+                        dithering_pixels=priority_dithering_pixels,
                         device=x_clean.device,
                     )
                     priority_centers_dithered.append((int(cy1), int(cx1)))
@@ -537,12 +554,8 @@ def make_pyramid_grid_context(
                     max_count = max(0, base_count + extra)
                     if max_count <= 0:
                         continue
-                    if forced_grid_shift is not None:
-                        shift_y = int(forced_grid_shift[0]) % max(1, spacing)
-                        shift_x = int(forced_grid_shift[1]) % max(1, spacing)
-                    else:
-                        shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
-                        shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
+                    shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
+                    shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
                     y_start = margin + shift_y
                     x_start = margin + shift_x
                     y_centers = list(range(y_start, max(y_start + 1, h - margin), spacing))
@@ -565,7 +578,8 @@ def make_pyramid_grid_context(
                             w=w,
                             half_lo=half_lo,
                             half_hi=half_hi,
-                            dithering_pixels=target_dithering_pixels,
+                            # Grid/lattice mode always dithers by lattice spacing.
+                            dithering_pixels=spacing,
                             device=x_clean.device,
                         )
                     y0 = max(0, cy - half_lo)
@@ -662,6 +676,10 @@ def make_pyramid_grid_context(
             all_dip_proto_per_channel.append(torch.from_numpy(dip_proto_ch))
             all_cdd_box_sizes.append(torch.tensor(cdd_box_sizes, dtype=torch.float32))
             all_cdd_blur_sigmas.append(torch.tensor(cdd_blur_sigmas, dtype=torch.float32))
+            all_priority_good_candidates.append(priority_good_candidates_bi)
+            all_priority_nonzero_mean.append(priority_nonzero_mean_bi)
+            all_priority_auto_base_targets.append(priority_auto_base_targets_bi)
+            all_priority_effective_targets.append(priority_effective_targets_bi)
 
             continue
 
@@ -728,6 +746,10 @@ def make_pyramid_grid_context(
                     uniq.append((cy, cx))
             all_unique_centers.append(torch.tensor(uniq, dtype=torch.long))
         all_mask_maps.append(torch.from_numpy(applied_mask_hard.copy()))
+        all_priority_good_candidates.append(priority_good_candidates_bi)
+        all_priority_nonzero_mean.append(priority_nonzero_mean_bi)
+        all_priority_auto_base_targets.append(priority_auto_base_targets_bi)
+        all_priority_effective_targets.append(priority_effective_targets_bi)
 
     # Pack variable-length targets to fixed K so batching is always valid.
     k_fixed = max((len(v) for v in all_locations), default=0)
@@ -774,6 +796,10 @@ def make_pyramid_grid_context(
         "dip_proto_per_channel": _safe_stack(all_dip_proto_per_channel),
         "cdd_box_sizes": _safe_stack(all_cdd_box_sizes),
         "cdd_blur_sigmas": _safe_stack(all_cdd_blur_sigmas),
+        "priority_good_candidates": torch.tensor(all_priority_good_candidates, dtype=x_clean.dtype, device=x_clean.device),
+        "priority_nonzero_mean": torch.tensor(all_priority_nonzero_mean, dtype=x_clean.dtype, device=x_clean.device),
+        "priority_auto_base_targets": torch.tensor(all_priority_auto_base_targets, dtype=x_clean.dtype, device=x_clean.device),
+        "priority_effective_targets": torch.tensor(all_priority_effective_targets, dtype=x_clean.dtype, device=x_clean.device),
     }
     return x_context, target_locations, target_scales, target_valid, debug
 
@@ -782,11 +808,9 @@ def prepare_context_batch(
     x_clean: torch.Tensor,
     *,
     sigmas,
-    cell_sizes,
     mask_fraction: float = 1.0,
     mask_scale: float = 1.0,
     spacing_scale: float = 1.5,
-    full_grid: bool = True,
     global_shift: bool = True,
     align_scales: bool = True,
     mask_box_size: int = 16,
@@ -797,14 +821,14 @@ def prepare_context_batch(
     cdd_append_last_residual: bool = True,
     patch_size: int = 2,
     return_debug: bool = False,
-    forced_grid_shift=None,
     enable_grid_jitter: bool = True,
     target_invalid_region_skip: bool = False,
     target_invalid_region_values=(0.0, "nan"),
     target_sampling_mode: str = "grid",
     priority_top_percent: float = 5.0,
-    priority_n_target: int = 20,
-    target_dithering_pixels: int = 6,
+    priority_n_target: int | str = 20,
+    priority_min_targets_per_map: int = 0,
+    priority_dithering_pixels: Optional[int] = None,
     cdd_use_gpu: bool = False,
 ):
     """Prepare context tensors from a clean batch.
@@ -820,11 +844,9 @@ def prepare_context_batch(
     return make_pyramid_grid_context(
         x_clean=x_clean,
         sigmas=sigmas,
-        cell_sizes=cell_sizes,
         mask_fraction=mask_fraction,
         mask_scale=mask_scale,
         spacing_scale=spacing_scale,
-        full_grid=full_grid,
         global_shift=global_shift,
         align_scales=align_scales,
         mask_box_size=mask_box_size,
@@ -835,7 +857,6 @@ def prepare_context_batch(
         cdd_append_last_residual=cdd_append_last_residual,
         inner_target_size=patch_size,
         return_debug=return_debug,
-        forced_grid_shift=forced_grid_shift,
         enable_grid_jitter=enable_grid_jitter,
         target_invalid_region_skip=target_invalid_region_skip,
         target_invalid_region_values=target_invalid_region_values,
@@ -843,7 +864,8 @@ def prepare_context_batch(
         target_sampling_mode=target_sampling_mode,
         priority_top_percent=priority_top_percent,
         priority_n_target=priority_n_target,
-        target_dithering_pixels=target_dithering_pixels,
+        priority_min_targets_per_map=priority_min_targets_per_map,
+        priority_dithering_pixels=priority_dithering_pixels,
         cdd_use_gpu=cdd_use_gpu,
     )
 

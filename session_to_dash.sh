@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SESSIONS_DIR="$ROOT_DIR/sessions"
+CONFIG_DIR="${CONFIG_DIR:-$ROOT_DIR/configs/experiments}"
 STAGE="plot"                       # compute | plot | all
 OVERWRITE="false"                  # default: skip existing
 EXPORT_DIR="$ROOT_DIR/results/dashboard"
@@ -53,4 +54,5 @@ if [[ "$RESET" == "true" ]]; then
 fi
 
 echo "run_session_to_dash sessions_dir=$SESSIONS_DIR stage=$STAGE overwrite=$OVERWRITE export_dir=$EXPORT_DIR reset=$RESET"
+export SESSION_DASH_CONFIG_DIR="$CONFIG_DIR"
 python3 "$ROOT_DIR/scripts/session_to_dash.py" "${ARGS[@]}"

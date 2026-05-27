@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html as html_lib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,7 +15,7 @@ import plotly.graph_objects as go
 import torch
 
 
-DASHBOARD_VERSION = "scatter3d-v1"
+DASHBOARD_VERSION = "aligned-loss-layout-v2"
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -47,10 +49,16 @@ DASH_DATA_REQUIRED = {
 
 def _find_session_config(session_dir: str) -> str | None:
     name = os.path.basename(os.path.abspath(session_dir))
+    env_cfg_dir = os.environ.get("SESSION_DASH_CONFIG_DIR", "").strip()
     candidates = [
         os.path.join(session_dir, "config_used.json"),
-        os.path.join(ROOT_DIR, "configs", f"{name}.json"),
     ]
+    if env_cfg_dir:
+        candidates.append(os.path.join(env_cfg_dir, f"{name}.json"))
+    candidates.extend([
+        os.path.join(ROOT_DIR, "configs", "experiments", f"{name}.json"),
+        os.path.join(ROOT_DIR, "configs", f"{name}.json"),
+    ])
     for path in candidates:
         if os.path.exists(path):
             return os.path.abspath(path)
@@ -220,6 +228,27 @@ def _rgb_from_xyz(xyz: np.ndarray, h: int, w: int) -> tuple[np.ndarray, np.ndarr
     return rgb, rgb_flat
 
 
+def _xyz_from_feature_map(feat: np.ndarray) -> np.ndarray:
+    """Fallback embedding: flatten CHW feature map to N x 3 via first channels."""
+    arr = np.asarray(feat, dtype=np.float32)
+    if arr.ndim == 4:
+        arr = arr[0]
+    if arr.ndim != 3:
+        return np.zeros((0, 3), dtype=np.float32)
+    c, h, w = arr.shape
+    flat = np.transpose(arr, (1, 2, 0)).reshape(h * w, c)
+    if c >= 3:
+        xyz = flat[:, :3]
+    elif c == 2:
+        xyz = np.concatenate([flat, np.zeros((flat.shape[0], 1), dtype=np.float32)], axis=1)
+    elif c == 1:
+        xyz = np.concatenate([flat, flat, flat], axis=1)
+    else:
+        xyz = np.zeros((h * w, 3), dtype=np.float32)
+    xyz = np.where(np.isfinite(xyz), xyz, 0.0).astype(np.float32)
+    return xyz
+
+
 def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     out_npz = os.path.join(session_dir, "dash_data.npz")
     if os.path.exists(out_npz) and not overwrite:
@@ -314,15 +343,19 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
     # Load precomputed PCA/UMAP artifacts saved by training-time pipeline.
     results_dir = os.path.join(session_dir, "results")
-    if not os.path.isdir(results_dir):
-        raise RuntimeError(f"{session_dir}: missing required directory {results_dir}")
-    if not _has_required_branch_artifacts(results_dir, "predict"):
-        raise RuntimeError(f"{session_dir}: missing required artifacts under {results_dir} for branch=predict")
-    if not _has_required_branch_artifacts(results_dir, "target"):
-        raise RuntimeError(f"{session_dir}: missing required artifacts under {results_dir} for branch=target")
-    verbose_missing = _verbose_artifact_report(session_dir)
-    for line in verbose_missing:
-        print(f"dashboard_artifact_check={line}")
+    has_results_dir = os.path.isdir(results_dir)
+    has_predict_branch = has_results_dir and _has_required_branch_artifacts(results_dir, "predict")
+    has_target_branch = has_results_dir and _has_required_branch_artifacts(results_dir, "target")
+    fallback_mode = not (has_predict_branch and has_target_branch)
+    if has_results_dir:
+        verbose_missing = _verbose_artifact_report(session_dir)
+        for line in verbose_missing:
+            print(f"dashboard_artifact_check={line}")
+    if fallback_mode:
+        print(
+            f"dashboard_fallback_mode={session_dir} "
+            f"reason=missing_branch_embeddings predict={int(has_predict_branch)} target={int(has_target_branch)}"
+        )
 
     pred_map = outputs.get("pred_map")
     if pred_map is None:
@@ -366,6 +399,33 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
     bundles = {}
     for prefix_saved, prefix_out in (("context", "context"), ("predict", "pred"), ("target", "gt")):
+        if fallback_mode:
+            if prefix_out == "pred":
+                src_map = outputs.get("pred_map", outputs.get("context_map"))
+            elif prefix_out == "gt":
+                src_map = outputs.get("gt_map", outputs.get("pred_map"))
+            else:
+                src_map = outputs.get("context_map", outputs.get("pred_map"))
+            if src_map is None:
+                xyz = np.zeros((h_lat * w_lat, 3), dtype=np.float32)
+            else:
+                xyz = _xyz_from_feature_map(_to_np(src_map))
+                if xyz.shape[0] != h_lat * w_lat:
+                    xyz = np.zeros((h_lat * w_lat, 3), dtype=np.float32)
+            pca = xyz
+            um = xyz
+            hh, ww = h_lat, w_lat
+            pca_rgb, pca_rgb_flat = _rgb_from_xyz(pca, hh, ww)
+            um_rgb, um_rgb_flat = _rgb_from_xyz(um, hh, ww)
+            bundles[prefix_out] = {
+                "pca3d": pca,
+                "umap3d": um,
+                "pca_rgb": pca_rgb,
+                "pca_rgb_flat": pca_rgb_flat,
+                "umap_rgb": um_rgb,
+                "umap_rgb_flat": um_rgb_flat,
+            }
+            continue
         src_prefix = prefix_saved
         try:
             hh, ww = _load_hw(src_prefix)
@@ -481,14 +541,14 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 cfg = json.load(f)
             mc = cfg.get("model", {})
             _sigmas = mc.get("sigmas", [2, 4, 8, 16])
-            _ms = float(mc.get("mask_scale", 1.0))
+            _ms = float(mc.get("mask_size_scaling", 1.0))
             _mb = int(mc.get("mask_box_size", 0))
-            _mf = float(mc.get("mask_fraction", 1.0))
+            _mf = float(mc.get("active_target_fraction", mc.get("mask_fraction", 1.0)))
             _ps = int(mc.get("patch_size", 3))
             mask_config_summary = [
-                f"mask_scale={_ms}",
+                f"mask_size_scaling={_ms}",
                 f"mask_box_size={_mb}",
-                f"mask_fraction={_mf}",
+                f"active_target_fraction={_mf}",
                 f"patch_size={_ps}",
             ]
             for s in _sigmas:
@@ -498,6 +558,23 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             # Add overall summary
             _computed = ", ".join(f"σ={s}→{max(_ps, round(float(s)*_ms+_mb))}px" for s in _sigmas)
             mask_config_summary.append(f"computed: {_computed}")
+        except Exception:
+            pass
+    tsel_path = os.path.join(session_dir, "target_selection_summary.json")
+    if os.path.exists(tsel_path):
+        try:
+            with open(tsel_path, "r", encoding="utf-8") as f:
+                tsel = json.load(f)
+            mask_config_summary.append(
+                "target_select: "
+                f"priority_n_target={tsel.get('priority_n_target_config')} "
+                f"priority_min_targets_per_map={int(tsel.get('priority_min_targets_per_map_config', 0))} "
+                f"active_target_fraction={float(tsel.get('active_target_fraction', np.nan)):.3g} "
+                f"good_candidates_mean={float(tsel.get('priority_good_candidates_mean', 0.0)):.3g} "
+                f"nonzero_mean={float(tsel.get('priority_nonzero_mean_mean', 1.0)):.3g} "
+                f"auto_base_mean={float(tsel.get('priority_auto_base_targets_mean', 0.0)):.3g} "
+                f"effective_mean={float(tsel.get('priority_effective_targets_mean', 0.0)):.3g}"
+            )
         except Exception:
             pass
 
@@ -737,13 +814,26 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     weighted_var = np.asarray(data["weighted_var"], dtype=np.float32) if "weighted_var" in data.files else np.asarray([], dtype=np.float32)
     weighted_cov = np.asarray(data["weighted_cov"], dtype=np.float32) if "weighted_cov" in data.files else np.asarray([], dtype=np.float32)
     def _smooth(y: np.ndarray, win: int = 25) -> np.ndarray:
-        if y.size < 3 or win <= 1:
-            return y
-        w = min(win, max(3, y.size // 5))
+        arr = np.asarray(y, dtype=np.float32).reshape(-1)
+        if arr.size < 3 or win <= 1:
+            return arr
+        valid = np.isfinite(arr)
+        if not valid.any():
+            return np.full_like(arr, np.nan, dtype=np.float32)
+        w = min(win, max(3, arr.size // 5))
         if w % 2 == 0:
             w += 1
-        k = np.ones(w, dtype=np.float32) / float(w)
-        return np.convolve(y, k, mode="same")
+        pad = w // 2
+        values = np.where(valid, arr, 0.0).astype(np.float32)
+        weights = valid.astype(np.float32)
+        values_pad = np.pad(values, (pad, pad), mode="edge")
+        weights_pad = np.pad(weights, (pad, pad), mode="edge")
+        kernel = np.ones(w, dtype=np.float32)
+        num = np.convolve(values_pad, kernel, mode="valid")
+        den = np.convolve(weights_pad, kernel, mode="valid")
+        out = np.divide(num, np.maximum(den, 1e-6), dtype=np.float32)
+        out[den <= 0.0] = np.nan
+        return out
     n = min(loss_x.size, loss_total.size, loss_jepa.size) if (loss_x.size and loss_total.size and loss_jepa.size) else 0
     fig_loss = go.Figure()
     if n > 0:
@@ -931,6 +1021,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     for i, card in enumerate(cards):
         fig = card["fig"]
         group = card["group"]
+        panel_title = str(card.get("title", f"panel_{i+1}"))
+        panel_title_html = html_lib.escape(panel_title, quote=True)
         controls = ""
         if group not in seen_groups and ("-pca" in group or "-umap" in group):
             controls = (
@@ -946,7 +1038,9 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             )
             seen_groups.add(group)
         rendered.append(
-            f'<section class="card" data-group="{group}">{controls}'
+            f'<section class="card" data-group="{group}">'
+            f'<div class="card-tools"><button class="save-panel" type="button" data-panel-title="{panel_title_html}">Save PNG</button></div>'
+            f'{controls}'
             f'{fig.to_html(full_html=False, include_plotlyjs=("cdn" if i == 0 else False), config={"responsive": True, "displaylogo": False})}'
             f'</section>'
         )
@@ -977,8 +1071,9 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
   <meta name="jepa-dashboard-version" content="{DASHBOARD_VERSION}" />
   <style>
     body {{ margin: 14px; background: #f4f6fa; color: #0d1527; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    h1 {{ margin: 0 0 12px 2px; font-size: 24px; font-weight: 650; }}
-    .version {{ color: #596275; font-size: 13px; font-weight: 500; margin-left: 8px; }}
+    .topbar {{ margin: 0 0 12px 2px; }}
+    h1 {{ margin: 0; font-size: 24px; font-weight: 650; color: #0d1527; }}
+    .version {{ color: #596275; font-size: 13px; font-weight: 600; margin-left: 8px; }}
     .mask-summary {{ margin: 0 0 18px 2px; padding: 14px 18px; background: #fff; border: 1px solid #d9deea; border-radius: 8px; font-size: 15px; line-height: 1.8; }}
     .mask-summary .val {{ color: #3a4055; margin-right: 20px; }}
     .mask-summary .erank {{ display: inline-block; margin-left: 8px; padding: 4px 14px; background: #1a1a2e; color: #fde725; border-radius: 6px; font-weight: 700; font-size: 17px; }}
@@ -988,13 +1083,18 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     .controls {{ display:flex; flex-wrap:wrap; gap:8px; margin: 0 0 12px 2px; align-items:center; }}
     .controls input {{ width:88px; }}
     .local-controls {{ margin: 2px 2px 8px 2px; padding: 6px; background: #f7f9ff; border: 1px solid #dde3f0; border-radius: 6px; }}
+    .card-tools {{ display: flex; justify-content: flex-end; margin: 2px 2px 6px 2px; }}
+    .save-panel {{ border: 1px solid #c7d2e8; background: #ffffff; color: #23304f; border-radius: 6px; padding: 4px 10px; font-size: 12px; font-weight: 600; cursor: pointer; }}
+    .save-panel:hover {{ background: #eef3ff; }}
     .card {{ background: #fff; border: 1px solid #d9deea; border-radius: 10px; box-shadow: 0 1px 2px rgba(10,20,40,0.08); padding: 6px; overflow: hidden; }}
     .card-dummy {{ visibility: hidden; min-height: 340px; }}
     @media (max-width: 1120px) {{ .grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
-  <h1>JEPA Session Dashboard: {os.path.basename(session_dir)} <span class="version">{DASHBOARD_VERSION}</span></h1>
+  <div class="topbar">
+    <h1>JEPA Session Dashboard: {os.path.basename(session_dir)} <span class="version">{DASHBOARD_VERSION}</span></h1>
+  </div>
   <div class="mask-summary">{mask_summary_html}</div>
   <div class="grid">{''.join(rendered)}</div>
   <script>
@@ -1078,7 +1178,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
       }}
     }});
   }}
-  function initControlDefaults() {{
+	  function initControlDefaults() {{
     document.querySelectorAll('.local-controls').forEach((controls) => {{
       const group = controls.getAttribute("data-group");
       const gd = document.querySelector('.card[data-group="' + group + '"] .js-plotly-plot');
@@ -1099,11 +1199,43 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
       }});
     }});
   }}
-  window.addEventListener("load", initControlDefaults);
-  document.querySelectorAll(".apply-local").forEach((btn) => {{
-    btn.addEventListener("click", () => applyRangesForGroup(btn.getAttribute("data-group")));
-  }});
-  </script>
+	  window.addEventListener("load", initControlDefaults);
+	  document.querySelectorAll(".apply-local").forEach((btn) => {{
+	    btn.addEventListener("click", () => applyRangesForGroup(btn.getAttribute("data-group")));
+	  }});
+	  function _safeFileName(name) {{
+	    return String(name || "panel")
+	      .toLowerCase()
+	      .replace(/[^a-z0-9]+/g, "_")
+	      .replace(/^_+|_+$/g, "") || "panel";
+	  }}
+	  async function savePanelPng(btn) {{
+	    const card = btn.closest(".card");
+	    const gd = card ? card.querySelector(".js-plotly-plot") : null;
+	    if (!gd || !window.Plotly || typeof window.Plotly.toImage !== "function") {{
+	      alert("Panel export unavailable for this card.");
+	      return;
+	    }}
+	    const title = btn.getAttribute("data-panel-title") || "panel";
+	    const width = Math.max(1200, gd.clientWidth || 1200);
+	    const height = Math.max(900, gd.clientHeight || 900);
+	    try {{
+	      const dataUrl = await window.Plotly.toImage(gd, {{ format: "png", width, height, scale: 2 }});
+	      const a = document.createElement("a");
+	      a.href = dataUrl;
+	      a.download = _safeFileName(title) + ".png";
+	      document.body.appendChild(a);
+	      a.click();
+	      a.remove();
+	    }} catch (err) {{
+	      console.error("savePanelPng failed", err);
+	      alert("Failed to save panel PNG.");
+	    }}
+	  }}
+	  document.querySelectorAll(".save-panel").forEach((btn) => {{
+	    btn.addEventListener("click", () => savePanelPng(btn));
+	  }});
+	  </script>
 </body>
 </html>
 """
@@ -1169,23 +1301,50 @@ def plot_dash(session_dir: str, overwrite: bool = False) -> str:
 
 
 def _preferred_html_for_export(session_dir: str, fallback_html: str) -> str:
+    def _inline_masking_iframe_srcs(page_html: str) -> str:
+        pattern = re.compile(r"""src=(["'])(masking_demo_[^"']+\.html)\1""")
+
+        def _repl(match: re.Match[str]) -> str:
+            demo_fn = match.group(2)
+            demo_path = os.path.join(session_dir, demo_fn)
+            if not os.path.exists(demo_path):
+                return match.group(0)
+            with open(demo_path, "r", encoding="utf-8") as demo_f:
+                srcdoc = html_lib.escape(demo_f.read(), quote=True)
+            return f'srcdoc="{srcdoc}"'
+
+        return pattern.sub(_repl, page_html)
+
     with open(fallback_html, "r", encoding="utf-8") as f:
-        html = f.read()
-    if 'data-mask-demo-auto="true"' in html:
-        return fallback_html
+        html_raw = f.read()
+    html_inlined = _inline_masking_iframe_srcs(html_raw)
+    if 'data-mask-demo-auto="true"' in html_raw:
+        if html_inlined == html_raw:
+            return fallback_html
+        out_html = os.path.join(session_dir, "dashboard_with_masking_demo.html")
+        with open(out_html, "w", encoding="utf-8") as f:
+            f.write(html_inlined)
+        return out_html
+
+    page_html = html_inlined
     demo_files = sorted([fn for fn in os.listdir(session_dir) if fn.startswith("masking_demo_") and fn.endswith(".html")])
     if not demo_files:
         return fallback_html
     parts = ["<hr/>", "<h2 style='font-family:sans-serif;margin:16px 0 8px 0;'>Masking Demo Panels</h2>"]
     for fn in demo_files:
+        demo_path = os.path.join(session_dir, fn)
+        if not os.path.exists(demo_path):
+            continue
+        with open(demo_path, "r", encoding="utf-8") as demo_f:
+            srcdoc = html_lib.escape(demo_f.read(), quote=True)
         parts.append(
             f"<div style='margin:10px 0;'><div style='font-family:sans-serif;font-size:14px;margin:4px 0;'>{fn}</div>"
-            f"<iframe src=\"{fn}\" style='width:100%;height:980px;border:1px solid #ddd;border-radius:6px;'></iframe></div>"
+            f"<iframe srcdoc=\"{srcdoc}\" style='width:100%;height:980px;border:1px solid #ddd;border-radius:6px;'></iframe></div>"
         )
-    html = html.replace("</body>", "\n" + "\n".join(parts) + "\n</body>")
+    page_html = page_html.replace("</body>", "\n" + "\n".join(parts) + "\n</body>")
     out_html = os.path.join(session_dir, "dashboard_with_masking_demo.html")
     with open(out_html, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(page_html)
     return out_html
 
 

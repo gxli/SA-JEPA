@@ -1,0 +1,22 @@
+{
+  "base_config": "../base_pyramid_scaleaware_convnext.json",
+  "model": {
+    "mode": "pyramid",
+    "model_key": "cdd_scaleaware_convnext",
+    "mask_size_scaling": 0.8,
+    "mask_spacing_scaling": 2.0,
+    "mask_box_size": 0,
+    "use_symmetric_feature_loss": true,
+    "target_sampling_mode": "priority_sampling",
+    "priority_top_percent": 15.0,
+    "priority_n_target": "auto",
+    "priority_min_targets_per_map": 10,
+    "priority_dithering_pixels": 6
+  },
+  "train": {
+    "epochs": 10,
+    "log_interval": 1,
+    "inference_tta_enabled": true,
+    "inference_tta_mode": "flip4"
+  }
+}

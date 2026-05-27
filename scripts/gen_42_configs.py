@@ -73,35 +73,25 @@ PYRAMID_MODEL_BASE = {
     "scaleaware_fusion_type": "topdown",
     "scaleaware_norm_per_scale": True,
     "cdd_append_last_residual": True,
-    "box_sigma_mult": 4,
-    "mask_scale": 1.0,
-    "min_mask_scale": 0,
-    "spacing_scale": 2.0,
-    "mask_size": 0.0,
-    "full_grid": True,
     "global_shift": False,
     "align_scales": True,
     "mask_box_size": 0,
     "cdd_mode": "log",
     "cdd_constrained": True,
     "cdd_sm_mode": "reflect",
-    "mask_fill_mode": "zero",
-    "dip_sigma_mult": 1.0,
-    "scaleaware_gaussian_ratios": [0.25, 0.5, 1.0, 2.0],
     "post_log_transform": True,
     "log_eps": 1e-06,
     "cdd_log_std_floor_mult": 0.05,
     "ema_momentum": 0.996,
     "normalize_loss": False,
     "predictor_layernorm": True,
-    "mask_scaling_gaussian": 1.0,
-    "mask_scaling_box": 1.0,
+    "mask_size_scaling": 1.0,
     "mask_spacing_scaling": 2.0,
     "target_invalid_region_skip": False,
     "target_sampling_mode": "priority_sampling",
     "priority_top_percent": 15.0,
     "priority_n_target": 20,
-    "target_dithering_pixels": 6,
+    "priority_dithering_pixels": 6,
     "patch_size": 3,
 }
 
@@ -120,35 +110,25 @@ IMAGE_MODEL_BASE = {
     "scaleaware_fusion_type": "topdown",
     "scaleaware_norm_per_scale": True,
     "cdd_append_last_residual": True,
-    "box_sigma_mult": 4,
-    "mask_scale": 0.0,
-    "min_mask_scale": 0,
-    "spacing_scale": 2.0,
-    "mask_size": 0.0,
-    "full_grid": True,
     "global_shift": False,
     "align_scales": True,
     "constant_mask_box": True,
     "cdd_mode": "log",
     "cdd_constrained": True,
     "cdd_sm_mode": "reflect",
-    "mask_fill_mode": "zero",
-    "dip_sigma_mult": 1.0,
-    "scaleaware_gaussian_ratios": [0.25, 0.5, 1.0, 2.0],
     "post_log_transform": True,
     "log_eps": 1e-06,
     "cdd_log_std_floor_mult": 0.05,
     "ema_momentum": 0.996,
     "normalize_loss": False,
     "predictor_layernorm": True,
-    "mask_scaling_gaussian": 1.0,
-    "mask_scaling_box": 0.0,
+    "mask_size_scaling": 0.0,
     "mask_spacing_scaling": 2.0,
     "target_invalid_region_skip": False,
     "target_sampling_mode": "priority_sampling",
     "priority_top_percent": 15.0,
     "priority_n_target": 20,
-    "target_dithering_pixels": 6,
+    "priority_dithering_pixels": 6,
     "patch_size": 3,
     "mask_fraction": 0.0,
 }
@@ -179,8 +159,7 @@ def main():
     for mfrac in [0.4, 0.8, 1.2, 1.6]:
         m = dict(PYRAMID_MODEL_BASE)
         m["mask_fraction"] = mfrac
-        m["mask_scale"] = 1.0
-        m["mask_scaling_box"] = 1.0
+        m["mask_size_scaling"] = 1.0
         m["mask_box_size"] = 0
         m.pop("constant_mask_box", None)
         name = f"gen_42_run_1_cdd_scaleaware_convnext-pyramid-scaleaware_mfrac_{_fmt(mfrac)}_mbox_00"
@@ -190,8 +169,7 @@ def main():
     for mbox in [5, 7, 9, 11]:
         m = dict(PYRAMID_MODEL_BASE)
         m["mask_fraction"] = 0.0
-        m["mask_scale"] = 0.0
-        m["mask_scaling_box"] = 0.0
+        m["mask_size_scaling"] = 0.0
         m["mask_box_size"] = mbox
         m["constant_mask_box"] = True
         name = f"gen_42_run_2_cdd_scaleaware_convnext-pyramid-scaleaware_mfrac_0p0_mbox_{mbox:02d}"

@@ -12,6 +12,7 @@ from .masking import extract_location_patches
 from .masking3d import extract_location_cubes, make_gaussian_pyramid3d, sample_target_locations_3d
 from .predictor import FullResPredictor
 from .predictor3d import FullResPredictor3D
+from .symmetry import symmetric_forward_3d
 
 
 class PyramidGridJEPA3D(nn.Module):
@@ -27,6 +28,7 @@ class PyramidGridJEPA3D(nn.Module):
         encoder_stride=1,
         ema_momentum=0.996,
         normalize_loss=False,
+        normalize_loss_l2=None,
         fusion="gate",
         constant_mask_box: bool = False,
         mask_box_size: int = 8,
@@ -34,19 +36,22 @@ class PyramidGridJEPA3D(nn.Module):
         mode: str = "2d",
         slab_depth: int = 3,
         slab_boundary_margin: int = 0,
+        use_symmetric_feature_loss: bool = False,
     ):
         super().__init__()
         self.sigmas = tuple(sigmas)
         self.patch_size = int(patch_size)
         self.num_targets = int(num_targets)
         self.ema_momentum = float(ema_momentum)
-        self.normalize_loss = bool(normalize_loss)
+        self.normalize_loss_l2 = bool(normalize_loss if normalize_loss_l2 is None else normalize_loss_l2)
+        self.normalize_loss = self.normalize_loss_l2
         self.constant_mask_box = bool(constant_mask_box)
         self.mask_box_size = int(mask_box_size)
         self.num_mask_boxes = int(num_mask_boxes)
         self.mode = self._normalize_mode(mode)
         self.slab_depth = max(1, int(slab_depth))
         self.slab_boundary_margin = max(0, int(slab_boundary_margin))
+        self.use_symmetric_feature_loss = bool(use_symmetric_feature_loss)
 
         self.context_encoder = ScaleAwareConvNeXt3DEncoder(
             num_scales=len(self.sigmas),
@@ -243,9 +248,16 @@ class PyramidGridJEPA3D(nn.Module):
             fields_context = fields * (1.0 - box_mask)
             mask_tokens = box_mask.expand(-1, fields.shape[1], -1, -1, -1)
 
-        context_map_3d = self.context_encoder(fields_context, mask_tokens=mask_tokens)
+        if self.use_symmetric_feature_loss:
+            context_map_3d = symmetric_forward_3d(self.context_encoder, fields_context, mask_tokens=mask_tokens)
+        else:
+            context_map_3d = self.context_encoder(fields_context, mask_tokens=mask_tokens)
         with torch.no_grad():
-            gt_map_3d = self.target_encoder(fields, mask_tokens=torch.zeros_like(fields))
+            zero_mask_tokens = torch.zeros_like(fields)
+            if self.use_symmetric_feature_loss:
+                gt_map_3d = symmetric_forward_3d(self.target_encoder, fields, mask_tokens=zero_mask_tokens)
+            else:
+                gt_map_3d = self.target_encoder(fields, mask_tokens=zero_mask_tokens)
 
         if self.mode == "3d":
             context_map = context_map_3d
@@ -330,7 +342,7 @@ class PyramidGridJEPA3D(nn.Module):
         gt = outputs["gt_patches"].detach()
         valid = outputs["target_valid"]
 
-        if self.normalize_loss:
+        if self.normalize_loss_l2:
             pred = F.normalize(pred, dim=2)
             gt = F.normalize(gt, dim=2)
 

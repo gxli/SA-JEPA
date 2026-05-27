@@ -15,6 +15,11 @@ if ROOT_DIR not in sys.path:
 from src.dataset import JEPADataset
 from src.models.masking import make_pyramid_grid_context
 
+DEMO_BOX_SIGMA_MULT = 4.0
+DEMO_MASK_SIZE = 0.0
+DEMO_DIP_SIGMA_MULT = 1.0
+DEMO_SCALEAWARE_GAUSSIAN_RATIOS = (0.25, 0.5, 1.0, 2.0)
+
 
 def _load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -70,6 +75,11 @@ def main():
         model_cfg["priority_top_percent"] = float(args.top_percent)
     if args.n_target is not None:
         model_cfg["priority_n_target"] = int(args.n_target)
+    pnt_raw = model_cfg.get("priority_n_target", 20)
+    try:
+        pnt_val = int(pnt_raw)
+    except (TypeError, ValueError):
+        pnt_val = 20
 
     ds = _build_dataset(data_cfg)
     x = ds[int(args.sample_index)].unsqueeze(0)  # 1x1xHxW
@@ -78,13 +88,11 @@ def main():
     x_ctx, tloc, _, tvalid, debug = make_pyramid_grid_context(
         x_clean=x,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
-        cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-        mask_fraction=float(model_cfg.get("mask_fraction", 1.0)),
-        box_sigma_mult=float(model_cfg.get("box_sigma_mult", 4.0)),
-        mask_scale=float(model_cfg.get("mask_scale", 1.0)),
-        spacing_scale=float(model_cfg.get("spacing_scale", 2.0)),
-        mask_size=float(model_cfg.get("mask_size", 0.0)),
-        full_grid=bool(model_cfg.get("full_grid", True)),
+        mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
+        box_sigma_mult=DEMO_BOX_SIGMA_MULT,
+        mask_scale=float(model_cfg.get("mask_size_scaling", 1.0)),
+        spacing_scale=float(model_cfg.get("mask_spacing_scaling", 2.0)),
+        mask_size=DEMO_MASK_SIZE,
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
         mask_box_size=int(model_cfg.get("mask_box_size", 16)),
@@ -92,15 +100,14 @@ def main():
         cdd_mode=str(model_cfg.get("cdd_mode", "log")),
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=str(model_cfg.get("cdd_sm_mode", "reflect")),
-        mask_fill_mode=str(model_cfg.get("mask_fill_mode", "gaussian_dip")),
-        dip_sigma_mult=1.0,
-        scaleaware_gaussian_ratios=tuple(model_cfg.get("scaleaware_gaussian_ratios", [0.25, 0.5, 1.0, 2.0])),
+        dip_sigma_mult=DEMO_DIP_SIGMA_MULT,
+        scaleaware_gaussian_ratios=DEMO_SCALEAWARE_GAUSSIAN_RATIOS,
         cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
         inner_target_size=int(model_cfg.get("patch_size", 2)),
         return_debug=True,
         target_sampling_mode=str(model_cfg.get("target_sampling_mode", "priority_sampliyg")),
         priority_top_percent=float(model_cfg.get("priority_top_percent", 5.0)),
-        priority_n_target=int(model_cfg.get("priority_n_target", 20)),
+        priority_n_target=pnt_val,
     )
 
     x_np = x[0, 0].cpu().numpy()
@@ -146,7 +153,7 @@ def main():
                 "out": args.out,
                 "target_sampling_mode": str(model_cfg.get("target_sampling_mode", "priority_sampliyg")),
                 "priority_top_percent": float(model_cfg.get("priority_top_percent", 5.0)),
-                "priority_n_target": int(model_cfg.get("priority_n_target", 20)),
+                "priority_n_target": model_cfg.get("priority_n_target", 20),
                 "n_valid_targets": int(valid.sum()),
             },
             indent=2,

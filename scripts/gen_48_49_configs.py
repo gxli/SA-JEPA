@@ -81,12 +81,6 @@ BASE_MODEL_COMMON = {
     "scaleaware_fusion_type": "topdown",
     "scaleaware_norm_per_scale": True,
     "cdd_append_last_residual": True,
-    "box_sigma_mult": 4,
-    "mask_scale": 1.0,
-    "min_mask_scale": 0,
-    "spacing_scale": 2.0,
-    "mask_size": 0.0,
-    "full_grid": True,
     "global_shift": False,
     "align_scales": True,
     "constant_mask_box": False,
@@ -94,23 +88,19 @@ BASE_MODEL_COMMON = {
     "cdd_mode": "log",
     "cdd_constrained": True,
     "cdd_sm_mode": "reflect",
-    "mask_fill_mode": "zero",
-    "dip_sigma_mult": 1.0,
-    "scaleaware_gaussian_ratios": [0.25, 0.5, 1.0, 2.0],
     "post_log_transform": True,
     "log_eps": 1e-06,
     "cdd_log_std_floor_mult": 0.05,
     "ema_momentum": 0.996,
     "normalize_loss": False,
     "predictor_layernorm": True,
-    "mask_scaling_gaussian": 1.0,
-    "mask_scaling_box": 1.0,
+    "mask_size_scaling": 1.0,
     "mask_spacing_scaling": 2.0,
     "target_invalid_region_skip": False,
     "target_sampling_mode": "priority_sampling",
     "priority_top_percent": 15.0,
     "priority_n_target": 20,
-    "target_dithering_pixels": 6,
+    "priority_dithering_pixels": 6,
     "patch_size": 3,
 }
 
@@ -149,8 +139,7 @@ def generate_gen(gen_id: int, model_key: str) -> int:
         m["mask_fraction"] = float(mfrac)
         m["mask_box_size"] = 0
         m["constant_mask_box"] = False
-        m["mask_scale"] = 1.0
-        m["mask_scaling_box"] = 1.0
+        m["mask_size_scaling"] = 1.0
         name = (
             f"gen_{gen_id}_run_1_{model_key}_"
             f"mfrac_{_fmt(mfrac)}_mbox_00"
@@ -164,8 +153,7 @@ def generate_gen(gen_id: int, model_key: str) -> int:
         m["mask_fraction"] = 0.0
         m["mask_box_size"] = int(mbox)
         m["constant_mask_box"] = True
-        m["mask_scale"] = 0.0
-        m["mask_scaling_box"] = 0.0
+        m["mask_size_scaling"] = 0.0
         name = (
             f"gen_{gen_id}_run_2_{model_key}_"
             f"mfrac_0p0_mbox_{mbox:02d}"

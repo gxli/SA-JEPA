@@ -78,7 +78,6 @@ def _prepare_context_from_model(
         "rescnn_dense_pyramid",
         "pyramid_convnext_dilated",
         "pyramid_cnn_res_dilated",
-        "mfae_convnext",
         "convnext_dense_masktoken",
         "convnext_dense_masktoken_d4",
     }
@@ -90,11 +89,9 @@ def _prepare_context_from_model(
     return prepare_context_batch(
         x_clean=x_clean,
         sigmas=model.sigmas,
-        cell_sizes=model.cell_sizes,
         mask_fraction=model.mask_fraction,
         mask_scale=model.mask_scale,
         spacing_scale=model.spacing_scale,
-        full_grid=model.full_grid,
         global_shift=model.global_shift,
         align_scales=model.align_scales,
         mask_box_size=model.mask_box_size,
@@ -110,7 +107,7 @@ def _prepare_context_from_model(
         target_sampling_mode=model.target_sampling_mode,
         priority_top_percent=model.priority_top_percent,
         priority_n_target=model.priority_n_target,
-        target_dithering_pixels=model.target_dithering_pixels,
+        priority_dithering_pixels=model.priority_dithering_pixels,
         cdd_use_gpu=(x_clean.device.type == "cuda"),
     )
 
@@ -162,8 +159,47 @@ def evaluate_validation(
 
 
 def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    def _deep_merge(base: dict, override: dict) -> dict:
+        out = dict(base)
+        for k, v in override.items():
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k] = _deep_merge(out[k], v)
+            else:
+                out[k] = v
+        return out
+
+    def _load_with_base(cfg_path: str, seen: set[str]) -> dict:
+        abs_path = os.path.abspath(cfg_path)
+        if abs_path in seen:
+            chain = " -> ".join(list(seen) + [abs_path])
+            raise ValueError(f"Cyclic base_config reference detected: {chain}")
+        seen.add(abs_path)
+        with open(abs_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        base_ref = cfg.pop("base_config", None)
+        if base_ref is None:
+            merged = cfg
+        else:
+            base_path = base_ref
+            if not os.path.isabs(base_path):
+                base_path = os.path.join(os.path.dirname(abs_path), base_path)
+            base_cfg = _load_with_base(base_path, seen)
+            merged = _deep_merge(base_cfg, cfg)
+        seen.remove(abs_path)
+        return merged
+
+    cfg = _load_with_base(path, seen=set())
+    cfg.setdefault("data", {})
+    cfg.setdefault("model", {})
+    cfg.setdefault("train", {})
+
+    # Keep shared CDD/log knobs in one place (data section) and mirror to model
+    # only when model did not set an explicit override.
+    for k in ("cdd_mode", "cdd_constrained", "cdd_sm_mode", "log_eps"):
+        if k in cfg["data"] and k not in cfg["model"]:
+            cfg["model"][k] = cfg["data"][k]
+    return cfg
 
 
 def make_session_dir(root: str, config_name: str) -> str:
@@ -224,9 +260,6 @@ def _resolve_encoder_alias_2d(name: str) -> str:
         "image_pyramid_cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
         "image_pyramid_cdd_scaleaware_convnext_d4": "cdd_scaleaware_convnext_d4",
         "image_pyramid_cdd_scaleaware_rescnn": "cdd_scaleaware_rescnn",
-        # Backward-compatible typo alias.
-        "imge_pyramid_cdd_opnet": "cdd_opnet",
-        "imge_pyramid_cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
         # Supported canonical names.
         "rescnn_dense": "rescnn_dense",
         "convnext_dense_masktoken": "convnext_dense_masktoken",
@@ -239,15 +272,6 @@ def _resolve_encoder_alias_2d(name: str) -> str:
         "rescnn-image-base": "rescnn_dense",
         "convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
         "opnet-image-scaleaware": "cdd_opnet",
-        # --- STALE encoders (no masked-token support) ---
-        # "convnext_dense": "convnext_dense",
-        # "mfae_convnext": "mfae_convnext",
-        # "dense_unet_small": "dense_unet_small",
-        # "fullres": "fullres",
-        # "rescnn_dense_pyramid": "rescnn_dense_pyramid",
-        # "convnext_dense_pyramid": "convnext_dense_pyramid",
-        # "pyramid_cnn_res_dilated": "pyramid_cnn_res_dilated",
-        # "pyramid_convnext_dilated": "pyramid_convnext_dilated",
     }
     return alias.get(key, str(name))
 
@@ -255,16 +279,6 @@ def _resolve_encoder_alias_2d(name: str) -> str:
 def _resolve_encoder_alias_3d(name: str) -> str:
     key = str(name).lower()
     alias = {
-        # Preferred naming convention (cube / cube_pyramid prefixes).
-        "cube_dense": "convnext_dense3d",
-        "cube_pyramid_scaleaware": "cdd_scaleaware_convnext3d",
-        # New human-readable labels (v1).
-        "volume_dense": "convnext_dense3d",
-        "volume_scaleaware": "cdd_scaleaware_convnext3d",
-        # New keyword-style labels (v2).
-        "convnext-volume-base": "convnext_dense3d",
-        "convnext-volume-scaleaware": "cdd_scaleaware_convnext3d",
-        # Canonical passthroughs.
         "convnext_dense3d": "convnext_dense3d",
         "cdd_scaleaware_convnext3d": "cdd_scaleaware_convnext3d",
     }
@@ -272,10 +286,10 @@ def _resolve_encoder_alias_3d(name: str) -> str:
 
 
 def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, device: torch.device) -> PyramidGridJEPA:
-    """Construct a PyramidGridJEPA from config dicts, with backward-compatible param aliases."""
+    """Construct a PyramidGridJEPA from config dicts."""
     blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
-    mask_scaling_box = float(model_cfg.get("mask_scaling_box", model_cfg.get("mask_scale", 1.0)))
-    mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", model_cfg.get("spacing_scale", 1.5)))
+    mask_size_scaling = float(model_cfg.get("mask_size_scaling", 1.0))
+    mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", 1.5))
     _, _, model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
     resolved_encoder_type = _resolve_encoder_alias_2d(resolve_encoder_type_default(model_cfg))
     resolved_mode = str(model_cfg.get("mode", "image")).lower()
@@ -304,16 +318,16 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         patch_size = patch_size + 1
         print(f"[warning] even patch_size requested; using odd patch_size={patch_size}")
 
+    normalize_loss_l2 = bool(model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", False)))
+    active_target_fraction = float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0)))
     return PyramidGridJEPA(
         latent_channels=model_cfg.get("latent_channels", 32),
         predictor_hidden=model_cfg.get("predictor_hidden"),
         patch_size=patch_size,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
-        cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-        mask_fraction=float(model_cfg.get("mask_fraction", 1.0)),
-        mask_scale=mask_scaling_box,
+        mask_fraction=active_target_fraction,
+        mask_scale=mask_size_scaling,
         spacing_scale=mask_spacing_scaling,
-        full_grid=model_cfg.get("full_grid", True),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
         mask_box_size=model_cfg.get("mask_box_size", 16),
@@ -321,13 +335,12 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=model_cfg.get("cdd_constrained", True),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-        mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
         cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
         post_log_transform=model_cfg.get("post_log_transform", model_post_log),
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
         ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
-        normalize_loss=model_cfg.get("normalize_loss", False),
+        normalize_loss_l2=normalize_loss_l2,
         predictor_layernorm=model_cfg.get("predictor_layernorm", False),
         use_image_mask_token=use_image_mask_token,
         mode=resolved_mode,
@@ -355,8 +368,10 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
         target_sampling_mode=str(model_cfg.get("target_sampling_mode", "grid")),
         priority_top_percent=float(model_cfg.get("priority_top_percent", 5.0)),
-        priority_n_target=int(model_cfg.get("priority_n_target", 20)),
-        target_dithering_pixels=int(model_cfg.get("target_dithering_pixels", 6)),
+        priority_n_target=model_cfg.get("priority_n_target", 20),
+        priority_min_targets_per_map=int(model_cfg.get("priority_min_targets_per_map", 0)),
+        priority_dithering_pixels=int(model_cfg.get("priority_dithering_pixels", model_cfg.get("target_dithering_pixels", 6))),
+        use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
     ).to(device)
 
 
@@ -373,6 +388,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         fusion = "concat"
     mode_key = str(model_cfg.get("mode", "pyramid3d")).strip().lower().replace(" ", "_")
     model_mode = str(model_cfg.get("volumetric_mode", "2d")) if mode_key == "pyramid3d" else mode_key
+    normalize_loss_l2 = bool(model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", False)))
     return PyramidGridJEPA3D(
         latent_channels=int(model_cfg.get("latent_channels", 16)),
         scale_channels=int(model_cfg.get("scale_channels", model_cfg.get("encoder_width", 8))),
@@ -383,7 +399,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         encoder_kernel_size=int(model_cfg.get("encoder_kernel_size", 5)),
         encoder_stride=int(model_cfg.get("encoder_stride", 1)),
         ema_momentum=float(model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996))),
-        normalize_loss=bool(model_cfg.get("normalize_loss", False)),
+        normalize_loss_l2=normalize_loss_l2,
         fusion=fusion,
         constant_mask_box=bool(model_cfg.get("constant_mask_box", False)),
         mask_box_size=int(model_cfg.get("mask_box_size", 8)),
@@ -391,6 +407,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         mode=model_mode,
         slab_depth=int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
         slab_boundary_margin=int(model_cfg.get("slab_boundary_margin", model_cfg.get("encoder_depth", 3))),
+        use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
     ).to(device)
 
 
@@ -517,9 +534,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             print(f"resume_model={model_ckpt_path}")
 
     scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
-    _msb = float(model_cfg.get("mask_scaling_box", model_cfg.get("mask_scale", 1.0)))
+    _msb = float(model_cfg.get("mask_size_scaling", 1.0))
     _mb = int(model_cfg.get("mask_box_size", 16))
-    _mss = float(model_cfg.get("mask_spacing_scaling", model_cfg.get("spacing_scale", 1.5)))
+    _mss = float(model_cfg.get("mask_spacing_scaling", 1.5))
     max_box = round(scale_max * _msb + _mb)
     auto_roll_max = max(1, int(round(float(max_box) * _mss)))
 
@@ -742,17 +759,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     umap_cfg = dict(train_cfg.get("umap", {}))
     compute_effective_rank = bool(train_cfg.get("compute_effective_rank", False))
     inference_visit_batches = int(train_cfg.get("inference_visit_batches", 32))
+    inference_tta_enabled = bool(train_cfg.get("inference_tta_enabled", False))
+    inference_tta_mode = str(train_cfg.get("inference_tta_mode", "flip4"))
     print(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
     jepa_loss_weight = float(train_cfg.get("jepa_loss_weight", 100.0))
     vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", 1.0))
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", 0.1))
     sigreg_weight = float(train_cfg.get("sigreg_weight", 0.0))
     sigreg_sketch_dim = int(train_cfg.get("sigreg_sketch_dim", 64))
-    # DEPRECATED: JEPA contrastive loss path is marked for removal and is disabled.
-    sharp_contrast_weight = 0.0
-    sharp_contrast_temperature = float(train_cfg.get("sharp_contrast_temperature", 0.10))
-    sharp_contrast_same_scale = bool(train_cfg.get("sharp_contrast_same_scale", True))
-    sharp_contrast_same_sample = bool(train_cfg.get("sharp_contrast_same_sample", True))
     vicreg_spatial_mode = str(train_cfg.get("vicreg_spatial_mode", "dense")).lower()
     if vicreg_spatial_mode not in ("dense", "pooled"):
         raise ValueError(
@@ -774,12 +788,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     "loss_jepa",
                     "loss_pixel",
                     "loss_sigreg",
-                    "loss_sharp_contrast",
                     "loss_var",
                     "loss_cov",
                     "weighted_jepa",
                     "weighted_sigreg",
-                    "weighted_sharp_contrast",
                     "weighted_var",
                     "weighted_cov",
                     "ema_momentum",
@@ -821,7 +833,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         epoch_var = 0.0
         epoch_cov = 0.0
         epoch_sigreg = 0.0
-        epoch_sharp = 0.0
         epoch_valid_frac = 0.0
         epoch_batches = 0
         metrics_rows = []
@@ -855,11 +866,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 )
                 z_pred = extract_valid_pooled_embeddings(outputs, key="pred_patches")
                 loss_sigreg = sketched_sigreg_loss(z_pred, sketch_dim=sigreg_sketch_dim)
-                # DEPRECATED: to be removed; kept as zero-valued placeholder for logging compatibility.
-                loss_sharp = torch.zeros((), device=x_clean.device, dtype=loss_jepa.dtype)
                 total_loss = (
                     (jepa_loss_weight * loss_jepa)
-                    + (sharp_contrast_weight * loss_sharp)
                     + (vicreg_var_weight * var_term_t)
                     + (vicreg_cov_weight * cov_term_t)
                     + (sigreg_weight * loss_sigreg)
@@ -895,12 +903,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     float(loss_jepa.item()),
                     float(loss_pixel_val),
                     float(loss_sigreg.item()),
-                    float(loss_sharp.item()),
                     float(var_term_t.item()),
                     float(cov_term_t.item()),
                     float((jepa_loss_weight * loss_jepa).item()),
                     float((sigreg_weight * loss_sigreg).item()),
-                    float((sharp_contrast_weight * loss_sharp).item()),
                     float((vicreg_var_weight * var_term_t).item()),
                     float((vicreg_cov_weight * cov_term_t).item()),
                     float(new_momentum),
@@ -965,7 +971,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     f"[{config_name}] Epoch {epoch + 1}/{epochs} Batch {batch_idx}/{len(dataloader)} "
                     f"total={_fmt_metric(total_loss.item())} jepa={_fmt_metric(loss_jepa.item())} pixel={_fmt_metric(loss_pixel_val)} "
                     f"sigreg={_fmt_metric(loss_sigreg.item())} "
-                    f"sharp={_fmt_metric(loss_sharp.item())} "
                     f"sim={_fmt_metric(sim_val)} var={_fmt_metric(var_val)} cov={_fmt_metric(cov_val)} "
                     f"raw_mse={_fmt_metric(raw_mse_val)} norm_err={_fmt_metric(norm_err_val)} "
                     f"valid_frac={_fmt_metric(valid_frac)}"
@@ -977,7 +982,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_var += float(var_val)
             epoch_cov += float(cov_val)
             epoch_sigreg += float(loss_sigreg.item())
-            epoch_sharp += float(loss_sharp.item())
             epoch_valid_frac += float(valid_frac)
             epoch_batches += 1
 
@@ -1000,7 +1004,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"avg_jepa={_fmt_metric(epoch_jepa/epoch_batches)} "
                 f"avg_pixel={_fmt_metric(epoch_pixel/epoch_batches)} "
                 f"avg_sigreg={_fmt_metric(epoch_sigreg/epoch_batches)} "
-                f"avg_sharp={_fmt_metric(epoch_sharp/epoch_batches)} "
                 f"avg_sim={_fmt_metric(epoch_sim/epoch_batches)} "
                 f"avg_var={_fmt_metric(epoch_var/epoch_batches)} "
                 f"avg_cov={_fmt_metric(epoch_cov/epoch_batches)} "
@@ -1079,6 +1082,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             compute_target_energy_map_fn=compute_target_energy_map,
             inference_visit_batches=inference_visit_batches,
             training_d4_augment=bool(data_cfg.get("d4_augment", False)),
+            inference_tta_enabled=inference_tta_enabled,
+            inference_tta_mode=inference_tta_mode,
         )
     # Keep dashboard artifacts in sync with inference outputs for all runs.
     # This writes session/results/* embedding files required by session_to_dash.py.

@@ -307,7 +307,7 @@ def main():
     grid_cols = demo_cfg.get("grid_cols")
     no_gap_boxes = bool(demo_cfg.get("no_gap_boxes", False))
     spacing_consistent = bool(demo_cfg.get("spacing_consistent", True))
-    mask_scale = float(demo_cfg.get("mask_scale", 1.0))
+    mask_scale = float(demo_cfg.get("mask_size_scaling", 1.0))
     pyramid_spacing_mult = float(demo_cfg.get("pyramid_spacing_mult", 2.0))
     seed = int(demo_cfg.get("seed", 42))
     rng = np.random.default_rng(seed)
@@ -582,12 +582,12 @@ def main():
         "grid_cols": grid_cols,
         "no_gap_boxes": no_gap_boxes,
         "spacing_consistent": spacing_consistent,
-        "mask_scale": mask_scale,
+        "mask_size_scaling": mask_scale,
         "effective_mask_half": int(round(effective_half)) if use_grid_centers else int(draw_half),
         "effective_mask_full": int(round(2.0 * effective_half)) if use_grid_centers else int(2 * draw_half),
         "spacing_target": float(spacing_target) if use_grid_centers else None,
         "spacing_px": int(spacing_px) if use_grid_centers else None,
-        "spacing_formula": "largest_scale * mask_scale * spacing_scale",
+        "spacing_formula": "largest_scale * mask_size_scaling * spacing_scale",
         "spacing_px": int(spacing_px) if use_grid_centers else None,
         "auto_pyramid_count": auto_pyramid_count if use_grid_centers else None,
         "pyramid_spacing_mult": pyramid_spacing_mult,

@@ -18,6 +18,11 @@ if ROOT_DIR not in sys.path:
 from src.dataset import JEPADataset
 from src.models.build_jepa import make_pyramid_grid_context
 
+DEMO_BOX_SIGMA_MULT = 4.0
+DEMO_DIP_SIGMA_MULT = 1.0
+DEMO_MASK_FILL_MODE = "zero"
+DEMO_FULL_GRID = True
+
 
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -56,12 +61,10 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
     return make_pyramid_grid_context(
         x_clean=x,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
-        cell_sizes=tuple(model_cfg.get("cell_sizes", [16, 32, 64, 128])),
-        mask_fraction=float(model_cfg.get("mask_fraction", 1.0)),
-        box_sigma_mult=float(model_cfg.get("box_sigma_mult", 4.0)),
-        mask_scale=float(model_cfg.get("mask_scale", 1.0)),
-        spacing_scale=float(model_cfg.get("spacing_scale", 1.5)),
-        full_grid=bool(model_cfg.get("full_grid", True)),
+        mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
+        box_sigma_mult=DEMO_BOX_SIGMA_MULT,
+        mask_scale=float(model_cfg.get("mask_size_scaling", 1.0)),
+        spacing_scale=float(model_cfg.get("mask_spacing_scaling", 1.5)),
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
         mask_box_size=int(model_cfg.get("mask_box_size", 16)),
@@ -69,8 +72,7 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-        mask_fill_mode=model_cfg.get("mask_fill_mode", "zero"),
-        dip_sigma_mult=1.0,
+        dip_sigma_mult=DEMO_DIP_SIGMA_MULT,
         constant_gaussian_sigma=float(model_cfg.get("constant_gaussian_sigma", 1.0)),
         return_debug=True,
     )
@@ -155,16 +157,17 @@ def main():
 
     mode = args.mask_mode
     if mode == "config":
-        mode = str(model_cfg.get("mask_fill_mode", "zero"))
+        mode = DEMO_MASK_FILL_MODE
     model_cfg["mask_fill_mode"] = mode
     if args.force_blur_mode is not None:
         model_cfg["blur_mode"] = args.force_blur_mode
     if args.rigid_mask_box:
-        model_cfg["mask_scale"] = 0.0
+        model_cfg["mask_size_scaling"] = 0.0
     else:
-        model_cfg["mask_scale"] = float(model_cfg.get("mask_scale", 1.0))
+        model_cfg["mask_size_scaling"] = float(model_cfg.get("mask_size_scaling", 1.0))
     if args.no_align_scales:
         model_cfg["align_scales"] = False
+    model_cfg["full_grid"] = DEMO_FULL_GRID
     if args.no_full_grid:
         model_cfg["full_grid"] = False
     if args.no_global_shift:

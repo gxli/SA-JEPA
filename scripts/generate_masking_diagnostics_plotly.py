@@ -55,16 +55,19 @@ def build_dataset(data_cfg: dict, for_cdd_masking: bool = False) -> JEPADataset:
 
 def build_context(x_t: torch.Tensor, cfg: dict):
     m = cfg.get("model", {})
+    pnt_raw = m.get("priority_n_target", 20)
+    try:
+        pnt_val = int(pnt_raw)
+    except (TypeError, ValueError):
+        pnt_val = 20
     force_blur_mode = str(m.get("_force_blur_mode", "")).strip().lower()
     blur_mode = force_blur_mode if force_blur_mode in {"gaussian", "cdd"} else str(m.get("blur_mode", "cdd"))
     return prepare_context_batch(
         x_clean=x_t,
         sigmas=tuple(m.get("sigmas", [2, 4, 8, 16])),
-        cell_sizes=tuple(m.get("cell_sizes", [16, 32, 64, 128])),
-        mask_fraction=float(m.get("mask_fraction", 1.0)),
-        mask_scale=float(m.get("mask_scaling_box", m.get("mask_scale", 1.0))),
-        spacing_scale=float(m.get("mask_spacing_scaling", m.get("spacing_scale", 1.5))),
-        full_grid=bool(m.get("full_grid", True)),
+        mask_fraction=float(m.get("active_target_fraction", m.get("mask_fraction", 1.0))),
+        mask_scale=float(m.get("mask_size_scaling", 1.0)),
+        spacing_scale=float(m.get("mask_spacing_scaling", 1.5)),
         global_shift=bool(m.get("global_shift", True)),
         align_scales=bool(m.get("align_scales", True)),
         mask_box_size=int(m.get("mask_box_size", 16)),
@@ -79,8 +82,8 @@ def build_context(x_t: torch.Tensor, cfg: dict):
         target_invalid_region_values=tuple(m.get("target_invalid_region_values", (0.0, "nan"))),
         target_sampling_mode=str(m.get("target_sampling_mode", "grid")),
         priority_top_percent=float(m.get("priority_top_percent", 5.0)),
-        priority_n_target=int(m.get("priority_n_target", 20)),
-        target_dithering_pixels=int(m.get("target_dithering_pixels", 6)),
+        priority_n_target=pnt_val,
+        priority_dithering_pixels=int(m.get("priority_dithering_pixels", m.get("target_dithering_pixels", 6))),
         cdd_use_gpu=False,
     )
 
@@ -132,10 +135,10 @@ def main():
     if args.force_blur_mode is not None:
         cfg.setdefault("model", {})["_force_blur_mode"] = str(args.force_blur_mode)
     if args.mask_fraction is not None:
+        cfg.setdefault("model", {})["active_target_fraction"] = float(args.mask_fraction)
         cfg.setdefault("model", {})["mask_fraction"] = float(args.mask_fraction)
     if args.mask_scale is not None:
-        cfg.setdefault("model", {})["mask_scale"] = float(args.mask_scale)
-        cfg.setdefault("model", {})["mask_scaling_box"] = float(args.mask_scale)
+        cfg.setdefault("model", {})["mask_size_scaling"] = float(args.mask_scale)
     if args.mask_box_size is not None:
         cfg.setdefault("model", {})["mask_box_size"] = int(args.mask_box_size)
     eff_blur_mode = str(cfg.get("model", {}).get("_force_blur_mode", cfg.get("model", {}).get("blur_mode", "cdd")))
@@ -263,8 +266,8 @@ def main():
         f"Mask Diagnostic: {os.path.basename(args.config)} | "
         f"blur={eff_blur_mode} "
         f"mask_box={m.get('mask_box_size')} "
-        f"mask_scale={m.get('mask_scale', m.get('mask_scaling_box'))} "
-        f"mask_fraction={m.get('mask_fraction')} boxes={box_sizes}"
+        f"mask_size_scaling={m.get('mask_size_scaling')} "
+        f"active_target_fraction={m.get('active_target_fraction', m.get('mask_fraction'))} boxes={box_sizes}"
     )
     panel_px = max(160, int(args.panel_px))
     fig.update_layout(
@@ -282,10 +285,10 @@ def main():
         "masking_function": "src.models.masking.make_pyramid_grid_context",
         "blur_mode": eff_blur_mode,
         "mask_box_size": int(m.get("mask_box_size", 0)),
-        "mask_scale": float(m.get("mask_scale", m.get("mask_scaling_box", 1.0))),
-        "mask_fraction": float(m.get("mask_fraction", 1.0)),
+        "mask_size_scaling": float(m.get("mask_size_scaling", 1.0)),
+        "mask_fraction": float(m.get("active_target_fraction", m.get("mask_fraction", 1.0))),
         "target_sampling_mode": str(m.get("target_sampling_mode", "grid")),
-        "priority_n_target": int(m.get("priority_n_target", 20)),
+        "priority_n_target": m.get("priority_n_target", 20),
         "valid_target_count": int(target_valid[0].sum().item()),
         "target_patch_size": target_patch,
         "target_patch_value_in_energy_channels": -2.0,

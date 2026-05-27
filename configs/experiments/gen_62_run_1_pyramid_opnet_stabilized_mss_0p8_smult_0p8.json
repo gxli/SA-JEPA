@@ -1,0 +1,21 @@
+{
+  "base_config": "../base_pyramid_scaleaware_convnext.json",
+  "model": {
+    "mode": "pyramid",
+    "model_key": "cdd_opnet",
+    "mask_size_scaling": 0.8,
+    "mask_spacing_scaling": 2.0,
+    "mask_box_size": 0,
+    "op_smoothing_mode": "sqrt_scale",
+    "op_smoothing_mult": 0.8,
+    "op_smoothing_padding_mode": "reflect",
+    "opnet_dilation_mode": "half_cdd_scale",
+    "opnet_max_dilation": 16
+  },
+  "train": {
+    "epochs": 10,
+    "log_interval": 1,
+    "inference_tta_enabled": true,
+    "inference_tta_mode": "flip4"
+  }
+}

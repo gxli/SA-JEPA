@@ -21,7 +21,6 @@ SUFFIX=""
 RSYNC_RSH='ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes'
 RSYNC_COMMON=(
     -avz
-    --checksum
     --partial
     --timeout=120
     --contimeout=20
@@ -71,89 +70,12 @@ run_rsync_retry() {
     done
 }
 
-verify_remote_file_md5() {
-    local local_file="$1"
-    local remote_file="$2"
-    if [[ ! -f "$local_file" ]]; then
-        echo "verify skipped (missing local): $local_file"
-        return 0
-    fi
-    local local_md5
-    local_md5="$(md5 -q "$local_file" 2>/dev/null || md5sum "$local_file" | awk '{print $1}')"
-    local remote_md5
-    remote_md5="$(ssh "$REMOTE" "if command -v md5sum >/dev/null 2>&1; then md5sum '$remote_file' | awk '{print \$1}'; elif command -v md5 >/dev/null 2>&1; then md5 -q '$remote_file'; else echo ''; fi" || true)"
-    if [[ -z "$remote_md5" ]]; then
-        echo "verify failed (no remote hash): $remote_file"
-        return 1
-    fi
-    if [[ "$local_md5" != "$remote_md5" ]]; then
-        echo "verify mismatch:"
-        echo "  local : $local_file $local_md5"
-        echo "  remote: $remote_file $remote_md5"
-        return 1
-    fi
-    echo "verify ok: $local_file"
-}
-
-copy_and_verify_file() {
-    local local_file="$1"
-    local remote_file="$2"
-    if verify_remote_file_md5 "$local_file" "$remote_file"; then
-        return 0
-    fi
-    echo "forcing copy via scp: $local_file -> $remote_file"
-    ssh "$REMOTE" "mkdir -p \"$(dirname "$remote_file")\""
-    scp -q -p "$local_file" "$REMOTE:$remote_file"
-    verify_remote_file_md5 "$local_file" "$remote_file"
-}
-
-collect_changed_code_files() {
-    local remote_root="$1"
-    local -a changed=()
-    local line path
-    # Use rsync dry-run itemization to collect only changed .py/.sh files.
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        # Skip rsync metadata lines.
-        [[ "$line" == "sending incremental file list" ]] && continue
-        [[ "$line" == sent\ * ]] && continue
-        [[ "$line" == total\ size\ * ]] && continue
-        # Itemized output starts with change flags then a space then path.
-        # Example: >f..t...... src/train.py
-        path="${line#* }"
-        [[ -z "$path" || "$path" == "$line" ]] && continue
-        case "$path" in
-            *.py|*.sh)
-                if [[ -f "$path" ]]; then
-                    changed+=("$path")
-                fi
-                ;;
-        esac
-    done < <(
-        rsync "${RSYNC_COMMON[@]}" \
-            --dry-run \
-            --itemize-changes \
-            --delete \
-            --exclude '.git' \
-            --exclude 'experiments/' \
-            --exclude 'result_local/' \
-            --exclude 'results/' \
-            --exclude 'sessions/' \
-            --exclude 'outputs/' \
-            --exclude '__pycache__/' \
-            --exclude '*.pyc' \
-            ./ "$REMOTE:$remote_root" 2>/dev/null || true
-    )
-    if [[ ${#changed[@]} -gt 0 ]]; then
-        printf '%s\n' "${changed[@]}"
-    fi
-}
 
 usage() {
     echo "----------------------------------------------------------------"
     echo "Sync Script for: $REL_PATH"
     echo "----------------------------------------------------------------"
-    echo "Usage: $0 {push|push-preview|pull|pull-plots|pull_plots|pull-plot|pull_plot|pull-all} [refresh] [suffix]"
+    echo "Usage: $0 {push|push-preview|pull|pull-plots|pull_plots|pull-plot|pull_plot|pull-all} [suffix]"
     echo ""
     echo "Arguments:"
     echo "  suffix  -> Remote directory version suffix (e.g. _v2)."
@@ -177,24 +99,13 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
 fi
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
     usage
 fi
 
-REFRESH_ONLY=0
-# Parse optional 2nd arg: refresh
-if [[ "${2:-}" == "refresh" ]]; then
-    REFRESH_ONLY=1
-elif [[ -n "${2:-}" ]]; then
+# Parse optional 2nd arg: suffix
+if [[ -n "${2:-}" ]]; then
     SUFFIX="$2"
-fi
-
-# Parse optional 3rd arg: suffix (only valid when 2nd is refresh)
-if [[ -n "${3:-}" ]]; then
-    if [[ "$REFRESH_ONLY" -eq 0 ]]; then
-        usage
-    fi
-    SUFFIX="$3"
 fi
 
 # Resolve remote HOME explicitly (avoid '~' path ambiguity across shells/hosts).
@@ -213,20 +124,11 @@ case "$1" in
     push)
         echo "Applying safe mirror push to $REMOTE:$REMOTE_DEST (preserve excluded dirs)"
         ssh "$REMOTE" "mkdir -p \"$REMOTE_HOME/proj/$VERSIONED_REL_PATH\""
-        changed_code_files=()
-        while IFS= read -r _f; do
-            [[ -n "$_f" ]] && changed_code_files+=("$_f")
-        done < <(collect_changed_code_files "$REMOTE_HOME/proj/$VERSIONED_REL_PATH")
-        if [[ ${#changed_code_files[@]} -eq 0 ]]; then
-            echo "changed_code_files=0"
-        else
-            echo "changed_code_files=${#changed_code_files[@]}"
-        fi
         run_rsync_retry "${RSYNC_COMMON[@]}" \
             ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
             --delete \
             --exclude '.git' \
-            --exclude 'experiments/' \
+            --exclude '/experiments/' \
             --exclude 'result_local/' \
             --exclude 'results/' \
             --exclude 'sessions/' \
@@ -234,14 +136,6 @@ case "$1" in
             --exclude '__pycache__/' \
             --exclude '*.pyc' \
             ./ "$REMOTE:$REMOTE_DEST"
-        # Verify only changed python/shell files landed correctly.
-        if [[ ${#changed_code_files[@]} -eq 0 ]]; then
-            echo "verify skipped: no changed .py/.sh files detected"
-        else
-            for f in "${changed_code_files[@]}"; do
-                copy_and_verify_file "$f" "$REMOTE_HOME/proj/$VERSIONED_REL_PATH/$f"
-            done
-        fi
         ;;
     push-preview)
         echo "Previewing safe mirror push (dry-run) to $REMOTE:$REMOTE_DEST (preserve excluded dirs)"
@@ -251,7 +145,7 @@ case "$1" in
             --dry-run \
             --delete \
             --exclude '.git' \
-            --exclude 'experiments/' \
+            --exclude '/experiments/' \
             --exclude 'result_local/' \
             --exclude 'results/' \
             --exclude 'sessions/' \
@@ -268,9 +162,6 @@ case "$1" in
             "$REMOTE:$REMOTE_OUTPUTS_DEST" "$LOCAL_RESULTS_DIR"/
         ;;
     pull-plots|pull_plots|pull-plot|pull_plot)
-        if [[ "$REFRESH_ONLY" -eq 1 ]]; then
-            echo "pull-plots refresh mode: existing local files are still skipped (--ignore-existing)"
-        fi
         echo "Pulling plot files (.html and images) from remote results/ to ./$LOCAL_RESULTS_DIR/ (skip existing local files)"
         mkdir -p "$LOCAL_RESULTS_DIR"
         d="$REMOTE_HOME/proj/$VERSIONED_REL_PATH/results/"
