@@ -11,7 +11,7 @@ OUT_DIR = os.path.join(ROOT, "configs", "experiments")
 
 BASE_CONFIG = "../base_pyramid_scaleaware_convnext.json"
 MASK_SIZE_SCALINGS = (0.4, 0.8, 1.2, 1.6, 2.0, 2.4)
-BOX_SIZES = (5, 7, 9, 11)
+BOX_SIZES = (3, 5, 7, 9, 11)
 
 
 def _fmt(v: float) -> str:

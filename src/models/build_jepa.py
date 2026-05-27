@@ -398,8 +398,8 @@ class PyramidGridJEPA(nn.Module):
     def _coerce_float_range(value, name: str):
         if value is None:
             return None
-        if len(value) != 2:
-            raise ValueError(f"{name} must contain exactly two values, got {value!r}")
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"{name} must be a list/tuple of exactly two values, got {value!r}")
         lo, hi = sorted((float(value[0]), float(value[1])))
         return lo, hi
 
@@ -416,11 +416,11 @@ class PyramidGridJEPA(nn.Module):
     def _coerce_int_range(value, name: str):
         if value is None:
             return None
-        if len(value) != 2:
-            raise ValueError(f"{name} must contain exactly two values, got {value!r}")
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"{name} must be a list/tuple of exactly two values, got {value!r}")
         lo, hi = sorted((int(round(float(value[0]))), int(round(float(value[1])))))
-        if lo < 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        if lo < 1:
+            raise ValueError(f"{name} must be >= 1, got {value!r}")
         return lo, hi
 
     @classmethod

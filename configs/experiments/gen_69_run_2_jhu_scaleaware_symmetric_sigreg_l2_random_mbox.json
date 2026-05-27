@@ -27,5 +27,8 @@
     "sigreg_sketch_dim": 64,
     "inference_tta_enabled": true,
     "inference_tta_mode": "flip4"
+  },
+  "data": {
+    "npy_pattern": "decomp_E_rot.npy_slice_sm_1.0.npy"
   }
 }

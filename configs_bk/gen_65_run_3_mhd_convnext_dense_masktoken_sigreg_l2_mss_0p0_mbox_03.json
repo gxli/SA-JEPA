@@ -1,15 +1,12 @@
 {
   "base_config": "../base_pyramid_scaleaware_convnext.json",
   "model": {
-    "mode": "pyramid",
-    "model_key": "cdd_scaleaware_convnext",
-    "encoder_width": 64,
-    "encoder_depth": 4,
-    "encoder_kernel_size": 7,
-    "constant_mask_box": false,
-    "mask_box_size": 0,
-    "mask_size_scaling": 1.0,
+    "mode": "image",
+    "model_key": "convnext_dense_masktoken",
+    "mask_size_scaling": 0.0,
     "mask_spacing_scaling": 2.0,
+    "mask_box_size": 3,
+    "normalize_loss_l2": true,
     "target_sampling_mode": "priority_sampling",
     "priority_top_percent": 15.0,
     "priority_n_target": "auto",
@@ -24,7 +21,7 @@
     "vicreg_cov_weight": 0.0,
     "sigreg_weight": 1.0,
     "sigreg_sketch_dim": 64,
-    "vicreg_spatial_mode": "dense",
-    "force_recompute_inference": true
+    "inference_tta_enabled": true,
+    "inference_tta_mode": "flip4"
   }
 }

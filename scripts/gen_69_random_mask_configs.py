@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate gen_69 random mask-size ablation configs."""
+"""Generate gen_69 random mask-size ablation configs for MHD, NGC, and JHU."""
 from __future__ import annotations
 
 import json
@@ -11,11 +11,26 @@ OUT_DIR = os.path.join(ROOT, "configs", "experiments")
 
 BASE_CONFIG = "../base_pyramid_scaleaware_convnext.json"
 MASK_SCALE_RANGE = (0.4, 2.4)
-MASK_BOX_RANGE = (5, 11)
+MASK_BOX_RANGE = (3, 11)
+
+DATASETS = {
+    "mhd": {
+        "label": "mhd",
+    },
+    "ngc": {
+        "label": "ngc",
+        "npy_pattern": "ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy",
+    },
+    "jhu": {
+        "label": "jhu",
+        "npy_pattern": "decomp_E_rot.npy_slice_sm_1.0.npy",
+    },
+}
 
 
-def _base_config() -> dict:
-    return {
+def _base_config(dataset: str) -> dict:
+    ds = DATASETS[dataset]
+    cfg: dict = {
         "base_config": BASE_CONFIG,
         "model": {
             "mode": "pyramid",
@@ -43,6 +58,9 @@ def _base_config() -> dict:
             "inference_tta_mode": "flip4",
         },
     }
+    if "npy_pattern" in ds:
+        cfg["data"] = {"npy_pattern": ds["npy_pattern"]}
+    return cfg
 
 
 def write_config(name: str, cfg: dict) -> str:
@@ -53,51 +71,60 @@ def write_config(name: str, cfg: dict) -> str:
     return path
 
 
-def scale_only_config() -> tuple[str, dict]:
-    cfg = _base_config()
+def scale_only_config(dataset: str) -> tuple[str, dict]:
+    ds = DATASETS[dataset]
+    cfg = _base_config(dataset)
     cfg["model"]["mask_size_scaling"] = list(MASK_SCALE_RANGE)
     cfg["model"]["mask_box_size"] = 0
-    name = "gen_69_run_1_mhd_scaleaware_symmetric_sigreg_l2_random_mscale"
+    name = f"gen_69_run_1_{ds['label']}_scaleaware_symmetric_sigreg_l2_random_mscale"
     return name, cfg
 
 
-def box_only_config() -> tuple[str, dict]:
-    cfg = _base_config()
+def box_only_config(dataset: str) -> tuple[str, dict]:
+    ds = DATASETS[dataset]
+    cfg = _base_config(dataset)
     cfg["model"]["mask_size_scaling"] = 0.0
     cfg["model"]["mask_box_size"] = list(MASK_BOX_RANGE)
-    name = "gen_69_run_2_mhd_scaleaware_symmetric_sigreg_l2_random_mbox"
+    name = f"gen_69_run_2_{ds['label']}_scaleaware_symmetric_sigreg_l2_random_mbox"
     return name, cfg
 
 
-def hybrid_config() -> tuple[str, dict]:
-    cfg = _base_config()
+def hybrid_config(dataset: str) -> tuple[str, dict]:
+    ds = DATASETS[dataset]
+    cfg = _base_config(dataset)
     cfg["model"]["mask_size_scaling"] = list(MASK_SCALE_RANGE)
     cfg["model"]["mask_box_size"] = list(MASK_BOX_RANGE)
-    name = "gen_69_run_3_mhd_scaleaware_symmetric_sigreg_l2_random_hybrid"
+    name = f"gen_69_run_3_{ds['label']}_scaleaware_symmetric_sigreg_l2_random_hybrid"
     return name, cfg
 
 
-def image_dense_config() -> tuple[str, dict]:
-    cfg = _base_config()
+def image_dense_config(dataset: str) -> tuple[str, dict]:
+    ds = DATASETS[dataset]
+    cfg = _base_config(dataset)
     cfg["model"]["mode"] = "image"
     cfg["model"]["model_key"] = "convnext_dense_masktoken"
     cfg["model"]["mask_size_scaling"] = 0.0
     cfg["model"]["mask_box_size"] = list(MASK_BOX_RANGE)
     cfg["model"].pop("use_symmetric_feature_loss", None)
-    name = "gen_69_run_4_mhd_convnext_dense_masktoken_sigreg_l2_random_mbox"
+    name = f"gen_69_run_4_{ds['label']}_convnext_dense_masktoken_sigreg_l2_random_mbox"
     return name, cfg
+
+
+VARIANTS = [
+    scale_only_config,
+    box_only_config,
+    hybrid_config,
+    image_dense_config,
+]
 
 
 def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
     paths = []
-    for name, cfg in (
-        scale_only_config(),
-        box_only_config(),
-        hybrid_config(),
-        image_dense_config(),
-    ):
-        paths.append(write_config(name, cfg))
+    for dataset in DATASETS:
+        for variant_fn in VARIANTS:
+            name, cfg = variant_fn(dataset)
+            paths.append(write_config(name, cfg))
 
     for path in paths:
         print(os.path.relpath(path, ROOT))

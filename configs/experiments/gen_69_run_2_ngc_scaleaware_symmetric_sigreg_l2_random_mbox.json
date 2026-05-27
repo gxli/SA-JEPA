@@ -27,5 +27,8 @@
     "sigreg_sketch_dim": 64,
     "inference_tta_enabled": true,
     "inference_tta_mode": "flip4"
+  },
+  "data": {
+    "npy_pattern": "ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy"
   }
 }

@@ -6,7 +6,7 @@
     "mask_size_scaling": 0.0,
     "mask_spacing_scaling": 2.0,
     "mask_box_size": [
-      5,
+      3,
       11
     ],
     "normalize_loss_l2": true,
