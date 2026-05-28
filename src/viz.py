@@ -659,6 +659,17 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
             ).save(mask_demo_path)
             mask_demo_rel = os.path.join("results", "mask_demo_channels_16x16.png")
 
+    # Check for scale response probe images.
+    scale_sens_rel = None
+    scale_winner_rel = None
+    run_name = os.path.basename(session_dir)
+    scale_sens_path = os.path.join(session_dir, f"{run_name}_scale_sensitivity_maps.png")
+    scale_winner_path = os.path.join(session_dir, f"{run_name}_scale_winner_map.png")
+    if os.path.exists(scale_sens_path):
+        scale_sens_rel = os.path.join(os.path.basename(session_dir), os.path.basename(scale_sens_path))
+    if os.path.exists(scale_winner_path):
+        scale_winner_rel = os.path.join(os.path.basename(session_dir), os.path.basename(scale_winner_path))
+
     # Build a single assembled dashboard entrypoint for this session.
     dashboard_path = os.path.join(session_dir, "dashboard.html")
     latent_name = os.path.basename(latent_html_path)
@@ -672,42 +683,34 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         except Exception as e:
             print(f"[warning] failed to read {loss_weights_path}: {type(e).__name__}: {e}")
 
-    # Weight label map: config key → short display label
-    WEIGHT_LABELS = {
-        "jepa_loss_weight": "jepa",
-        "vicreg_var_weight": "var",
-        "vicreg_cov_weight": "cov",
-        "sigreg_weight": "sigreg",
-    }
-    # Ordered raw → weighted column pairs to read from metrics.csv
-    LOSS_COLUMN_PAIRS = [
-        ("loss_jepa", "weighted_jepa"),
-        ("loss_var", "weighted_var"),
-        ("loss_cov", "weighted_cov"),
-        ("loss_sigreg", "weighted_sigreg"),
+    # Weight config key → (csv weighted column, short label)
+    WEIGHTED_COLUMN_MAP = [
+        ("jepa_loss_weight", "weighted_jepa", "jepa"),
+        ("vicreg_var_weight", "weighted_var", "var"),
+        ("vicreg_cov_weight", "weighted_cov", "cov"),
+        ("sigreg_weight", "weighted_sigreg", "sigreg"),
+        ("symmetric_feature_loss_weight", "weighted_symmetric", "sym"),
     ]
 
     loss_x = []
     loss_total = []
-    loss_raw: dict[str, list[float]] = {}
     loss_weighted: dict[str, list[float]] = {}
     if os.path.exists(metrics_path):
         try:
             with open(metrics_path, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 fieldnames = set(reader.fieldnames or [])
-                for raw_col, w_col in LOSS_COLUMN_PAIRS:
-                    if raw_col in fieldnames:
-                        loss_raw[raw_col] = []
-                    if w_col in fieldnames:
-                        loss_weighted[w_col] = []
+                active_columns = []
+                for wkey, wcol, label in WEIGHTED_COLUMN_MAP:
+                    w = loss_weights.get(wkey, 0.0)
+                    if w is not None and float(w) > 0.0 and wcol in fieldnames:
+                        loss_weighted[wcol] = []
+                        active_columns.append((wcol, label, float(w)))
                 for row in reader:
                     loss_x.append(float(row["epoch"]) + 0.001 * float(row["batch"]))
                     loss_total.append(float(row.get("total_loss", 0.0)))
-                    for raw_col in loss_raw:
-                        loss_raw[raw_col].append(float(row.get(raw_col, 0.0)))
-                    for w_col in loss_weighted:
-                        loss_weighted[w_col].append(float(row.get(w_col, 0.0)))
+                    for wcol, _, _ in active_columns:
+                        loss_weighted[wcol].append(float(row.get(wcol, 0.0)))
         except Exception as e:
             print(f"[warning] failed to read {metrics_path}: {type(e).__name__}: {e}")
     ref_clean = os.path.join("results", "reference_000_clean.png")
@@ -777,107 +780,57 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
   </div>
 ''' if mask_demo_rel is not None else ""
   }
+  {
+    f'''
+  <div class="section">
+    <h2>Scale Response Probe</h2>
+    <div class="grid">
+      <div class="card"><p>Scale Sensitivity Maps</p><img src="{scale_sens_rel}" alt="scale_sensitivity_maps" /></div>
+      <div class="card"><p>Dominant Scale per Location</p><img src="{scale_winner_rel}" alt="scale_winner_map" /></div>
+    </div>
+  </div>
+''' if scale_sens_rel is not None and scale_winner_rel is not None else ""
+  }
 </body>
 </html>
 """
     if len(loss_x) > 0:
-        # Build trace names with weight annotations
-        def _weight_suffix(raw_col: str) -> str:
-            # raw_col: "loss_jepa" → look up "jepa_loss_weight" → " (x100)"
-            for weight_key, label in WEIGHT_LABELS.items():
-                if label in raw_col.replace("loss_", ""):
-                    w = loss_weights.get(weight_key)
-                    if w is not None:
-                        return f" (x{w:.3g})"
-            return ""
+        # Build trace name → weight mapping from loss_weights.json.
+        _weight_of_column = {}
+        for wkey, wcol, label in WEIGHTED_COLUMN_MAP:
+            w = loss_weights.get(wkey, 0.0)
+            if w is not None and float(w) > 0.0:
+                _weight_of_column[wcol] = (label, float(w))
 
-        # Weighted traces (top subplot)
-        traces_weighted = []
-        traces_weighted.append({"x": loss_x, "y": loss_total, "mode": "lines", "name": "total_loss"})
+        traces = []
+        traces.append({"x": loss_x, "y": loss_total, "mode": "lines", "name": "total"})
         for w_col in sorted(loss_weighted.keys()):
-            base = w_col.replace("weighted_", "")
-            suffix = _weight_suffix(f"loss_{base}")
-            traces_weighted.append(
-                {"x": loss_x, "y": loss_weighted[w_col], "mode": "lines", "name": f"weighted_{base}{suffix}"}
-            )
-
-        # Raw traces (bottom subplot)
-        traces_raw = []
-        for raw_col in sorted(loss_raw.keys()):
-            suffix = _weight_suffix(raw_col)
-            traces_raw.append({"x": loss_x, "y": loss_raw[raw_col], "mode": "lines", "name": f"{raw_col}{suffix}"})
+            info = _weight_of_column.get(w_col)
+            if info is None:
+                continue
+            label, w = info
+            traces.append({
+                "x": loss_x,
+                "y": loss_weighted[w_col],
+                "mode": "lines",
+                "name": f"{label} (\xd7{w:.3g})",
+            })
 
         script = f"""
 <script>
 (function() {{
-  const tracesWeighted = {json.dumps(traces_weighted)};
-  const tracesRaw = {json.dumps(traces_raw)};
+  const traces = {json.dumps(traces)};
+  if (traces.length === 0) return;
 
-  // Build subplot layout: weighted top, raw bottom
-  const nWeighted = tracesWeighted.length;
-  const nRaw = tracesRaw.length;
-  const totalWeighted = nWeighted > 0 ? 1 : 0;
-  const totalRaw = nRaw > 0 ? 1 : 0;
-  const panels = totalWeighted + totalRaw;
-  if (panels === 0) return;
-
-  const subplotRows = panels;
-  const rowWeights = [];
-  const data = [];
-  const annotations = [];
-  const yAxisConfigs = [];
-
-  let row = 1;
-
-  if (nWeighted > 0) {{
-    for (let i = 0; i < tracesWeighted.length; i++) {{
-      const t = tracesWeighted[i];
-      data.push({{ ...t, xaxis: 'x', yaxis: 'y' + (row > 1 ? row : '') }});
-    }}
-    rowWeights.push(1);
-    yAxisConfigs.push({{ title: 'weighted loss' }});
-    annotations.push({{
-      text: 'Weighted (xWeight)',
-      xref: 'paper', yref: 'y' + (row > 1 ? row : '') + ' domain',
-      x: 0.0, y: 0.85, xanchor: 'left', showarrow: false,
-      font: {{ size: 11, color: '#555' }}
-    }});
-    row++;
-  }}
-
-  if (nRaw > 0) {{
-    for (let i = 0; i < tracesRaw.length; i++) {{
-      const t = tracesRaw[i];
-      data.push({{ ...t, xaxis: 'x', yaxis: 'y' + (row > 1 ? row : '') }});
-    }}
-    rowWeights.push(1);
-    yAxisConfigs.push({{ title: 'raw loss' }});
-    annotations.push({{
-      text: 'Raw',
-      xref: 'paper', yref: 'y' + (row > 1 ? row : '') + ' domain',
-      x: 0.0, y: 0.85, xanchor: 'left', showarrow: false,
-      font: {{ size: 11, color: '#555' }}
-    }});
-  }}
-
-  const layout = {{
-    title: 'Training Loss Curve',
-    grid: {{ rows: subplotRows, columns: 1, pattern: 'independent', roworder: 'top to bottom' }},
+  Plotly.newPlot('loss-plot', traces, {{
+    title: 'Training Loss',
     xaxis: {{ title: 'epoch + 0.001*batch' }},
+    yaxis: {{ title: 'weighted loss' }},
     template: 'plotly_white',
-    margin: {{ l: 60, r: 100, t: 50, b: 55 }},
+    margin: {{ l: 60, r: 20, t: 50, b: 55 }},
     legend: {{ x: 1.02, y: 1.0, xanchor: 'left' }},
-    annotations: annotations,
-    height: 200 * subplotRows + 120,
-  }};
-
-  // Set per-axis configs
-  for (let i = 0; i < yAxisConfigs.length; i++) {{
-    const axisKey = 'yaxis' + (i > 0 ? (i + 1) : '');
-    layout[axisKey] = yAxisConfigs[i];
-  }}
-
-  Plotly.newPlot('loss-plot', data, layout, {{ responsive: true }});
+    height: 420,
+  }}, {{ responsive: true }});
 }})();
 </script>
 """

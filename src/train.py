@@ -1231,4 +1231,38 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 print(f"[{config_name}] warning: volumetric UMAP generation failed: {type(e).__name__}: {e}")
         else:
             print(f"[{config_name}] warning: inference_outputs.pt missing; skip dashboard generation")
+
+    if not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)):
+        try:
+            from src.scale_probe import probe_scale_response, save_scale_response_plots
+
+            probe_batch = next(iter(dataloader)).to(device, non_blocking=True)
+            probe_batch = torch.nan_to_num(probe_batch, nan=0.0, posinf=0.0, neginf=0.0)
+            model.eval()
+            with torch.no_grad():
+                ctx_result = _prepare_context_from_model(model, probe_batch, return_debug=True)
+                if len(ctx_result) >= 5:
+                    debug = ctx_result[4]
+                    cdd_channels = debug.get("cdd_channels_orig")
+                    if cdd_channels is not None and cdd_channels.ndim == 4:
+                        report = probe_scale_response(
+                            model,
+                            x_pyr=cdd_channels.to(device),
+                            scale_names=train_cfg.get("scale_probe_names"),
+                            out_dir=session_dir,
+                            run_name=config_name,
+                        )
+                        print(f"[{config_name}] scale_probe_report={json.dumps(report['scale_drop_sensitivity_fraction'])}")
+                        saved_plots = save_scale_response_plots(
+                            session_dir,
+                            scale_names=train_cfg.get("scale_probe_names"),
+                            run_name=config_name,
+                        )
+                        print(f"[{config_name}] scale_probe_plots={len(saved_plots)}")
+                    else:
+                        print(f"[{config_name}] scale_probe: cdd_channels not in debug, skipping")
+            model.train()
+        except Exception as e:
+            print(f"[{config_name}] warning: scale_probe_failed: {type(e).__name__}: {e}")
+
     return session_dir
