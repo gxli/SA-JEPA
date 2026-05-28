@@ -19,13 +19,13 @@
   "train": {
     "epochs": 10,
     "log_interval": 1,
-    "jepa_loss_weight": 100.0,
     "vicreg_var_weight": 0.0,
     "vicreg_cov_weight": 0.0,
     "sigreg_weight": 1.0,
     "sigreg_sketch_dim": 64,
     "inference_tta_enabled": true,
-    "inference_tta_mode": "flip4"
+    "inference_tta_mode": "flip4",
+    "mse_loss_weight": 100.0
   },
   "data": {
     "npy_pattern": "decomp_E_rot.npy_slice_sm_1.0.npy"

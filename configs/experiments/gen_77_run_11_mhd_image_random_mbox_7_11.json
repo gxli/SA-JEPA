@@ -6,7 +6,7 @@
     "mask_size_scaling": 0.0,
     "mask_spacing_scaling": 2.0,
     "mask_box_size": [
-      3,
+      7,
       11
     ],
     "normalize_loss_l2": true,
@@ -14,17 +14,20 @@
     "priority_top_percent": 15.0,
     "priority_n_target": "auto",
     "priority_min_targets_per_map": 10,
-    "priority_dithering_pixels": 6
+    "priority_dithering_pixels": 6,
+    "target_nonoverlap": true,
+    "mask_box_hardcap": 17
   },
   "train": {
     "epochs": 10,
     "log_interval": 1,
+    "mse_loss_weight": 100.0,
     "vicreg_var_weight": 0.0,
     "vicreg_cov_weight": 0.0,
     "sigreg_weight": 1.0,
     "sigreg_sketch_dim": 64,
     "inference_tta_enabled": true,
     "inference_tta_mode": "flip4",
-    "mse_loss_weight": 100.0
+    "scale_probe_enabled": true
   }
 }

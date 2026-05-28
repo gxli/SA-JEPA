@@ -20,8 +20,6 @@
   "train": {
     "epochs": 5,
     "log_interval": 1,
-    "jepa_loss_weight": 100.0,
-    "symmetric_feature_loss_weight": 1.0,
     "vicreg_var_weight": 0.0,
     "vicreg_cov_weight": 0.0,
     "sigreg_weight": 1.0,
@@ -30,6 +28,7 @@
     "inference_tta_mode": "flip4",
     "umap": {
       "l2_normalize": false
-    }
+    },
+    "mse_loss_weight": 100.0
   }
 }

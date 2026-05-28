@@ -354,7 +354,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
         normalize_loss_l2=normalize_loss_l2,
         predictor_layernorm=model_cfg.get("predictor_layernorm", False),
-        predictor_spatial_conv=model_cfg.get("predictor_spatial_conv", True),
+        predictor_spatial_conv=model_cfg.get("predictor_spatial_conv", False),
         predictor_residual=model_cfg.get("predictor_residual", True),
         use_image_mask_token=use_image_mask_token,
         mode=resolved_mode,
@@ -784,7 +784,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     inference_tta_enabled = bool(train_cfg.get("inference_tta_enabled", False))
     inference_tta_mode = str(train_cfg.get("inference_tta_mode", "flip4"))
     print(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
-    jepa_loss_weight = float(train_cfg.get("jepa_loss_weight", 100.0))
+    mse_loss_weight = float(train_cfg.get("mse_loss_weight", 100.0))
     vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", 1.0))
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", 0.1))
     sigreg_weight = float(train_cfg.get("sigreg_weight", 0.0))
@@ -812,13 +812,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     "batch",
                     "global_step",
                     "total_loss",
-                    "loss_jepa",
+                    "loss_mse",
                     "lr",
                     "loss_sigreg",
                     "loss_symmetric",
                     "loss_var",
                     "loss_cov",
-                    "weighted_jepa",
+                    "weighted_mse",
                     "weighted_sigreg",
                     "weighted_symmetric",
                     "weighted_var",
@@ -854,7 +854,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         with open(loss_weights_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
-                    "jepa_loss_weight": jepa_loss_weight,
+                    "mse_loss_weight": mse_loss_weight,
                     "vicreg_var_weight": vicreg_var_weight,
                     "vicreg_cov_weight": vicreg_cov_weight,
                     "sigreg_weight": sigreg_weight,
@@ -872,7 +872,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         print(f"[{config_name}] checkpoint epoch {start_epoch} already >= configured epochs {epochs}, skipping training loop")
     for epoch in range(start_epoch, epochs):
         epoch_total = 0.0
-        epoch_jepa = 0.0
+        epoch_mse = 0.0
         epoch_sim = 0.0
         epoch_var = 0.0
         epoch_cov = 0.0
@@ -904,7 +904,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
             with autocast(device_type=device.type, enabled=use_amp):
                 outputs = model(x_clean, context_data=context_data) if not is_3d_mode else model(x_clean)
-                loss_jepa = model.compute_loss(outputs)
+                loss_mse = model.compute_loss(outputs)
                 _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
                     outputs,
                     spatial_mode=vicreg_spatial_mode,
@@ -913,7 +913,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 loss_sigreg = sketched_sigreg_loss(z_pred, sketch_dim=sigreg_sketch_dim)
                 loss_symmetric = model.compute_symmetric_loss(outputs)
                 total_loss = (
-                    (jepa_loss_weight * loss_jepa)
+                    (mse_loss_weight * loss_mse)
                     + (vicreg_var_weight * var_term_t)
                     + (vicreg_cov_weight * cov_term_t)
                     + (sigreg_weight * loss_sigreg)
@@ -959,13 +959,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     batch_idx,
                     epoch * max(1, len(dataloader)) + batch_idx,
                     float(total_loss.item()),
-                    float(loss_jepa.item()),
+                    float(loss_mse.item()),
                     float(lr),
                     float(loss_sigreg.item()),
                     float(loss_symmetric.item()),
                     float(var_term_t.item()),
                     float(cov_term_t.item()),
-                    float((jepa_loss_weight * loss_jepa).item()),
+                    float((mse_loss_weight * loss_mse).item()),
                     float((sigreg_weight * loss_sigreg).item()),
                     float((symmetric_feature_loss_weight * loss_symmetric).item()),
                     float((vicreg_var_weight * var_term_t).item()),
@@ -1030,7 +1030,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             if batch_idx % log_interval == 0:
                 print(
                     f"[{config_name}] Epoch {epoch + 1}/{epochs} Batch {batch_idx}/{len(dataloader)} "
-                    f"lr={_fmt_metric(lr)} total={_fmt_metric(total_loss.item())} jepa={_fmt_metric(loss_jepa.item())} "
+                    f"lr={_fmt_metric(lr)} total={_fmt_metric(total_loss.item())} mse={_fmt_metric(loss_mse.item())} "
                     f"sigreg={_fmt_metric(loss_sigreg.item())} "
                     f"sym={_fmt_metric(loss_symmetric.item())} "
                     f"sim={_fmt_metric(sim_val)} var={_fmt_metric(var_val)} cov={_fmt_metric(cov_val)} "
@@ -1038,7 +1038,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     f"valid_frac={_fmt_metric(valid_frac)}"
                 )
             epoch_total += float(total_loss.item())
-            epoch_jepa += float(loss_jepa.item())
+            epoch_mse += float(loss_mse.item())
             epoch_sim += float(sim_val)
             epoch_var += float(var_val)
             epoch_cov += float(cov_val)
@@ -1063,7 +1063,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             print(
                 f"[{config_name}] Epoch {epoch + 1}/{epochs} summary "
                 f"avg_total={_fmt_metric(epoch_total/epoch_batches)} "
-                f"avg_jepa={_fmt_metric(epoch_jepa/epoch_batches)} "
+                f"avg_mse={_fmt_metric(epoch_mse/epoch_batches)} "
                 f"avg_sigreg={_fmt_metric(epoch_sigreg/epoch_batches)} "
                 f"avg_sym={_fmt_metric(epoch_symmetric/epoch_batches)} "
                 f"avg_sim={_fmt_metric(epoch_sim/epoch_batches)} "
@@ -1234,7 +1234,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     if not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)):
         try:
-            from src.scale_probe import probe_scale_response, save_scale_response_plots
+            from src.scale_probe import probe_scale_response
 
             probe_batch = next(iter(dataloader)).to(device, non_blocking=True)
             probe_batch = torch.nan_to_num(probe_batch, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1253,12 +1253,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                             run_name=config_name,
                         )
                         print(f"[{config_name}] scale_probe_report={json.dumps(report['scale_drop_sensitivity_fraction'])}")
-                        saved_plots = save_scale_response_plots(
-                            session_dir,
-                            scale_names=train_cfg.get("scale_probe_names"),
-                            run_name=config_name,
-                        )
-                        print(f"[{config_name}] scale_probe_plots={len(saved_plots)}")
                     else:
                         print(f"[{config_name}] scale_probe: cdd_channels not in debug, skipping")
             model.train()

@@ -53,7 +53,7 @@ class PyramidGridJEPA(nn.Module):
         cdd_log_std_floor_mult: float = 0.05,
         ema_momentum: float = 0.996,
         normalize_loss_l2: bool = False,
-        predictor_layernorm: bool = True,
+        predictor_layernorm: bool = False,
         predictor_spatial_conv: bool = False,
         projector_conv: bool = True,
         predictor_residual: bool = True,

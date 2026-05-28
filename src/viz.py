@@ -8,6 +8,7 @@ import subprocess
 import sys
 from collections import defaultdict
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -618,8 +619,8 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     np.save(os.path.join(results_dir, "target_locations_hist_counts.npy"), hist_counts.astype(np.float32))
     target_vis_img = os.path.join(results_dir, "target_locations_vis.png")
     hist_vis_img = os.path.join(results_dir, "target_locations_hist_vis.png")
-    _save_png(target_vis_img, target_vis, cmap="magma")
-    _save_png(hist_vis_img, hist_log, cmap="viridis", nan_black=True)
+    _save_png_with_colorbar(target_vis_img, target_vis, cmap="magma")
+    _save_png_with_colorbar(hist_vis_img, hist_log, cmap="viridis", nan_black=True)
 
     # Optional channel-wise masking demo (16x16 center crop), 4 panels per row:
     # [orig, masked, delta, abs-delta]. This is a quick visual reference.
@@ -659,16 +660,81 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
             ).save(mask_demo_path)
             mask_demo_rel = os.path.join("results", "mask_demo_channels_16x16.png")
 
-    # Check for scale response probe images.
+    # Check for scale response probe data and generate plots if needed.
     scale_sens_rel = None
     scale_winner_rel = None
     run_name = os.path.basename(session_dir)
-    scale_sens_path = os.path.join(session_dir, f"{run_name}_scale_sensitivity_maps.png")
-    scale_winner_path = os.path.join(session_dir, f"{run_name}_scale_winner_map.png")
-    if os.path.exists(scale_sens_path):
-        scale_sens_rel = os.path.join(os.path.basename(session_dir), os.path.basename(scale_sens_path))
-    if os.path.exists(scale_winner_path):
-        scale_winner_rel = os.path.join(os.path.basename(session_dir), os.path.basename(scale_winner_path))
+    scale_pt_path = os.path.join(session_dir, f"{run_name}_scale_response.pt")
+    if os.path.exists(scale_pt_path):
+        scale_sens_path = os.path.join(session_dir, f"{run_name}_scale_sensitivity_maps.png")
+        scale_winner_path = os.path.join(session_dir, f"{run_name}_scale_winner_map.png")
+        try:
+            from src.scale_probe import save_scale_response_plots
+            save_scale_response_plots(session_dir, run_name=run_name)
+        except Exception as e:
+            print(f"[warning] scale probe plot generation failed: {type(e).__name__}: {e}")
+        if os.path.exists(scale_sens_path):
+            scale_sens_rel = os.path.join(os.path.basename(session_dir), os.path.basename(scale_sens_path))
+        if os.path.exists(scale_winner_path):
+            scale_winner_rel = os.path.join(os.path.basename(session_dir), os.path.basename(scale_winner_path))
+
+    # Read merged config for architecture summary.
+    arch_summary_html = ""
+    config_used_path = os.path.join(session_dir, "config_used.json")
+    if os.path.exists(config_used_path):
+        try:
+            with open(config_used_path, "r", encoding="utf-8") as f:
+                cfg_used = json.load(f)
+            mc = cfg_used.get("model", {})
+
+            enc = mc.get("model_key", mc.get("encoder_type", "?"))
+            enc_map = {
+                "cdd_scaleaware_convnext": "CDD Scale-Aware ConvNeXt",
+                "cdd_scaleaware_convnext_d4": "CDD Scale-Aware ConvNeXt (D4)",
+                "cdd_scaleaware_rescnn": "CDD Scale-Aware ResCNN",
+                "cdd_opnet": "CDD OpNet",
+            }
+            enc_label = enc_map.get(enc, enc)
+
+            sc = mc.get("predictor_spatial_conv", True)
+            pln = mc.get("predictor_layernorm", False)
+            pj = mc.get("projector_conv", True)
+            pred_label = (
+                f"{'3×3 conv' if sc else '1×1 channel-only'}"
+                f"{', LN' if pln else ', no LN'}"
+                ", + residual"
+            )
+            proj_label = f"{'1×1→GELU→1×1' if pj else 'Identity'}"
+
+            msc = mc.get("mask_size_scaling", 0.0)
+            mbox = mc.get("mask_box_size", 16)
+            if isinstance(mbox, list):
+                mbox_str = f"[{mbox[0]}, {mbox[1]}]"
+            else:
+                mbox_str = str(mbox)
+            mask_label = (
+                "pyramid" if msc > 0 else "random box"
+            ) + f" (scale={msc}, box={mbox_str})"
+
+            tsm = mc.get("target_sampling_mode", "grid")
+            no = mc.get("target_nonoverlap", False)
+            tgt_label = tsm
+            if tsm == "priority_sampling":
+                tgt_label += f" top{mc.get('priority_top_percent', 5):.0f}%"
+                pn = mc.get("priority_n_target", "auto")
+                tgt_label += f" n={pn}"
+            if no:
+                tgt_label += " nonoverlap"
+
+            arch_summary_html = f"""<div style="background:#f5f5f5; border-radius:6px; padding:12px 16px; margin-bottom:20px; font-size:14px; line-height:1.7;">
+<b>Encoder:</b> {enc_label}<br>
+<b>Projector:</b> {proj_label}<br>
+<b>Predictor:</b> {pred_label}<br>
+<b>Mask:</b> {mask_label}<br>
+<b>Targets:</b> {tgt_label}
+</div>"""
+        except Exception as e:
+            print(f"[warning] failed to build arch summary: {type(e).__name__}: {e}")
 
     # Build a single assembled dashboard entrypoint for this session.
     dashboard_path = os.path.join(session_dir, "dashboard.html")
@@ -685,7 +751,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
 
     # Weight config key → (csv weighted column, short label)
     WEIGHTED_COLUMN_MAP = [
-        ("jepa_loss_weight", "weighted_jepa", "jepa"),
+        ("mse_loss_weight", "weighted_mse", "mse"),
         ("vicreg_var_weight", "weighted_var", "var"),
         ("vicreg_cov_weight", "weighted_cov", "cov"),
         ("sigreg_weight", "weighted_sigreg", "sigreg"),
@@ -747,6 +813,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
 </head>
 <body>
   <h1>JEPA Session Dashboard</h1>
+  {arch_summary_html}
   <div class="section">
     <h2>Loss Curve</h2>
     {loss_html}
@@ -917,14 +984,14 @@ def save_loss_curve(session_dir: str):
         for row in reader:
             x_ep.append(float(row["epoch"]) + 0.001 * float(row["batch"]))
             total.append(float(row["total_loss"]))
-            jepa.append(float(row["loss_jepa"]))
+            jepa.append(float(row["loss_mse"]))
     if len(x_ep) == 0:
         return None
     # Matplotlib-free lightweight output for compatibility.
     out_path = os.path.join(session_dir, "loss_curve.csv")
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["x", "total_loss", "loss_jepa"])
+        w.writerow(["x", "total_loss", "loss_mse"])
         for x, t, j in zip(x_ep, total, jepa):
             w.writerow([x, t, j])
     return out_path
@@ -981,3 +1048,18 @@ def _save_png(path: str, arr: np.ndarray, cmap: str = "gray", nan_black: bool = 
     if nan_black and mask.any():
         rgb[mask] = 0
     Image.fromarray(np.flipud(rgb), mode="RGB").save(path)
+
+
+def _save_png_with_colorbar(path: str, arr: np.ndarray, cmap: str = "viridis", nan_black: bool = False) -> None:
+    a = np.asarray(arr, dtype=np.float32)
+    masked = np.ma.masked_invalid(a)
+    fig, ax = plt.subplots(figsize=(5, 5))
+    im = ax.imshow(masked, cmap=cmap, origin="upper", interpolation="nearest")
+    if nan_black:
+        ax.set_facecolor("black")
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=8)
+    ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=ax.get_facecolor())
+    plt.close(fig)
