@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 
+
 class LayerNorm2d(nn.Module):
     """LayerNorm over channels for BCHW tensors."""
 
@@ -542,9 +543,12 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
                 if self.cdd_append_last_residual:
                     residual = fields[:, -1:, :, :]
                     res_mask = mask_tokens[:, -1:, :, :]
-                    split = residual / n_missing
-                    fields = torch.cat([fields[:, :-1, :, :], split.expand(-1, n_missing, -1, -1)], dim=1)
-                    mask_tokens = torch.cat([mask_tokens[:, :-1, :, :], res_mask.expand(-1, n_missing, -1, -1)], dim=1)
+
+                    n_split = n_missing + 1
+                    split = residual / float(n_split)
+
+                    fields = torch.cat([fields[:, :-1, :, :], split.expand(-1, n_split, -1, -1)], dim=1)
+                    mask_tokens = torch.cat([mask_tokens[:, :-1, :, :], res_mask.expand(-1, n_split, -1, -1)], dim=1)
                 else:
                     zeros = torch.zeros(b, n_missing, h, w, dtype=fields.dtype, device=fields.device)
                     fields = torch.cat([fields, zeros], dim=1)
@@ -698,9 +702,12 @@ class CDDScaleAwareResCNNEncoder(nn.Module):
                 if self.cdd_append_last_residual:
                     residual = fields[:, -1:, :, :]
                     res_mask = mask_tokens[:, -1:, :, :]
-                    split = residual / n_missing
-                    fields = torch.cat([fields[:, :-1, :, :], split.expand(-1, n_missing, -1, -1)], dim=1)
-                    mask_tokens = torch.cat([mask_tokens[:, :-1, :, :], res_mask.expand(-1, n_missing, -1, -1)], dim=1)
+
+                    n_split = n_missing + 1
+                    split = residual / float(n_split)
+
+                    fields = torch.cat([fields[:, :-1, :, :], split.expand(-1, n_split, -1, -1)], dim=1)
+                    mask_tokens = torch.cat([mask_tokens[:, :-1, :, :], res_mask.expand(-1, n_split, -1, -1)], dim=1)
                 else:
                     zeros = torch.zeros(b, n_missing, h, w, dtype=fields.dtype, device=fields.device)
                     fields = torch.cat([fields, zeros], dim=1)

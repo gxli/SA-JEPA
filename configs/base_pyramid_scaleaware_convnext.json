@@ -45,6 +45,7 @@
     "ema_momentum": 0.996,
     "normalize_loss_l2": false,
     "predictor_layernorm": true,
+    "predictor_residual": true,
     "mask_size_scaling": 1.0,
     "mask_spacing_scaling": 2.0,
     "target_invalid_region_skip": false,

@@ -10,8 +10,25 @@ class FullResPredictor(nn.Module):
         hidden: int = 64,
         use_layernorm: bool = False,
         kernel_size: int = 3,
+        spatial_conv: bool = True,
+        residual: bool = True,
     ):
         super().__init__()
+        self.residual = bool(residual)
+        if not spatial_conv:
+            # Channel-only: 1x1 -> LayerNorm -> GELU -> 1x1, zero-init last conv, residual.
+            norm = LayerNorm2d(hidden) if use_layernorm else nn.Identity()
+            self.net = nn.Sequential(
+                nn.Conv2d(channels, hidden, kernel_size=1),
+                norm,
+                nn.GELU(),
+                nn.Conv2d(hidden, channels, kernel_size=1),
+            )
+            nn.init.zeros_(self.net[-1].weight)
+            if self.net[-1].bias is not None:
+                nn.init.zeros_(self.net[-1].bias)
+            return
+
         k = int(kernel_size)
         if k <= 0 or (k % 2) == 0:
             raise ValueError(f"FullResPredictor kernel_size must be a positive odd integer, got {kernel_size}")
@@ -32,4 +49,5 @@ class FullResPredictor(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x)
+        y = self.net(x)
+        return x + y if self.residual else y

@@ -53,7 +53,10 @@ class PyramidGridJEPA(nn.Module):
         cdd_log_std_floor_mult: float = 0.05,
         ema_momentum: float = 0.996,
         normalize_loss_l2: bool = False,
-        predictor_layernorm: bool = False,
+        predictor_layernorm: bool = True,
+        predictor_spatial_conv: bool = False,
+        projector_conv: bool = True,
+        predictor_residual: bool = True,
         use_image_mask_token: bool = False,
         mode: str = "image",
         encoder_type: str = "convnext_dense_masktoken",
@@ -84,6 +87,9 @@ class PyramidGridJEPA(nn.Module):
         priority_min_targets_per_map: int = 0,
         priority_dithering_pixels: int = 6,
         use_symmetric_feature_loss: bool = False,
+        target_nonoverlap: bool = False,
+        target_allow_partial_overlap: float = 0.0,
+        mask_box_hardcap: int | None = None,
     ):
         super().__init__()
 
@@ -129,6 +135,8 @@ class PyramidGridJEPA(nn.Module):
         self.ema_momentum = float(ema_momentum)
         self.normalize_loss_l2 = bool(normalize_loss_l2)
         self.predictor_layernorm = bool(predictor_layernorm)
+        self.predictor_spatial_conv = bool(predictor_spatial_conv)
+        self.predictor_residual = bool(predictor_residual)
         self.use_image_mask_token = bool(use_image_mask_token)
         self.mode = str(mode)
         self.encoder_type = str(encoder_type)
@@ -161,6 +169,10 @@ class PyramidGridJEPA(nn.Module):
         self.priority_min_targets_per_map = int(priority_min_targets_per_map)
         self.priority_dithering_pixels = int(priority_dithering_pixels)
         self.use_symmetric_feature_loss = bool(use_symmetric_feature_loss)
+        self.target_nonoverlap = bool(target_nonoverlap)
+        self.target_allow_partial_overlap = float(target_allow_partial_overlap)
+        self.mask_box_hardcap = None if mask_box_hardcap is None else int(mask_box_hardcap)
+        self.projector_conv = bool(projector_conv)
         self.opnet_cache_primitives = bool(opnet_cache_primitives)
         self.opnet_cache_detach = bool(opnet_cache_detach)
         if self.mode not in ("image", "pyramid"):
@@ -375,12 +387,15 @@ class PyramidGridJEPA(nn.Module):
 
         if predictor_hidden is None:
             predictor_hidden = latent_channels * 2
-        self.projector = nn.Sequential(
-            nn.Conv2d(latent_channels, int(predictor_hidden), kernel_size=1),
-            LayerNorm2d(int(predictor_hidden)) if self.predictor_layernorm else nn.Identity(),
-            nn.GELU(),
-            nn.Conv2d(int(predictor_hidden), latent_channels, kernel_size=1),
-        )
+        if self.projector_conv:
+            self.projector = nn.Sequential(
+                nn.Conv2d(latent_channels, int(predictor_hidden), kernel_size=1),
+                LayerNorm2d(int(predictor_hidden)) if self.predictor_layernorm else nn.Identity(),
+                nn.GELU(),
+                nn.Conv2d(int(predictor_hidden), latent_channels, kernel_size=1),
+            )
+        else:
+            self.projector = nn.Identity()
         self.target_projector = copy.deepcopy(self.projector)
         for p in self.target_projector.parameters():
             p.requires_grad = False
@@ -391,6 +406,8 @@ class PyramidGridJEPA(nn.Module):
             channels=latent_channels,
             hidden=int(predictor_hidden),
             use_layernorm=self.predictor_layernorm,
+            spatial_conv=self.predictor_spatial_conv,
+            residual=self.predictor_residual,
             kernel_size=pred_ks,
         )
 
@@ -531,6 +548,9 @@ class PyramidGridJEPA(nn.Module):
                     priority_n_target=self.priority_n_target,
                     priority_min_targets_per_map=self.priority_min_targets_per_map,
                     priority_dithering_pixels=self.priority_dithering_pixels,
+                    target_nonoverlap=self.target_nonoverlap,
+                    target_allow_partial_overlap=self.target_allow_partial_overlap,
+                    mask_box_hardcap=self.mask_box_hardcap,
                 )
             else:
                 x_context, target_locations, target_scales, target_valid = make_pyramid_grid_context(
@@ -557,6 +577,9 @@ class PyramidGridJEPA(nn.Module):
                     priority_n_target=self.priority_n_target,
                     priority_min_targets_per_map=self.priority_min_targets_per_map,
                     priority_dithering_pixels=self.priority_dithering_pixels,
+                    target_nonoverlap=self.target_nonoverlap,
+                    target_allow_partial_overlap=self.target_allow_partial_overlap,
+                    mask_box_hardcap=self.mask_box_hardcap,
                 )
 
         x_clean_enc = x_clean
@@ -593,11 +616,11 @@ class PyramidGridJEPA(nn.Module):
             clean_image = x_clean_enc
             masked_image = clean_image * (1.0 - mask_token)
 
-            # ResCNN mask-token mode (token-first channels):
-            # context = [mask token, zero-filled masked image]
-            # target  = [zero token, clean image]
-            x_context_enc = torch.cat([mask_token, masked_image], dim=1)
-            x_clean_enc = torch.cat([zero_token, clean_image], dim=1)
+            # Standardized [image, mask] channel ordering:
+            # context = [masked image, mask token]
+            # target  = [clean image, zero token]
+            x_context_enc = torch.cat([masked_image, mask_token], dim=1)
+            x_clean_enc = torch.cat([clean_image, zero_token], dim=1)
 
         # Optional multiscale CDD path: encode channel cubes directly.
         # Keep x_clean/x_context image outputs for backward-compatible diagnostics.
@@ -644,6 +667,7 @@ class PyramidGridJEPA(nn.Module):
         if not bool(mask_inference):
             # In mask-free inference, predictor branch should consume clean features.
             enc_context = enc_target
+        symmetric_var = None  # accumulated rotation-view variance (scalar or None)
         if self.encoder_type == "cdd_opnet":
             if self.mode != "pyramid":
                 raise ValueError("cdd_opnet requires mode='pyramid'.")
@@ -652,23 +676,27 @@ class PyramidGridJEPA(nn.Module):
             mask_tokens = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
             if bool(mask_inference):
                 if self.use_symmetric_feature_loss:
-                    context_map = symmetric_forward_2d(
+                    context_map, ctx_var = symmetric_forward_2d(
                         self.context_encoder,
                         cdd_masked,
                         mask_tokens=mask_tokens,
                         floor_source=cdd_orig,
+                        return_var=True,
                     )
+                    symmetric_var = ctx_var if symmetric_var is None else symmetric_var + ctx_var
                 else:
                     context_map = self.context_encoder(cdd_masked, mask_tokens=mask_tokens, floor_source=cdd_orig)
             else:
                 zero_mask_tokens = torch.zeros_like(mask_tokens)
                 if self.use_symmetric_feature_loss:
-                    context_map = symmetric_forward_2d(
+                    context_map, ctx_var = symmetric_forward_2d(
                         self.context_encoder,
                         cdd_orig,
                         mask_tokens=zero_mask_tokens,
                         floor_source=cdd_orig,
+                        return_var=True,
                     )
+                    symmetric_var = ctx_var if symmetric_var is None else symmetric_var + ctx_var
                 else:
                     context_map = self.context_encoder(
                         cdd_orig,
@@ -678,12 +706,14 @@ class PyramidGridJEPA(nn.Module):
             with torch.no_grad():
                 zero_mask_tokens = torch.zeros_like(mask_tokens)
                 if self.use_symmetric_feature_loss:
-                    gt_map = symmetric_forward_2d(
+                    gt_map, gt_var = symmetric_forward_2d(
                         self.target_encoder,
                         cdd_orig,
                         mask_tokens=zero_mask_tokens,
                         floor_source=cdd_orig,
+                        return_var=True,
                     )
+                    symmetric_var = gt_var if symmetric_var is None else symmetric_var + gt_var
                 else:
                     gt_map = self.target_encoder(
                         cdd_orig,
@@ -702,29 +732,35 @@ class PyramidGridJEPA(nn.Module):
             zero_mask_tokens = torch.zeros_like(mask_tokens)
             if bool(mask_inference):
                 if self.use_symmetric_feature_loss:
-                    context_map = symmetric_forward_2d(
+                    context_map, ctx_var = symmetric_forward_2d(
                         self.context_encoder,
                         cdd_masked_scaleaware,
                         mask_tokens=mask_tokens,
+                        return_var=True,
                     )
+                    symmetric_var = ctx_var if symmetric_var is None else symmetric_var + ctx_var
                 else:
                     context_map = self.context_encoder(cdd_masked_scaleaware, mask_tokens=mask_tokens)
             else:
                 if self.use_symmetric_feature_loss:
-                    context_map = symmetric_forward_2d(
+                    context_map, ctx_var = symmetric_forward_2d(
                         self.context_encoder,
                         cdd_orig_scaleaware,
                         mask_tokens=zero_mask_tokens,
+                        return_var=True,
                     )
+                    symmetric_var = ctx_var if symmetric_var is None else symmetric_var + ctx_var
                 else:
                     context_map = self.context_encoder(cdd_orig_scaleaware, mask_tokens=zero_mask_tokens)
             with torch.no_grad():
                 if self.use_symmetric_feature_loss:
-                    gt_map = symmetric_forward_2d(
+                    gt_map, gt_var = symmetric_forward_2d(
                         self.target_encoder,
                         cdd_orig_scaleaware,
                         mask_tokens=zero_mask_tokens,
+                        return_var=True,
                     )
+                    symmetric_var = gt_var if symmetric_var is None else symmetric_var + gt_var
                 else:
                     gt_map = self.target_encoder(cdd_orig_scaleaware, mask_tokens=zero_mask_tokens)
         elif self.encoder_type == "convnext_dense_pyramid":
@@ -738,11 +774,13 @@ class PyramidGridJEPA(nn.Module):
             enc_target = torch.cat([cdd_orig_enc, torch.zeros_like(mask_tokens)], dim=1)
             with torch.no_grad():
                 if self.use_symmetric_feature_loss:
-                    gt_map = symmetric_forward_2d(self.target_encoder, enc_target)
+                    gt_map, gt_var = symmetric_forward_2d(self.target_encoder, enc_target, return_var=True)
+                    symmetric_var = gt_var if symmetric_var is None else symmetric_var + gt_var
                 else:
                     gt_map = self.target_encoder(enc_target)
             if self.use_symmetric_feature_loss:
-                context_map = symmetric_forward_2d(self.context_encoder, enc_context)
+                context_map, ctx_var = symmetric_forward_2d(self.context_encoder, enc_context, return_var=True)
+                symmetric_var = ctx_var if symmetric_var is None else symmetric_var + ctx_var
             else:
                 context_map = self.context_encoder(enc_context)
         elif self.encoder_type in ("convnext_dense_masktoken", "convnext_dense_masktoken_d4"):
@@ -810,6 +848,8 @@ class PyramidGridJEPA(nn.Module):
             "pred_map": pred_map,
             "gt_map": gt_map,
         }
+        if symmetric_var is not None:
+            out["symmetric_var"] = symmetric_var
         if actual_context_in is not None:
             out["network_context_in"] = actual_context_in
             out["network_target_in"] = actual_target_in
@@ -830,6 +870,13 @@ class PyramidGridJEPA(nn.Module):
             out["dip_field_per_channel"] = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
             out["pyramid_mask_token"] = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
         return out
+
+    def compute_symmetric_loss(self, outputs):
+        """Mean rotation-view variance, averaged over all spatial and channel dims."""
+        var = outputs.get("symmetric_var")
+        if var is None:
+            return torch.tensor(0.0, device=outputs["pred_patches"].device)
+        return var.mean()
 
     def compute_loss(self, outputs):
         pred = outputs["pred_patches"]
@@ -852,5 +899,6 @@ class PyramidGridJEPA(nn.Module):
     def update_target_encoder(self):
         for p_context, p_target in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
             p_target.mul_(self.ema_momentum).add_(p_context.detach(), alpha=1.0 - self.ema_momentum)
-        for p_proj, p_target_proj in zip(self.projector.parameters(), self.target_projector.parameters()):
-            p_target_proj.mul_(self.ema_momentum).add_(p_proj.detach(), alpha=1.0 - self.ema_momentum)
+        if self.projector_conv:
+            for p_proj, p_target_proj in zip(self.projector.parameters(), self.target_projector.parameters()):
+                p_target_proj.mul_(self.ema_momentum).add_(p_proj.detach(), alpha=1.0 - self.ema_momentum)

@@ -248,6 +248,7 @@ function mapRgb(points, loPct, hiPct) {{
     const xx = i - yy * W;
     rgbImage[yy][xx] = [r[i], g[i], b[i]];
   }}
+  rgbImage.reverse();
   return {{ rgbImage, colors }};
 }}
 function mkScatter(points, colors, sceneName) {{
@@ -662,19 +663,51 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     dashboard_path = os.path.join(session_dir, "dashboard.html")
     latent_name = os.path.basename(latent_html_path)
     metrics_path = os.path.join(session_dir, "metrics.csv")
+    loss_weights_path = os.path.join(session_dir, "loss_weights.json")
+    loss_weights = {}
+    if os.path.exists(loss_weights_path):
+        try:
+            with open(loss_weights_path, "r", encoding="utf-8") as f:
+                loss_weights = json.load(f)
+        except Exception as e:
+            print(f"[warning] failed to read {loss_weights_path}: {type(e).__name__}: {e}")
+
+    # Weight label map: config key → short display label
+    WEIGHT_LABELS = {
+        "jepa_loss_weight": "jepa",
+        "vicreg_var_weight": "var",
+        "vicreg_cov_weight": "cov",
+        "sigreg_weight": "sigreg",
+    }
+    # Ordered raw → weighted column pairs to read from metrics.csv
+    LOSS_COLUMN_PAIRS = [
+        ("loss_jepa", "weighted_jepa"),
+        ("loss_var", "weighted_var"),
+        ("loss_cov", "weighted_cov"),
+        ("loss_sigreg", "weighted_sigreg"),
+    ]
+
     loss_x = []
     loss_total = []
-    loss_jepa = []
-    loss_pixel = []
+    loss_raw: dict[str, list[float]] = {}
+    loss_weighted: dict[str, list[float]] = {}
     if os.path.exists(metrics_path):
         try:
             with open(metrics_path, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
+                fieldnames = set(reader.fieldnames or [])
+                for raw_col, w_col in LOSS_COLUMN_PAIRS:
+                    if raw_col in fieldnames:
+                        loss_raw[raw_col] = []
+                    if w_col in fieldnames:
+                        loss_weighted[w_col] = []
                 for row in reader:
                     loss_x.append(float(row["epoch"]) + 0.001 * float(row["batch"]))
-                    loss_total.append(float(row["total_loss"]))
-                    loss_jepa.append(float(row["loss_jepa"]))
-                    loss_pixel.append(float(row["loss_pixel"]))
+                    loss_total.append(float(row.get("total_loss", 0.0)))
+                    for raw_col in loss_raw:
+                        loss_raw[raw_col].append(float(row.get(raw_col, 0.0)))
+                    for w_col in loss_weighted:
+                        loss_weighted[w_col].append(float(row.get(w_col, 0.0)))
         except Exception as e:
             print(f"[warning] failed to read {metrics_path}: {type(e).__name__}: {e}")
     ref_clean = os.path.join("results", "reference_000_clean.png")
@@ -687,7 +720,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     target_vis_rel = os.path.join("results", "target_locations_vis.png")
     hist_vis_rel = os.path.join("results", "target_locations_hist_vis.png")
     loss_html = (
-        '<div id="loss-plot" style="width: 100%; height: 420px; border: 1px solid #ddd; border-radius: 6px;"></div>'
+        '<div id="loss-plot" style="width: 100%; height: 600px; border: 1px solid #ddd; border-radius: 6px;"></div>'
         if len(loss_x) > 0
         else "<p>Loss data not available yet.</p>"
     )
@@ -748,23 +781,104 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
 </html>
 """
     if len(loss_x) > 0:
+        # Build trace names with weight annotations
+        def _weight_suffix(raw_col: str) -> str:
+            # raw_col: "loss_jepa" → look up "jepa_loss_weight" → " (x100)"
+            for weight_key, label in WEIGHT_LABELS.items():
+                if label in raw_col.replace("loss_", ""):
+                    w = loss_weights.get(weight_key)
+                    if w is not None:
+                        return f" (x{w:.3g})"
+            return ""
+
+        # Weighted traces (top subplot)
+        traces_weighted = []
+        traces_weighted.append({"x": loss_x, "y": loss_total, "mode": "lines", "name": "total_loss"})
+        for w_col in sorted(loss_weighted.keys()):
+            base = w_col.replace("weighted_", "")
+            suffix = _weight_suffix(f"loss_{base}")
+            traces_weighted.append(
+                {"x": loss_x, "y": loss_weighted[w_col], "mode": "lines", "name": f"weighted_{base}{suffix}"}
+            )
+
+        # Raw traces (bottom subplot)
+        traces_raw = []
+        for raw_col in sorted(loss_raw.keys()):
+            suffix = _weight_suffix(raw_col)
+            traces_raw.append({"x": loss_x, "y": loss_raw[raw_col], "mode": "lines", "name": f"{raw_col}{suffix}"})
+
         script = f"""
 <script>
-const lossX = {json.dumps(loss_x)};
-const lossTotal = {json.dumps(loss_total)};
-const lossJepa = {json.dumps(loss_jepa)};
-const lossPixel = {json.dumps(loss_pixel)};
-Plotly.newPlot('loss-plot', [
-  {{x: lossX, y: lossTotal, mode: 'lines', name: 'total_loss'}},
-  {{x: lossX, y: lossJepa, mode: 'lines', name: 'loss_jepa'}},
-  {{x: lossX, y: lossPixel, mode: 'lines', name: 'loss_pixel'}}
-], {{
-  title: 'Training Loss Curve',
-  xaxis: {{title: 'epoch + 0.001*batch'}},
-  yaxis: {{title: 'loss'}},
-  template: 'plotly_white',
-  margin: {{l: 60, r: 20, t: 50, b: 55}}
-}}, {{responsive: true}});
+(function() {{
+  const tracesWeighted = {json.dumps(traces_weighted)};
+  const tracesRaw = {json.dumps(traces_raw)};
+
+  // Build subplot layout: weighted top, raw bottom
+  const nWeighted = tracesWeighted.length;
+  const nRaw = tracesRaw.length;
+  const totalWeighted = nWeighted > 0 ? 1 : 0;
+  const totalRaw = nRaw > 0 ? 1 : 0;
+  const panels = totalWeighted + totalRaw;
+  if (panels === 0) return;
+
+  const subplotRows = panels;
+  const rowWeights = [];
+  const data = [];
+  const annotations = [];
+  const yAxisConfigs = [];
+
+  let row = 1;
+
+  if (nWeighted > 0) {{
+    for (let i = 0; i < tracesWeighted.length; i++) {{
+      const t = tracesWeighted[i];
+      data.push({{ ...t, xaxis: 'x', yaxis: 'y' + (row > 1 ? row : '') }});
+    }}
+    rowWeights.push(1);
+    yAxisConfigs.push({{ title: 'weighted loss' }});
+    annotations.push({{
+      text: 'Weighted (xWeight)',
+      xref: 'paper', yref: 'y' + (row > 1 ? row : '') + ' domain',
+      x: 0.0, y: 0.85, xanchor: 'left', showarrow: false,
+      font: {{ size: 11, color: '#555' }}
+    }});
+    row++;
+  }}
+
+  if (nRaw > 0) {{
+    for (let i = 0; i < tracesRaw.length; i++) {{
+      const t = tracesRaw[i];
+      data.push({{ ...t, xaxis: 'x', yaxis: 'y' + (row > 1 ? row : '') }});
+    }}
+    rowWeights.push(1);
+    yAxisConfigs.push({{ title: 'raw loss' }});
+    annotations.push({{
+      text: 'Raw',
+      xref: 'paper', yref: 'y' + (row > 1 ? row : '') + ' domain',
+      x: 0.0, y: 0.85, xanchor: 'left', showarrow: false,
+      font: {{ size: 11, color: '#555' }}
+    }});
+  }}
+
+  const layout = {{
+    title: 'Training Loss Curve',
+    grid: {{ rows: subplotRows, columns: 1, pattern: 'independent', roworder: 'top to bottom' }},
+    xaxis: {{ title: 'epoch + 0.001*batch' }},
+    template: 'plotly_white',
+    margin: {{ l: 60, r: 100, t: 50, b: 55 }},
+    legend: {{ x: 1.02, y: 1.0, xanchor: 'left' }},
+    annotations: annotations,
+    height: 200 * subplotRows + 120,
+  }};
+
+  // Set per-axis configs
+  for (let i = 0; i < yAxisConfigs.length; i++) {{
+    const axisKey = 'yaxis' + (i > 0 ? (i + 1) : '');
+    layout[axisKey] = yAxisConfigs[i];
+  }}
+
+  Plotly.newPlot('loss-plot', data, layout, {{ responsive: true }});
+}})();
 </script>
 """
         html = html.replace("</body>", script + "\n</body>")
@@ -845,23 +959,21 @@ def save_loss_curve(session_dir: str):
     x_ep = []
     total = []
     jepa = []
-    pixel = []
     with open(metrics_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             x_ep.append(float(row["epoch"]) + 0.001 * float(row["batch"]))
             total.append(float(row["total_loss"]))
             jepa.append(float(row["loss_jepa"]))
-            pixel.append(float(row["loss_pixel"]))
     if len(x_ep) == 0:
         return None
     # Matplotlib-free lightweight output for compatibility.
     out_path = os.path.join(session_dir, "loss_curve.csv")
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["x", "total_loss", "loss_jepa", "loss_pixel"])
-        for x, t, j, p in zip(x_ep, total, jepa, pixel):
-            w.writerow([x, t, j, p])
+        w.writerow(["x", "total_loss", "loss_jepa"])
+        for x, t, j in zip(x_ep, total, jepa):
+            w.writerow([x, t, j])
     return out_path
 def _normalize01(x: np.ndarray) -> np.ndarray:
     arr = np.asarray(x, dtype=np.float32)
@@ -915,4 +1027,4 @@ def _save_png(path: str, arr: np.ndarray, cmap: str = "gray", nan_black: bool = 
     rgb = _apply_cmap(a, cmap=cmap)
     if nan_black and mask.any():
         rgb[mask] = 0
-    Image.fromarray(rgb, mode="RGB").save(path)
+    Image.fromarray(np.flipud(rgb), mode="RGB").save(path)

@@ -35,19 +35,23 @@ def _transform_tensor_kwargs(
     return out
 
 
-def symmetric_forward_2d(encoder: nn.Module, x: torch.Tensor, **kwargs) -> torch.Tensor:
+def symmetric_forward_2d(encoder: nn.Module, x: torch.Tensor, return_var: bool = False, **kwargs):
     """
     Four-way rotational group average for dense 2D spatial features.
 
     Inputs and tensor kwargs with matching HxW spatial shape are rotated together.
     Encoder outputs are inverse-rotated before averaging, preserving the original
     feature-map layout.
+
+    When return_var=True, also returns the per-pixel variance across the 4 rotation
+    views as a regularisation signal (shape matches the averaged output).
     """
     if x.ndim < 4:
         raise ValueError(f"symmetric_forward_2d expects at least 4D input, got {tuple(x.shape)}")
 
     spatial_shape = tuple(x.shape[-2:])
     accum = None
+    sq_accum = None
     for k in range(4):
         rot = lambda t, kk=k: torch.rot90(t, k=kk, dims=(-2, -1))
         x_rot = rot(x)
@@ -56,7 +60,14 @@ def symmetric_forward_2d(encoder: nn.Module, x: torch.Tensor, **kwargs) -> torch
             feat = encoder(x_rot, **kw)
         feat = torch.rot90(feat, k=-k, dims=(-2, -1))
         accum = feat if accum is None else accum + feat
-    return accum / 4.0
+        if return_var:
+            sq_accum = feat.pow(2) if sq_accum is None else sq_accum + feat.pow(2)
+    avg = accum / 4.0
+    if return_var:
+        var = (sq_accum / 4.0) - avg.pow(2)
+        var = var.clamp(min=0.0)
+        return avg, var
+    return avg
 
 
 def symmetric_forward_3d(encoder: nn.Module, x: torch.Tensor, **kwargs) -> torch.Tensor:

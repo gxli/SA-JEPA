@@ -110,6 +110,9 @@ def _prepare_context_from_model(
         priority_n_target=model.priority_n_target,
         priority_min_targets_per_map=model.priority_min_targets_per_map,
         priority_dithering_pixels=model.priority_dithering_pixels,
+        target_nonoverlap=getattr(model, "target_nonoverlap", False),
+        target_allow_partial_overlap=getattr(model, "target_allow_partial_overlap", 0.0),
+        mask_box_hardcap=getattr(model, "mask_box_hardcap", None),
         cdd_use_gpu=(x_clean.device.type == "cuda"),
     )
 
@@ -351,6 +354,8 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
         normalize_loss_l2=normalize_loss_l2,
         predictor_layernorm=model_cfg.get("predictor_layernorm", False),
+        predictor_spatial_conv=model_cfg.get("predictor_spatial_conv", True),
+        predictor_residual=model_cfg.get("predictor_residual", True),
         use_image_mask_token=use_image_mask_token,
         mode=resolved_mode,
         encoder_type=resolved_encoder_type,
@@ -784,6 +789,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", 0.1))
     sigreg_weight = float(train_cfg.get("sigreg_weight", 0.0))
     sigreg_sketch_dim = int(train_cfg.get("sigreg_sketch_dim", 64))
+    symmetric_feature_loss_weight = float(train_cfg.get("symmetric_feature_loss_weight", 0.0))
     vicreg_spatial_mode = str(train_cfg.get("vicreg_spatial_mode", "dense")).lower()
     if vicreg_spatial_mode not in ("dense", "pooled"):
         raise ValueError(
@@ -791,6 +797,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
     ema_base = float(train_cfg.get("ema_momentum_base", model.ema_momentum))
     ema_final = float(train_cfg.get("ema_momentum_final", 1.0))
+
+    base_lr = float(train_cfg.get("lr", 1e-4))
+    min_lr = float(train_cfg.get("min_lr", 1e-6))
+    warmup_epochs = float(train_cfg.get("warmup_epochs", 1.0))
 
     metrics_path = os.path.join(session_dir, "metrics.csv")
     if not os.path.exists(metrics_path):
@@ -803,12 +813,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     "global_step",
                     "total_loss",
                     "loss_jepa",
-                    "loss_pixel",
+                    "lr",
                     "loss_sigreg",
+                    "loss_symmetric",
                     "loss_var",
                     "loss_cov",
                     "weighted_jepa",
                     "weighted_sigreg",
+                    "weighted_symmetric",
                     "weighted_var",
                     "weighted_cov",
                     "ema_momentum",
@@ -837,6 +849,22 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             writer = csv.writer(f)
             writer.writerow(["epoch", "batch", "sample_idx", "target_idx", "y", "x", "scale"])
 
+    loss_weights_path = os.path.join(session_dir, "loss_weights.json")
+    if not os.path.exists(loss_weights_path):
+        with open(loss_weights_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "jepa_loss_weight": jepa_loss_weight,
+                    "vicreg_var_weight": vicreg_var_weight,
+                    "vicreg_cov_weight": vicreg_cov_weight,
+                    "sigreg_weight": sigreg_weight,
+                    "symmetric_feature_loss_weight": symmetric_feature_loss_weight,
+                },
+                f,
+                indent=2,
+            )
+            f.write("\n")
+
     model.train()
     start = time.time()
     visit_counts = None
@@ -845,11 +873,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     for epoch in range(start_epoch, epochs):
         epoch_total = 0.0
         epoch_jepa = 0.0
-        epoch_pixel = 0.0
         epoch_sim = 0.0
         epoch_var = 0.0
         epoch_cov = 0.0
         epoch_sigreg = 0.0
+        epoch_symmetric = 0.0
         epoch_valid_frac = 0.0
         epoch_batches = 0
         metrics_rows = []
@@ -883,20 +911,34 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 )
                 z_pred = extract_valid_pooled_embeddings(outputs, key="pred_patches")
                 loss_sigreg = sketched_sigreg_loss(z_pred, sketch_dim=sigreg_sketch_dim)
+                loss_symmetric = model.compute_symmetric_loss(outputs)
                 total_loss = (
                     (jepa_loss_weight * loss_jepa)
                     + (vicreg_var_weight * var_term_t)
                     + (vicreg_cov_weight * cov_term_t)
                     + (sigreg_weight * loss_sigreg)
+                    + (symmetric_feature_loss_weight * loss_symmetric)
                 )
-                loss_pixel_val = 0.0
-
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
+
             current_step = epoch * max(1, len(dataloader)) + batch_idx
             total_steps = max(1, int(epochs) * max(1, len(dataloader)))
             progress = min(1.0, max(0.0, float(current_step) / float(total_steps)))
+
+            # Cosine LR schedule with linear warmup.
+            warmup_steps = int(warmup_epochs * max(1, len(dataloader)))
+            if current_step < warmup_steps:
+                lr = base_lr * (current_step / max(1, warmup_steps))
+            else:
+                progress_lr = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+                progress_lr = min(1.0, max(0.0, float(progress_lr)))
+                lr = min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress_lr))
+
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+
             # Cosine EMA schedule from base momentum toward final momentum.
             new_momentum = float(
                 ema_final - 0.5 * (ema_final - ema_base) * (1.0 + math.cos(math.pi * progress))
@@ -918,12 +960,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     epoch * max(1, len(dataloader)) + batch_idx,
                     float(total_loss.item()),
                     float(loss_jepa.item()),
-                    float(loss_pixel_val),
+                    float(lr),
                     float(loss_sigreg.item()),
+                    float(loss_symmetric.item()),
                     float(var_term_t.item()),
                     float(cov_term_t.item()),
                     float((jepa_loss_weight * loss_jepa).item()),
                     float((sigreg_weight * loss_sigreg).item()),
+                    float((symmetric_feature_loss_weight * loss_symmetric).item()),
                     float((vicreg_var_weight * var_term_t).item()),
                     float((vicreg_cov_weight * cov_term_t).item()),
                     float(new_momentum),
@@ -986,19 +1030,20 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             if batch_idx % log_interval == 0:
                 print(
                     f"[{config_name}] Epoch {epoch + 1}/{epochs} Batch {batch_idx}/{len(dataloader)} "
-                    f"total={_fmt_metric(total_loss.item())} jepa={_fmt_metric(loss_jepa.item())} pixel={_fmt_metric(loss_pixel_val)} "
+                    f"lr={_fmt_metric(lr)} total={_fmt_metric(total_loss.item())} jepa={_fmt_metric(loss_jepa.item())} "
                     f"sigreg={_fmt_metric(loss_sigreg.item())} "
+                    f"sym={_fmt_metric(loss_symmetric.item())} "
                     f"sim={_fmt_metric(sim_val)} var={_fmt_metric(var_val)} cov={_fmt_metric(cov_val)} "
                     f"raw_mse={_fmt_metric(raw_mse_val)} norm_err={_fmt_metric(norm_err_val)} "
                     f"valid_frac={_fmt_metric(valid_frac)}"
                 )
             epoch_total += float(total_loss.item())
             epoch_jepa += float(loss_jepa.item())
-            epoch_pixel += float(loss_pixel_val)
             epoch_sim += float(sim_val)
             epoch_var += float(var_val)
             epoch_cov += float(cov_val)
             epoch_sigreg += float(loss_sigreg.item())
+            epoch_symmetric += float(loss_symmetric.item())
             epoch_valid_frac += float(valid_frac)
             epoch_batches += 1
 
@@ -1019,8 +1064,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"[{config_name}] Epoch {epoch + 1}/{epochs} summary "
                 f"avg_total={_fmt_metric(epoch_total/epoch_batches)} "
                 f"avg_jepa={_fmt_metric(epoch_jepa/epoch_batches)} "
-                f"avg_pixel={_fmt_metric(epoch_pixel/epoch_batches)} "
                 f"avg_sigreg={_fmt_metric(epoch_sigreg/epoch_batches)} "
+                f"avg_sym={_fmt_metric(epoch_symmetric/epoch_batches)} "
                 f"avg_sim={_fmt_metric(epoch_sim/epoch_batches)} "
                 f"avg_var={_fmt_metric(epoch_var/epoch_batches)} "
                 f"avg_cov={_fmt_metric(epoch_cov/epoch_batches)} "
@@ -1072,6 +1117,27 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         # Keep model_last in sync for inference-only resume paths.
         torch.save(model.state_dict(), model_ckpt_path)
         print(f"[{config_name}] checkpoint_saved={resume_ckpt_path} epoch={epoch + 1}")
+
+        # Per-epoch embedding snapshot for movie generation.
+        if bool(train_cfg.get("movie_dump_every_epoch", False)):
+            movie_dir = os.path.join(session_dir, "movie_frames")
+            os.makedirs(movie_dir, exist_ok=True)
+            with torch.no_grad():
+                model.eval()
+                x_movie = next(iter(dataloader)).to(device, non_blocking=True)
+                x_movie = torch.nan_to_num(x_movie, nan=0.0, posinf=0.0, neginf=0.0)
+                if is_3d_mode:
+                    out_m = model(x_movie)
+                else:
+                    context_result = _prepare_context_from_model(model, x_movie, return_debug=False)
+                    out_m = model(x_movie, context_data=context_result)
+                frame = {
+                    "pred_map": out_m["pred_map"][:1].detach().cpu(),
+                    "gt_map": out_m["gt_map"][:1].detach().cpu(),
+                    "x_clean": x_movie[:1].detach().cpu(),
+                }
+                torch.save(frame, os.path.join(movie_dir, f"epoch_{epoch + 1:04d}.pt"))
+            model.train()
 
     torch.save(model.state_dict(), os.path.join(session_dir, "model_last.pt"))
 

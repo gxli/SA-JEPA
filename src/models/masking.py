@@ -150,19 +150,72 @@ def _odd_box(v: int, minimum: int = 3) -> int:
     return x
 
 
+def _rejection_sample_targets(
+    candidates: list[tuple[int, int]],
+    num_targets: int,
+    h: int,
+    w: int,
+    exclusion_box: int,
+    device: torch.device,
+    max_tries: int = 4096,
+    allow_partial_overlap: float = 0.0,
+) -> list[tuple[int, int]]:
+    """Select non-overlapping targets via occupancy-map rejection sampling.
+
+    The exclusion footprint is a square of size exclusion_box centered on
+    each accepted target.  This footprint protects the *mask* from
+    overlapping, not just the inner target patch.
+    """
+    if exclusion_box <= 0 or len(candidates) == 0:
+        return candidates[:num_targets]
+
+    half = exclusion_box // 2
+    occ = torch.zeros((h, w), dtype=torch.bool, device=device)
+    accepted: list[tuple[int, int]] = []
+    tries = 0
+
+    # Shuffle candidates for unbiased selection.
+    perm = torch.randperm(len(candidates), device=device)
+    idx = 0
+    while len(accepted) < num_targets and tries < max_tries and idx < len(candidates):
+        tries += 1
+        cy, cx = candidates[int(perm[idx])]
+        idx += 1
+
+        y0 = max(0, int(cy) - half)
+        y1 = min(h, int(cy) + exclusion_box - half)
+        x0 = max(0, int(cx) - half)
+        x1 = min(w, int(cx) + exclusion_box - half)
+        if y1 <= y0 or x1 <= x0:
+            continue
+
+        footprint = occ[y0:y1, x0:x1]
+        overlap_frac = float(footprint.float().mean().item())
+        if overlap_frac <= float(allow_partial_overlap):
+            accepted.append((int(cy), int(cx)))
+            occ[y0:y1, x0:x1] = True
+
+    return accepted
+
+
 def _effective_mask_box_size(
     sigma: float,
     mask_scale: float,
     mask_box_size: int,
     inner_target_size: int,
+    hardcap: int | None = None,
 ) -> int:
     """Compute mask box size: round(sigma * mask_scale + mask_box_size).
 
     mask_scale=0  -> constant box (mask_box_size across all scales).
     mask_box_size=0 -> pure pyramid (box proportional to sigma).
+    hardcap clamps the result to a maximum (None or 0 = no cap).
     """
     base_box = round(float(sigma) * float(mask_scale) + int(mask_box_size))
-    return _odd_box(max(base_box, int(inner_target_size)))
+    box = max(base_box, int(inner_target_size))
+    if hardcap is not None and hardcap > 0:
+        box = min(box, int(hardcap))
+    return _odd_box(box)
 
 
 def _ensure_target_patches_masked(
@@ -212,6 +265,9 @@ def make_pyramid_grid_context(
     priority_n_target: int | str = 20,
     priority_min_targets_per_map: int = 0,
     priority_dithering_pixels: Optional[int] = None,
+    target_nonoverlap: bool = False,
+    target_allow_partial_overlap: float = 0.0,
+    mask_box_hardcap: int | None = None,
     cdd_use_gpu: bool = False,
 ):
     """
@@ -305,6 +361,7 @@ def make_pyramid_grid_context(
                 mask_scale=mask_scale,
                 mask_box_size=mask_box_size,
                 inner_target_size=inner_target_size,
+                hardcap=mask_box_hardcap,
             )
             max_half_lo = max_box // 2
             max_half_hi = max_box - max_half_lo
@@ -349,6 +406,7 @@ def make_pyramid_grid_context(
                 mask_scale=mask_scale,
                 mask_box_size=mask_box_size,
                 inner_target_size=inner_target_size,
+                hardcap=mask_box_hardcap,
             )
             half_lo = box // 2
             half_hi = box - half_lo
@@ -493,9 +551,21 @@ def make_pyramid_grid_context(
                     min_targets = max(0, int(priority_min_targets_per_map))
                     base_targets_scaled = max(0, int(round(float(base_targets_unscaled) * float(total_fraction))))
                     base_targets = max(min_targets, base_targets_scaled)
-                    perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
                     k_sel = min(base_targets, len(priority_catalogue))
-                    priority_catalogue = [priority_catalogue[int(i)] for i in perm[:k_sel]]
+                    if target_nonoverlap:
+                        priority_catalogue = _rejection_sample_targets(
+                            candidates=priority_catalogue,
+                            num_targets=k_sel,
+                            h=h,
+                            w=w,
+                            exclusion_box=max_box,
+                            device=x_clean.device,
+                            allow_partial_overlap=float(target_allow_partial_overlap),
+                        )
+                        k_sel = len(priority_catalogue)
+                    else:
+                        perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
+                        priority_catalogue = [priority_catalogue[int(i)] for i in perm[:k_sel]]
                     priority_good_candidates_bi = float(len(good_candidates))
                     priority_nonzero_mean_bi = float(nonzero_mean)
                     priority_auto_base_targets_bi = float(auto_base)
@@ -829,6 +899,9 @@ def prepare_context_batch(
     priority_n_target: int | str = 20,
     priority_min_targets_per_map: int = 0,
     priority_dithering_pixels: Optional[int] = None,
+    target_nonoverlap: bool = False,
+    target_allow_partial_overlap: float = 0.0,
+    mask_box_hardcap: int | None = None,
     cdd_use_gpu: bool = False,
 ):
     """Prepare context tensors from a clean batch.
@@ -866,6 +939,9 @@ def prepare_context_batch(
         priority_n_target=priority_n_target,
         priority_min_targets_per_map=priority_min_targets_per_map,
         priority_dithering_pixels=priority_dithering_pixels,
+        target_nonoverlap=target_nonoverlap,
+        target_allow_partial_overlap=target_allow_partial_overlap,
+        mask_box_hardcap=mask_box_hardcap,
         cdd_use_gpu=cdd_use_gpu,
     )
 
@@ -911,8 +987,8 @@ def extract_location_patches(
     # expanded integer index tensors.
     b_idx = torch.arange(b, device=z.device).view(b, 1, 1, 1, 1)
     c_idx = torch.arange(c, device=z.device).view(1, 1, c, 1, 1)
-    y_idx = y_idx.unsqueeze(2)  # B x K x 1 x P x P
-    x_idx = x_idx.unsqueeze(2)  # B x K x 1 x P x P
+    y_idx = y_idx.unsqueeze(2)  # Actual shape: B x K x 1 x P x 1
+    x_idx = x_idx.unsqueeze(2)  # Actual shape: B x K x 1 x 1 x P
 
     patches = z[b_idx, c_idx, y_idx, x_idx]  # B x K x C x P x P
     valid_mask = valid.view(b, k, 1, 1, 1)

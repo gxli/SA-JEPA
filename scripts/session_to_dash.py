@@ -462,6 +462,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     metrics_path = os.path.join(session_dir, "metrics.csv")
     loss_x, loss_total, loss_jepa = [], [], []
     loss_sigreg, loss_var, loss_cov = [], [], []
+    loss_symmetric, weighted_symmetric = [], []
     weighted_jepa, weighted_sigreg, weighted_var, weighted_cov = [], [], [], []
     if os.path.exists(metrics_path):
         with open(metrics_path, "r", encoding="utf-8") as f:
@@ -474,10 +475,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     tl = float(row.get("total_loss", row.get("loss_total", row.get("loss", "nan"))))
                     jl = float(row.get("loss_jepa", row.get("jepa_loss", "nan")))
                     sl = float(row.get("loss_sigreg", "nan"))
+                    syml = float(row.get("loss_symmetric", "nan"))
                     vl = float(row.get("loss_var", "nan"))
                     cl = float(row.get("loss_cov", "nan"))
                     wj = float(row.get("weighted_jepa", "nan"))
                     ws = float(row.get("weighted_sigreg", "nan"))
+                    wsym = float(row.get("weighted_symmetric", "nan"))
                     wv = float(row.get("weighted_var", "nan"))
                     wc = float(row.get("weighted_cov", "nan"))
                 except Exception:
@@ -492,10 +495,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     loss_total.append(tl)
                     loss_jepa.append(jl)
                     loss_sigreg.append(sl if np.isfinite(sl) else np.nan)
+                    loss_symmetric.append(syml if np.isfinite(syml) else np.nan)
                     loss_var.append(vl if np.isfinite(vl) else np.nan)
                     loss_cov.append(cl if np.isfinite(cl) else np.nan)
                     weighted_jepa.append(wj if np.isfinite(wj) else np.nan)
                     weighted_sigreg.append(ws if np.isfinite(ws) else np.nan)
+                    weighted_symmetric.append(wsym if np.isfinite(wsym) else np.nan)
                     weighted_var.append(wv if np.isfinite(wv) else np.nan)
                     weighted_cov.append(wc if np.isfinite(wc) else np.nan)
     effective_rank_x, effective_rank_y = [], []
@@ -545,11 +550,19 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             _mb = int(mc.get("mask_box_size", 0))
             _mf = float(mc.get("active_target_fraction", mc.get("mask_fraction", 1.0)))
             _ps = int(mc.get("patch_size", 3))
+            _symmetric = bool(mc.get("use_symmetric_feature_loss", False))
+            _norm_l2 = bool(mc.get("normalize_loss_l2", mc.get("normalize_loss", False)))
+            _sampling = str(mc.get("target_sampling_mode", "grid"))
+            _enc = str(mc.get("model_key", mc.get("encoder_type", "unknown")))
             mask_config_summary = [
+                f"encoder={_enc}",
                 f"mask_size_scaling={_ms}",
                 f"mask_box_size={_mb}",
                 f"active_target_fraction={_mf}",
                 f"patch_size={_ps}",
+                f"target_sampling={_sampling}",
+                f"use_symmetric_feature_loss={_symmetric}",
+                f"normalize_loss_l2={_norm_l2}",
             ]
             for s in _sigmas:
                 box = max(_ps, round(float(s) * _ms + _mb))
@@ -608,10 +621,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         loss_total=np.asarray(loss_total, dtype=np.float32),
         loss_jepa=np.asarray(loss_jepa, dtype=np.float32),
         loss_sigreg=np.asarray(loss_sigreg, dtype=np.float32),
+        loss_symmetric=np.asarray(loss_symmetric, dtype=np.float32),
         loss_var=np.asarray(loss_var, dtype=np.float32),
         loss_cov=np.asarray(loss_cov, dtype=np.float32),
         weighted_jepa=np.asarray(weighted_jepa, dtype=np.float32),
         weighted_sigreg=np.asarray(weighted_sigreg, dtype=np.float32),
+        weighted_symmetric=np.asarray(weighted_symmetric, dtype=np.float32),
         weighted_var=np.asarray(weighted_var, dtype=np.float32),
         weighted_cov=np.asarray(weighted_cov, dtype=np.float32),
         effective_rank_x=np.asarray(effective_rank_x, dtype=np.float64),
@@ -797,7 +812,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 xaxis_title="x",
                 yaxis_title="y",
                 zaxis_title="scale",
-                aspectmode="cube",
+                aspectmode="manual",
+                aspectratio=dict(x=w0, y=h0, z=max(w0, h0)),
                 camera=dict(projection=dict(type="orthographic")),
             ),
         )
@@ -807,10 +823,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     loss_total = np.asarray(data["loss_total"], dtype=np.float32) if "loss_total" in data.files else np.asarray([], dtype=np.float32)
     loss_jepa = np.asarray(data["loss_jepa"], dtype=np.float32) if "loss_jepa" in data.files else np.asarray([], dtype=np.float32)
     loss_sigreg = np.asarray(data["loss_sigreg"], dtype=np.float32) if "loss_sigreg" in data.files else np.asarray([], dtype=np.float32)
+    loss_symmetric = np.asarray(data["loss_symmetric"], dtype=np.float32) if "loss_symmetric" in data.files else np.asarray([], dtype=np.float32)
     loss_var = np.asarray(data["loss_var"], dtype=np.float32) if "loss_var" in data.files else np.asarray([], dtype=np.float32)
     loss_cov = np.asarray(data["loss_cov"], dtype=np.float32) if "loss_cov" in data.files else np.asarray([], dtype=np.float32)
     weighted_jepa = np.asarray(data["weighted_jepa"], dtype=np.float32) if "weighted_jepa" in data.files else np.asarray([], dtype=np.float32)
     weighted_sigreg = np.asarray(data["weighted_sigreg"], dtype=np.float32) if "weighted_sigreg" in data.files else np.asarray([], dtype=np.float32)
+    weighted_symmetric = np.asarray(data["weighted_symmetric"], dtype=np.float32) if "weighted_symmetric" in data.files else np.asarray([], dtype=np.float32)
     weighted_var = np.asarray(data["weighted_var"], dtype=np.float32) if "weighted_var" in data.files else np.asarray([], dtype=np.float32)
     weighted_cov = np.asarray(data["weighted_cov"], dtype=np.float32) if "weighted_cov" in data.files else np.asarray([], dtype=np.float32)
     def _smooth(y: np.ndarray, win: int = 25) -> np.ndarray:
@@ -862,6 +880,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 fig_loss_components.add_trace(go.Scattergl(x=lx, y=y, mode="lines", name=f"{name}(raw)", line=dict(width=1), opacity=0.2))
                 fig_loss_components.add_trace(go.Scattergl(x=lx, y=_smooth(y), mode="lines", name=f"{name}(smooth)", line=dict(width=2)))
         _add_if("loss_sigreg", loss_sigreg)
+        _add_if("loss_symmetric", loss_symmetric)
         _add_if("loss_var", loss_var)
         _add_if("loss_cov", loss_cov)
     fig_loss_components.update_layout(
@@ -879,6 +898,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         for name, arr in (
             ("weighted_jepa", weighted_jepa),
             ("weighted_sigreg", weighted_sigreg),
+            ("weighted_symmetric", weighted_symmetric),
             ("weighted_var", weighted_var),
             ("weighted_cov", weighted_cov),
         ):
