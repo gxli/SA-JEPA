@@ -14,10 +14,7 @@
     "target_nonoverlap": true,
     "mask_box_hardcap": 17,
     "mask_size_scaling": 0.0,
-    "mask_box_size": [
-      7,
-      11
-    ]
+    "mask_box_size": [3, 17]
   },
   "train": {
     "epochs": 10,

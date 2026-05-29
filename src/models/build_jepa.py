@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .cdd_opnet import CDDOpNetEncoder
 from .encoders import (
+    CDDFiLMScaleAwareConvNeXtEncoder,
     CDDScaleAwareConvNeXtEncoder,
     CDDScaleAwareResCNNEncoder,
     ConvNeXtDenseEncoder,
@@ -26,6 +27,24 @@ from .masking import (
 )
 from .predictor import FullResPredictor
 from .symmetry import symmetric_forward_2d
+
+# Shared encoder-type sets used by both build_jepa.py and train.py.
+CDD_CUBE_ENCODER_TYPES = frozenset({
+    "cdd_scaleaware_convnext",
+    "cdd_scaleaware_convnext_d4",
+    "cdd_scaleaware_rescnn",
+    "cdd_opnet",
+    "convnext_dense_pyramid",
+    "rescnn_dense_pyramid",
+    "pyramid_convnext_dilated",
+    "pyramid_cnn_res_dilated",
+    "cdd_film_scaleaware_convnext",
+})
+
+CDD_DEBUG_ENCODER_TYPES = frozenset(CDD_CUBE_ENCODER_TYPES | {
+    "convnext_dense_masktoken",
+    "convnext_dense_masktoken_d4",
+})
 
 
 class PyramidGridJEPA(nn.Module):
@@ -70,6 +89,8 @@ class PyramidGridJEPA(nn.Module):
         scaleaware_adapter_kernel_size: int = 3,
         scaleaware_fusion_type: str = "concat",
         scaleaware_norm_per_scale: bool = False,
+        use_film: bool = True,
+        use_per_scale_adapters: bool = False,
         opnet_dilation_mode: str = "half_cdd_scale",
         opnet_dilations=None,
         opnet_max_dilation: int = 16,
@@ -148,7 +169,9 @@ class PyramidGridJEPA(nn.Module):
         self.encoder_norm_eps = None if encoder_norm_eps is None else float(encoder_norm_eps)
         self.scaleaware_feat_channels = int(scaleaware_feat_channels)
         self.scaleaware_adapter_kernel_size = int(scaleaware_adapter_kernel_size)
-        self.scaleaware_fusion_type = str(scaleaware_fusion_type).lower()
+        self.scaleaware_fusion_type = str(scaleaware_fusion_type)
+        self.use_film = bool(use_film)
+        self.use_per_scale_adapters = bool(use_per_scale_adapters)
         self.scaleaware_norm_per_scale = bool(scaleaware_norm_per_scale)
         self.opnet_dilation_mode = str(opnet_dilation_mode)
         self.opnet_dilations = opnet_dilations
@@ -328,6 +351,25 @@ class PyramidGridJEPA(nn.Module):
                 norm_eps=self.encoder_norm_eps if self.encoder_norm_eps is not None else 1e-5,
                 cdd_append_last_residual=self.cdd_append_last_residual,
             )
+        elif self.encoder_type == "cdd_film_scaleaware_convnext":
+            if self.mode != "pyramid":
+                raise ValueError("cdd_film_scaleaware_convnext requires mode='pyramid'.")
+            self.context_encoder = CDDFiLMScaleAwareConvNeXtEncoder(
+                scales=tuple(float(s) for s in self.sigmas),
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=self.encoder_depth,
+                kernel_size=self.encoder_kernel_size,
+                expansion=4,
+                scale_feat_channels=self.scaleaware_feat_channels,
+                adapter_kernel_size=self.scaleaware_adapter_kernel_size,
+                fusion_type=self.scaleaware_fusion_type,
+                use_film=self.use_film,
+                use_per_scale_adapters=self.use_per_scale_adapters,
+                use_reflect_padding=True,
+                final_norm=True,
+                cdd_append_last_residual=self.cdd_append_last_residual,
+            )
         elif self.encoder_type == "convnext_dense":
             self.context_encoder = ConvNeXtDenseEncoder(
                 in_channels=1,
@@ -504,18 +546,7 @@ class PyramidGridJEPA(nn.Module):
             if invalid_pixel_mask.any():
                 x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
 
-            debug_encoder_types = {
-                "cdd_scaleaware_convnext",
-                "cdd_scaleaware_convnext_d4",
-                "cdd_scaleaware_rescnn",
-                "cdd_opnet",
-                "convnext_dense_pyramid",
-                "rescnn_dense_pyramid",
-                "pyramid_convnext_dilated",
-                "pyramid_cnn_res_dilated",
-                "convnext_dense_masktoken",
-                "convnext_dense_masktoken_d4",
-            }
+            debug_encoder_types = CDD_DEBUG_ENCODER_TYPES
             need_debug_tensors = bool(
                 return_debug
                 or self.encoder_type in debug_encoder_types
@@ -633,16 +664,7 @@ class PyramidGridJEPA(nn.Module):
         dip_per_ch = None
         cdd_orig_enc = None
         cdd_masked_enc = None
-        needs_cdd_cube = self.encoder_type in {
-            "cdd_scaleaware_convnext",
-            "cdd_scaleaware_convnext_d4",
-            "cdd_scaleaware_rescnn",
-            "cdd_opnet",
-            "convnext_dense_pyramid",
-            "rescnn_dense_pyramid",
-            "pyramid_convnext_dilated",
-            "pyramid_cnn_res_dilated",
-        }
+        needs_cdd_cube = self.encoder_type in CDD_CUBE_ENCODER_TYPES
         if needs_cdd_cube:
             cdd_orig = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
             cdd_masked = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
@@ -720,7 +742,7 @@ class PyramidGridJEPA(nn.Module):
                         mask_tokens=zero_mask_tokens,
                         floor_source=cdd_orig,
                     )
-        elif self.encoder_type in ("cdd_scaleaware_convnext", "cdd_scaleaware_convnext_d4", "cdd_scaleaware_rescnn"):
+        elif self.encoder_type in ("cdd_scaleaware_convnext", "cdd_scaleaware_convnext_d4", "cdd_scaleaware_rescnn", "cdd_film_scaleaware_convnext"):
             if self.mode != "pyramid":
                 raise ValueError(f"{self.encoder_type} requires mode='pyramid'.")
             mask_tokens = dip_per_ch

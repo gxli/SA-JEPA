@@ -32,10 +32,10 @@ from src.losses import (
     extract_valid_pooled_embeddings,
     sketched_sigreg_loss,
 )
-from src.models.build_jepa import PyramidGridJEPA
+from src.models.build_jepa import CDD_DEBUG_ENCODER_TYPES, PyramidGridJEPA
 from src.models.build_jepa3d import PyramidGridJEPA3D
 from src.models.masking import prepare_context_batch
-from src.viz import save_inference_dashboard, save_loss_curve, save_volumetric_umap_embeddings
+from src.utils.viz import save_inference_dashboard, save_loss_curve, save_volumetric_umap_embeddings
 
 def _fmt_metric(v: float) -> str:
     x = float(v)
@@ -69,21 +69,9 @@ def _prepare_context_from_model(
     return_debug: bool = False,
 ):
     enc_type = str(getattr(model, "encoder_type", "")).lower()
-    debug_encoder_types = {
-        "cdd_scaleaware_convnext",
-        "cdd_scaleaware_convnext_d4",
-        "cdd_scaleaware_rescnn",
-        "cdd_opnet",
-        "convnext_dense_pyramid",
-        "rescnn_dense_pyramid",
-        "pyramid_convnext_dilated",
-        "pyramid_cnn_res_dilated",
-        "convnext_dense_masktoken",
-        "convnext_dense_masktoken_d4",
-    }
     need_debug = bool(
         return_debug
-        or enc_type in debug_encoder_types
+        or enc_type in CDD_DEBUG_ENCODER_TYPES
         or bool(getattr(model, "use_image_mask_token", False))
     )
     mask_scale, mask_box_size = model.sample_mask_params(device=x_clean.device)
@@ -312,6 +300,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
             "cdd_scaleaware_rescnn",
             "cdd_opnet",
             "convnext_dense_pyramid",
+            "cdd_film_scaleaware_convnext",
         }
         if resolved_encoder_type not in allowed_pyramid:
             raise ValueError(
@@ -1234,7 +1223,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     if not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)):
         try:
-            from src.scale_probe import probe_scale_response
+            from src.utils.scale_probe import probe_scale_response
 
             probe_batch = next(iter(dataloader)).to(device, non_blocking=True)
             probe_batch = torch.nan_to_num(probe_batch, nan=0.0, posinf=0.0, neginf=0.0)

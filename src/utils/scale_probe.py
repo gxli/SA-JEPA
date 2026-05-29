@@ -249,7 +249,7 @@ def save_scale_response_plots(
     saved = []
 
     # Per-scale sensitivity maps (sample 0).
-    fig, axes = plt.subplots(1, S, figsize=(4 * S, 4))
+    fig, axes = plt.subplots(1, S, figsize=(4 * S + 1, 4))
     if S == 1:
         axes = [axes]
     vmax = float(sensitivity_maps[0].max().item())
@@ -263,7 +263,8 @@ def save_scale_response_plots(
         )
         axes[i].set_title(f"{scale_names[i]} sensitivity")
         axes[i].axis("off")
-        plt.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
+    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.02, location="right")
+    cbar.ax.tick_params(labelsize=8)
     fig.tight_layout()
     p = os.path.join(session_dir, f"{run_name}_scale_sensitivity_maps.png")
     fig.savefig(p, dpi=150, bbox_inches="tight")
@@ -273,14 +274,15 @@ def save_scale_response_plots(
     # Scale-only similarity maps.
     if "scale_only_sim_maps" in data:
         sim_maps = data["scale_only_sim_maps"]
-        fig, axes = plt.subplots(1, S, figsize=(4 * S, 4))
+        fig, axes = plt.subplots(1, S, figsize=(4 * S + 1, 4))
         if S == 1:
             axes = [axes]
         for i in range(S):
             im = axes[i].imshow(sim_maps[0, i].numpy(), cmap="RdYlBu_r", origin="upper")
             axes[i].set_title(f"{scale_names[i]} only-sim")
             axes[i].axis("off")
-            plt.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
+        cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.02, location="right")
+        cbar.ax.tick_params(labelsize=8)
         fig.tight_layout()
         p = os.path.join(session_dir, f"{run_name}_scale_only_similarity.png")
         fig.savefig(p, dpi=150, bbox_inches="tight")

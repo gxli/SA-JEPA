@@ -656,27 +656,123 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
             canvas = np.concatenate(rows, axis=0)
             scale = 12
             Image.fromarray(canvas, mode="RGB").resize(
-                (canvas.shape[1] * scale, canvas.shape[0] * scale), resample=Image.Resampling.NEAREST
+                (canvas.shape[1] * scale, canvas.shape[0] * scale), resample=Image.NEAREST
             ).save(mask_demo_path)
             mask_demo_rel = os.path.join("results", "mask_demo_channels_16x16.png")
 
-    # Check for scale response probe data and generate plots if needed.
-    scale_sens_rel = None
-    scale_winner_rel = None
+    # Scale response probe: load .pt data for Plotly rendering.
+    scale_probe_script = ""
     run_name = os.path.basename(session_dir)
     scale_pt_path = os.path.join(session_dir, f"{run_name}_scale_response.pt")
     if os.path.exists(scale_pt_path):
-        scale_sens_path = os.path.join(session_dir, f"{run_name}_scale_sensitivity_maps.png")
-        scale_winner_path = os.path.join(session_dir, f"{run_name}_scale_winner_map.png")
         try:
-            from src.scale_probe import save_scale_response_plots
-            save_scale_response_plots(session_dir, run_name=run_name)
+            sp_data = torch.load(scale_pt_path, map_location="cpu", weights_only=False)
+            sens_maps = sp_data["sensitivity_maps"][0].numpy()  # (S, H, W)
+            winner_map = sp_data.get("winner_map")
+            if winner_map is not None:
+                winner_map = winner_map.numpy()
+            S = sens_maps.shape[0]
+
+            # Per-scale sensitivity heatmaps with shared colorbar.
+            sens_div_id = f"scale-sens-{run_name}"
+            sens_traces = []
+            vmax = float(sens_maps.max())
+            for i in range(S):
+                sens_traces.append({
+                    "z": sens_maps[i].tolist(),
+                    "type": "heatmap",
+                    "colorscale": "Inferno",
+                    "zmin": 0,
+                    "zmax": vmax,
+                    "name": f"scale_{i}",
+                    "xaxis": f"x{i + 1}",
+                    "yaxis": f"y{i + 1}",
+                    "colorbar": {"len": 0.95, "y": 0.5, "thickness": 12, "tickfont": {"size": 9}} if i == S - 1 else None,
+                    "showscale": i == S - 1,
+                })
+            # Build subplot grid: 1 row × S columns.
+            annotations = []
+            for i in range(S):
+                annotations.append({
+                    "text": f"scale_{i}",
+                    "x": (i + 0.5) / S,
+                    "y": 1.02,
+                    "xref": "paper", "yref": "paper",
+                    "showarrow": False,
+                    "font": {"size": 11},
+                })
+            sens_layout = {
+                "grid": {"rows": 1, "columns": S, "pattern": "independent"},
+                "annotations": annotations,
+                "margin": {"l": 30, "r": 30, "t": 40, "b": 20},
+                "height": 380,
+                "template": "plotly_white",
+            }
+
+            # Winner map heatmap.
+            winner_div_id = f"scale-winner-{run_name}"
+            winner_traces = []
+            winner_layout = None
+            if winner_map is not None:
+                winner_traces.append({
+                    "z": winner_map.tolist(),
+                    "type": "heatmap",
+                    "colorscale": [[i / max(1, S - 1), f"hsl({int(360 * i / S)}, 70%, 50%)"] for i in range(S)],
+                    "zmin": 0,
+                    "zmax": S - 1,
+                    "colorbar": {"tickvals": list(range(S)), "ticktext": [f"scale_{i}" for i in range(S)], "len": 0.95, "thickness": 12},
+                })
+                winner_layout = {
+                    "margin": {"l": 30, "r": 30, "t": 20, "b": 20},
+                    "height": 400,
+                    "template": "plotly_white",
+                }
+
+            scale_probe_script = f"""
+<div id="{sens_div_id}" style="width:100%;height:400px;"></div>
+<div id="{winner_div_id}" style="width:100%;height:420px;"></div>
+<script>
+(function() {{
+  Plotly.newPlot('{sens_div_id}', {json.dumps(sens_traces)}, {json.dumps(sens_layout)}, {{ responsive: true }});
+  Plotly.newPlot('{winner_div_id}', {json.dumps(winner_traces)}, {json.dumps(winner_layout)}, {{ responsive: true }});
+}})();
+</script>
+"""
         except Exception as e:
-            print(f"[warning] scale probe plot generation failed: {type(e).__name__}: {e}")
-        if os.path.exists(scale_sens_path):
-            scale_sens_rel = os.path.join(os.path.basename(session_dir), os.path.basename(scale_sens_path))
-        if os.path.exists(scale_winner_path):
-            scale_winner_rel = os.path.join(os.path.basename(session_dir), os.path.basename(scale_winner_path))
+            print(f"[warning] scale probe Plotly rendering failed: {type(e).__name__}: {e}")
+
+    # Energy map: target vs pred difference (Plotly heatmap).
+    energy_map_script = ""
+    energy_map_path = os.path.join(session_dir, "target_energy_map.npy")
+    if os.path.exists(energy_map_path):
+        try:
+            emap = np.load(energy_map_path)
+            if emap.ndim == 4:
+                emap = emap[0, 0]
+            elif emap.ndim == 3:
+                emap = emap[0]
+            energy_div_id = f"energy-map-{run_name}"
+            energy_traces = [{
+                "z": emap.tolist(),
+                "type": "heatmap",
+                "colorscale": "Inferno",
+                "colorbar": {"len": 0.95, "thickness": 12, "tickfont": {"size": 9}},
+            }]
+            energy_layout = {
+                "margin": {"l": 30, "r": 30, "t": 20, "b": 20},
+                "height": 400,
+                "template": "plotly_white",
+            }
+            energy_map_script = f"""
+<div id="{energy_div_id}" style="width:100%;height:420px;"></div>
+<script>
+(function() {{
+  Plotly.newPlot('{energy_div_id}', {json.dumps(energy_traces)}, {json.dumps(energy_layout)}, {{ responsive: true }});
+}})();
+</script>
+"""
+        except Exception as e:
+            print(f"[warning] energy map Plotly rendering failed: {type(e).__name__}: {e}")
 
     # Read merged config for architecture summary.
     arch_summary_html = ""
@@ -851,12 +947,17 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     f'''
   <div class="section">
     <h2>Scale Response Probe</h2>
-    <div class="grid">
-      <div class="card"><p>Scale Sensitivity Maps</p><img src="{scale_sens_rel}" alt="scale_sensitivity_maps" /></div>
-      <div class="card"><p>Dominant Scale per Location</p><img src="{scale_winner_rel}" alt="scale_winner_map" /></div>
-    </div>
+    {scale_probe_script}
   </div>
-''' if scale_sens_rel is not None and scale_winner_rel is not None else ""
+''' if scale_probe_script else ""
+  }
+  {
+    f'''
+  <div class="section">
+    <h2>Energy Map (target vs pred)</h2>
+    {energy_map_script}
+  </div>
+''' if energy_map_script else ""
   }
 </body>
 </html>
@@ -880,7 +981,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
                 "x": loss_x,
                 "y": loss_weighted[w_col],
                 "mode": "lines",
-                "name": f"{label} (\xd7{w:.3g})",
+                "name": label,
             })
 
         script = f"""
@@ -890,11 +991,10 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
   if (traces.length === 0) return;
 
   Plotly.newPlot('loss-plot', traces, {{
-    title: 'Training Loss',
     xaxis: {{ title: 'epoch + 0.001*batch' }},
     yaxis: {{ title: 'weighted loss' }},
     template: 'plotly_white',
-    margin: {{ l: 60, r: 20, t: 50, b: 55 }},
+    margin: {{ l: 60, r: 20, t: 20, b: 55 }},
     legend: {{ x: 1.02, y: 1.0, xanchor: 'left' }},
     height: 420,
   }}, {{ responsive: true }});

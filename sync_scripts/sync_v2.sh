@@ -126,7 +126,7 @@ case "$1" in
         ssh "$REMOTE" "mkdir -p \"$REMOTE_HOME/proj/$VERSIONED_REL_PATH\""
         run_rsync_retry "${RSYNC_COMMON[@]}" \
             ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
-            --delete \
+            --delete --force \
             --exclude '.git' \
             --exclude '/experiments/' \
             --exclude 'result_local/' \
@@ -143,7 +143,7 @@ case "$1" in
         run_rsync_retry "${RSYNC_COMMON[@]}" \
             ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
             --dry-run \
-            --delete \
+            --delete --force \
             --exclude '.git' \
             --exclude '/experiments/' \
             --exclude 'result_local/' \

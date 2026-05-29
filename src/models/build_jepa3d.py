@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .encoders3d import ScaleAwareConvNeXt3DEncoder
+from .encoders3d import ScaleAwareConvNeXt3DEncoder, ScaleFiLMConvNeXt3DEncoder
 from .masking import extract_location_patches
 from .masking3d import extract_location_cubes, make_gaussian_pyramid3d, sample_target_locations_3d
 from .predictor import FullResPredictor
@@ -36,6 +36,8 @@ class PyramidGridJEPA3D(nn.Module):
         slab_depth: int = 3,
         slab_boundary_margin: int = 0,
         use_symmetric_feature_loss: bool = False,
+        use_film: bool = True,
+        use_per_scale_adapters: bool = False,
     ):
         super().__init__()
         self.sigmas = tuple(sigmas)
@@ -50,16 +52,31 @@ class PyramidGridJEPA3D(nn.Module):
         self.slab_depth = max(1, int(slab_depth))
         self.slab_boundary_margin = max(0, int(slab_boundary_margin))
         self.use_symmetric_feature_loss = bool(use_symmetric_feature_loss)
+        self.use_film = bool(use_film)
+        self.use_per_scale_adapters = bool(use_per_scale_adapters)
 
-        self.context_encoder = ScaleAwareConvNeXt3DEncoder(
-            num_scales=len(self.sigmas),
-            out_channels=int(latent_channels),
-            scale_channels=int(scale_channels),
-            depth=int(encoder_depth),
-            kernel_size=int(encoder_kernel_size),
-            stride=int(encoder_stride),
-            fusion=str(fusion),
-        )
+        if self.use_film or self.use_per_scale_adapters:
+            self.context_encoder = ScaleFiLMConvNeXt3DEncoder(
+                num_scales=len(self.sigmas),
+                out_channels=int(latent_channels),
+                scale_channels=int(scale_channels),
+                depth=int(encoder_depth),
+                kernel_size=int(encoder_kernel_size),
+                stride=int(encoder_stride),
+                fusion=str(fusion),
+                use_film=self.use_film,
+                use_per_scale_adapters=self.use_per_scale_adapters,
+            )
+        else:
+            self.context_encoder = ScaleAwareConvNeXt3DEncoder(
+                num_scales=len(self.sigmas),
+                out_channels=int(latent_channels),
+                scale_channels=int(scale_channels),
+                depth=int(encoder_depth),
+                kernel_size=int(encoder_kernel_size),
+                stride=int(encoder_stride),
+                fusion=str(fusion),
+            )
         self.target_encoder = copy.deepcopy(self.context_encoder)
         for p in self.target_encoder.parameters():
             p.requires_grad_(False)
