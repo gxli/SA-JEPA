@@ -1,40 +1,6 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
-
-
-def gaussian_kernel1d_3d(sigma: float, device, dtype, truncate: float = 3.0):
-    radius = max(1, int(round(truncate * float(sigma))))
-    x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
-    k = torch.exp(-0.5 * (x / float(sigma)) ** 2)
-    k = k / k.sum()
-    return k
-
-
-def gaussian_blur3d(x: torch.Tensor, sigma: float):
-    if sigma <= 0:
-        return x
-    _, c, _, _, _ = x.shape
-    k = gaussian_kernel1d_3d(sigma, x.device, x.dtype)
-    r = k.numel() // 2
-
-    kd = k.view(1, 1, -1, 1, 1).repeat(c, 1, 1, 1, 1)
-    x = F.conv3d(F.pad(x, (0, 0, 0, 0, r, r), mode="replicate"), kd, groups=c)
-
-    kh = k.view(1, 1, 1, -1, 1).repeat(c, 1, 1, 1, 1)
-    x = F.conv3d(F.pad(x, (0, 0, r, r, 0, 0), mode="replicate"), kh, groups=c)
-
-    kw = k.view(1, 1, 1, 1, -1).repeat(c, 1, 1, 1, 1)
-    x = F.conv3d(F.pad(x, (r, r, 0, 0, 0, 0), mode="replicate"), kw, groups=c)
-    return x
-
-
-def make_gaussian_pyramid3d(x: torch.Tensor, sigmas=(2, 4, 8, 16)):
-    chans = []
-    for s in sigmas:
-        chans.append(gaussian_blur3d(x, float(s)).squeeze(1))
-    return torch.stack(chans, dim=1)
 
 
 def sample_target_locations_3d(
@@ -54,7 +20,7 @@ def sample_target_locations_3d(
     lo_x = half
     hi_x = width - (patch_size - half)
 
-    if hi_z <= lo_z or hi_y <= lo_y or hi_x <= lo_x:
+    if hi_z < lo_z or hi_y < lo_y or hi_x < lo_x:
         raise ValueError("Patch too large for volume")
 
     z = torch.randint(lo_z, hi_z + 1, (batch_size, num_targets), device=device)

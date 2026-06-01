@@ -18,8 +18,6 @@ if ROOT_DIR not in sys.path:
 from src.dataset import JEPADataset
 from src.models.build_jepa import make_pyramid_grid_context
 
-DEMO_BOX_SIGMA_MULT = 4.0
-DEMO_DIP_SIGMA_MULT = 1.0
 DEMO_MASK_FILL_MODE = "zero"
 DEMO_FULL_GRID = True
 
@@ -29,27 +27,11 @@ def load_config(path: str) -> dict:
         return json.load(f)
 
 
-def build_dataset(data_cfg: dict, for_cdd_masking: bool = False) -> JEPADataset:
-    ds_log_transform = bool(data_cfg.get("log_transform", True))
-    ds_apply_cdd = True
-    if for_cdd_masking:
-        ds_log_transform = False
-        ds_apply_cdd = False
+def build_dataset(data_cfg: dict) -> JEPADataset:
     return JEPADataset(
         num_samples=max(1, int(data_cfg.get("num_samples", 1))),
-        image_size=int(data_cfg.get("image_size", 256)),
         data_root=data_cfg.get("data_root", "data"),
         npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-        log_transform=ds_log_transform,
-        log_eps=float(data_cfg.get("log_eps", 1.0)),
-        cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8]),
-        cdd_strength=float(data_cfg.get("cdd_strength", 1.0)),
-        cdd_clip=bool(data_cfg.get("cdd_clip", True)),
-        norm_before_cdd=bool(data_cfg.get("norm_before_cdd", True)),
-        cdd_mode=data_cfg.get("cdd_mode", "log"),
-        cdd_constrained=bool(data_cfg.get("cdd_constrained", True)),
-        cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-        apply_cdd=ds_apply_cdd,
         cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
         cube_slice_axis=int(data_cfg.get("cube_slice_axis", 0)),
         cube_slice_index=int(data_cfg.get("cube_slice_index", 0)),
@@ -62,18 +44,14 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         x_clean=x,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
-        box_sigma_mult=DEMO_BOX_SIGMA_MULT,
         mask_scale=float(model_cfg.get("mask_size_scaling", 1.0)),
         spacing_scale=float(model_cfg.get("mask_spacing_scaling", 1.5)),
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
         mask_box_size=int(model_cfg.get("mask_box_size", 16)),
-        blur_mode=model_cfg.get("blur_mode", "cdd"),
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-        dip_sigma_mult=DEMO_DIP_SIGMA_MULT,
-        constant_gaussian_sigma=float(model_cfg.get("constant_gaussian_sigma", 1.0)),
         return_debug=True,
     )
 
@@ -93,7 +71,7 @@ def evaluate_mask_symmetry(
         x = ds[i % len(ds)][0].numpy().astype(np.float32)
         x_t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
         _, _, _, _, debug = make_context_and_debug(x_t, model_cfg_run, int(base_seed + i))
-        if visit_source == "gaussian":
+        if visit_source == "channel_mask":
             dip_t = debug.get("dip_field")
             if dip_t is None or dip_t.numel() == 0:
                 mask = np.clip(debug["mask_map"][0].cpu().numpy().astype(np.float32), 0.0, 1.0)
@@ -131,8 +109,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate mask boundary symmetry via aggregate heatmap")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--sessions-dir", type=str, default="sessions")
-    parser.add_argument("--mask-mode", type=str, choices=["config", "zero", "gaussian_dip"], default="config")
-    parser.add_argument("--force-blur-mode", type=str, choices=["gaussian", "cdd"], default=None)
+    parser.add_argument("--mask-mode", type=str, choices=["config", "zero", "channel_mask"], default="config")
     parser.add_argument("--rigid-mask-box", action="store_true")
     parser.add_argument("--no-align-scales", action="store_true", help="Disable shared cross-scale aligned grid centers")
     parser.add_argument("--no-full-grid", action="store_true", help="Sample a stochastic subset instead of full lattice")
@@ -142,9 +119,9 @@ def main():
     parser.add_argument(
         "--visit-source",
         type=str,
-        choices=["hard", "gaussian", "centers"],
+        choices=["hard", "channel_mask", "centers"],
         default="hard",
-        help="What to accumulate: hard mask footprint, gaussian dip field, or centers only",
+        help="What to accumulate: hard mask footprint, per-channel CDD mask, or centers only",
     )
     args = parser.parse_args()
 
@@ -159,8 +136,6 @@ def main():
     if mode == "config":
         mode = DEMO_MASK_FILL_MODE
     model_cfg["mask_fill_mode"] = mode
-    if args.force_blur_mode is not None:
-        model_cfg["blur_mode"] = args.force_blur_mode
     if args.rigid_mask_box:
         model_cfg["mask_size_scaling"] = 0.0
     else:
@@ -173,7 +148,7 @@ def main():
     if args.no_global_shift:
         model_cfg["global_shift"] = False
 
-    ds = build_dataset(data_cfg, for_cdd_masking=(model_cfg.get("blur_mode", "cdd") == "cdd"))
+    ds = build_dataset(data_cfg)
     heat, metrics = evaluate_mask_symmetry(
         ds,
         model_cfg,

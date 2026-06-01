@@ -11,13 +11,7 @@ BASE_DATA = {
     "data_root": "data",
     "npy_pattern": "C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy",
     "num_samples": 200,
-    "image_size": 256,
-    "log_transform": True,
     "log_eps": 1e-06,
-    "cdd_scales": [2, 4, 8, 16],
-    "cdd_strength": 1,
-    "cdd_clip": True,
-    "norm_before_cdd": True,
     "cdd_mode": "log",
     "cdd_constrained": True,
     "cdd_sm_mode": "reflect",
@@ -25,9 +19,6 @@ BASE_DATA = {
     "cube_slice_axis": 0,
     "cube_slice_index": 0,
     "random_roll_max": 0,
-    "cache_cdd": True,
-    "cache_random_slices": True,
-    "precompute_cdd_cache_all_slices": True,
     "d4_augment": True,
 }
 
@@ -61,7 +52,6 @@ BASE_TRAIN = {
 
 PYRAMID_MODEL_BASE = {
     "mode": "pyramid",
-    "blur_mode": "cdd",
     "model_key": "cdd_scaleaware_convnext-pyramid-scaleaware",
     "sigmas": [2, 4, 8, 16],
     "latent_channels": 32,
@@ -97,7 +87,6 @@ PYRAMID_MODEL_BASE = {
 
 IMAGE_MODEL_BASE = {
     "mode": "image",
-    "blur_mode": "cdd",
     "model_key": "convnext_image_dense_masked",
     "sigmas": [2, 4, 8, 16],
     "latent_channels": 32,

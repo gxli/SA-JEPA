@@ -90,7 +90,8 @@ def probe_scale_response(
     pred_full_n = None
     if include_predictor and hasattr(model, "predictor"):
         try:
-            pred_full = model.predictor(z_full)
+            z_in_full = model.projector(z_full) if hasattr(model, "projector") else z_full
+            pred_full = model.predictor(z_in_full)
             pred_full_n = _normalize_channel_map(pred_full)
         except Exception:
             pred_full = None
@@ -110,7 +111,8 @@ def probe_scale_response(
         sensitivity_maps.append(diff)
 
         if pred_full_n is not None:
-            pred_drop = model.predictor(z_drop)
+            z_in_drop = model.projector(z_drop) if hasattr(model, "projector") else z_drop
+            pred_drop = model.predictor(z_in_drop)
             pred_drop_n = _normalize_channel_map(pred_drop)
             pred_diff = (pred_full_n - pred_drop_n).pow(2).sum(dim=1).sqrt()
             pred_sensitivity_maps.append(pred_diff)

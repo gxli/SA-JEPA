@@ -1,9 +1,7 @@
 {
   "base_config": "../base_pyramid_scaleaware_convnext.json",
   "data": {
-    "npy_pattern": "chengdu.npy",
-    "log_transform": true,
-    "norm_before_cdd": true
+    "npy_pattern": "chengdu.npy"
   },
   "model": {
     "mode": "pyramid",

@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import os
 import subprocess
 import sys
-from collections import defaultdict
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -325,40 +321,6 @@ render(1.0, 99.0);
     return out_path
 
 
-def save_blurred_debug_images(
-    project_root: str,
-    session_name: str,
-    x_clean_raw: torch.Tensor,
-    x_context_raw: torch.Tensor,
-    max_images: int = 8,
-) -> str:
-    out_dir = os.path.join(project_root, "results", "debug_blurred_images", session_name)
-    os.makedirs(out_dir, exist_ok=True)
-    n = min(int(max_images), int(x_context_raw.shape[0]))
-    for i in range(n):
-        clean = x_clean_raw[i, 0].detach().cpu().numpy().astype(np.float32)
-        ctx = x_context_raw[i, 0].detach().cpu().numpy().astype(np.float32)
-        delta = clean - ctx
-        _save_png(os.path.join(out_dir, f"{i:03d}_clean.png"), clean, cmap="gray")
-        _save_png(os.path.join(out_dir, f"{i:03d}_context_blurred.png"), ctx, cmap="gray")
-        _save_png(os.path.join(out_dir, f"{i:03d}_clean_minus_context.png"), delta, cmap="coolwarm")
-    return out_dir
-
-
-def save_context_reference_images(session_dir: str, x_clean_raw: torch.Tensor, x_context_input: torch.Tensor) -> str:
-    out_dir = os.path.join(session_dir, "results")
-    os.makedirs(out_dir, exist_ok=True)
-    clean = x_clean_raw[0, 0].detach().cpu().numpy().astype(np.float32)
-    ctx = x_context_input[0, 0].detach().cpu().numpy().astype(np.float32)
-    delta = clean - ctx
-    _save_png(os.path.join(out_dir, "reference_000_clean.png"), clean, cmap="gray")
-    _save_png(os.path.join(out_dir, "reference_000_context_input.png"), ctx, cmap="gray")
-    _save_png(os.path.join(out_dir, "reference_000_clean_minus_context_input.png"), delta, cmap="coolwarm")
-    # Backward compatibility for downstream scripts still expecting old filenames.
-    _save_png(os.path.join(out_dir, "reference_000_context_blurred.png"), ctx, cmap="gray")
-    _save_png(os.path.join(out_dir, "reference_000_clean_minus_context.png"), delta, cmap="coolwarm")
-    return out_dir
-
 
 def _build_input_validity_mask(x_clean_raw: torch.Tensor, target_h: int, target_w: int) -> np.ndarray:
     """Build a bool validity mask at latent-map resolution from the raw input.
@@ -630,96 +592,3 @@ def save_volumetric_umap_embeddings(session_dir: str, outputs: dict, umap_cfg: d
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     return meta_path
-
-
-def save_loss_curve(session_dir: str):
-    metrics_path = os.path.join(session_dir, "metrics.csv")
-    if not os.path.exists(metrics_path):
-        return None
-    x_ep = []
-    total = []
-    jepa = []
-    with open(metrics_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            x_ep.append(float(row["epoch"]) + 0.001 * float(row["batch"]))
-            total.append(float(row["total_loss"]))
-            jepa.append(float(row["loss_mse"]))
-    if len(x_ep) == 0:
-        return None
-    # Matplotlib-free lightweight output for compatibility.
-    out_path = os.path.join(session_dir, "loss_curve.csv")
-    with open(out_path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["x", "total_loss", "loss_mse"])
-        for x, t, j in zip(x_ep, total, jepa):
-            w.writerow([x, t, j])
-    return out_path
-def _normalize01(x: np.ndarray) -> np.ndarray:
-    arr = np.asarray(x, dtype=np.float32)
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-    lo = float(np.min(arr))
-    hi = float(np.max(arr))
-    if hi <= lo:
-        return np.zeros_like(arr, dtype=np.float32)
-    return (arr - lo) / (hi - lo)
-
-
-def _apply_cmap(x: np.ndarray, cmap: str = "gray") -> np.ndarray:
-    z = _normalize01(x)
-    if cmap == "gray":
-        g = np.clip(np.round(z * 255.0), 0, 255).astype(np.uint8)
-        return np.stack([g, g, g], axis=-1)
-    if cmap == "coolwarm":
-        # Simple blue-white-red diverging map for signed deltas.
-        v = np.nan_to_num(np.asarray(x, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-        m = float(max(1e-12, np.percentile(np.abs(v), 99.0)))
-        t = np.clip(v / m, -1.0, 1.0)
-        r = np.where(t >= 0, 255, 255 * (1.0 + t))
-        g = 255 * (1.0 - np.abs(t))
-        b = np.where(t <= 0, 255, 255 * (1.0 - t))
-        return np.stack([r, g, b], axis=-1).clip(0, 255).astype(np.uint8)
-    if cmap in ("magma", "viridis"):
-        # Lightweight perceptual ramps (approximate) without matplotlib.
-        if cmap == "magma":
-            anchors = np.array(
-                [[0.00, 0, 0, 4], [0.25, 59, 15, 112], [0.50, 182, 54, 121], [0.75, 251, 140, 60], [1.00, 252, 253, 191]],
-                dtype=np.float32,
-            )
-        else:
-            anchors = np.array(
-                [[0.00, 68, 1, 84], [0.25, 59, 82, 139], [0.50, 33, 145, 140], [0.75, 94, 201, 98], [1.00, 253, 231, 37]],
-                dtype=np.float32,
-            )
-        flat = z.reshape(-1)
-        out = np.zeros((flat.shape[0], 3), dtype=np.float32)
-        xs = anchors[:, 0]
-        for c in range(3):
-            out[:, c] = np.interp(flat, xs, anchors[:, c + 1])
-        return out.reshape(z.shape + (3,)).clip(0, 255).astype(np.uint8)
-    g = np.clip(np.round(z * 255.0), 0, 255).astype(np.uint8)
-    return np.stack([g, g, g], axis=-1)
-
-
-def _save_png(path: str, arr: np.ndarray, cmap: str = "gray", nan_black: bool = False) -> None:
-    a = np.asarray(arr)
-    mask = np.isnan(a)
-    rgb = _apply_cmap(a, cmap=cmap)
-    if nan_black and mask.any():
-        rgb[mask] = 0
-    Image.fromarray(np.flipud(rgb), mode="RGB").save(path)
-
-
-def _save_png_with_colorbar(path: str, arr: np.ndarray, cmap: str = "viridis", nan_black: bool = False) -> None:
-    a = np.asarray(arr, dtype=np.float32)
-    masked = np.ma.masked_invalid(a)
-    fig, ax = plt.subplots(figsize=(5, 5))
-    im = ax.imshow(masked, cmap=cmap, origin="upper", interpolation="nearest")
-    if nan_black:
-        ax.set_facecolor("black")
-    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.ax.tick_params(labelsize=8)
-    ax.axis("off")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=ax.get_facecolor())
-    plt.close(fig)

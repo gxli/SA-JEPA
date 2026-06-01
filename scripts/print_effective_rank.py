@@ -22,7 +22,6 @@ def _read_model_inputs(session_dir: str) -> dict:
             "mode": str(m.get("mode", "NA")),
             "mask_fraction": str(m.get("active_target_fraction", m.get("mask_fraction", "NA"))),
             "mask_size": str(m.get("mask_size_scaling", m.get("mask_size", "NA"))),
-            "norm_before_cdd": _fmt_bool(d.get("norm_before_cdd", True)),
             "normalize_loss_l2": _fmt_bool(m.get("normalize_loss_l2", m.get("normalize_loss", False))),
             "predictor_layernorm": _fmt_bool(m.get("predictor_layernorm", True)),
             "scaleaware_norm_per_scale": _fmt_bool(m.get("scaleaware_norm_per_scale", False)),
@@ -46,7 +45,6 @@ def _missing_model_inputs() -> dict:
         "mode": "NA",
         "mask_fraction": "NA",
         "mask_size": "NA",
-        "norm_before_cdd": "-",
         "normalize_loss_l2": "-",
         "predictor_layernorm": "-",
         "scaleaware_norm_per_scale": "-",
@@ -194,7 +192,6 @@ def main() -> int:
                 inputs["mode"],
                 inputs["mask_fraction"],
                 inputs["mask_size"],
-                inputs["norm_before_cdd"],
                 inputs["normalize_loss_l2"],
                 inputs["predictor_layernorm"],
                 inputs["scaleaware_norm_per_scale"],
@@ -226,7 +223,7 @@ def main() -> int:
     session_w = max([len("session"), *(len(row[0]) for row in rows_sorted)])
     header = (
         f"{'session':<{session_w}} {'mode':<8} {'mfrac':>6} {'mscale':>6} "
-        f"{'cddn':>4} {'l2n':>3} {'pln':>3} {'psn':>3} {'adn':>3} {'stn':>3} {'fin':>3} "
+        f"{'l2n':>3} {'pln':>3} {'psn':>3} {'adn':>3} {'stn':>3} {'fin':>3} "
         f"{'fin_type':<9} {'enc_norm':<9} {'grn':>3} "
         f"{'erank':>9} {'ctx_er':>9} {'pred_er':>9} {'gt_er':>9} "
         f"{'t1':>7} {'t4':>7} {'t8':>7} {'pred_pr':>9} {'gt_pr':>9} "
@@ -240,7 +237,6 @@ def main() -> int:
             mode,
             mf,
             ms,
-            norm_before_cdd,
             normalize_loss_l2,
             predictor_layernorm,
             scaleaware_norm_per_scale,
@@ -267,7 +263,7 @@ def main() -> int:
         dead_n_str = p_dead_n if p_dead_n != "" else "-"
         print(
             f"{s:<{session_w}} {mode:<8} {_fmt_float(mf,6,2)} {_fmt_float(ms,6,2)} "
-            f"{norm_before_cdd:>4} {normalize_loss_l2:>3} {predictor_layernorm:>3} "
+            f"{normalize_loss_l2:>3} {predictor_layernorm:>3} "
             f"{scaleaware_norm_per_scale:>3} {scaleaware_adapter_norm:>3} "
             f"{scaleaware_stem_norm:>3} {scaleaware_final_norm:>3} "
             f"{encoder_final_norm_type:<9} {encoder_norm_type:<9} {use_grn:>3} "
@@ -277,7 +273,7 @@ def main() -> int:
         )
 
     n_total = len(rows_sorted)
-    n_rank = sum(1 for r in rows_sorted if r[14] != "")
+    n_rank = sum(1 for r in rows_sorted if r[13] != "")
     print("-" * len(header))
     print(f"sessions={n_total} with_rank={n_rank} missing_rank={n_total - n_rank}")
     return 0

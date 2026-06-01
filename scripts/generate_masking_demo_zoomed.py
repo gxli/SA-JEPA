@@ -36,7 +36,7 @@ def _zoom_panel_from_config(
     model_cfg = cfg.get("model", {})
     data_cfg = cfg.get("data", {})
 
-    ds = build_dataset(data_cfg, for_cdd_masking=(model_cfg.get("blur_mode", "cdd") == "cdd"))
+    ds = build_dataset(data_cfg)
     x = ds[int(sample_index) % len(ds)][0].numpy().astype(np.float32)
     x_t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
 
@@ -61,12 +61,7 @@ def _zoom_panel_from_config(
     dip_t = debug.get("dip_field_per_channel")
     if dip_t is None or dip_t.numel() == 0:
         raise RuntimeError(f"dip_field_per_channel missing for config: {config_path}")
-    mask_fill_mode = str(model_cfg.get("mask_fill_mode", "zero"))
-    interp_mode = "bilinear" if "gaussian" in mask_fill_mode else "nearest"
-    if interp_mode in ("bilinear", "bicubic"):
-        dip = F.interpolate(dip_t[:1], size=(h_enc, w_enc), mode=interp_mode, align_corners=False)[0].cpu().numpy()
-    else:
-        dip = F.interpolate(dip_t[:1], size=(h_enc, w_enc), mode=interp_mode)[0].cpu().numpy()
+    dip = F.interpolate(dip_t[:1], size=(h_enc, w_enc), mode="nearest")[0].cpu().numpy()
     if binarize_mask:
         mask_agg = (dip.max(axis=0) > 1e-6).astype(np.float32)
     else:

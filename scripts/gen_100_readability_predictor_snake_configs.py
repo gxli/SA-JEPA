@@ -40,8 +40,6 @@ def _config(npy_pattern: str, mask_size_scaling: float, symmetry_weight: float) 
         "base_config": BASE_CONFIG,
         "data": {
             "npy_pattern": npy_pattern,
-            "log_transform": True,
-            "norm_before_cdd": True,
         },
         "model": {
             "mode": "pyramid",
@@ -79,7 +77,6 @@ def _config(npy_pattern: str, mask_size_scaling: float, symmetry_weight: float) 
             "mse_loss_weight": 50.0,
             "vicreg_var_weight": 0.0,
             "vicreg_cov_weight": 0.0,
-            "sigreg_on_pred": True,
             "sigreg_weight": 10.0,
             "sigreg_sketch_dim": 64,
             "symmetric_feature_loss_weight": float(symmetry_weight),

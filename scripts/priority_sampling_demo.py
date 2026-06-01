@@ -15,12 +15,6 @@ if ROOT_DIR not in sys.path:
 from src.dataset import JEPADataset
 from src.models.masking import make_pyramid_grid_context
 
-DEMO_BOX_SIGMA_MULT = 4.0
-DEMO_MASK_SIZE = 0.0
-DEMO_DIP_SIGMA_MULT = 1.0
-DEMO_SCALEAWARE_GAUSSIAN_RATIOS = (0.25, 0.5, 1.0, 2.0)
-
-
 def _load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -30,19 +24,8 @@ def _build_dataset(data_cfg: dict) -> JEPADataset:
     # Keep demo aligned with cdd-mode training: no dataset CDD, no pre-log.
     return JEPADataset(
         num_samples=max(1, int(data_cfg.get("num_samples", 1))),
-        image_size=int(data_cfg.get("image_size", 256)),
         data_root=data_cfg.get("data_root", "data"),
         npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-        log_transform=False,
-        log_eps=float(data_cfg.get("log_eps", 1.0)),
-        cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8, 16]),
-        cdd_strength=float(data_cfg.get("cdd_strength", 1.0)),
-        cdd_clip=bool(data_cfg.get("cdd_clip", True)),
-        norm_before_cdd=bool(data_cfg.get("norm_before_cdd", True)),
-        cdd_mode=data_cfg.get("cdd_mode", "log"),
-        cdd_constrained=bool(data_cfg.get("cdd_constrained", True)),
-        cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-        apply_cdd=False,
         cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
         cube_slice_axis=int(data_cfg.get("cube_slice_axis", 0)),
         cube_slice_index=int(data_cfg.get("cube_slice_index", 0)),
@@ -70,7 +53,7 @@ def main():
     cfg = _load_config(args.config)
     model_cfg = dict(cfg.get("model", {}))
     data_cfg = dict(cfg.get("data", {}))
-    model_cfg.setdefault("target_sampling_mode", "priority_sampliyg")
+    model_cfg.setdefault("target_sampling_mode", "priority_sampling")
     if args.top_percent is not None:
         model_cfg["priority_top_percent"] = float(args.top_percent)
     if args.n_target is not None:
@@ -89,23 +72,18 @@ def main():
         x_clean=x,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
-        box_sigma_mult=DEMO_BOX_SIGMA_MULT,
         mask_scale=float(model_cfg.get("mask_size_scaling", 1.0)),
         spacing_scale=float(model_cfg.get("mask_spacing_scaling", 2.0)),
-        mask_size=DEMO_MASK_SIZE,
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
         mask_box_size=int(model_cfg.get("mask_box_size", 16)),
-        blur_mode=str(model_cfg.get("blur_mode", "cdd")),
         cdd_mode=str(model_cfg.get("cdd_mode", "log")),
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=str(model_cfg.get("cdd_sm_mode", "reflect")),
-        dip_sigma_mult=DEMO_DIP_SIGMA_MULT,
-        scaleaware_gaussian_ratios=DEMO_SCALEAWARE_GAUSSIAN_RATIOS,
         cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
         inner_target_size=int(model_cfg.get("patch_size", 2)),
         return_debug=True,
-        target_sampling_mode=str(model_cfg.get("target_sampling_mode", "priority_sampliyg")),
+        target_sampling_mode=str(model_cfg.get("target_sampling_mode", "priority_sampling")),
         priority_top_percent=float(model_cfg.get("priority_top_percent", 5.0)),
         priority_n_target=pnt_val,
     )

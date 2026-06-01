@@ -217,6 +217,11 @@ def _effective_mask_box_size(
     mask_box_size=0 -> pure pyramid (box proportional to sigma).
     hardcap clamps the result to a maximum (None or 0 = no cap).
     """
+    if hardcap is not None and hardcap > 0 and int(hardcap) < int(inner_target_size):
+        raise ValueError(
+            f"mask_box_hardcap={int(hardcap)} cannot be smaller than "
+            f"inner_target_size={int(inner_target_size)}"
+        )
     base_box = round(float(sigma) * float(mask_scale) + int(mask_box_size))
     box = max(base_box, int(inner_target_size))
     capped = False
@@ -260,7 +265,6 @@ def make_pyramid_grid_context(
     global_shift: bool = True,
     align_scales: bool = True,
     mask_box_size: int = 16,
-    blur_mode: str = "gaussian",
     cdd_mode: str = "log",
     cdd_constrained: bool = True,
     cdd_sm_mode: str = "reflect",
@@ -301,8 +305,6 @@ def make_pyramid_grid_context(
         inner_target_size = inner_target_size + 1
     if x_clean.shape[1] != 1:
         raise ValueError(f"Expected grayscale input with 1 channel, got {x_clean.shape[1]}")
-    if blur_mode not in ("gaussian", "cdd"):
-        raise ValueError(f"Unsupported blur_mode: {blur_mode}")
     sampling_mode = str(target_sampling_mode).strip().lower()
     if priority_dithering_pixels is None or priority_dithering_pixels <= 0:
         priority_dithering_pixels = inner_target_size
@@ -314,6 +316,8 @@ def make_pyramid_grid_context(
 
     b, _, h, w = x_clean.shape
     active_sigmas = tuple(float(s) for s in sigmas)
+    if not active_sigmas:
+        raise ValueError("sigmas must contain at least one CDD scale")
     n_sigmas = len(active_sigmas)
     total_fraction = max(0.0, float(mask_fraction))
     per_scale_fraction = total_fraction / max(1, n_sigmas)
@@ -353,7 +357,13 @@ def make_pyramid_grid_context(
 
         # Compute shared grid centers for scale alignment
         max_sigma = max(float(s) for s in sigmas)
-        base_box = round(max_sigma * float(mask_scale) + int(mask_box_size))
+        base_box = _effective_mask_box_size(
+            sigma=max_sigma,
+            mask_scale=mask_scale,
+            mask_box_size=mask_box_size,
+            inner_target_size=inner_target_size,
+            hardcap=mask_box_hardcap,
+        )
         base_margin = base_box // 2 + 1
         spacing_px = int(max(1, round(float(base_box) * float(spacing_scale))))
         shared_centers = _shared_grid_centers(
@@ -410,76 +420,8 @@ def make_pyramid_grid_context(
                 if shared_centers_dithered is not None:
                     shared_centers_dithered = [shared_centers_dithered[int(i)] for i in idx]
 
-        for si, sigma in enumerate(active_sigmas):
-            if blur_mode == "cdd":
-                # CDD mode applies masking in the decomposed channel space below.
-                # Skipping this pre-CDD image-space pass avoids double-masking and
-                # center drift from independent dithering draws.
-                continue
-            box = _effective_mask_box_size(
-                sigma=float(sigma),
-                mask_scale=mask_scale,
-                mask_box_size=mask_box_size,
-                inner_target_size=inner_target_size,
-                hardcap=mask_box_hardcap,
-            )
-            half_lo = box // 2
-            half_hi = box - half_lo
-            if align_scales:
-                centers = shared_centers_dithered if shared_centers_dithered is not None else shared_centers
-            else:
-                spacing = int(max(1, round(float(box) * float(spacing_scale))))
-                margin = max(half_lo, half_hi) + 1
-                area_budget = per_scale_fraction * float(h * w)
-                desired_count = area_budget / max(1.0, float(box * box))
-                base_count = int(math.floor(desired_count))
-                frac = float(desired_count - base_count)
-                extra = int(torch.rand(1, device=x_clean.device).item() < frac)
-                max_count = max(0, base_count + extra)
-                if max_count <= 0:
-                    continue
-                if lattice_shift_override is not None:
-                    shift_y = int(lattice_shift_override[0]) % spacing
-                    shift_x = int(lattice_shift_override[1]) % spacing
-                else:
-                    shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
-                    shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
-                y_start = margin + shift_y
-                x_start = margin + shift_x
-                y_centers = list(range(y_start, max(y_start + 1, h - margin), spacing))
-                x_centers = list(range(x_start, max(x_start + 1, w - margin), spacing))
-                centers = [(cy, cx) for cy in y_centers for cx in x_centers]
-                if len(centers) > max_count:
-                    idx = torch.randperm(len(centers), device=x_clean.device)[:max_count]
-                    centers = [centers[int(i)] for i in idx]
-
-            for cy, cx in centers:
-                if not align_scales and enable_target_dithering:
-                    cy, cx = _dither_target_center(
-                        cy=int(cy),
-                        cx=int(cx),
-                        h=h,
-                        w=w,
-                        half_lo=half_lo,
-                        half_hi=half_hi,
-                        # Grid/lattice mode always dithers by lattice spacing.
-                        dithering_pixels=spacing,
-                        device=x_clean.device,
-                    )
-                y0 = max(0, cy - half_lo)
-                y1 = min(h, cy + half_hi)
-                x0 = max(0, cx - half_lo)
-                x1 = min(w, cx + half_hi)
-                if y1 <= y0 or x1 <= x0:
-                    continue
-                if blur_mode != "cdd":
-                    arr[y0:y1, x0:x1] = 0.0
-                applied_mask_hard[y0:y1, x0:x1] = 1
-                applied_locations.append((cy, cx))
-                applied_scales.append(float(sigma))
-
-        # --- CDD mode branch ---
-        if blur_mode == "cdd":
+        # Masking is applied only after CDD decomposition.
+        if active_sigmas:
             import constrained_diffusion as cdd
 
             cdd_kwargs = dict(
@@ -526,6 +468,7 @@ def make_pyramid_grid_context(
                         mask_scale=mask_scale,
                         mask_box_size=mask_box_size,
                         inner_target_size=inner_target_size,
+                        hardcap=mask_box_hardcap,
                     )
                     max_half_lo = max_box // 2
                     max_half_hi = max_box - max_half_lo
@@ -566,7 +509,7 @@ def make_pyramid_grid_context(
                         try:
                             base_targets_unscaled = int(round(float(priority_n_raw)))
                         except (TypeError, ValueError):
-                            base_targets_unscaled = int(round(float(priority_n_target))) if priority_n_target is not None else 0
+                            base_targets_unscaled = 0
                     min_targets = max(0, int(priority_min_targets_per_map))
                     base_targets_scaled = max(0, int(round(float(base_targets_unscaled) * float(total_fraction))))
                     base_targets = max(min_targets, base_targets_scaled)
@@ -631,6 +574,7 @@ def make_pyramid_grid_context(
                     mask_scale=mask_scale,
                     mask_box_size=mask_box_size,
                     inner_target_size=inner_target_size,
+                    hardcap=mask_box_hardcap,
                 )
                 ch = min(si, cdd_mod.shape[0] - 1)
                 half_lo = box // 2
@@ -785,74 +729,6 @@ def make_pyramid_grid_context(
 
             continue
 
-        # --- Gaussian mode target sampling ---
-        sample_locations = list(applied_locations)
-        sample_scales = list(applied_scales)
-        unique_loc_to_scale = {}
-        for (cy, cx), s in zip(sample_locations, sample_scales):
-            key = (int(cy), int(cx))
-            if key not in unique_loc_to_scale:
-                unique_loc_to_scale[key] = float(s)
-        sample_locations = []
-        sample_scales = []
-        patch_half_lo = int(inner_target_size) // 2
-        patch_half_hi = int(inner_target_size) - patch_half_lo
-        for cy, cx in unique_loc_to_scale.keys():
-            iy = int(cy)
-            ix = int(cx)
-            if iy - patch_half_lo < 0 or ix - patch_half_lo < 0:
-                continue
-            if iy + patch_half_hi > h or ix + patch_half_hi > w:
-                continue
-            if bool(target_invalid_region_skip):
-                py0 = iy - patch_half_lo
-                py1 = iy + patch_half_hi
-                px0 = ix - patch_half_lo
-                px1 = ix + patch_half_hi
-                patch = arr[py0:py1, px0:px1]
-                if patch.size == 0:
-                    continue
-                invalid_mask = np.zeros_like(patch, dtype=bool)
-                if sample_invalid_mask is not None:
-                    invalid_mask |= sample_invalid_mask[py0:py1, px0:px1]
-                for spec in invalid_value_specs:
-                    if isinstance(spec, str) and spec.lower() == "nan":
-                        if sample_invalid_mask is not None:
-                            continue
-                        invalid_mask |= np.isnan(patch)
-                    else:
-                        try:
-                            invalid_mask |= np.isclose(patch, float(spec), equal_nan=False)
-                        except (TypeError, ValueError):
-                            continue
-                if np.all(invalid_mask):
-                    continue
-            sample_locations.append((iy, ix))
-            sample_scales.append(float(unique_loc_to_scale[(cy, cx)]))
-        sample_valid = [1] * len(sample_locations)
-        _ensure_target_patches_masked(sample_locations, applied_mask_hard, inner_target_size)
-
-        # Write masked NumPy array back to the context tensor.
-        x_context[bi, 0] = torch.from_numpy(arr).to(device=x_context.device, dtype=x_context.dtype)
-
-        all_locations.append(sample_locations)
-        all_scales.append(sample_scales)
-        all_valid.append(sample_valid)
-        if return_debug:
-            uniq = []
-            seen = set()
-            for cy, cx in applied_locations:
-                key = (int(cy), int(cx))
-                if key not in seen:
-                    seen.add(key)
-                    uniq.append((cy, cx))
-            all_unique_centers.append(torch.tensor(uniq, dtype=torch.long))
-        all_mask_maps.append(torch.from_numpy(applied_mask_hard.copy()))
-        all_priority_good_candidates.append(priority_good_candidates_bi)
-        all_priority_nonzero_mean.append(priority_nonzero_mean_bi)
-        all_priority_auto_base_targets.append(priority_auto_base_targets_bi)
-        all_priority_effective_targets.append(priority_effective_targets_bi)
-
     # Pack variable-length targets to fixed K so batching is always valid.
     k_fixed = max((len(v) for v in all_locations), default=0)
     k_fixed = max(1, k_fixed)
@@ -916,7 +792,6 @@ def prepare_context_batch(
     global_shift: bool = True,
     align_scales: bool = True,
     mask_box_size: int = 16,
-    blur_mode: str = "gaussian",
     cdd_mode: str = "log",
     cdd_constrained: bool = True,
     cdd_sm_mode: str = "reflect",
@@ -957,7 +832,6 @@ def prepare_context_batch(
         global_shift=global_shift,
         align_scales=align_scales,
         mask_box_size=mask_box_size,
-        blur_mode=blur_mode,
         cdd_mode=cdd_mode,
         cdd_constrained=cdd_constrained,
         cdd_sm_mode=cdd_sm_mode,

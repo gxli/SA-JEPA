@@ -70,7 +70,7 @@ def symmetric_forward_2d(encoder: nn.Module, x: torch.Tensor, return_var: bool =
     return avg
 
 
-def symmetric_forward_3d(encoder: nn.Module, x: torch.Tensor, **kwargs) -> torch.Tensor:
+def symmetric_forward_3d(encoder: nn.Module, x: torch.Tensor, return_var: bool = False, **kwargs):
     """
     Eight-way flip group average for dense 3D spatial features.
 
@@ -83,6 +83,7 @@ def symmetric_forward_3d(encoder: nn.Module, x: torch.Tensor, **kwargs) -> torch
     spatial_shape = tuple(x.shape[-3:])
     spatial_dims = (-3, -2, -1)
     accum = None
+    sq_accum = None
     count = 0
     for r in range(len(spatial_dims) + 1):
         for dims in itertools.combinations(spatial_dims, r):
@@ -95,5 +96,11 @@ def symmetric_forward_3d(encoder: nn.Module, x: torch.Tensor, **kwargs) -> torch
             else:
                 feat = encoder(x, **kwargs)
             accum = feat if accum is None else accum + feat
+            if return_var:
+                sq_accum = feat.pow(2) if sq_accum is None else sq_accum + feat.pow(2)
             count += 1
-    return accum / float(count)
+    avg = accum / float(count)
+    if return_var:
+        var = (sq_accum / float(count)) - avg.pow(2)
+        return avg, var.clamp(min=0.0)
+    return avg

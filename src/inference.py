@@ -209,6 +209,11 @@ def run_post_training_inference(
         mask_scale = float(getattr(model, "mask_scale", 1.0))
         mask_box_size = int(getattr(model, "mask_box_size", 16))
         max_box = round(largest_sigma * mask_scale + mask_box_size)
+        hardcap = getattr(model, "mask_box_hardcap", None)
+        if hardcap is not None and int(hardcap) > 0:
+            max_box = min(max_box, int(hardcap))
+            if max_box % 2 == 0:
+                max_box -= 1
         spacing = int(
             max(
                 1,
@@ -216,10 +221,7 @@ def run_post_training_inference(
             )
         )
         if bool(mask_inference):
-            # TODO(cleanup): lattice sweep is a workaround for Gaussian masking's
-            # inability to produce a dense error map in a single pass. Replace
-            # with discrete block masking (MAE-style) so one forward pass is
-            # enough. Remove this sweep once block masking is validated.
+            # Lattice sweep provides a dense inference map from discrete block masks.
             import warnings
             warnings.warn(
                 "Lattice sweep inference is deprecated and will be removed. "
@@ -555,31 +557,19 @@ def run_post_training_inference_3d(
 
     pred_map = outputs["pred_map"][:1].detach().cpu()
     gt_map = outputs["gt_map"][:1].detach().cpu()
-    context_key = "context_map"
-    if "context_map_3d" in outputs and outputs["context_map_3d"].dim() == 5:
-        context_key = "context_map_3d"
-    context_map = outputs[context_key][:1].detach().cpu()
+    context_map = outputs["context_map"][:1].detach().cpu()
     x_clean = outputs["x_clean"][:1].detach().cpu()
-    model_mode = str(getattr(model, "mode", "3d")).strip().lower().replace(" ", "_")
-    middle_slice_index = -1
-
-    if pred_map.dim() == 4:
-        # 2D/slice path already collapsed depth; evaluate directly.
-        e_maps_mid = representation_dense_energy(pred_map, gt_map)
-    elif pred_map.dim() == 5 and model_mode == "3d_slab":
-        # Slab mode keeps a compact depth chunk; evaluate over whole slab.
-        e_maps_mid = representation_dense_energy(pred_map, gt_map)
-        middle_slice_index = int(pred_map.shape[2] // 2)
-    elif pred_map.dim() == 5:
-        # Default backward-compatible full-volume inference summary on center slice.
-        middle_slice_index = int(pred_map.shape[2] // 2)
-        e_maps_mid = representation_dense_energy(pred_map[:, :, middle_slice_index], gt_map[:, :, middle_slice_index])
-    else:
-        raise ValueError(f"Unexpected pred_map shape in 3D inference: {tuple(pred_map.shape)}")
+    x_context = outputs["x_context"][:1].detach().cpu()
+    mask_cube = outputs["mask_cube"][:1].detach().cpu()
+    if pred_map.dim() != 5:
+        raise ValueError(f"Expected center-slab pred_map BxCxDxHxW, got {tuple(pred_map.shape)}")
+    center_slab_middle_index = int(pred_map.shape[2] // 2)
+    slab_energy = representation_dense_energy(pred_map, gt_map)
 
     inference_outputs = {
         "x_clean": x_clean,
-        "x_context": x_clean,
+        "x_context": x_context,
+        "mask_cube": mask_cube,
         "pred_map": pred_map,
         "gt_map": gt_map,
         "context_map": context_map,
@@ -588,27 +578,25 @@ def run_post_training_inference_3d(
         "target_scales": outputs.get("target_scales", torch.ones_like(outputs["target_valid"], dtype=x_clean.dtype))[:1].detach().cpu(),
         "pred_patches": outputs["pred_patches"][:1].detach().cpu(),
         "gt_patches": outputs["gt_patches"][:1].detach().cpu(),
-        "target_energy_map": e_maps_mid["energy_rel_sym"],
-        "target_energy_raw_map": e_maps_mid["energy_raw"],
-        "target_energy_rel_gt_map": e_maps_mid["energy_rel_gt"],
-        "target_energy_cosine_map": e_maps_mid["energy_cosine"],
-        "middle_slice_index": torch.tensor(middle_slice_index, dtype=torch.int64),
+        "target_energy_map": slab_energy["energy_rel_sym"],
+        "target_energy_raw_map": slab_energy["energy_raw"],
+        "target_energy_rel_gt_map": slab_energy["energy_rel_gt"],
+        "target_energy_cosine_map": slab_energy["energy_cosine"],
+        "center_slab_middle_index": torch.tensor(center_slab_middle_index, dtype=torch.int64),
     }
-    if "selected_slice_index" in outputs:
-        inference_outputs["selected_slice_index"] = outputs["selected_slice_index"][:1].detach().cpu()
-    if "selected_slab_start_index" in outputs:
-        inference_outputs["selected_slab_start_index"] = outputs["selected_slab_start_index"][:1].detach().cpu()
-    if "selected_slab_depth" in outputs:
-        inference_outputs["selected_slab_depth"] = outputs["selected_slab_depth"][:1].detach().cpu()
+    inference_outputs["selected_slab_start_index"] = outputs["selected_slab_start_index"][:1].detach().cpu()
+    inference_outputs["selected_slab_depth"] = outputs["selected_slab_depth"][:1].detach().cpu()
     torch.save(inference_outputs, inference_outputs_path)
 
     np.save(os.path.join(session_dir, "network_input_clean_3d.npy"), x_clean.numpy())
+    np.save(os.path.join(session_dir, "network_input_context_3d.npy"), x_context.numpy())
+    np.save(os.path.join(session_dir, "mask_cube_3d.npy"), mask_cube.numpy())
     np.save(os.path.join(session_dir, "pred_map_3d.npy"), pred_map.numpy())
     np.save(os.path.join(session_dir, "gt_map_3d.npy"), gt_map.numpy())
     np.save(os.path.join(session_dir, "context_map_3d.npy"), context_map.numpy())
-    np.save(os.path.join(session_dir, "target_energy_map_mid_slice.npy"), e_maps_mid["energy_rel_sym"].numpy())
-    np.save(os.path.join(session_dir, "target_energy_raw_map_mid_slice.npy"), e_maps_mid["energy_raw"].numpy())
-    np.save(os.path.join(session_dir, "target_energy_rel_gt_map_mid_slice.npy"), e_maps_mid["energy_rel_gt"].numpy())
-    np.save(os.path.join(session_dir, "target_energy_cosine_map_mid_slice.npy"), e_maps_mid["energy_cosine"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_map_slab.npy"), slab_energy["energy_rel_sym"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_raw_map_slab.npy"), slab_energy["energy_raw"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_rel_gt_map_slab.npy"), slab_energy["energy_rel_gt"].numpy())
+    np.save(os.path.join(session_dir, "target_energy_cosine_map_slab.npy"), slab_energy["energy_cosine"].numpy())
     print(f"[{config_name}] saved 3D inference artifacts")
     return session_dir

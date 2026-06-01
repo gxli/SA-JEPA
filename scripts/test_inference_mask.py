@@ -17,36 +17,16 @@ if ROOT_DIR not in sys.path:
 from src.dataset import JEPADataset
 from src.models.build_jepa import make_pyramid_grid_context
 
-DEMO_BOX_SIGMA_MULT = 4.0
-DEMO_DIP_SIGMA_MULT = 1.0
-
-
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def build_dataset(data_cfg: dict, for_cdd_masking: bool) -> JEPADataset:
-    ds_log_transform = bool(data_cfg.get("log_transform", True))
-    ds_apply_cdd = True
-    if for_cdd_masking:
-        ds_log_transform = False
-        ds_apply_cdd = False
+def build_dataset(data_cfg: dict) -> JEPADataset:
     return JEPADataset(
         num_samples=max(1, int(data_cfg.get("num_samples", 1))),
-        image_size=int(data_cfg.get("image_size", 256)),
         data_root=data_cfg.get("data_root", "data"),
         npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-        log_transform=ds_log_transform,
-        log_eps=float(data_cfg.get("log_eps", 1.0)),
-        cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8]),
-        cdd_strength=float(data_cfg.get("cdd_strength", 1.0)),
-        cdd_clip=bool(data_cfg.get("cdd_clip", True)),
-        norm_before_cdd=bool(data_cfg.get("norm_before_cdd", True)),
-        cdd_mode=data_cfg.get("cdd_mode", "log"),
-        cdd_constrained=bool(data_cfg.get("cdd_constrained", True)),
-        cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-        apply_cdd=ds_apply_cdd,
         cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
         cube_slice_axis=int(data_cfg.get("cube_slice_axis", 0)),
         cube_slice_index=int(data_cfg.get("cube_slice_index", 0)),
@@ -73,8 +53,7 @@ def main():
     session_dir = os.path.join(args.sessions_dir, config_name)
     os.makedirs(session_dir, exist_ok=True)
 
-    blur_mode = str(model_cfg.get("blur_mode", "cdd"))
-    ds = build_dataset(data_cfg, for_cdd_masking=(blur_mode == "cdd"))
+    ds = build_dataset(data_cfg)
     x = ds[int(args.sample_index) % len(ds)][0].numpy().astype(np.float32)
     x_t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
     h, w = int(x.shape[0]), int(x.shape[1])
@@ -85,6 +64,11 @@ def main():
     spacing_scale = float(model_cfg.get("mask_spacing_scaling", 1.5))
     mask_box_size = int(model_cfg.get("mask_box_size", 16))
     max_box = round(largest_sigma * mask_scale + mask_box_size)
+    hardcap = model_cfg.get("mask_box_hardcap")
+    if hardcap is not None and int(hardcap) > 0:
+        max_box = min(max_box, int(hardcap))
+        if max_box % 2 == 0:
+            max_box -= 1
     spacing = int(max(1, round(float(max_box) * spacing_scale)))
 
     half = spacing // 2
@@ -105,18 +89,14 @@ def main():
             x_clean=x_t,
             sigmas=sigmas,
             mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
-            box_sigma_mult=DEMO_BOX_SIGMA_MULT,
             mask_scale=mask_scale,
             spacing_scale=spacing_scale,
             global_shift=bool(model_cfg.get("global_shift", True)),
             align_scales=bool(model_cfg.get("align_scales", True)),
             mask_box_size=mask_box_size,
-            blur_mode=blur_mode,
             cdd_mode=model_cfg.get("cdd_mode", "log"),
             cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
             cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-            dip_sigma_mult=DEMO_DIP_SIGMA_MULT,
-            constant_gaussian_sigma=float(model_cfg.get("constant_gaussian_sigma", 1.0)),
             inner_target_size=int(model_cfg.get("patch_size", 2)),
             return_debug=True,
             enable_grid_jitter=False,

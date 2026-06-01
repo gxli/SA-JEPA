@@ -40,6 +40,21 @@ Do not use legacy keys:
 - `model.spacing_scale`
 - `model.mask_scaling_box`
 
+## Model-Side CDD
+
+CDD decomposition is performed only by model-side masking. The dataset loads
+and normalizes images without running CDD or maintaining a CDD cache.
+
+Use `model.sigmas` as the single source of truth for CDD decomposition scales.
+There is no standalone Gaussian masking mode or `model.blur_mode` selector.
+
+## 3D Slab Mode
+
+The only supported 3D mode is `model.mode: "3d_slab"` with
+`data.input_type: "cube"`. The model consumes the raw 3D field directly,
+applies box masks that intersect a thin center slab, and computes 3D patch loss
+inside that slab. Use `model.slab_depth` to set its thickness.
+
 ## Shared CDD/log knobs
 
 Keep these in `data` only in config files:
@@ -50,3 +65,13 @@ Keep these in `data` only in config files:
 - `log_eps`
 
 The loader mirrors them into `model` only when missing, so files stay DRY.
+
+Dataset preprocessing is always linear `normalize01`. Do not use
+`data.log_transform`; `model.post_log_transform` is the only runtime log
+switch. The model applies it after masking.
+
+`JEPADataset` always preserves native input resolution. Do not use the removed
+`data.image_size` key; there is no implicit resize step.
+
+SigReg always uses pre-predictor context patch embeddings when
+`sigreg_weight > 0`. Do not use the removed `sigreg_on_pred` selector.

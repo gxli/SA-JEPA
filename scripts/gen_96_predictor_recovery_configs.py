@@ -25,8 +25,6 @@ def _base_config(npy_pattern: str) -> dict:
         "base_config": BASE_CONFIG,
         "data": {
             "npy_pattern": npy_pattern,
-            "log_transform": True,
-            "norm_before_cdd": True,
         },
         "model": {
             "mode": "pyramid",

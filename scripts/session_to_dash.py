@@ -336,6 +336,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             if tok.ndim == 4 and tok.shape[0] > 0:
                 mask_cube = tok[0]
     if mask_cube is None:
+        tok = outputs.get("mask_cube")
+        if tok is not None:
+            tok = _to_np(tok).astype(np.float32)
+            if tok.ndim == 5 and tok.shape[0] > 0 and tok.shape[1] > 0:
+                mask_cube = tok[0, 0]
+    if mask_cube is None:
         mask_cube = np.zeros((1, h, w), dtype=np.float32)
     else:
         mask_cube = np.where(np.isfinite(mask_cube), mask_cube, 0.0).astype(np.float32)
@@ -1027,7 +1033,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             },
         ]
     )
-    if model_mode in ("pyramid", "pyramid3d") and "pyramid_mask_cube" in data.files:
+    if model_mode in ("pyramid", "3d_slab") and "pyramid_mask_cube" in data.files:
         cards.append(
             {
                 "title": "Pyramid Mask 3D (Sample-0)",

@@ -50,6 +50,14 @@ def _fmt_metric(v: float) -> str:
     return f"{x:.4f}"
 
 
+def _flush_csv_rows(path: str, rows: list[list]) -> None:
+    if not rows:
+        return
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+    rows.clear()
+
+
 def _collate_pad_hw(batch: list[torch.Tensor]) -> torch.Tensor:
     if len(batch) == 0:
         raise ValueError("Empty batch is not supported")
@@ -64,6 +72,80 @@ def _collate_pad_hw(batch: list[torch.Tensor]) -> torch.Tensor:
             x = F.pad(x, (0, dw, 0, dh), mode="constant", value=float("nan"))
         out.append(x)
     return torch.stack(out, dim=0)
+
+
+def _move_to_device(value, device: torch.device):
+    if torch.is_tensor(value):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(x, device) for x in value)
+    if isinstance(value, list):
+        return [_move_to_device(x, device) for x in value]
+    if isinstance(value, dict):
+        return {k: _move_to_device(v, device) for k, v in value.items()}
+    return value
+
+
+class _MaskingCollator:
+    def __init__(self, model: PyramidGridJEPA, return_debug: bool = False):
+        enc_type = str(getattr(model, "encoder_type", "")).lower()
+        self.return_debug = bool(
+            return_debug
+            or enc_type in CDD_DEBUG_ENCODER_TYPES
+            or bool(getattr(model, "use_image_mask_token", False))
+        )
+        self.mask_scale = float(model.mask_scale)
+        self.mask_scale_range = model.mask_scale_range
+        self.mask_box_size = int(model.mask_box_size)
+        self.mask_box_size_range = model.mask_box_size_range
+        self.context_kwargs = {
+            "sigmas": model.sigmas,
+            "mask_fraction": model.mask_fraction,
+            "spacing_scale": model.spacing_scale,
+            "global_shift": model.global_shift,
+            "align_scales": model.align_scales,
+            "cdd_mode": model.cdd_mode,
+            "cdd_constrained": model.cdd_constrained,
+            "cdd_sm_mode": model.cdd_sm_mode,
+            "cdd_append_last_residual": model.cdd_append_last_residual,
+            "patch_size": model.patch_size,
+            "return_debug": self.return_debug,
+            "target_invalid_region_skip": model.target_invalid_region_skip,
+            "target_invalid_region_values": model.target_invalid_region_values,
+            "target_sampling_mode": model.target_sampling_mode,
+            "priority_top_percent": model.priority_top_percent,
+            "priority_n_target": model.priority_n_target,
+            "priority_min_targets_per_map": model.priority_min_targets_per_map,
+            "priority_dithering_pixels": model.priority_dithering_pixels,
+            "target_nonoverlap": getattr(model, "target_nonoverlap", False),
+            "target_allow_partial_overlap": getattr(model, "target_allow_partial_overlap", 0.0),
+            "mask_box_hardcap": getattr(model, "mask_box_hardcap", None),
+            "cdd_use_gpu": torch.cuda.is_available(),
+        }
+
+    def _sample_mask_params(self) -> tuple[float, int]:
+        mask_scale = self.mask_scale
+        if self.mask_scale_range is not None:
+            lo, hi = self.mask_scale_range
+            mask_scale = lo + (hi - lo) * float(torch.rand(()).item()) if hi > lo else lo
+
+        mask_box_size = self.mask_box_size
+        if self.mask_box_size_range is not None:
+            lo, hi = self.mask_box_size_range
+            mask_box_size = int(torch.randint(lo, hi + 1, ()).item()) if hi > lo else lo
+        return float(mask_scale), int(mask_box_size)
+
+    def __call__(self, batch: list[torch.Tensor]):
+        x_clean = _collate_pad_hw(batch)
+        mask_scale, mask_box_size = self._sample_mask_params()
+        context_data = prepare_context_batch(
+            x_clean=x_clean,
+            mask_scale=mask_scale,
+            mask_box_size=mask_box_size,
+            **self.context_kwargs,
+        )
+        x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
+        return x_clean, context_data
 
 
 def _prepare_context_from_model(
@@ -87,7 +169,6 @@ def _prepare_context_from_model(
         global_shift=model.global_shift,
         align_scales=model.align_scales,
         mask_box_size=mask_box_size,
-        blur_mode=model.blur_mode,
         cdd_mode=model.cdd_mode,
         cdd_constrained=model.cdd_constrained,
         cdd_sm_mode=model.cdd_sm_mode,
@@ -116,7 +197,6 @@ def evaluate_validation(
     device: torch.device,
     max_batches: int | None = None,
     vicreg_spatial_mode: str = "pooled",
-    debug_context: bool = False,
 ) -> dict:
     model.eval()
     n = 0
@@ -126,10 +206,9 @@ def evaluate_validation(
     for batch_idx, batch in enumerate(val_loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
-        x_clean = batch.to(device, non_blocking=True)
-        # Let _prepare_context_from_model → prepare_context_batch
-        # handle NaN detection internally before cleaning for CDD ops.
-        context_result = _prepare_context_from_model(model, x_clean, return_debug=debug_context)
+        x_clean, context_result = batch
+        x_clean = x_clean.to(device, non_blocking=True)
+        context_result = _move_to_device(context_result, device)
         if len(context_result) == 5:
             x_context, tloc, tscale, tvalid, debug = context_result
         else:
@@ -190,6 +269,31 @@ def load_config(path: str) -> dict:
     cfg.setdefault("data", {})
     cfg.setdefault("model", {})
     cfg.setdefault("train", {})
+    if "log_transform" in cfg["data"]:
+        legacy_value = cfg["data"].pop("log_transform")
+        print(
+            "[config migration] ignoring removed data.log_transform="
+            f"{legacy_value!r}; dataset preprocessing is always linear normalize01. "
+            "Use model.post_log_transform."
+        )
+    if "image_size" in cfg["data"]:
+        legacy_value = cfg["data"].pop("image_size")
+        print(
+            "[config migration] ignoring removed data.image_size="
+            f"{legacy_value!r}; JEPADataset always preserves native input resolution."
+        )
+    if "log_transform" in cfg["model"]:
+        legacy_value = cfg["model"].pop("log_transform")
+        print(
+            "[config migration] ignoring removed model.log_transform="
+            f"{legacy_value!r}; use model.post_log_transform."
+        )
+    for section in ("data", "model", "train"):
+        if "sigreg_on_pred" in cfg[section]:
+            raise ValueError(
+                "sigreg_on_pred was removed. "
+                "SigReg always uses pre-predictor context patch embeddings when sigreg_weight > 0."
+            )
 
     # Keep shared CDD/log knobs in one place (data section) and mirror to model
     # only when model did not set an explicit override.
@@ -205,20 +309,8 @@ def make_session_dir(root: str, config_name: str) -> str:
     return path
 
 
-def resolve_pipeline_config(data_cfg: dict, model_cfg: dict) -> tuple[bool, bool, bool]:
-    blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
-    if blur_mode not in ("gaussian", "cdd"):
-        raise ValueError(
-            f"Unsupported blur_mode={blur_mode}. "
-            "Allowed blur_mode values are 'gaussian' and 'cdd'."
-        )
-    # Policy:
-    # - gaussian mode: dataset runs CDD, no pre-log, model may apply post-log.
-    # - cdd mode: dataset skips CDD and pre-log, model performs CDD masking.
-    dataset_apply_cdd = (blur_mode == "gaussian")
-    dataset_log_transform = False
-    model_post_log = bool(model_cfg.get("post_log_transform", data_cfg.get("log_transform", True)))
-    return dataset_apply_cdd, dataset_log_transform, model_post_log
+def resolve_pipeline_config(data_cfg: dict, model_cfg: dict) -> bool:
+    return bool(model_cfg.get("post_log_transform", True))
 
 
 def resolve_encoder_type_default(model_cfg: dict) -> str:
@@ -238,7 +330,7 @@ def resolve_encoder_type_default(model_cfg: dict) -> str:
 
 def _is_3d_jepa_mode(mode: str) -> bool:
     mode_norm = str(mode).strip().lower().replace(" ", "_")
-    return mode_norm in {"pyramid3d", "3d", "2d", "3d_slice", "3d_slab"}
+    return mode_norm == "3d_slab"
 
 
 def _resolve_encoder_alias_2d(name: str) -> str:
@@ -284,9 +376,8 @@ def _resolve_encoder_alias_3d(name: str) -> str:
 
 def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, device: torch.device) -> PyramidGridJEPA:
     """Construct a PyramidGridJEPA from config dicts."""
-    blur_mode = str(model_cfg.get("blur_mode", "gaussian"))
     mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", 1.5))
-    _, _, model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
+    model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
     resolved_encoder_type = _resolve_encoder_alias_2d(resolve_encoder_type_default(model_cfg))
     resolved_mode = str(model_cfg.get("mode", "image")).lower()
     use_image_mask_token = bool(model_cfg.get("use_image_mask_token", False))
@@ -337,7 +428,6 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         align_scales=model_cfg.get("align_scales", True),
         mask_box_size=model_cfg.get("mask_box_size", 16),
         mask_box_size_range=model_cfg.get("mask_box_size_range"),
-        blur_mode=blur_mode,
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=model_cfg.get("cdd_constrained", True),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
@@ -397,6 +487,14 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
 
 
 def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.device) -> PyramidGridJEPA3D:
+    mode = str(model_cfg.get("mode", "")).strip().lower().replace(" ", "_")
+    if mode != "3d_slab":
+        raise ValueError(
+            f"Unsupported 3D JEPA mode={model_cfg.get('mode')}. "
+            "Use model.mode='3d_slab'; full-volume and slice variants were removed."
+        )
+    if "volumetric_mode" in model_cfg:
+        raise ValueError("model.volumetric_mode was removed; use model.mode='3d_slab'.")
     enc_type = _resolve_encoder_alias_3d(model_cfg.get("encoder_type", "cdd_scaleaware_convnext3d")).lower()
     allowed_3d = {"convnext_dense3d", "cdd_scaleaware_convnext3d"}
     if enc_type not in allowed_3d:
@@ -407,13 +505,10 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
     fusion = str(model_cfg.get("scaleaware_fusion_type", "gate"))
     if "dense" in enc_type:
         fusion = "concat"
-    mode_key = str(model_cfg.get("mode", "pyramid3d")).strip().lower().replace(" ", "_")
-    model_mode = str(model_cfg.get("volumetric_mode", "2d")) if mode_key == "pyramid3d" else mode_key
     normalize_loss_l2 = bool(model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", False)))
     return PyramidGridJEPA3D(
         latent_channels=int(model_cfg.get("latent_channels", 16)),
         scale_channels=int(model_cfg.get("scale_channels", model_cfg.get("encoder_width", 8))),
-        sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         patch_size=int(model_cfg.get("patch_size", 2)),
         num_targets=int(model_cfg.get("num_targets", 32)),
         encoder_depth=int(model_cfg.get("encoder_depth", 3)),
@@ -421,13 +516,12 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         encoder_stride=int(model_cfg.get("encoder_stride", 1)),
         ema_momentum=float(model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996))),
         normalize_loss_l2=normalize_loss_l2,
+        post_log_transform=bool(model_cfg.get("post_log_transform", True)),
+        log_eps=float(model_cfg.get("log_eps", 1e-6)),
         fusion=fusion,
-        constant_mask_box=bool(model_cfg.get("constant_mask_box", False)),
         mask_box_size=int(model_cfg.get("mask_box_size", 8)),
         num_mask_boxes=int(model_cfg.get("num_mask_boxes", 8)),
-        mode=model_mode,
         slab_depth=int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
-        slab_boundary_margin=int(model_cfg.get("slab_boundary_margin", model_cfg.get("encoder_depth", 3))),
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
         use_film=bool(model_cfg.get("use_film", True)),
         use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
@@ -471,18 +565,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
     if input_type == "cube" and not is_3d_mode:
         raise ValueError(
-            "data.input_type='cube' requires a 3D model mode (pyramid3d, 3d, 2d, 3d_slice, 3d_slab)."
+            "data.input_type='cube' requires model.mode='3d_slab'."
         )
+    if is_3d_mode and input_type != "cube":
+        raise ValueError("model.mode='3d_slab' requires data.input_type='cube'.")
     image_batch_inference = (input_type == "image_batch")
 
-    dataset_apply_cdd, dataset_log_transform, _ = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
+    resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
 
     print(
         f"[{config_name}] Resolved pipeline: "
-        f"dataset_apply_cdd={dataset_apply_cdd}, "
-        f"dataset_log_transform={dataset_log_transform}, "
-        f"model.post_log_transform={model_cfg.get('post_log_transform', '<unset>')}, "
-        f"data.log_transform={data_cfg.get('log_transform', True)}, "
+        "dataset_preprocess=normalize01, "
+        f"model.post_log_transform={model_cfg.get('post_log_transform', True)}, "
         f"data.cdd_mode={data_cfg.get('cdd_mode', 'log')}, "
         f"model.cdd_mode={model_cfg.get('cdd_mode', 'log')}"
     )
@@ -624,8 +718,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
             num_samples=int(data_cfg.get("num_samples", 2000)),
             crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
-            log_transform=bool(data_cfg.get("log_transform", True)),
-            log_eps=float(data_cfg.get("log_eps", 1.0)),
             normalize=bool(data_cfg.get("normalize", True)),
             crop_strategy=str(data_cfg.get("crop_strategy", "random")),
         )
@@ -636,8 +728,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
             num_samples=max(1, int(train_cfg.get("inference_num_samples", 8))),
             crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
-            log_transform=bool(data_cfg.get("log_transform", True)),
-            log_eps=float(data_cfg.get("log_eps", 1.0)),
             normalize=bool(data_cfg.get("normalize", True)),
             crop_strategy="center",
         )
@@ -648,28 +738,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     else:
         dataset = JEPADataset(
             num_samples=data_cfg.get("num_samples", 2000),
-            image_size=data_cfg.get("image_size", 256),
             data_root=data_cfg.get("data_root", "data"),
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-            log_transform=dataset_log_transform,
-            log_eps=data_cfg.get("log_eps", 1.0),
-            cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8, 16]),
-            cdd_strength=data_cfg.get("cdd_strength", 1.0),
-            cdd_clip=data_cfg.get("cdd_clip", True),
-            norm_before_cdd=data_cfg.get("norm_before_cdd", True),
-            cdd_mode=data_cfg.get("cdd_mode", "log"),
-            cdd_constrained=data_cfg.get("cdd_constrained", True),
-            cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-            apply_cdd=dataset_apply_cdd,
             cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
             cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
             cube_slice_index=data_cfg.get("cube_slice_index", 0),
             random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
             d4_augment=bool(data_cfg.get("d4_augment", False)),
-            cache_cdd=bool(data_cfg.get("cache_cdd", True)),
-            cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
-            cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
-            precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
             input_type=input_type,
             image_batch_selected_indices=image_batch_selected_indices,
         )
@@ -694,28 +769,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         if len(val_idx) > 0:
             val_dataset = JEPADataset(
                 num_samples=max(1, int(train_cfg.get("val_num_samples", max(16, int(0.25 * train_dataset.num_samples))))),
-                image_size=data_cfg.get("image_size", 256),
                 data_root=data_cfg.get("data_root", "data"),
                 npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-                log_transform=dataset_log_transform,
-                log_eps=data_cfg.get("log_eps", 1.0),
-                cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8, 16]),
-                cdd_strength=data_cfg.get("cdd_strength", 1.0),
-                cdd_clip=data_cfg.get("cdd_clip", True),
-                norm_before_cdd=data_cfg.get("norm_before_cdd", True),
-                cdd_mode=data_cfg.get("cdd_mode", "log"),
-                cdd_constrained=data_cfg.get("cdd_constrained", True),
-                cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-                apply_cdd=dataset_apply_cdd,
                 cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
                 cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
                 cube_slice_index=data_cfg.get("cube_slice_index", 0),
                 random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
                 d4_augment=False,
-                cache_cdd=bool(data_cfg.get("cache_cdd", True)),
-                cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
-                cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
-                precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
                 input_type=input_type,
                 image_batch_selected_indices=image_batch_selected_indices,
             )
@@ -737,12 +797,20 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         num_workers = 4 if device.type == "cuda" else 0
     pin_memory = bool(device.type == "cuda")
     persistent_workers = bool(num_workers > 0)
+    prefetch_factor = max(1, int(train_cfg.get("prefetch_factor", 2))) if num_workers > 0 else None
     print(
         f"[{config_name}] Dataloader setup: num_workers={num_workers}, "
-        f"pin_memory={pin_memory}, persistent_workers={persistent_workers}"
+        f"pin_memory={pin_memory}, persistent_workers={persistent_workers}, "
+        f"prefetch_factor={prefetch_factor}"
     )
+    loader_worker_kwargs = {}
+    if num_workers > 0:
+        loader_worker_kwargs["prefetch_factor"] = prefetch_factor
 
-    masking_collate = None if is_3d_mode else _collate_pad_hw
+    masking_collate = None if is_3d_mode else _MaskingCollator(
+        model,
+        return_debug=bool(train_cfg.get("debug_masking_tensors", False)),
+    )
     dataloader = DataLoader(
         train_dataset,
         batch_size=train_cfg.get("batch_size", 32),
@@ -751,6 +819,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         collate_fn=masking_collate,
+        **loader_worker_kwargs,
     )
     val_loader = None
     if val_dataset is not None:
@@ -762,33 +831,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
             collate_fn=masking_collate,
+            **loader_worker_kwargs,
         )
     # Inference must use canonical orientation (no D4 augmentation).
     if not is_3d_mode:
         inference_dataset = JEPADataset(
             num_samples=train_dataset.num_samples,
-            image_size=data_cfg.get("image_size", 256),
             data_root=data_cfg.get("data_root", "data"),
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-            log_transform=dataset_log_transform,
-            log_eps=data_cfg.get("log_eps", 1.0),
-            cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8, 16]),
-            cdd_strength=data_cfg.get("cdd_strength", 1.0),
-            cdd_clip=data_cfg.get("cdd_clip", True),
-            norm_before_cdd=data_cfg.get("norm_before_cdd", True),
-            cdd_mode=data_cfg.get("cdd_mode", "log"),
-            cdd_constrained=data_cfg.get("cdd_constrained", True),
-            cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-            apply_cdd=dataset_apply_cdd,
             cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
             cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
             cube_slice_index=data_cfg.get("cube_slice_index", 0),
             random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
             d4_augment=False,
-            cache_cdd=bool(data_cfg.get("cache_cdd", True)),
-            cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
-            cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
-            precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
             input_type=input_type,
             image_batch_inference=image_batch_inference,
             image_batch_selected_indices=image_batch_selected_indices,
@@ -803,6 +858,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         collate_fn=(None if is_3d_mode else _collate_pad_hw),
+        **loader_worker_kwargs,
     )
 
     optimizer = optim.AdamW(
@@ -811,6 +867,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         weight_decay=train_cfg.get("weight_decay", 1e-5),
     )
     use_amp = device.type == "cuda"
+    autocast_device = "cuda" if use_amp else "cpu"
     scaler = GradScaler("cuda", enabled=use_amp)
     if resume_state is not None:
         optimizer_state_loaded = False
@@ -836,6 +893,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     epochs = train_cfg.get("epochs", 20)
     log_interval = train_cfg.get("log_interval", 10)
+    log_flush_interval = max(1, int(log_interval))
+    diagnostic_interval = max(1, int(train_cfg.get("diagnostic_interval", log_flush_interval)))
     force_recompute_inference = bool(train_cfg.get("force_recompute_inference", False))
     inference_mask_passes = int(train_cfg.get("inference_mask_passes", 1))
     mask_inference = bool(train_cfg.get("mask_inference", False))
@@ -928,6 +987,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             )
             f.write("\n")
 
+    movie_dump_every_epoch = bool(train_cfg.get("movie_dump_every_epoch", False))
+    movie_batch = next(iter(inference_loader)) if movie_dump_every_epoch else None
+    movie_context_data = None
+
     model.train()
     start = time.time()
     visit_counts = None
@@ -947,20 +1010,27 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         metrics_rows = []
         masked_scale_rows = []
         visited_rows = []
-        pbar = tqdm(enumerate(dataloader), total=len(dataloader),
-                     desc=f"[{config_name}] E {epoch + 1}/{epochs}",
-                     unit="batch", dynamic_ncols=True, mininterval=0.1)
+        tqdm.write(f"[{config_name}]")
+        pbar = tqdm(
+            enumerate(dataloader),
+            total=len(dataloader),
+            desc=f"E {epoch + 1}/{epochs}",
+            unit="batch",
+            dynamic_ncols=True,
+            mininterval=0.1,
+            position=0,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        )
+        metrics_bar = tqdm(total=0, bar_format="{desc}", position=1, leave=False, dynamic_ncols=True)
         for batch_idx, batch in pbar:
             if is_3d_mode:
                 x_clean = batch.to(device, non_blocking=True)
                 x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
                 context_data = None
             else:
-                x_clean = batch.to(device, non_blocking=True)
-                # Let _prepare_context_from_model → prepare_context_batch
-                # handle NaN detection internally before cleaning for CDD ops.
-                debug_context = bool(train_cfg.get("debug_masking_tensors", False))
-                context_result = _prepare_context_from_model(model, x_clean, return_debug=debug_context)
+                x_clean, context_result = batch
+                x_clean = x_clean.to(device, non_blocking=True)
+                context_result = _move_to_device(context_result, device)
                 if len(context_result) == 5:
                     x_context, tloc, tscale, tvalid, debug = context_result
                 else:
@@ -984,15 +1054,16 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(device_type=device.type, enabled=use_amp):
+            with autocast(device_type=autocast_device, enabled=use_amp):
                 outputs = model(x_clean, context_data=context_data) if not is_3d_mode else model(x_clean)
                 loss_mse = model.compute_loss(outputs)
                 _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
                     outputs,
                     spatial_mode=vicreg_spatial_mode,
                 )
-                z_pred = extract_valid_pooled_embeddings(outputs, key="pred_patches")
-                loss_sigreg = sketched_sigreg_loss(z_pred, sketch_dim=sigreg_sketch_dim)
+                z_ctx_key = "context_patches" if "context_patches" in outputs else "pred_patches"
+                z_ctx = extract_valid_pooled_embeddings(outputs, key=z_ctx_key)
+                loss_sigreg = sketched_sigreg_loss(z_ctx, sketch_dim=sigreg_sketch_dim)
                 loss_symmetric = model.compute_symmetric_loss(outputs)
                 total_loss = (
                     (mse_loss_weight * loss_mse)
@@ -1055,10 +1126,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     round(elapsed, 4),
                 ]
             )
-            # Save masked-scale usage as training log in session dir.
-            scales = outputs["target_scales"].detach().cpu().numpy()
-            valid = outputs["target_valid"].detach().cpu().numpy().astype(bool)
-            valid_scales = scales[valid]
+            should_log_diagnostics = (
+                ((batch_idx + 1) % diagnostic_interval == 0)
+                or ((batch_idx + 1) == len(dataloader))
+            )
             if "cdd_channels_masked" in outputs:
                 cube_path = os.path.join(session_dir, "example_masked_channel_cube.npy")
                 if not os.path.exists(cube_path):
@@ -1066,49 +1137,48 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         cube_path,
                         outputs["cdd_channels_masked"][0].detach().cpu().numpy().astype(np.float32),
                     )
-            if valid_scales.size > 0:
-                uniq, cnt = np.unique(np.round(valid_scales.astype(np.float32), 6), return_counts=True)
-                for s, c in zip(uniq.tolist(), cnt.tolist()):
-                    masked_scale_rows.append([epoch + 1, batch_idx, float(s), int(c)])
-            # Save visited target locations for full-session diagnostics.
-            tloc = outputs["target_locations"].detach().cpu().numpy()
-            tvalid = outputs["target_valid"].detach().cpu().numpy().astype(bool)
-            tscale = outputs["target_scales"].detach().cpu().numpy()
-            if (not is_3d_mode) and visit_counts is None:
-                hh, ww = int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])
-                visit_counts = np.zeros((hh, ww), dtype=np.float32)
-            for bi in range(tloc.shape[0]):
-                for ki in range(tloc.shape[1]):
-                    if not bool(tvalid[bi, ki]):
-                        continue
-                    yy = int(tloc[bi, ki, 0])
-                    xx = int(tloc[bi, ki, 1])
-                    if (visit_counts is not None) and 0 <= yy < visit_counts.shape[0] and 0 <= xx < visit_counts.shape[1]:
-                        visit_counts[yy, xx] += 1.0
-            bsz = tloc.shape[0]
-            ksz = tloc.shape[1]
-            for bi in range(bsz):
-                for ki in range(ksz):
-                    if not bool(tvalid[bi, ki]):
-                        continue
-                    visited_rows.append(
-                        [
-                            epoch + 1,
-                            batch_idx,
-                            bi,
-                            ki,
-                            int(tloc[bi, ki, 0]),
-                            int(tloc[bi, ki, 1]),
-                            float(tscale[bi, ki]),
-                        ]
-                    )
-            pbar.set_postfix(
-                total=f"{total_loss.item():.4f}",
-                mse=f"{loss_mse.item():.4f}",
-                sig=f"{loss_sigreg.item():.4f}",
-                sim=f"{sim_val:.4f}",
-                vfrac=f"{valid_frac:.3f}",
-                lr=f"{lr:.1e}",
+            if should_log_diagnostics:
+                # Keep the hot path asynchronous: copy diagnostic tensors to host
+                # only at the configured sampling interval.
+                scales = outputs["target_scales"].detach().cpu().numpy()
+                tvalid = outputs["target_valid"].detach().cpu().numpy().astype(bool)
+                valid_scales = scales[tvalid]
+                if valid_scales.size > 0:
+                    uniq, cnt = np.unique(np.round(valid_scales.astype(np.float32), 6), return_counts=True)
+                    for s, c in zip(uniq.tolist(), cnt.tolist()):
+                        masked_scale_rows.append([epoch + 1, batch_idx, float(s), int(c)])
+
+                tloc = outputs["target_locations"].detach().cpu().numpy()
+                if (not is_3d_mode) and visit_counts is None:
+                    hh, ww = int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])
+                    visit_counts = np.zeros((hh, ww), dtype=np.float32)
+                for bi in range(tloc.shape[0]):
+                    for ki in range(tloc.shape[1]):
+                        if not bool(tvalid[bi, ki]):
+                            continue
+                        yy = int(tloc[bi, ki, 0])
+                        xx = int(tloc[bi, ki, 1])
+                        if (visit_counts is not None) and 0 <= yy < visit_counts.shape[0] and 0 <= xx < visit_counts.shape[1]:
+                            visit_counts[yy, xx] += 1.0
+                        visited_rows.append(
+                            [
+                                epoch + 1,
+                                batch_idx,
+                                bi,
+                                ki,
+                                yy,
+                                xx,
+                                float(scales[bi, ki]),
+                            ]
+                        )
+            if (batch_idx + 1) % log_flush_interval == 0:
+                _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
+                _flush_csv_rows(visited_targets_log_path, visited_rows)
+            metrics_bar.set_description_str(
+                f"tot={total_loss.item():.4f} mse={loss_mse.item():.4f} "
+                f"sig={loss_sigreg.item():.4f} sim={sim_val:.4f} "
+                f"vf={valid_frac:.3f} lr={lr:.1e}",
+                refresh=True,
             )
             epoch_total += float(total_loss.item())
             epoch_mse += float(loss_mse.item())
@@ -1120,15 +1190,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_valid_frac += float(valid_frac)
             epoch_batches += 1
 
+        metrics_bar.close()
         if metrics_rows:
             with open(metrics_path, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerows(metrics_rows)
-        if masked_scale_rows:
-            with open(masked_scales_log_path, "a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerows(masked_scale_rows)
-        if visited_rows:
-            with open(visited_targets_log_path, "a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerows(visited_rows)
+        _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
+        _flush_csv_rows(visited_targets_log_path, visited_rows)
         if visit_counts is not None:
             np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
 
@@ -1160,7 +1227,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 device=device,
                 max_batches=train_cfg.get("val_max_batches"),
                 vicreg_spatial_mode=vicreg_spatial_mode,
-                debug_context=bool(train_cfg.get("debug_masking_tensors", False)),
             )
             val_loss = float(v["val_loss"])
             val_sim = float(v["val_sim"])
@@ -1198,19 +1264,20 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         tqdm.write(f"[{config_name}] ckpt_saved epoch={epoch + 1}")
 
         # Per-epoch embedding snapshot for movie generation.
-        if bool(train_cfg.get("movie_dump_every_epoch", False)):
+        if movie_dump_every_epoch:
             movie_dir = os.path.join(session_dir, "movie_frames")
             os.makedirs(movie_dir, exist_ok=True)
             with torch.no_grad():
                 model.eval()
-                x_movie = next(iter(dataloader)).to(device, non_blocking=True)
+                x_movie = movie_batch.to(device, non_blocking=True)
                 # Let _prepare_context_from_model handle NaN internally.
                 if is_3d_mode:
                     x_movie = torch.nan_to_num(x_movie, nan=0.0, posinf=0.0, neginf=0.0)
                     out_m = model(x_movie)
                 else:
-                    context_result = _prepare_context_from_model(model, x_movie, return_debug=False)
-                    out_m = model(x_movie, context_data=context_result)
+                    if movie_context_data is None:
+                        movie_context_data = _prepare_context_from_model(model, x_movie, return_debug=False)
+                    out_m = model(x_movie, context_data=movie_context_data)
                 frame = {
                     "pred_map": out_m["pred_map"][:1].detach().cpu(),
                     "gt_map": out_m["gt_map"][:1].detach().cpu(),
@@ -1328,7 +1395,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         try:
             from src.utils.scale_probe import probe_scale_response
 
-            probe_batch = next(iter(dataloader)).to(device, non_blocking=True)
+            probe_batch, _ = next(iter(dataloader))
+            probe_batch = probe_batch.to(device, non_blocking=True)
             # Let _prepare_context_from_model handle NaN internally.
             model.eval()
             with torch.no_grad():

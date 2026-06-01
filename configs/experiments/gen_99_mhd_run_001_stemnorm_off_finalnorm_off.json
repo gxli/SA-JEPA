@@ -36,7 +36,6 @@
     "mse_loss_weight": 100.0,
     "vicreg_var_weight": 1.0,
     "vicreg_cov_weight": 0.0,
-    "sigreg_on_pred": true,
     "sigreg_weight": 0.0,
     "sigreg_sketch_dim": 64,
     "symmetric_feature_loss_weight": 0.02,

@@ -1,9 +1,7 @@
 {
   "base_config": "../base_pyramid_scaleaware_convnext.json",
   "data": {
-    "npy_pattern": "ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy",
-    "log_transform": true,
-    "norm_before_cdd": true
+    "npy_pattern": "ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy"
   },
   "model": {
     "mode": "pyramid",
@@ -48,7 +46,6 @@
     "mse_loss_weight": 50.0,
     "vicreg_var_weight": 0.0,
     "vicreg_cov_weight": 0.0,
-    "sigreg_on_pred": true,
     "sigreg_weight": 10.0,
     "sigreg_sketch_dim": 64,
     "symmetric_feature_loss_weight": 0.005,

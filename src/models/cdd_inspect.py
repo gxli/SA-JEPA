@@ -143,7 +143,8 @@ class CDDOperatorFeatures2D(nn.Module):
         eps = max(1e-30, float(self.log_eps))
         base = torch.abs(x)
         base_std = torch.std(base, dim=(-2, -1), keepdim=True)
-        log_floor = torch.clamp(base_std * float(self.log_std_floor_mult), min=eps)
+        structural_std_floor = torch.clamp(base_std, min=1e-3)
+        log_floor = torch.clamp(structural_std_floor * float(self.log_std_floor_mult), min=eps)
         # log1p(base / floor) is always >= 0, preserving monotonicity and sign.
         # log(base + floor) would flip sign when base + floor < 1.
         return torch.sign(x) * torch.log1p(base / log_floor)
@@ -161,13 +162,15 @@ class CDDOperatorFeatures2D(nn.Module):
         # Use non-negative base from x, same spirit as the main CDD path.
         base = torch.clamp(maps["x"], min=0.0)
         base_std = torch.std(base, dim=(-2, -1), keepdim=True)
-        return torch.clamp(base_std * float(self.log_std_floor_mult), min=eps)
+        structural_std_floor = torch.clamp(base_std, min=1e-3)
+        return torch.clamp(structural_std_floor * float(self.log_std_floor_mult), min=eps)
 
     def _compute_stack_floor(self, stack: torch.Tensor) -> torch.Tensor:
         eps = max(1e-30, float(self.log_eps))
         base = torch.abs(stack)
         base_std = torch.std(base, dim=(-2, -1), keepdim=True)
-        return torch.clamp(base_std * float(self.log_std_floor_mult), min=eps)
+        structural_std_floor = torch.clamp(base_std, min=1e-3)
+        return torch.clamp(structural_std_floor * float(self.log_std_floor_mult), min=eps)
 
     def _apply_lognorm_maps(self, maps: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         signed_keys = {"grad_x", "grad_y", "lap"}

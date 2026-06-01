@@ -9,8 +9,6 @@ import sys
 
 import numpy as np
 import torch
-from matplotlib import pyplot as plt
-from matplotlib.gridspec import GridSpec
 from sklearn.decomposition import PCA
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -29,20 +27,20 @@ def _fit_umap_2d(all_pred: np.ndarray, all_gt: np.ndarray, n_neighbors: int = 30
     """Fit one UMAP on concatenated pred+gt from all frames."""
     try:
         import umap
-    except ImportError:
-        print("[session_to_movie] umap-learn not installed; skipping UMAP, will use PCA only")
+        x = np.concatenate([all_pred, all_gt], axis=0)
+        reducer = umap.UMAP(
+            n_components=2,
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            metric="euclidean",
+            random_state=42,
+            init="spectral",
+        )
+        reducer.fit(x)
+        return reducer
+    except Exception as e:
+        print(f"[session_to_movie] UMAP unavailable ({type(e).__name__}: {e}); using PCA dumps")
         return None
-    x = np.concatenate([all_pred, all_gt], axis=0)
-    reducer = umap.UMAP(
-        n_components=2,
-        n_neighbors=n_neighbors,
-        min_dist=min_dist,
-        metric="euclidean",
-        random_state=42,
-        init="spectral",
-    )
-    reducer.fit(x)
-    return reducer
 
 
 def _render_frame(
@@ -54,6 +52,9 @@ def _render_frame(
     out_path: str,
 ):
     """Render a 2x2 frame: pred PCA | gt PCA / pred UMAP | gt UMAP."""
+    from matplotlib import pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
     H, W = pred_map.shape[-2], pred_map.shape[-1]
     C = pred_map.shape[0] if pred_map.ndim == 3 else pred_map.shape[-1]
 
@@ -65,23 +66,12 @@ def _render_frame(
         pred_flat = pred_map
         gt_flat = gt_map
 
-    # Sub-sample for speed (max 5000 points)
-    n_max = 5000
-    if pred_flat.shape[0] > n_max:
-        rng = np.random.RandomState(epoch)
-        idx = rng.choice(pred_flat.shape[0], n_max, replace=False)
-        pred_sub = pred_flat[idx]
-        gt_sub = gt_flat[idx]
-    else:
-        pred_sub = pred_flat
-        gt_sub = gt_flat
-
-    pred_pca = pca.transform(pred_sub)
-    gt_pca = pca.transform(gt_sub)
+    pred_pca = pca.transform(pred_flat)
+    gt_pca = pca.transform(gt_flat)
 
     if umap_reducer is not None:
-        pred_umap = umap_reducer.transform(pred_sub)
-        gt_umap = umap_reducer.transform(gt_sub)
+        pred_umap = umap_reducer.transform(pred_flat)
+        gt_umap = umap_reducer.transform(gt_flat)
     else:
         pred_umap = pred_pca
         gt_umap = gt_pca
@@ -119,6 +109,37 @@ def _render_frame(
     plt.close(fig)
 
 
+def _save_embedding_dump(
+    pred_map: np.ndarray,
+    gt_map: np.ndarray,
+    pca,
+    umap_reducer,
+    epoch: int,
+    out_path: str,
+) -> None:
+    """Save whole-map PCA/UMAP arrays for rendering or analysis downstream."""
+    channels = pred_map.shape[0]
+    pred_flat = pred_map.reshape(channels, -1).T
+    gt_flat = gt_map.reshape(channels, -1).T
+    pred_pca = pca.transform(pred_flat).astype(np.float32)
+    gt_pca = pca.transform(gt_flat).astype(np.float32)
+    if umap_reducer is None:
+        pred_umap = pred_pca
+        gt_umap = gt_pca
+    else:
+        pred_umap = umap_reducer.transform(pred_flat).astype(np.float32)
+        gt_umap = umap_reducer.transform(gt_flat).astype(np.float32)
+    np.savez_compressed(
+        out_path,
+        epoch=np.asarray(epoch, dtype=np.int64),
+        spatial_shape=np.asarray(pred_map.shape[-2:], dtype=np.int64),
+        pred_pca=pred_pca,
+        gt_pca=gt_pca,
+        pred_umap=pred_umap,
+        gt_umap=gt_umap,
+    )
+
+
 def collect_all_frames(movie_dir: str) -> tuple[list[int], list[str], np.ndarray, np.ndarray]:
     """Load all frames and return aggregated pred/gt arrays for fitting."""
     import glob
@@ -136,13 +157,6 @@ def collect_all_frames(movie_dir: str) -> tuple[list[int], list[str], np.ndarray
         C, H, W = pm.shape
         pred_flat = pm.reshape(C, -1).T  # [H*W, C]
         gt_flat = gm.reshape(C, -1).T
-        # Subsample for PCA/UMAP fitting
-        n_max_fit = 2000
-        if pred_flat.shape[0] > n_max_fit:
-            rng = np.random.RandomState(42)
-            idx = rng.choice(pred_flat.shape[0], n_max_fit, replace=False)
-            pred_flat = pred_flat[idx]
-            gt_flat = gt_flat[idx]
         all_pred_chunks.append(pred_flat)
         all_gt_chunks.append(gt_flat)
         epochs.append(ep)
@@ -155,9 +169,12 @@ def main():
     parser = argparse.ArgumentParser(description="Convert session movie frames to PNGs")
     parser.add_argument("session_dir", help="Path to session directory containing movie_frames/")
     parser.add_argument("--out-dir", default=None, help="Output directory for PNG frames")
+    parser.add_argument("--dump-only", action="store_true", help="Save PCA/UMAP NPZ dumps without rendering PNGs")
     parser.add_argument("--make-mp4", action="store_true", help="Generate MP4 with ffmpeg")
     parser.add_argument("--fps", type=int, default=5, help="Frames per second for MP4")
     args = parser.parse_args()
+    if args.dump_only and args.make_mp4:
+        parser.error("--dump-only cannot be combined with --make-mp4")
 
     session_dir = os.path.abspath(args.session_dir)
     movie_dir = os.path.join(session_dir, "movie_frames")
@@ -168,7 +185,10 @@ def main():
     session_name = os.path.basename(session_dir.rstrip("/"))
     out_root = args.out_dir or os.path.join(ROOT, "results", "movie_pngs")
     out_dir = os.path.join(out_root, session_name)
-    os.makedirs(out_dir, exist_ok=True)
+    if not args.dump_only:
+        os.makedirs(out_dir, exist_ok=True)
+    dump_dir = os.path.join(session_dir, "movie_embedding_dumps")
+    os.makedirs(dump_dir, exist_ok=True)
 
     print(f"[session_to_movie] loading frames from {movie_dir}")
     epochs, frame_paths, all_pred, all_gt = collect_all_frames(movie_dir)
@@ -190,11 +210,18 @@ def main():
         frame = torch.load(fp, map_location="cpu", weights_only=False)
         pm = frame["pred_map"][0].numpy()
         gm = frame["gt_map"][0].numpy()
+        dump_path = os.path.join(dump_dir, f"epoch_{ep:04d}.npz")
+        _save_embedding_dump(pm, gm, pca, umap_reducer, ep, dump_path)
+        if args.dump_only:
+            continue
         out_path = os.path.join(out_dir, f"frame_{i:04d}.png")
         _render_frame(pm, gm, pca, umap_reducer, ep, out_path)
         if (i + 1) % 20 == 0 or i == 0:
             print(f"[session_to_movie] rendered {i + 1}/{len(epochs)} frames")
 
+    print(f"[session_to_movie] whole-map embedding dumps saved to {dump_dir}")
+    if args.dump_only:
+        return
     print(f"[session_to_movie] all {len(epochs)} frames saved to {out_dir}")
 
     if args.make_mp4:

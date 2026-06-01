@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_DIR="${ROOT_DIR}/configs"
-SESSIONS_DIR="${ROOT_DIR}/sessions"
+SESSIONS_DIR="${SESSIONS_DIR:-${ROOT_DIR}/sessions}"
 FORCE_REINFERENCE="${FORCE_REINFERENCE:-0}"
 CONFIG_GLOB="${CONFIG_GLOB:-experiments/*.json}"
 CONFIG_SEARCH_ROOT="${CONFIG_SEARCH_ROOT:-${CONFIG_DIR}}"

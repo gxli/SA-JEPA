@@ -47,8 +47,8 @@ def _flatten_vicreg_samples(
     return z1, z2
 
 
-def extract_valid_pooled_embeddings(outputs: dict, key: str = "pred_patches") -> torch.Tensor:
-    patches = outputs[key]  # B,K,C,P,P
+def extract_valid_pooled_embeddings(outputs: dict, key: str = "context_patches") -> torch.Tensor:
+    patches = outputs[key]  # Pre-predictor context embeddings by default: B,K,C,...
     valid = outputs["target_valid"]  # B,K
     _, _, c = patches.shape[:3]
     pooled = patches.mean(dim=tuple(range(3, patches.dim())))  # B,K,C
@@ -81,27 +81,29 @@ def sketched_sigreg_loss(z: torch.Tensor, sketch_dim: int = 64) -> torch.Tensor:
 
 def compute_sim_var_cov(outputs: dict, spatial_mode: str = "dense") -> tuple[float, float, float]:
     pred = outputs["pred_patches"].detach().float()  # B,K,C,P,P
+    ctx = outputs.get("context_patches", outputs["pred_patches"]).detach().float()  # B,K,C,P,P
     gt = outputs["gt_patches"].detach().float()  # B,K,C,P,P
     valid = outputs["target_valid"].detach()  # B,K
 
-    z1, z2 = _flatten_vicreg_samples(pred, gt, valid, spatial_mode=spatial_mode)
-    if z1.numel() == 0 or z2.numel() == 0:
+    z_pred, z_gt = _flatten_vicreg_samples(pred, gt, valid, spatial_mode=spatial_mode)
+    z_ctx, _ = _flatten_vicreg_samples(ctx, gt, valid, spatial_mode=spatial_mode)
+    if z_pred.numel() == 0 or z_gt.numel() == 0:
         return 0.0, 0.0, 0.0
 
     # sim: cosine similarity (higher is better)
-    sim = torch.nn.functional.cosine_similarity(z1, z2, dim=1).mean()
+    sim = torch.nn.functional.cosine_similarity(z_pred, z_gt, dim=1).mean()
 
-    if z1.shape[0] < 2:
+    if z_pred.shape[0] < 2:
         return float(sim.item()), 0.0, 0.0
 
     # var: VICReg variance regularizer term (lower is better; 0 ideal)
-    std_z1 = torch.sqrt(z1.var(dim=0, unbiased=False) + 1e-4)
-    std_z2 = torch.sqrt(z2.var(dim=0, unbiased=False) + 1e-4)
-    var_term = 0.5 * (torch.relu(1.0 - std_z1).mean() + torch.relu(1.0 - std_z2).mean())
+    std_ctx = torch.sqrt(z_ctx.var(dim=0, unbiased=False) + 1e-4)
+    std_gt = torch.sqrt(z_gt.var(dim=0, unbiased=False) + 1e-4)
+    var_term = 0.5 * (torch.relu(1.0 - std_ctx).mean() + torch.relu(1.0 - std_gt).mean())
 
     # cov: VICReg covariance regularizer term (lower is better; 0 ideal)
-    z1c = z1 - z1.mean(dim=0, keepdim=True)
-    z2c = z2 - z2.mean(dim=0, keepdim=True)
+    z1c = z_ctx - z_ctx.mean(dim=0, keepdim=True)
+    z2c = z_gt - z_gt.mean(dim=0, keepdim=True)
     cov_z1 = (z1c.T @ z1c) / max(1, z1c.shape[0] - 1)
     cov_z2 = (z2c.T @ z2c) / max(1, z2c.shape[0] - 1)
     cov_term = 0.5 * ((_offdiag(cov_z1).pow(2).mean()) + (_offdiag(cov_z2).pow(2).mean()))
@@ -111,25 +113,27 @@ def compute_sim_var_cov(outputs: dict, spatial_mode: str = "dense") -> tuple[flo
 
 def compute_sim_var_cov_torch(outputs: dict, spatial_mode: str = "dense") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     pred = outputs["pred_patches"].float()  # keep graph, cast to fp32 for safe norm
+    ctx = outputs.get("context_patches", outputs["pred_patches"]).float()  # regularize before predictor
     gt = outputs["gt_patches"].float()  # keep graph (target branch already no-grad in forward)
     valid = outputs["target_valid"]
 
-    z1, z2 = _flatten_vicreg_samples(pred, gt, valid, spatial_mode=spatial_mode)
-    if z1.numel() == 0 or z2.numel() == 0:
+    z_pred, z_gt = _flatten_vicreg_samples(pred, gt, valid, spatial_mode=spatial_mode)
+    z_ctx, _ = _flatten_vicreg_samples(ctx, gt, valid, spatial_mode=spatial_mode)
+    if z_pred.numel() == 0 or z_gt.numel() == 0:
         z = pred.sum() * 0.0
         return z, z, z
 
-    sim = torch.nn.functional.cosine_similarity(z1, z2, dim=1).mean()
-    if z1.shape[0] < 2:
+    sim = torch.nn.functional.cosine_similarity(z_pred, z_gt, dim=1).mean()
+    if z_pred.shape[0] < 2:
         z = sim * 0.0
         return sim, z, z
 
-    std_z1 = torch.sqrt(z1.var(dim=0, unbiased=False) + 1e-4)
-    std_z2 = torch.sqrt(z2.var(dim=0, unbiased=False) + 1e-4)
-    var_term = 0.5 * (torch.relu(1.0 - std_z1).mean() + torch.relu(1.0 - std_z2).mean())
+    std_ctx = torch.sqrt(z_ctx.var(dim=0, unbiased=False) + 1e-4)
+    std_gt = torch.sqrt(z_gt.var(dim=0, unbiased=False) + 1e-4)
+    var_term = 0.5 * (torch.relu(1.0 - std_ctx).mean() + torch.relu(1.0 - std_gt).mean())
 
-    z1c = z1 - z1.mean(dim=0, keepdim=True)
-    z2c = z2 - z2.mean(dim=0, keepdim=True)
+    z1c = z_ctx - z_ctx.mean(dim=0, keepdim=True)
+    z2c = z_gt - z_gt.mean(dim=0, keepdim=True)
     cov_z1 = (z1c.T @ z1c) / max(1, z1c.shape[0] - 1)
     cov_z2 = (z2c.T @ z2c) / max(1, z2c.shape[0] - 1)
     cov_term = 0.5 * ((_offdiag(cov_z1).pow(2).mean()) + (_offdiag(cov_z2).pow(2).mean()))
@@ -170,8 +174,10 @@ def compute_jepa_energy(outputs: dict, normalize: bool = False) -> float:
     gt = outputs["gt_patches"].detach()
     valid = outputs["target_valid"]
     if normalize:
-        pred = torch.nn.functional.normalize(pred, dim=2)
-        gt = torch.nn.functional.normalize(gt, dim=2)
+        b, k = pred.shape[:2]
+        patch_shape = pred.shape[2:]
+        pred = torch.nn.functional.normalize(pred.reshape(b, k, -1), dim=2).reshape(b, k, *patch_shape)
+        gt = torch.nn.functional.normalize(gt.reshape(b, k, -1), dim=2).reshape(b, k, *patch_shape)
     reduce_dims = tuple(range(2, pred.dim()))
     energy_per_target = (pred - gt).pow(2).mean(dim=reduce_dims)
     if bool(valid.any()):
@@ -200,32 +206,6 @@ def representation_dense_energy(pred_map: torch.Tensor, gt_map: torch.Tensor, ep
         "energy_cosine": cos,
     }
 
-
-def representation_patch_energy(pred_patches: torch.Tensor, gt_patches: torch.Tensor, eps: float = 1e-8) -> dict[str, torch.Tensor]:
-    diff = pred_patches - gt_patches
-
-    raw = diff.pow(2).mean(dim=(2, 3, 4))
-
-    diff2 = diff.pow(2).sum(dim=(2, 3, 4))
-    gt2 = gt_patches.pow(2).sum(dim=(2, 3, 4))
-    pred2 = pred_patches.pow(2).sum(dim=(2, 3, 4))
-
-    rel_gt = diff2 / gt2.clamp_min(eps)
-    rel_sym = diff2 / (0.5 * (gt2 + pred2)).clamp_min(eps)
-
-    cos = 1.0 - F.cosine_similarity(
-        pred_patches.flatten(2),
-        gt_patches.flatten(2),
-        dim=2,
-        eps=eps,
-    )
-
-    return {
-        "energy_raw": raw,
-        "energy_rel_gt": rel_gt,
-        "energy_rel_sym": rel_sym,
-        "energy_cosine": cos,
-    }
 
 
 def compute_target_energy_map(outputs: dict, image_size: tuple[int, int]) -> dict[str, torch.Tensor]:

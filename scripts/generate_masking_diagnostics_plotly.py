@@ -25,28 +25,11 @@ def load_config(path: str) -> dict:
         return json.load(f)
 
 
-def build_dataset(data_cfg: dict, for_cdd_masking: bool = False) -> JEPADataset:
-    ds_log_transform = bool(data_cfg.get("log_transform", True))
-    # Keep demo input in raw image space by default to avoid CDD dependency path.
-    ds_apply_cdd = False
-    if for_cdd_masking:
-        ds_log_transform = False
-        ds_apply_cdd = False
+def build_dataset(data_cfg: dict) -> JEPADataset:
     return JEPADataset(
         num_samples=max(1, int(data_cfg.get("num_samples", 1))),
-        image_size=int(data_cfg.get("image_size", 256)),
         data_root=data_cfg.get("data_root", "data"),
         npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-        log_transform=ds_log_transform,
-        log_eps=float(data_cfg.get("log_eps", 1.0)),
-        cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8]),
-        cdd_strength=float(data_cfg.get("cdd_strength", 1.0)),
-        cdd_clip=bool(data_cfg.get("cdd_clip", True)),
-        norm_before_cdd=bool(data_cfg.get("norm_before_cdd", True)),
-        cdd_mode=data_cfg.get("cdd_mode", "log"),
-        cdd_constrained=bool(data_cfg.get("cdd_constrained", True)),
-        cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-        apply_cdd=ds_apply_cdd,
         cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
         cube_slice_axis=int(data_cfg.get("cube_slice_axis", 0)),
         cube_slice_index=int(data_cfg.get("cube_slice_index", 0)),
@@ -60,8 +43,6 @@ def build_context(x_t: torch.Tensor, cfg: dict):
         pnt_val = int(pnt_raw)
     except (TypeError, ValueError):
         pnt_val = 20
-    force_blur_mode = str(m.get("_force_blur_mode", "")).strip().lower()
-    blur_mode = force_blur_mode if force_blur_mode in {"gaussian", "cdd"} else str(m.get("blur_mode", "cdd"))
     return prepare_context_batch(
         x_clean=x_t,
         sigmas=tuple(m.get("sigmas", [2, 4, 8, 16])),
@@ -71,7 +52,6 @@ def build_context(x_t: torch.Tensor, cfg: dict):
         global_shift=bool(m.get("global_shift", True)),
         align_scales=bool(m.get("align_scales", True)),
         mask_box_size=int(m.get("mask_box_size", 16)),
-        blur_mode=blur_mode,
         cdd_mode=str(m.get("cdd_mode", "log")),
         cdd_constrained=bool(m.get("cdd_constrained", True)),
         cdd_sm_mode=str(m.get("cdd_sm_mode", "reflect")),
@@ -122,7 +102,6 @@ def main():
     ap.add_argument("--crop", type=int, default=16)
     ap.add_argument("--center-box", type=int, default=3)
     ap.add_argument("--binarize-mask", action="store_true")
-    ap.add_argument("--force-blur-mode", choices=["gaussian", "cdd"], default=None)
     ap.add_argument("--mask-fraction", type=float, default=None)
     ap.add_argument("--mask-scale", type=float, default=None)
     ap.add_argument("--mask-box-size", type=int, default=None)
@@ -132,8 +111,6 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    if args.force_blur_mode is not None:
-        cfg.setdefault("model", {})["_force_blur_mode"] = str(args.force_blur_mode)
     if args.mask_fraction is not None:
         cfg.setdefault("model", {})["active_target_fraction"] = float(args.mask_fraction)
         cfg.setdefault("model", {})["mask_fraction"] = float(args.mask_fraction)
@@ -141,8 +118,7 @@ def main():
         cfg.setdefault("model", {})["mask_size_scaling"] = float(args.mask_scale)
     if args.mask_box_size is not None:
         cfg.setdefault("model", {})["mask_box_size"] = int(args.mask_box_size)
-    eff_blur_mode = str(cfg.get("model", {}).get("_force_blur_mode", cfg.get("model", {}).get("blur_mode", "cdd")))
-    ds = build_dataset(cfg.get("data", {}), for_cdd_masking=(eff_blur_mode == "cdd"))
+    ds = build_dataset(cfg.get("data", {}))
     x = ds[int(args.sample_index) % len(ds)][0].numpy().astype(np.float32)
     x_t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
 
@@ -207,7 +183,7 @@ def main():
         box_sizes = (box_sizes + [box_sizes[-1] if box_sizes else 3] * n_ch)[:n_ch]
     box_sizes = [b + 1 if b % 2 == 0 else b for b in box_sizes[:n_ch]]
 
-    # Channel plots disabled (gaussian dip removed).
+    # Channel plots disabled (CDD-only masking).
     # panel_count = n_ch + 1
     panel_count = 1
     cols = max(1, int(args.cols))
@@ -258,13 +234,13 @@ def main():
         zmin=-2.0,
         zmax=1.0,
     )
-    # Channel plots disabled (gaussian dip removed).
+    # Channel plots disabled (CDD-only masking).
     # for i in range(n_ch):
     #     add(dip_plot[i], target_contour, i + 1, box_sizes[i], colorscale=energy_marker_colorscale, zmin=-2.0, zmax=1.0)
 
     title = (
         f"Mask Diagnostic: {os.path.basename(args.config)} | "
-        f"blur={eff_blur_mode} "
+        "masking=cdd "
         f"mask_box={m.get('mask_box_size')} "
         f"mask_size_scaling={m.get('mask_size_scaling')} "
         f"active_target_fraction={m.get('active_target_fraction', m.get('mask_fraction'))} boxes={box_sizes}"
@@ -283,7 +259,7 @@ def main():
         "config": os.path.abspath(args.config),
         "pipeline_entry": "src.models.masking.prepare_context_batch",
         "masking_function": "src.models.masking.make_pyramid_grid_context",
-        "blur_mode": eff_blur_mode,
+        "masking_mode": "cdd",
         "mask_box_size": int(m.get("mask_box_size", 0)),
         "mask_size_scaling": float(m.get("mask_size_scaling", 1.0)),
         "mask_fraction": float(m.get("active_target_fraction", m.get("mask_fraction", 1.0))),

@@ -19,10 +19,6 @@ if ROOT_DIR not in sys.path:
 from src.dataset import JEPADataset
 from src.models.build_jepa import PyramidGridJEPA, make_pyramid_grid_context
 
-DEMO_BOX_SIGMA_MULT = 4.0
-DEMO_MASK_SIZE = 0.0
-DEMO_DIP_SIGMA_MULT = 1.0
-DEMO_SCALEAWARE_GAUSSIAN_RATIOS = (0.25, 0.5, 1.0, 2.0)
 DEMO_MASK_FILL_MODE = "zero"
 
 
@@ -89,30 +85,13 @@ def display_soft_pair(a: np.ndarray, b: np.ndarray, p_low: float = 0.2, p_high: 
     return _map(a), _map(b)
 
 
-def build_dataset(data_cfg: dict, for_cdd_masking: bool = False) -> JEPADataset:
-    ds_log_transform = bool(data_cfg.get("log_transform", True))
-    ds_apply_cdd = True
-    # Keep demo data path aligned with training pipeline policy:
-    # - cdd mode: dataset normalize only (no dataset CDD, no pre-log)
-    # - gaussian mode: dataset normalize + mandatory CDD + optional pre-log
-    if for_cdd_masking:
-        ds_log_transform = False
-        ds_apply_cdd = False
+def build_dataset(data_cfg: dict) -> JEPADataset:
+    # Keep demo data path aligned with training: normalize in the dataset and
+    # perform any CDD decomposition only in model-side masking.
     return JEPADataset(
         num_samples=max(1, int(data_cfg.get("num_samples", 1))),
-        image_size=int(data_cfg.get("image_size", 256)),
         data_root=data_cfg.get("data_root", "data"),
         npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-        log_transform=ds_log_transform,
-        log_eps=float(data_cfg.get("log_eps", 1.0)),
-        cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8]),
-        cdd_strength=float(data_cfg.get("cdd_strength", 1.0)),
-        cdd_clip=bool(data_cfg.get("cdd_clip", True)),
-        norm_before_cdd=bool(data_cfg.get("norm_before_cdd", True)),
-        cdd_mode=data_cfg.get("cdd_mode", "log"),
-        cdd_constrained=bool(data_cfg.get("cdd_constrained", True)),
-        cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-        apply_cdd=ds_apply_cdd,
         cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
         cube_slice_axis=int(data_cfg.get("cube_slice_axis", 0)),
         cube_slice_index=int(data_cfg.get("cube_slice_index", 0)),
@@ -125,18 +104,14 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         x_clean=x,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
-        box_sigma_mult=DEMO_BOX_SIGMA_MULT,
         mask_scale=float(model_cfg.get("mask_size_scaling", 1.0)),
         spacing_scale=float(model_cfg.get("mask_spacing_scaling", 1.5)),
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
         mask_box_size=int(model_cfg.get("mask_box_size", 16)),
-        blur_mode=model_cfg.get("blur_mode", "cdd"),
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-        dip_sigma_mult=DEMO_DIP_SIGMA_MULT,
-        constant_gaussian_sigma=float(model_cfg.get("constant_gaussian_sigma", 1.0)),
         return_debug=True,
     )
 
@@ -357,7 +332,7 @@ def plot_dip_field(debug: dict, out_path: str):
     dip = dip_t[0].cpu().numpy()
     fig, ax = plt.subplots(1, 1, figsize=(6, 6))
     im = ax.imshow(dip, cmap="magma")
-    ax.set_title("Applied Gaussian Dip Field")
+    ax.set_title("Applied CDD Channel Mask Field")
     ax.axis("off")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     plt.tight_layout()
@@ -432,7 +407,7 @@ def plot_dip_proto_per_channel(debug: dict, out_path: str):
 
 
 def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
-    model_post_log = bool(model_cfg.get("post_log_transform", data_cfg.get("log_transform", True)))
+    model_post_log = bool(model_cfg.get("post_log_transform", True))
     return PyramidGridJEPA(
         mode=model_cfg.get("mode", "image"),
         latent_channels=model_cfg.get("latent_channels", 32),
@@ -440,20 +415,14 @@ def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
         patch_size=model_cfg.get("patch_size", 2),
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0)),
-        box_sigma_mult=DEMO_BOX_SIGMA_MULT,
         mask_scale=model_cfg.get("mask_size_scaling", 1.0),
-        mask_size=DEMO_MASK_SIZE,
         spacing_scale=model_cfg.get("mask_spacing_scaling", 1.5),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
         mask_box_size=model_cfg.get("mask_box_size", 16),
-        blur_mode=model_cfg.get("blur_mode", "cdd"),
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=model_cfg.get("cdd_constrained", True),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-        dip_sigma_mult=DEMO_DIP_SIGMA_MULT,
-        constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
-        scaleaware_gaussian_ratios=DEMO_SCALEAWARE_GAUSSIAN_RATIOS,
         cdd_append_last_residual=model_cfg.get("cdd_append_last_residual", True),
         post_log_transform=model_post_log,
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
@@ -555,7 +524,7 @@ def build_overview_figure(
     frac = (frac_i1 - frac_i2) / np.maximum(frac_den, den_floor)
     mask_map = debug["mask_map"][0].cpu().numpy().astype(np.float32)
     dip_t = debug.get("dip_field")
-    if mode == "gaussian_dip" and dip_t is not None and dip_t.numel() > 0:
+    if mode == "channel_mask" and dip_t is not None and dip_t.numel() > 0:
         applied_mask = np.clip(dip_t[0].cpu().numpy().astype(np.float32), 0.0, 1.0)
     else:
         applied_mask = np.clip(mask_map, 0.0, 1.0)
@@ -630,7 +599,7 @@ def build_overview_figure(
                     row=1,
                     col=col,
                 )
-    if mode == "gaussian_dip" and centers.size > 0:
+    if mode == "channel_mask" and centers.size > 0:
         for col in (1, 2):
             fig.add_trace(
                 go.Scattergl(
@@ -768,7 +737,7 @@ def build_network_figure(x_clean: np.ndarray, x_context: np.ndarray, pred_norm: 
     return fig
 
 
-def build_gaussian_mask_channels_figure(debug: dict, title: str):
+def build_channel_mask_figure(debug: dict, title: str):
     dip_t = debug.get("dip_field_per_channel")
     if dip_t is None or dip_t.numel() == 0:
         return None, None
@@ -805,7 +774,7 @@ def evaluate_mask_symmetry(
         x_t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
         _, _, _, _, debug = make_context_and_debug(x_t, model_cfg_run, int(base_seed + i))
         dip_t = debug.get("dip_field")
-        if str(model_cfg_run.get("mask_fill_mode", DEMO_MASK_FILL_MODE)) == "gaussian_dip" and dip_t is not None and dip_t.numel() > 0:
+        if str(model_cfg_run.get("mask_fill_mode", DEMO_MASK_FILL_MODE)) == "channel_mask" and dip_t is not None and dip_t.numel() > 0:
             mask = np.clip(dip_t[0].cpu().numpy().astype(np.float32), 0.0, 1.0)
         else:
             mask = np.clip(debug["mask_map"][0].cpu().numpy().astype(np.float32), 0.0, 1.0)
@@ -837,8 +806,7 @@ def main():
     parser.add_argument("--sessions-dir", type=str, default="sessions")
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--mask-mode", type=str, choices=["config", "zero", "gaussian_dip", "both"], default="config")
-    parser.add_argument("--force-blur-mode", type=str, choices=["gaussian", "cdd"], default=None)
+    parser.add_argument("--mask-mode", type=str, choices=["config", "zero", "channel_mask", "both"], default="config")
     parser.add_argument("--rigid-mask-box", action="store_true", help="Keep constant box mask size (disable adaptive sizing)")
     parser.add_argument("--eval-samples", type=int, default=0, help="If >0, run aggregate mask symmetry eval with this many samples")
     args = parser.parse_args()
@@ -851,13 +819,13 @@ def main():
     session_dir = os.path.join(args.sessions_dir, config_name)
     os.makedirs(session_dir, exist_ok=True)
 
-    ds = build_dataset(data_cfg, for_cdd_masking=(model_cfg.get("blur_mode", "cdd") == "cdd"))
+    ds = build_dataset(data_cfg)
     x = ds[int(args.sample_index) % len(ds)][0].numpy().astype(np.float32)
     x_t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
 
     modes = []
     if args.mask_mode == "both":
-        modes = ["zero", "gaussian_dip"]
+        modes = ["zero", "channel_mask"]
     elif args.mask_mode == "config":
         modes = [DEMO_MASK_FILL_MODE]
     else:
@@ -867,8 +835,8 @@ def main():
     effective_single_mode = modes[0] if len(modes) == 1 else None
     if effective_single_mode == "zero":
         report_name = f"masking_demo_{config_name}_box_masked.html"
-    elif effective_single_mode == "gaussian_dip":
-        report_name = f"masking_demo_{config_name}_gaussian_dip_only.html"
+    elif effective_single_mode == "channel_mask":
+        report_name = f"masking_demo_{config_name}_channel_mask_only.html"
     else:
         report_name = f"masking_demo_{config_name}_all.html"
     report_html = os.path.join(session_dir, report_name)
@@ -882,8 +850,6 @@ def main():
     for mode in modes:
         model_cfg_run = dict(model_cfg)
         model_cfg_run["mask_fill_mode"] = mode
-        if args.force_blur_mode is not None:
-            model_cfg_run["blur_mode"] = args.force_blur_mode
         # Default demo behavior: adaptive per-scale box masks.
         if args.rigid_mask_box:
             model_cfg_run["mask_size_scaling"] = 0.0
@@ -944,13 +910,13 @@ def main():
         html_parts.append("<div class='panel'>")
         html_parts.append(pio.to_html(fig_net, include_plotlyjs=False, full_html=False, config={"responsive": True}))
         html_parts.append("</div>")
-        if mode == "gaussian_dip":
-            fig_mask_ch, dip_ch = build_gaussian_mask_channels_figure(debug, title="Gaussian Mask Per Channel")
+        if mode == "channel_mask":
+            fig_mask_ch, dip_ch = build_channel_mask_figure(debug, title="CDD Channel Mask Per Channel")
             if fig_mask_ch is not None:
                 html_parts.append("<div class='panel'>")
                 html_parts.append(pio.to_html(fig_mask_ch, include_plotlyjs=False, full_html=False, config={"responsive": True}))
                 html_parts.append("</div>")
-                mask_path = os.path.join(session_dir, "masking_demo_gaussian_mask_per_channel.npy")
+                mask_path = os.path.join(session_dir, "masking_demo_cdd_mask_per_channel.npy")
                 np.save(mask_path, dip_ch)
             else:
                 mask_path = None
@@ -1052,7 +1018,7 @@ def main():
 
         meta = {
             "mask_fill_mode": mode,
-            "blur_mode": str(model_cfg_run.get("blur_mode", "cdd")),
+            "masking_mode": "cdd",
             "checkpoint_used": ckpt_used,
             "use_cdd": bool(data_cfg.get("use_cdd", True)),
             "mask_fraction": float(model_cfg_run.get("active_target_fraction", model_cfg_run.get("mask_fraction", 1.0))),
@@ -1063,7 +1029,7 @@ def main():
             "unique_centers": [[int(y), int(x)] for y, x in centers.tolist()],
             "target_scales": [float(s) for s in target_scales[0].cpu().numpy().tolist()],
             "target_locations": [[int(y), int(x)] for y, x in target_locations[0].cpu().numpy().tolist()],
-            "gaussian_mask_per_channel_path": mask_path,
+            "cdd_mask_per_channel_path": mask_path,
             "mask_symmetry_heatmap_path": eval_heatmap_path,
             "mask_symmetry_metrics": eval_metrics,
             "cdd_summary": cdd_summary,
@@ -1077,8 +1043,8 @@ def main():
 
     if effective_single_mode == "zero":
         meta_name = f"masking_demo_meta_{config_name}_box_masked.json"
-    elif effective_single_mode == "gaussian_dip":
-        meta_name = f"masking_demo_meta_{config_name}_gaussian_dip_only.json"
+    elif effective_single_mode == "channel_mask":
+        meta_name = f"masking_demo_meta_{config_name}_channel_mask_only.json"
     else:
         meta_name = f"masking_demo_meta_{config_name}_all.json"
     out_meta = os.path.join(session_dir, meta_name)

@@ -35,8 +35,6 @@ def _pyramid_base() -> dict:
         "base_config": BASE_CONFIG,
         "data": {
             "npy_pattern": MHD_PATTERN,
-            "log_transform": True,
-            "norm_before_cdd": True,
         },
         "model": {
             "mode": "pyramid",
@@ -75,7 +73,6 @@ def _pyramid_base() -> dict:
             "mse_loss_weight": 50.0,
             "vicreg_var_weight": 0.0,
             "vicreg_cov_weight": 0.0,
-            "sigreg_on_pred": True,
             "sigreg_weight": 10.0,
             "sigreg_sketch_dim": 64,
             "symmetric_feature_loss_weight": 0.0,

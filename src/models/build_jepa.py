@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -62,7 +62,6 @@ class PyramidGridJEPA(nn.Module):
         align_scales: bool = True,
         mask_box_size: int = 16,
         mask_box_size_range=None,
-        blur_mode: str = "gaussian",
         cdd_mode: str = "log",
         cdd_constrained: bool = True,
         cdd_sm_mode: str = "reflect",
@@ -152,7 +151,6 @@ class PyramidGridJEPA(nn.Module):
             mask_box_size_range if mask_box_size_range is not None else inline_mask_box_size_range,
             "mask_box_size_range",
         )
-        self.blur_mode = str(blur_mode)
         self.cdd_mode = str(cdd_mode)
         self.cdd_constrained = bool(cdd_constrained)
         self.cdd_sm_mode = str(cdd_sm_mode)
@@ -579,10 +577,10 @@ class PyramidGridJEPA(nn.Module):
             raise ValueError(f"Expected grayscale input, got {x_clean.shape[1]} channels")
 
         if context_data is not None:
-            x_context = context_data[0]
-            target_locations = context_data[1]
-            target_scales = context_data[2]
-            target_valid = context_data[3]
+            x_context = context_data[0].to(device=x_clean.device)
+            target_locations = context_data[1].to(device=x_clean.device)
+            target_scales = context_data[2].to(device=x_clean.device)
+            target_valid = context_data[3].to(device=x_clean.device)
             debug = context_data[4] if len(context_data) > 4 else {}
         else:
             invalid_pixel_mask = ~torch.isfinite(x_clean)
@@ -606,7 +604,6 @@ class PyramidGridJEPA(nn.Module):
                     global_shift=self.global_shift,
                     align_scales=self.align_scales,
                     mask_box_size=effective_mask_box_size,
-                    blur_mode=self.blur_mode,
                     cdd_mode=self.cdd_mode,
                     cdd_constrained=self.cdd_constrained,
                     cdd_sm_mode=self.cdd_sm_mode,
@@ -638,7 +635,6 @@ class PyramidGridJEPA(nn.Module):
                     global_shift=self.global_shift,
                     align_scales=self.align_scales,
                     mask_box_size=effective_mask_box_size,
-                    blur_mode=self.blur_mode,
                     cdd_mode=self.cdd_mode,
                     cdd_constrained=self.cdd_constrained,
                     cdd_sm_mode=self.cdd_sm_mode,
@@ -664,16 +660,12 @@ class PyramidGridJEPA(nn.Module):
         x_context_enc = x_context
         if self.post_log_transform:
             eps = max(1e-30, float(self.log_eps))
-            if self.blur_mode == "cdd":
-                # CDD stabilization: shared per-sample std floor from clean branch.
-                base = torch.clamp(x_clean, min=0.0)
-                base_std = torch.std(base, dim=(-2, -1), keepdim=True)
-                log_floor = torch.clamp(base_std * float(self.cdd_log_std_floor_mult), min=eps)
-                x_clean_enc = torch.log(torch.clamp(x_clean, min=0.0) + log_floor)
-                x_context_enc = torch.log(torch.clamp(x_context, min=0.0) + log_floor)
-            else:
-                x_clean_enc = torch.log(torch.clamp(x_clean, min=0.0) + eps)
-                x_context_enc = torch.log(torch.clamp(x_context, min=0.0) + eps)
+            # Shared floor keeps clean and masked CDD reconstructions on one scale.
+            base = torch.clamp(x_clean, min=0.0)
+            base_std = torch.std(base, dim=(-2, -1), keepdim=True)
+            log_floor = torch.clamp(base_std * float(self.cdd_log_std_floor_mult), min=eps)
+            x_clean_enc = torch.log(torch.clamp(x_clean, min=0.0) + log_floor)
+            x_context_enc = torch.log(torch.clamp(x_context, min=0.0) + log_floor)
 
         if self.use_image_mask_token:
             if "mask_map" not in debug:
@@ -713,9 +705,9 @@ class PyramidGridJEPA(nn.Module):
         cdd_masked_enc = None
         needs_cdd_cube = self.encoder_type in CDD_CUBE_ENCODER_TYPES
         if needs_cdd_cube:
-            cdd_orig = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
-            cdd_masked = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
-            dip_per_ch = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
+            cdd_orig = debug["cdd_channels_orig"].to(device=x_clean.device, dtype=x_clean.dtype)
+            cdd_masked = debug["cdd_channels_masked"].to(device=x_clean.device, dtype=x_clean.dtype)
+            dip_per_ch = debug["dip_field_per_channel"].to(device=x_clean.device, dtype=x_clean.dtype)
             # Global CDD-cube stabilization for pyramid encoders that consume
             # concatenated channel cubes directly (non-CDDOpNet paths).
             if self.post_log_transform:
@@ -736,13 +728,14 @@ class PyramidGridJEPA(nn.Module):
         if not bool(mask_inference):
             # In mask-free inference, predictor branch should consume clean features.
             enc_context = enc_target
-        symmetric_var = None  # accumulated rotation-view variance (scalar or None)
+        symmetric_var = None  # trainable context-encoder rotation-view variance
+        target_symmetric_var = None  # detached EMA diagnostic only
         if self.encoder_type == "cdd_opnet":
             if self.mode != "pyramid":
                 raise ValueError("cdd_opnet requires mode='pyramid'.")
-            cdd_orig = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
-            cdd_masked = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
-            mask_tokens = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
+            cdd_orig = debug["cdd_channels_orig"].to(device=x_clean.device, dtype=x_clean.dtype)
+            cdd_masked = debug["cdd_channels_masked"].to(device=x_clean.device, dtype=x_clean.dtype)
+            mask_tokens = debug["dip_field_per_channel"].to(device=x_clean.device, dtype=x_clean.dtype)
             if bool(mask_inference):
                 if self.use_symmetric_feature_loss:
                     context_map, ctx_var = symmetric_forward_2d(
@@ -782,7 +775,7 @@ class PyramidGridJEPA(nn.Module):
                         floor_source=cdd_orig,
                         return_var=True,
                     )
-                    symmetric_var = gt_var if symmetric_var is None else symmetric_var + gt_var
+                    target_symmetric_var = gt_var if target_symmetric_var is None else target_symmetric_var + gt_var
                 else:
                     gt_map = self.target_encoder(
                         cdd_orig,
@@ -829,7 +822,7 @@ class PyramidGridJEPA(nn.Module):
                         mask_tokens=zero_mask_tokens,
                         return_var=True,
                     )
-                    symmetric_var = gt_var if symmetric_var is None else symmetric_var + gt_var
+                    target_symmetric_var = gt_var if target_symmetric_var is None else target_symmetric_var + gt_var
                 else:
                     gt_map = self.target_encoder(cdd_orig_scaleaware, mask_tokens=zero_mask_tokens)
         elif self.encoder_type == "convnext_dense_pyramid":
@@ -844,7 +837,7 @@ class PyramidGridJEPA(nn.Module):
             with torch.no_grad():
                 if self.use_symmetric_feature_loss:
                     gt_map, gt_var = symmetric_forward_2d(self.target_encoder, enc_target, return_var=True)
-                    symmetric_var = gt_var if symmetric_var is None else symmetric_var + gt_var
+                    target_symmetric_var = gt_var if target_symmetric_var is None else target_symmetric_var + gt_var
                 else:
                     gt_map = self.target_encoder(enc_target)
             if self.use_symmetric_feature_loss:
@@ -900,10 +893,12 @@ class PyramidGridJEPA(nn.Module):
 
         pred_patches = extract_location_patches(pred_map, target_locations, patch_size=self.patch_size)
         gt_patches = extract_location_patches(gt_map, target_locations, patch_size=self.patch_size)
+        context_patches = extract_location_patches(context_proj, target_locations, patch_size=self.patch_size)
 
         out = {
             "pred_patches": pred_patches,
             "gt_patches": gt_patches,
+            "context_patches": context_patches,
             # Raw pre-encoder tensors (for diagnostics/visualization).
             "x_clean_raw": x_clean,
             "x_context_raw": x_context,
@@ -919,13 +914,15 @@ class PyramidGridJEPA(nn.Module):
         }
         if symmetric_var is not None:
             out["symmetric_var"] = symmetric_var
+        if target_symmetric_var is not None:
+            out["target_symmetric_var"] = target_symmetric_var
         if actual_context_in is not None:
             out["network_context_in"] = actual_context_in
             out["network_target_in"] = actual_target_in
         if return_debug or needs_cdd_cube:
             # Exact applied hard mask footprint from make_pyramid_grid_context.
             if return_debug:
-                out["target_mask_map"] = debug["mask_map"].unsqueeze(1).to(dtype=x_clean.dtype)
+                out["target_mask_map"] = debug["mask_map"].unsqueeze(1).to(device=x_clean.device, dtype=x_clean.dtype)
                 for k in (
                     "priority_good_candidates",
                     "priority_nonzero_mean",
@@ -933,29 +930,34 @@ class PyramidGridJEPA(nn.Module):
                     "priority_effective_targets",
                 ):
                     if k in debug:
-                        out[k] = debug[k].to(dtype=x_clean.dtype)
-            out["cdd_channels_orig"] = debug["cdd_channels_orig"].to(dtype=x_clean.dtype)
-            out["cdd_channels_masked"] = debug["cdd_channels_masked"].to(dtype=x_clean.dtype)
-            out["dip_field_per_channel"] = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
-            out["pyramid_mask_token"] = debug["dip_field_per_channel"].to(dtype=x_clean.dtype)
+                        out[k] = debug[k].to(device=x_clean.device, dtype=x_clean.dtype)
+            out["cdd_channels_orig"] = debug["cdd_channels_orig"].to(device=x_clean.device, dtype=x_clean.dtype)
+            out["cdd_channels_masked"] = debug["cdd_channels_masked"].to(device=x_clean.device, dtype=x_clean.dtype)
+            out["dip_field_per_channel"] = debug["dip_field_per_channel"].to(device=x_clean.device, dtype=x_clean.dtype)
+            out["pyramid_mask_token"] = debug["dip_field_per_channel"].to(device=x_clean.device, dtype=x_clean.dtype)
         return out
 
     def compute_symmetric_loss(self, outputs):
-        """Mean rotation-view variance, averaged over all spatial and channel dims."""
+        """Context-encoder view variance, averaged over spatial and channel dims."""
         var = outputs.get("symmetric_var")
         if var is None:
             return torch.tensor(0.0, device=outputs["pred_patches"].device)
         return var.mean()
 
     def compute_loss(self, outputs):
-        pred = outputs["pred_patches"]
-        gt = outputs["gt_patches"].detach()
+        # Keep reductions in fp32: patch sums can overflow under AMP.
+        pred = outputs["pred_patches"].float()
+        gt = outputs["gt_patches"].detach().float()
 
         valid = outputs["target_valid"]  # B x K (bool)
 
         if self.normalize_loss_l2:
-            pred = F.normalize(pred, dim=2)
-            gt = F.normalize(gt, dim=2)
+            # Normalize the full patch vector so spatial contrast is preserved.
+            b, k, c, p1, p2 = pred.shape
+            pred = F.normalize(pred.reshape(b, k, -1), dim=2).reshape(b, k, c, p1, p2)
+            gt = F.normalize(gt.reshape(b, k, -1), dim=2).reshape(b, k, c, p1, p2)
+            outputs["pred_patches"] = pred
+            outputs["gt_patches"] = gt
         loss_map = F.mse_loss(pred, gt, reduction="none")  # B x K x C x P x P
         w = valid.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).to(loss_map.dtype)
         if not bool(valid.any().item()):

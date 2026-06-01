@@ -14,11 +14,7 @@ if ROOT_DIR not in sys.path:
 
 from src.dataset import JEPADataset
 from src.models.build_jepa import PyramidGridJEPA
-
-
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+from src.train import load_config
 
 
 def _compute_pca_2d(x: np.ndarray) -> np.ndarray:
@@ -50,31 +46,21 @@ def _compute_umap_2d(x: np.ndarray) -> np.ndarray:
 
 
 def build_model(model_cfg: dict, data_cfg: dict, device: torch.device) -> PyramidGridJEPA:
-    blur_mode = model_cfg.get("blur_mode", "gaussian")
-    if blur_mode == "cdd":
-        model_post_log = bool(data_cfg.get("log_transform", True))
-    else:
-        model_post_log = bool(model_cfg.get("post_log_transform", data_cfg.get("log_transform", True)))
-
     model = PyramidGridJEPA(
         latent_channels=model_cfg.get("latent_channels", 32),
         predictor_hidden=model_cfg.get("predictor_hidden"),
         patch_size=model_cfg.get("patch_size", 2),
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0)),
-        box_sigma_mult=model_cfg.get("box_sigma_mult", 4.0),
         mask_scale=model_cfg.get("mask_size_scaling", 1.0),
         spacing_scale=model_cfg.get("mask_spacing_scaling", 1.5),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
         mask_box_size=model_cfg.get("mask_box_size", 16),
-        blur_mode=blur_mode,
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=model_cfg.get("cdd_constrained", True),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
-        dip_sigma_mult=1.0,
-        constant_gaussian_sigma=model_cfg.get("constant_gaussian_sigma", 1.0),
-        post_log_transform=model_post_log,
+        post_log_transform=bool(model_cfg.get("post_log_transform", True)),
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
         ema_momentum=model_cfg.get("ema_momentum", 0.996),
@@ -130,22 +116,11 @@ def main():
         loaded_ckpt = ckpt
     model.eval()
 
-    # Use dataset preprocessing exactly as training policy.
+    # Dataset preprocessing stays linear; model-side post-log matches training.
     ds = JEPADataset(
         num_samples=1,
-        image_size=data_cfg.get("image_size", 256),
         data_root=data_root,
         npy_pattern=npy_pattern,
-        log_transform=bool(data_cfg.get("log_transform", True)),
-        log_eps=data_cfg.get("log_eps", 1.0),
-        cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8, 16]),
-        cdd_strength=data_cfg.get("cdd_strength", 1.0),
-        cdd_clip=data_cfg.get("cdd_clip", True),
-        norm_before_cdd=data_cfg.get("norm_before_cdd", True),
-        cdd_mode=data_cfg.get("cdd_mode", "log"),
-        cdd_constrained=data_cfg.get("cdd_constrained", True),
-        cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
-        apply_cdd=(model_cfg.get("blur_mode", "gaussian") != "cdd"),
         cube_slice_strategy="fixed",
         cube_slice_axis=int(data_cfg.get("cube_slice_axis", 0)),
         cube_slice_index=0,

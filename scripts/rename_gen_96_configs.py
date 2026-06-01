@@ -33,11 +33,7 @@ def canonical_config_name(run: int, cfg: dict) -> str:
     sym_path = bool(model["use_symmetric_feature_loss"])
     sym_weight = float(train["symmetric_feature_loss_weight"])
     symloss = "symloss_on" if sym_path and sym_weight > 0.0 else "symloss_off"
-    lognorm_on = (
-        bool(data["log_transform"])
-        and bool(data["norm_before_cdd"])
-        and bool(model["post_log_transform"])
-    )
+    lognorm_on = bool(model.get("post_log_transform", True))
     dataset = _dataset_tag(cfg)
     if dataset == "c12":
         prefix = f"gen_96_run_{run:03d}"

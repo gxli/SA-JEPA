@@ -7,7 +7,6 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -16,61 +15,28 @@ if ROOT_DIR not in sys.path:
 from src.dataset import JEPADataset
 
 
-def gaussian_kernel_2d(sigma: float, device: torch.device) -> torch.Tensor:
-    radius = max(1, int(round(3.0 * sigma)))
-    size = 2 * radius + 1
-    coords = torch.arange(size, dtype=torch.float32, device=device) - radius
-    g = torch.exp(-(coords**2) / (2.0 * sigma * sigma))
-    g = g / g.sum()
-    kernel = torch.outer(g, g)
-    return kernel / kernel.sum()
-
-
-def gaussian_blur_batch(x: torch.Tensor, sigma: float) -> torch.Tensor:
-    _, c, _, _ = x.shape
-    kernel = gaussian_kernel_2d(sigma, x.device)
-    k = kernel.shape[0]
-    weight = kernel.view(1, 1, k, k).repeat(c, 1, 1, 1)
-    pad = k // 2
-    # Reflect padding avoids boundary darkening artifacts.
-    x_pad = F.pad(x, (pad, pad, pad, pad), mode="reflect")
-    return F.conv2d(x_pad, weight, padding=0, groups=c)
-
-
 def pyramid_blur_center(
     x: torch.Tensor,
     center_y: int,
     center_x: int,
     scales=(2, 4, 8, 16),
     radius: int = 32,
-    use_gaussian_dip: bool = False,
-    dip_sigma_mult: float = 1.0,
 ) -> torch.Tensor:
     x_context = x.clone()
 
     _, c, h, w = x.shape
-    # Channel-matched masking:
-    # - hard mode: zero out scale-sized boxes
-    # - soft mode: gaussian dip x * (1 - g), sigma = scale * dip_sigma_mult
+    # Channel-matched masking: zero out scale-sized boxes.
     if len(scales) == 0:
         return x_context
     max_sigma = float(max(scales))
-    yy = torch.arange(h, device=x.device, dtype=torch.float32).view(h, 1)
-    xx = torch.arange(w, device=x.device, dtype=torch.float32).view(1, w)
     for ch in range(c):
         sigma = float(scales[min(ch, len(scales) - 1)])
         rr = max(2, int(round(radius * (sigma / max_sigma)))) if max_sigma > 0 else int(radius)
-        if use_gaussian_dip:
-            s = max(1e-6, float(sigma) * float(dip_sigma_mult))
-            g = torch.exp(-(((yy - float(center_y)) ** 2 + (xx - float(center_x)) ** 2) / (2.0 * s * s)))
-            g = g.clamp(0.0, 1.0).view(1, 1, h, w)
-            x_context[:, ch : ch + 1] = x_context[:, ch : ch + 1] * (1.0 - g)
-        else:
-            y0 = max(0, center_y - rr)
-            y1 = min(h, center_y + rr)
-            x0 = max(0, center_x - rr)
-            x1 = min(w, center_x + rr)
-            x_context[:, ch : ch + 1, y0:y1, x0:x1] = 0.0
+        y0 = max(0, center_y - rr)
+        y1 = min(h, center_y + rr)
+        x0 = max(0, center_x - rr)
+        x1 = min(w, center_x + rr)
+        x_context[:, ch : ch + 1, y0:y1, x0:x1] = 0.0
     return x_context
 
 
@@ -128,7 +94,7 @@ def _choose_log_eps(arr: np.ndarray, cfg_eps: float = None) -> float:
     return min(float(cfg_eps), max(1e-30, p10 * 1e-2))
 
 
-def load_input(path: str, log_transform: bool = False, log_eps: float = None) -> np.ndarray:
+def load_input(path: str) -> np.ndarray:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".npy":
         arr = np.load(path)
@@ -147,9 +113,6 @@ def load_input(path: str, log_transform: bool = False, log_eps: float = None) ->
             raise ValueError(f"Unsupported image shape: {img.shape}")
 
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-    if log_transform:
-        eps = _choose_log_eps(arr, cfg_eps=log_eps)
-        arr = np.log(np.clip(arr, a_min=0.0, a_max=None) + eps)
     return arr
 
 
@@ -255,6 +218,7 @@ def main():
 
     cfg = load_config(args.config)
     data_cfg = cfg.get("data", {})
+    model_cfg = cfg.get("model", {})
     demo_cfg = cfg.get("blur_demo", {})
     config_name = os.path.splitext(os.path.basename(args.config))[0]
 
@@ -267,17 +231,8 @@ def main():
     # Use the main dataset pipeline for full consistency with training.
     dataset = JEPADataset(
         num_samples=max(1, int(data_cfg.get("num_samples", 1))),
-        image_size=int(data_cfg.get("image_size", 224)),
         data_root=data_cfg.get("data_root", "data"),
         npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
-        log_transform=data_cfg.get("log_transform", True),
-        log_eps=data_cfg.get("log_eps", 1.0),
-        cdd_scales=data_cfg.get("cdd_scales", [2, 4, 8]),
-        cdd_strength=data_cfg.get("cdd_strength", 1.0),
-        cdd_clip=data_cfg.get("cdd_clip", True),
-        cdd_mode=data_cfg.get("cdd_mode", "log"),
-        cdd_constrained=data_cfg.get("cdd_constrained", True),
-        cdd_sm_mode=data_cfg.get("cdd_sm_mode", "reflect"),
         cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
         cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
         cube_slice_index=data_cfg.get("cube_slice_index", 0),
@@ -296,8 +251,6 @@ def main():
 
     scales = tuple(demo_cfg.get("scales", [1, 2, 4]))
     make_channel_plot = bool(demo_cfg.get("make_channel_plot", True))
-    use_gaussian_dip = bool(demo_cfg.get("use_gaussian_dip", True))
-    dip_sigma_mult = float(demo_cfg.get("dip_sigma_mult", 1.0))
     radius = int(demo_cfg.get("radius", 32))
     num_centers_cfg = demo_cfg.get("num_random_centers", "auto")
     use_grid_centers = bool(demo_cfg.get("use_grid_centers", True))
@@ -312,8 +265,7 @@ def main():
     seed = int(demo_cfg.get("seed", 42))
     rng = np.random.default_rng(seed)
 
-    cdd_scales = tuple(data_cfg.get("cdd_scales", [2, 4, 8]))
-    cdd_strength = float(data_cfg.get("cdd_strength", 1.0))
+    cdd_scales = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
     cdd_mode = data_cfg.get("cdd_mode", "log")
     cdd_constrained = bool(data_cfg.get("cdd_constrained", True))
     cdd_sm_mode = data_cfg.get("cdd_sm_mode", "reflect")
@@ -325,20 +277,18 @@ def main():
         "source": "JEPADataset",
     }
     # Run package CDD directly on original image to get true scale-component channels.
-    arr_linear = load_input(input_path, log_transform=False, log_eps=cfg_log_eps)
-    norm_before_cdd = bool(data_cfg.get("norm_before_cdd", True))
-    if norm_before_cdd:
-        amin = float(arr_linear.min())
-        amax = float(arr_linear.max())
-        denom = amax - amin
-        if denom > 1e-20:
-            arr_linear = (arr_linear - amin) / denom
-        else:
-            arr_linear = np.zeros_like(arr_linear, dtype=np.float32)
+    arr_linear = load_input(input_path)
+    amin = float(arr_linear.min())
+    amax = float(arr_linear.max())
+    denom = amax - amin
+    if denom > 1e-20:
+        arr_linear = (arr_linear - amin) / denom
+    else:
+        arr_linear = np.zeros_like(arr_linear, dtype=np.float32)
     _, cdd_pkg_meta, cdd_full_result, cdd_residual = constrained_diffusion_decomposition(
         arr_linear,
         scales=cdd_scales,
-        strength=cdd_strength,
+        strength=1.0,
         mode=cdd_mode,
         constrained=cdd_constrained,
         sm_mode=cdd_sm_mode,
@@ -463,8 +413,6 @@ def main():
             center_x=xx,
             scales=scales,
             radius=draw_half,
-            use_gaussian_dip=use_gaussian_dip,
-            dip_sigma_mult=dip_sigma_mult,
         )
 
     # Reconstruct original/modified from CDD components + residual for main 4-panel checks.
@@ -527,8 +475,7 @@ def main():
             ax_l.axis("off")
 
             ax_r.imshow(ch_blur_vis, cmap=cmap)
-            mode_name = "Dip" if use_gaussian_dip else "Masked"
-            ax_r.set_title(f"Channel {ch} {mode_name} (scale={sigma_map[ch]:g})")
+            ax_r.set_title(f"Channel {ch} Masked (scale={sigma_map[ch]:g})")
             ax_r.axis("off")
 
             ax_d.imshow(ch_delta_vis, cmap="seismic")
@@ -565,13 +512,11 @@ def main():
         else cfg_log_eps,
         "scales": list(scales),
         "channel_sigma_map": sigma_map,
-        "cdd_scales": list(cdd_scales),
-        "cdd_strength": cdd_strength,
+        "model_sigmas": list(cdd_scales),
         "decomposition_name": "constrained_diffusion_decomposition",
         "decomposition_then_log": True,
         "cdd_meta": cdd_meta,
         "cdd_package_meta": cdd_pkg_meta,
-        "norm_before_cdd": norm_before_cdd,
         "radius": radius,
         "draw_half": draw_half,
         "channel_box_half": channel_box_half,
@@ -596,8 +541,6 @@ def main():
         "seed": seed,
         "global_shift_mode": True,
         "global_shift_xy": [shift_y, shift_x] if use_grid_centers else [0, 0],
-        "use_gaussian_dip": use_gaussian_dip,
-        "dip_sigma_mult": dip_sigma_mult,
         "shared_log_eps": shared_eps,
         "output": out_path,
         "channels_output": channels_path if make_channel_plot else None,

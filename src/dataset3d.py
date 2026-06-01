@@ -15,8 +15,6 @@ class JEPA3DCropDataset(Dataset):
         npy_pattern: str = "*.npy",
         num_samples: int = 1000,
         crop_size: int = 64,
-        log_transform: bool = True,
-        log_eps: float = 1.0,
         normalize: bool = True,
         crop_strategy: str = "random",
     ):
@@ -26,8 +24,6 @@ class JEPA3DCropDataset(Dataset):
 
         self.num_samples = int(num_samples)
         self.crop_size = int(crop_size)
-        self.log_transform = bool(log_transform)
-        self.log_eps = float(log_eps)
         self.normalize = bool(normalize)
         self.crop_strategy = str(crop_strategy).lower()
         if self.crop_strategy not in ("random", "center", "mixed"):
@@ -89,13 +85,5 @@ class JEPA3DCropDataset(Dataset):
 
         if self.normalize:
             crop = self._normalize01(crop)
-
-        if self.log_transform:
-            pos = crop[crop > 0]
-            eps = self.log_eps
-            if pos.size > 0:
-                p10 = float(np.percentile(pos, 10))
-                eps = min(float(self.log_eps), max(1e-30, p10 * 1e-2))
-            crop = np.log(np.clip(crop, 0.0, None) + eps)
 
         return torch.from_numpy(crop.astype(np.float32)).unsqueeze(0)

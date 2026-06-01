@@ -543,6 +543,11 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
             adapter_layers.append(nn.GELU())
             self.adapter = nn.Sequential(*adapter_layers)
 
+        print(
+            f"[CDDScaleAwareConvNeXt] depth={depth}, dilations={dilations}, "
+            f"stem_norm={stem_norm}, adapter_norm={adapter_norm}, "
+            f"final_norm={final_norm}({final_norm_type}), grn={use_grn}"
+        )
         self.convnext = ConvNeXtDenseEncoder(
             in_channels=self.num_scales * self.scale_feat_channels,
             hidden_channels=hidden_channels,
@@ -585,7 +590,7 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
                     f"[{self.__class__.__name__}] WARNING: "
                     f"Truncated {n_extra} extra channel(s) "
                     f"(append_last_residual={self.cdd_append_last_residual}). "
-                    f"Check cdd_scales vs sigmas mismatch."
+                    "Check model.sigmas and encoder scale count."
                 )
             else:
                 n_missing = self.num_scales - s
@@ -606,7 +611,7 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
                     f"[{self.__class__.__name__}] WARNING: "
                     f"Padded {n_missing} missing channel(s) "
                     f"(append_last_residual={self.cdd_append_last_residual}). "
-                    f"Check cdd_scales vs sigmas mismatch."
+                    "Check model.sigmas and encoder scale count."
                 )
             s = self.num_scales
 
