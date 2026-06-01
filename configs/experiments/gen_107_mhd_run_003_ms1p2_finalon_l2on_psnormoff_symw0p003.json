@@ -33,7 +33,7 @@
     "epochs": 5,
     "log_interval": 1,
     "diagnostic_interval": 10,
-    "batch_size": 8,
+    "batch_size": 4,
     "num_workers": 8,
     "prefetch_factor": 2,
     "vicreg_spatial_mode": "pooled",

@@ -33,7 +33,8 @@ def _tta_views_2d(x: torch.Tensor, mode: str) -> list[tuple[str, torch.Tensor]]:
     raise ValueError(f"Unsupported inference TTA mode: {mode}")
 
 
-def _invert_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
+def _apply_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
+    """Apply the same TTA view transform, matching _tta_views_2d output."""
     if name == "id":
         return z
     if name == "fx":
@@ -43,6 +44,11 @@ def _invert_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
     if name == "fxy":
         return torch.flip(z, dims=(-2, -1))
     raise ValueError(name)
+
+
+def _invert_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
+    """Invert a TTA view transform (flip is self-inverse, same as _apply_tta_2d)."""
+    return _apply_tta_2d(name, z)
 
 
 def _mask_invalid_targets_from_input(
@@ -202,7 +208,13 @@ def run_post_training_inference(
     model.eval()
     with torch.no_grad():
         print(f"[{config_name}] post_training_inference loading sample batch")
-        x_raw = next(iter(dataloader))
+        raw_batch = next(iter(dataloader))
+        if isinstance(raw_batch, (tuple, list)) and len(raw_batch) == 2 and raw_batch[1] is not None:
+            cdd_raw, x_raw = raw_batch
+            cdd_raw = cdd_raw.to(next(model.parameters()).device)
+        else:
+            cdd_raw = None
+            x_raw = raw_batch if not isinstance(raw_batch, (tuple, list)) else raw_batch[0]
         x_raw = x_raw.to(next(model.parameters()).device)
         # Deterministic lattice sweep is only meaningful when mask inference is enabled.
         largest_sigma = float(max(getattr(model, "sigmas", (16.0,))))
@@ -248,6 +260,7 @@ def run_post_training_inference(
         for pi, shift in enumerate(shifts):
             per_view = []
             for vi, (vname, xv) in enumerate(tta_views):
+                cdv = _apply_tta_2d(vname, cdd_raw) if cdd_raw is not None else None
                 out_v = model(
                     xv,
                     return_debug=(pi == 0 and vi == 0),
@@ -255,6 +268,7 @@ def run_post_training_inference(
                     enable_target_dithering=False,
                     lattice_shift_override=shift,
                     mask_inference=bool(mask_inference),
+                    cdd_orig=cdv,
                 )
                 out_v["pred_map"] = _invert_tta_2d(vname, out_v["pred_map"])
                 out_v["gt_map"] = _invert_tta_2d(vname, out_v["gt_map"])
@@ -479,15 +493,22 @@ def run_post_training_inference(
         max_visit_batches = 0
     dev = next(model.parameters()).device
     with torch.no_grad():
-        for ib, xb in enumerate(dataloader):
+        for ib, batch in enumerate(dataloader):
             if max_visit_batches > 0 and ib >= max_visit_batches:
                 break
+            if isinstance(batch, (tuple, list)) and len(batch) == 2 and batch[1] is not None:
+                cdd_b, xb = batch
+                cdd_b = cdd_b.to(dev)
+            else:
+                cdd_b = None
+                xb = batch if not isinstance(batch, (tuple, list)) else batch[0]
             xb = xb.to(dev)
             outb = model(
                 xb,
                 return_debug=False,
                 enable_grid_jitter=False,
                 mask_inference=bool(mask_inference),
+                cdd_orig=cdd_b,
             )
             tloc_b = outb["target_locations"].detach().cpu().numpy()
             tvalid_b = outb["target_valid"].detach().cpu().numpy().astype(bool)

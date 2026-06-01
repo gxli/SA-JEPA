@@ -124,8 +124,10 @@ case "$1" in
     push)
         echo "Applying safe mirror push to $REMOTE:$REMOTE_DEST (preserve excluded dirs)"
         ssh "$REMOTE" "mkdir -p \"$REMOTE_HOME/proj/$VERSIONED_REL_PATH\""
+        # Do not use --append/--append-verify for mutable project files. Those
+        # flags are for resuming large downloads and can corrupt or skip edits
+        # to existing files under src/ and configs/.
         run_rsync_retry "${RSYNC_COMMON[@]}" \
-            ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
             --delete --force \
             --exclude '.git' \
             --exclude 'result_local/' \
@@ -140,7 +142,6 @@ case "$1" in
         echo "Previewing safe mirror push (dry-run) to $REMOTE:$REMOTE_DEST (preserve excluded dirs)"
         ssh "$REMOTE" "mkdir -p \"$REMOTE_HOME/proj/$VERSIONED_REL_PATH\""
         run_rsync_retry "${RSYNC_COMMON[@]}" \
-            ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
             --dry-run \
             --delete --force \
             --exclude '.git' \

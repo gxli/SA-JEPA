@@ -20,6 +20,7 @@ class JEPADataset(Dataset):
         input_type: str = "image",
         image_batch_inference: bool = False,
         image_batch_selected_indices: dict | None = None,
+        cdd_cache: dict | None = None,
     ):
         self.input_type = str(input_type).lower()
         allowed_input_types = {"image", "cube", "image_batch"}
@@ -42,6 +43,7 @@ class JEPADataset(Dataset):
         self.cube_slice_index = cube_slice_index
         self.random_roll_max = int(random_roll_max)
         self.d4_augment = bool(d4_augment)
+        self.cdd_cache = cdd_cache
 
         pattern = os.path.join(data_root, npy_pattern)
         self.npy_files = sorted(glob.glob(pattern))
@@ -149,7 +151,36 @@ class JEPADataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        path, forced_slice_idx = self.sample_index[idx % len(self.sample_index)]
+        key = self.sample_index[idx % len(self.sample_index)]
+
+        if self.cdd_cache is not None:
+            cdd_np = self.cdd_cache.get(key)
+            if cdd_np is None:
+                raise KeyError(f"CDD cache miss for key={key}")
+            # cdd_np is (S, H, W) float32
+            cdd_orig = torch.from_numpy(cdd_np.astype(np.float32))
+            x_clean = cdd_orig.sum(dim=0, keepdim=True)  # 1 x H x W
+            if self.d4_augment:
+                if bool(np.random.randint(0, 2)):
+                    cdd_orig = torch.flip(cdd_orig, dims=(-1,))
+                    x_clean = torch.flip(x_clean, dims=(-1,))
+                if bool(np.random.randint(0, 2)):
+                    cdd_orig = torch.flip(cdd_orig, dims=(-2,))
+                    x_clean = torch.flip(x_clean, dims=(-2,))
+            if self.random_roll_max > 0:
+                dy = int(np.random.randint(-self.random_roll_max, self.random_roll_max + 1))
+                dx = int(np.random.randint(-self.random_roll_max, self.random_roll_max + 1))
+                pad_val = self.random_roll_max
+                padded_cdd = torch.nn.functional.pad(cdd_orig, (pad_val, pad_val, pad_val, pad_val), mode='reflect')
+                padded_img = torch.nn.functional.pad(x_clean, (pad_val, pad_val, pad_val, pad_val), mode='reflect')
+                h, w = cdd_orig.shape[-2], cdd_orig.shape[-1]
+                y0 = pad_val - dy
+                x0 = pad_val - dx
+                cdd_orig = padded_cdd[..., y0:y0+h, x0:x0+w]
+                x_clean = padded_img[..., y0:y0+h, x0:x0+w]
+            return cdd_orig, x_clean
+
+        path, forced_slice_idx = key
         sample = self._load_sample(path, forced_slice_idx=forced_slice_idx).clone()  # 1 x H x W
         if self.d4_augment:
             # Shape-safe augmentation for non-square inputs: random H/V flips only.

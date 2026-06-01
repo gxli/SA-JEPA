@@ -286,6 +286,7 @@ def make_pyramid_grid_context(
     target_allow_partial_overlap: float = 0.0,
     mask_box_hardcap: int | None = None,
     cdd_use_gpu: bool = False,
+    cdd_orig_in: Optional[torch.Tensor] = None,
 ):
     """
     x_clean: B x 1 x H x W
@@ -422,32 +423,38 @@ def make_pyramid_grid_context(
 
         # Masking is applied only after CDD decomposition.
         if active_sigmas:
-            import constrained_diffusion as cdd
+            if cdd_orig_in is not None:
+                # Use pre-computed CDD channels (residual already baked in).
+                cdd_orig = cdd_orig_in[bi].cpu().numpy().astype(np.float32, copy=False)
+                cdd_mod = cdd_orig.copy()
+                cdd_residual = None  # unused — residual is in last channel
+            else:
+                import constrained_diffusion as cdd
 
-            cdd_kwargs = dict(
-                mode=cdd_mode,
-                constrained=bool(cdd_constrained),
-                sm_mode=cdd_sm_mode,
-                return_scales=False,
-                verbose=False,
-                use_gpu=bool(cdd_use_gpu),
-            )
-            cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(
-                arr.astype(np.float32),
-                num_channels=len(active_sigmas),
-                max_scale=max(active_sigmas),
-                **cdd_kwargs,
-            )
-            cdd_channels_arr = np.asarray(cdd_channels_arr, dtype=np.float32)
-            cdd_residual = np.asarray(cdd_residual, dtype=np.float32)
+                cdd_kwargs = dict(
+                    mode=cdd_mode,
+                    constrained=bool(cdd_constrained),
+                    sm_mode=cdd_sm_mode,
+                    return_scales=False,
+                    verbose=False,
+                    use_gpu=bool(cdd_use_gpu),
+                )
+                cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(
+                    arr.astype(np.float32),
+                    num_channels=len(active_sigmas),
+                    max_scale=max(active_sigmas),
+                    **cdd_kwargs,
+                )
+                cdd_channels_arr = np.asarray(cdd_channels_arr, dtype=np.float32)
+                cdd_residual = np.asarray(cdd_residual, dtype=np.float32)
 
-            cdd_orig = np.clip(np.asarray(cdd_channels_arr, dtype=np.float32), a_min=0.0, a_max=None)
+                cdd_orig = np.clip(np.asarray(cdd_channels_arr, dtype=np.float32), a_min=0.0, a_max=None)
 
-            if cdd_append_last_residual:
-                cdd_orig[-1] = cdd_orig[-1] + cdd_residual
+                if cdd_append_last_residual:
+                    cdd_orig[-1] = cdd_orig[-1] + cdd_residual
 
-            # Context branch starts from the exact same clipped+residual base as target.
-            cdd_mod = cdd_orig.copy()
+                # Context branch starts from the exact same clipped+residual base as target.
+                cdd_mod = cdd_orig.copy()
 
             all_cdd_orig.append(torch.from_numpy(cdd_orig.copy()))
 
@@ -645,7 +652,8 @@ def make_pyramid_grid_context(
                     applied_scales.append(float(sigma))
 
             # If residual is already baked into cdd_mod[-1], don't double-add it.
-            if cdd_append_last_residual:
+            # Pre-computed CDD always has residual in the last channel.
+            if cdd_residual is None or cdd_append_last_residual:
                 recon = np.sum(cdd_mod, axis=0)
             else:
                 recon = np.sum(cdd_mod, axis=0) + cdd_residual
@@ -812,6 +820,7 @@ def prepare_context_batch(
     target_allow_partial_overlap: float = 0.0,
     mask_box_hardcap: int | None = None,
     cdd_use_gpu: bool = False,
+    cdd_orig_in: Optional[torch.Tensor] = None,
 ):
     """Prepare context tensors from a clean batch.
 
@@ -853,6 +862,7 @@ def prepare_context_batch(
         target_allow_partial_overlap=target_allow_partial_overlap,
         mask_box_hardcap=mask_box_hardcap,
         cdd_use_gpu=cdd_use_gpu,
+        cdd_orig_in=cdd_orig_in,
     )
 
 

@@ -560,6 +560,7 @@ class PyramidGridJEPA(nn.Module):
         lattice_shift_override=None,
         mask_inference: bool = True,
         context_data=None,
+        cdd_orig: torch.Tensor | None = None,
     ):
         """
         x_clean: B x 1 x H x W
@@ -624,6 +625,7 @@ class PyramidGridJEPA(nn.Module):
                     target_nonoverlap=self.target_nonoverlap,
                     target_allow_partial_overlap=self.target_allow_partial_overlap,
                     mask_box_hardcap=self.mask_box_hardcap,
+                    cdd_orig_in=cdd_orig,
                 )
             else:
                 x_context, target_locations, target_scales, target_valid = make_pyramid_grid_context(
@@ -654,6 +656,7 @@ class PyramidGridJEPA(nn.Module):
                     target_nonoverlap=self.target_nonoverlap,
                     target_allow_partial_overlap=self.target_allow_partial_overlap,
                     mask_box_hardcap=self.mask_box_hardcap,
+                    cdd_orig_in=cdd_orig,
                 )
 
         x_clean_enc = x_clean

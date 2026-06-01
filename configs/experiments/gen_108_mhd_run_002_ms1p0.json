@@ -8,7 +8,7 @@
     "model_key": "cdd_scaleaware_convnext",
     "encoder_depth": 4,
     "mask_spacing_scaling": 2.0,
-    "mask_size_scaling": 1.2,
+    "mask_size_scaling": 1.0,
     "mask_box_size": 0,
     "normalize_loss_l2": true,
     "predictor_spatial_conv": true,

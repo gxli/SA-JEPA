@@ -74,6 +74,101 @@ def _collate_pad_hw(batch: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(out, dim=0)
 
 
+def _collate_pad_cdd(batch: list[torch.Tensor]) -> torch.Tensor:
+    """Collate CDD tensors (S, H, W) into a padded batch (B, S, H, W)."""
+    if len(batch) == 0:
+        raise ValueError("Empty batch is not supported")
+    max_h = max(int(x.shape[-2]) for x in batch)
+    max_w = max(int(x.shape[-1]) for x in batch)
+    out = []
+    for x in batch:
+        dh = max_h - int(x.shape[-2])
+        dw = max_w - int(x.shape[-1])
+        if dh > 0 or dw > 0:
+            x = F.pad(x, (0, dw, 0, dh), mode="constant", value=float("nan"))
+        out.append(x)
+    return torch.stack(out, dim=0)
+
+
+def _collate_for_inference(batch):
+    """Collate inference batches — handles both (cdd_orig, x_clean) tuples and plain tensors."""
+    if len(batch) == 0:
+        raise ValueError("Empty batch is not supported")
+    if isinstance(batch[0], (tuple, list)) and len(batch[0]) == 2:
+        cdd_list = [item[0] for item in batch]
+        x_clean_list = [item[1] for item in batch]
+        return _collate_pad_cdd(cdd_list), _collate_pad_hw(x_clean_list)
+    return _collate_pad_hw(batch), None
+
+
+def _precompute_cdd_cache(
+    *,
+    data_cfg: dict,
+    model_cfg: dict,
+    device: torch.device,
+    config_name: str,
+) -> dict:
+    """Pre-compute CDD decomposition for all data files on GPU, store in CPU RAM."""
+    import glob as _glob
+    import constrained_diffusion as cdd
+
+    data_root = data_cfg.get("data_root", "data")
+    npy_pattern = data_cfg.get("npy_pattern", "*.npy")
+    cdd_mode = str(model_cfg.get("cdd_mode", data_cfg.get("cdd_mode", "log")))
+    cdd_constrained = bool(model_cfg.get("cdd_constrained", data_cfg.get("cdd_constrained", True)))
+    cdd_sm_mode = str(model_cfg.get("cdd_sm_mode", data_cfg.get("cdd_sm_mode", "reflect")))
+    cdd_append_last_residual = bool(model_cfg.get("cdd_append_last_residual", True))
+    sigmas = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
+    if device.type != "cuda":
+        print(f"[{config_name}] CDD precompute: no CUDA, skipping")
+        return {}
+    npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
+    if not npy_files:
+        print(f"[{config_name}] CDD precompute: no files found, skipping")
+        return {}
+    print(f"[{config_name}] CDD precompute: {len(npy_files)} file(s) on GPU...")
+    cache = {}
+    for path in npy_files:
+        arr = np.load(path, mmap_mode="r").astype(np.float32)
+        # Normalize01 (same as JEPADataset._normalize01)
+        amin, amax = float(arr.min()), float(arr.max())
+        if amax - amin > 1e-20:
+            arr = (arr - amin) / (amax - amin)
+        else:
+            arr = np.zeros_like(arr, dtype=np.float32)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        if arr.ndim == 2:
+            slices = [(arr2d, None) for arr2d in [arr]]
+        elif arr.ndim == 3:
+            # Pre-compute all slices along axis 0 for 3D data.
+            depth = arr.shape[0]
+            slices = [(arr[i], i) for i in range(depth)]
+        else:
+            raise ValueError(f"Unexpected ndim={arr.ndim} for {path}")
+        for arr2d, slice_idx in slices:
+            cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(
+                arr2d,
+                num_channels=len(sigmas),
+                max_scale=max(float(s) for s in sigmas),
+                mode=cdd_mode,
+                constrained=cdd_constrained,
+                sm_mode=cdd_sm_mode,
+                return_scales=False,
+                verbose=False,
+                use_gpu=True,
+            )
+            cdd_orig = np.clip(np.asarray(cdd_channels_arr, dtype=np.float32), a_min=0.0, a_max=None)
+            if cdd_append_last_residual:
+                cdd_orig[-1] = cdd_orig[-1] + np.asarray(cdd_residual, dtype=np.float32)
+            cache_key = (path, slice_idx)  # matches JEPADataset.sample_index key format
+            cache[cache_key] = cdd_orig.astype(np.float32, copy=False)
+    # Free GPU memory used by CDD.
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    print(f"[{config_name}] CDD precompute: {len(cache)} entries cached, GPU freed")
+    return cache
+
+
 def _move_to_device(value, device: torch.device):
     if torch.is_tensor(value):
         return value.to(device, non_blocking=True)
@@ -104,10 +199,6 @@ class _MaskingCollator:
             "spacing_scale": model.spacing_scale,
             "global_shift": model.global_shift,
             "align_scales": model.align_scales,
-            "cdd_mode": model.cdd_mode,
-            "cdd_constrained": model.cdd_constrained,
-            "cdd_sm_mode": model.cdd_sm_mode,
-            "cdd_append_last_residual": model.cdd_append_last_residual,
             "patch_size": model.patch_size,
             "return_debug": self.return_debug,
             "target_invalid_region_skip": model.target_invalid_region_skip,
@@ -120,7 +211,6 @@ class _MaskingCollator:
             "target_nonoverlap": getattr(model, "target_nonoverlap", False),
             "target_allow_partial_overlap": getattr(model, "target_allow_partial_overlap", 0.0),
             "mask_box_hardcap": getattr(model, "mask_box_hardcap", None),
-            "cdd_use_gpu": torch.cuda.is_available(),
         }
 
     def _sample_mask_params(self) -> tuple[float, int]:
@@ -135,13 +225,22 @@ class _MaskingCollator:
             mask_box_size = int(torch.randint(lo, hi + 1, ()).item()) if hi > lo else lo
         return float(mask_scale), int(mask_box_size)
 
-    def __call__(self, batch: list[torch.Tensor]):
-        x_clean = _collate_pad_hw(batch)
+    def __call__(self, batch):
+        use_cdd = isinstance(batch[0], (tuple, list)) and len(batch[0]) == 2
+        if use_cdd:
+            cdd_list = [item[0] for item in batch]
+            x_clean_list = [item[1] for item in batch]
+            cdd_orig_in = _collate_pad_cdd(cdd_list)
+            x_clean = _collate_pad_hw(x_clean_list)
+        else:
+            cdd_orig_in = None
+            x_clean = _collate_pad_hw(batch)
         mask_scale, mask_box_size = self._sample_mask_params()
         context_data = prepare_context_batch(
             x_clean=x_clean,
             mask_scale=mask_scale,
             mask_box_size=mask_box_size,
+            cdd_orig_in=cdd_orig_in,
             **self.context_kwargs,
         )
         x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
@@ -712,6 +811,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             f"saved_to={sel_path}"
         )
 
+    # --- Pre-compute CDD once on GPU, store in CPU RAM ---
+    cdd_cache = _precompute_cdd_cache(
+        data_cfg=data_cfg,
+        model_cfg=model_cfg,
+        device=device,
+        config_name=config_name,
+    ) if not is_3d_mode else None
+
     if is_3d_mode:
         dataset = JEPA3DCropDataset(
             data_root=data_cfg.get("data_root", "data"),
@@ -747,6 +854,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             d4_augment=bool(data_cfg.get("d4_augment", False)),
             input_type=input_type,
             image_batch_selected_indices=image_batch_selected_indices,
+            cdd_cache=cdd_cache,
         )
         val_fraction = float(train_cfg.get("val_fraction", 0.1))
         val_fraction = min(max(val_fraction, 0.0), 0.95)
@@ -778,6 +886,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 d4_augment=False,
                 input_type=input_type,
                 image_batch_selected_indices=image_batch_selected_indices,
+                cdd_cache=cdd_cache,
             )
             val_dataset.sample_index = val_idx
     print(
@@ -847,6 +956,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             input_type=input_type,
             image_batch_inference=image_batch_inference,
             image_batch_selected_indices=image_batch_selected_indices,
+            cdd_cache=cdd_cache,
         )
         inference_dataset.sample_index = list(train_idx)
         inference_dataset.num_samples = train_dataset.num_samples
@@ -857,7 +967,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
-        collate_fn=(None if is_3d_mode else _collate_pad_hw),
+        collate_fn=(None if is_3d_mode else _collate_for_inference),
         **loader_worker_kwargs,
     )
 
@@ -1269,6 +1379,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             os.makedirs(movie_dir, exist_ok=True)
             with torch.no_grad():
                 model.eval()
+                if isinstance(movie_batch, (tuple, list)):
+                    movie_batch = movie_batch[1] if movie_batch[1] is not None else movie_batch[0]
                 x_movie = movie_batch.to(device, non_blocking=True)
                 # Let _prepare_context_from_model handle NaN internally.
                 if is_3d_mode:
