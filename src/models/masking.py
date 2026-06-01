@@ -25,10 +25,14 @@ def _shared_grid_centers(
     global_shift: bool,
     device: torch.device,
     enable_grid_jitter: bool = True,
+    lattice_shift_override: Optional[Tuple[int, int]] = None,
 ):
     """Generate one globally-shifted full-image lattice, then boundary-mask it."""
     spacing_px = int(max(1, spacing_px))
-    if global_shift:
+    if lattice_shift_override is not None:
+        shift_y = int(lattice_shift_override[0]) % spacing_px
+        shift_x = int(lattice_shift_override[1]) % spacing_px
+    elif global_shift:
         shift_y = int(torch.randint(0, spacing_px, (1,), device=device).item())
         shift_x = int(torch.randint(0, spacing_px, (1,), device=device).item())
     else:
@@ -143,10 +147,12 @@ def _dither_target_center(
     return cy2, cx2
 
 
-def _odd_box(v: int, minimum: int = 3) -> int:
+def _odd_box(v: int, minimum: int = 3, bump_up: bool = True) -> int:
     x = int(max(minimum, v))
     if x % 2 == 0:
-        x += 1
+        x += 1 if bump_up else -1
+    if x < minimum:
+        x = minimum
     return x
 
 
@@ -213,9 +219,14 @@ def _effective_mask_box_size(
     """
     base_box = round(float(sigma) * float(mask_scale) + int(mask_box_size))
     box = max(base_box, int(inner_target_size))
+    capped = False
     if hardcap is not None and hardcap > 0:
-        box = min(box, int(hardcap))
-    return _odd_box(box)
+        if box > int(hardcap):
+            box = int(hardcap)
+            capped = True
+    # bump_up=False when capped: round DOWN to the nearest odd so we never
+    # silently exceed the hardcap (e.g. hardcap=16 → _odd_box(16, bump_up=False)=15).
+    return _odd_box(box, bump_up=not capped)
 
 
 def _ensure_target_patches_masked(
@@ -257,6 +268,8 @@ def make_pyramid_grid_context(
     inner_target_size: int = 2,
     return_debug: bool = False,
     enable_grid_jitter: bool = True,
+    enable_target_dithering: bool = True,
+    lattice_shift_override: Optional[Tuple[int, int]] = None,
     target_invalid_region_skip: bool = False,
     target_invalid_region_values=(0.0, "nan"),
     invalid_pixel_mask: Optional[torch.Tensor] = None,
@@ -351,6 +364,7 @@ def make_pyramid_grid_context(
             global_shift=effective_global_shift,
             device=x_clean.device,
             enable_grid_jitter=bool(enable_grid_jitter),
+            lattice_shift_override=lattice_shift_override,
         )
         shared_centers_dithered = None
         if align_scales and sampling_mode != "priority_sampling" and len(shared_centers) > 0:
@@ -365,20 +379,21 @@ def make_pyramid_grid_context(
             )
             max_half_lo = max_box // 2
             max_half_hi = max_box - max_half_lo
-            shared_centers_dithered = []
-            for cy0, cx0 in shared_centers:
-                cy1, cx1 = _dither_target_center(
-                    cy=int(cy0),
-                    cx=int(cx0),
-                    h=h,
-                    w=w,
-                    half_lo=max_half_lo,
-                    half_hi=max_half_hi,
-                    # Grid/lattice mode always dithers by lattice spacing.
-                    dithering_pixels=spacing_px,
-                    device=x_clean.device,
-                )
-                shared_centers_dithered.append((int(cy1), int(cx1)))
+            if enable_target_dithering:
+                shared_centers_dithered = []
+                for cy0, cx0 in shared_centers:
+                    cy1, cx1 = _dither_target_center(
+                        cy=int(cy0),
+                        cx=int(cx0),
+                        h=h,
+                        w=w,
+                        half_lo=max_half_lo,
+                        half_hi=max_half_hi,
+                        # Grid/lattice mode always dithers by lattice spacing.
+                        dithering_pixels=spacing_px,
+                        device=x_clean.device,
+                    )
+                    shared_centers_dithered.append((int(cy1), int(cx1)))
         if total_fraction <= 0.0:
             shared_centers = []
             shared_centers_dithered = []
@@ -423,8 +438,12 @@ def make_pyramid_grid_context(
                 max_count = max(0, base_count + extra)
                 if max_count <= 0:
                     continue
-                shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
-                shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
+                if lattice_shift_override is not None:
+                    shift_y = int(lattice_shift_override[0]) % spacing
+                    shift_x = int(lattice_shift_override[1]) % spacing
+                else:
+                    shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
+                    shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
                 y_start = margin + shift_y
                 x_start = margin + shift_x
                 y_centers = list(range(y_start, max(y_start + 1, h - margin), spacing))
@@ -435,7 +454,7 @@ def make_pyramid_grid_context(
                     centers = [centers[int(i)] for i in idx]
 
             for cy, cx in centers:
-                if not align_scales:
+                if not align_scales and enable_target_dithering:
                     cy, cx = _dither_target_center(
                         cy=int(cy),
                         cx=int(cx),
@@ -553,23 +572,18 @@ def make_pyramid_grid_context(
                     base_targets = max(min_targets, base_targets_scaled)
                     k_sel = min(base_targets, len(priority_catalogue))
                     if target_nonoverlap:
-                        priority_catalogue = _rejection_sample_targets(
-                            candidates=priority_catalogue,
-                            num_targets=k_sel,
-                            h=h,
-                            w=w,
-                            exclusion_box=max_box,
-                            device=x_clean.device,
-                            allow_partial_overlap=float(target_allow_partial_overlap),
-                        )
-                        k_sel = len(priority_catalogue)
+                        # Shuffle first, then non-overlap filter on undithered
+                        # centres to get a reasonable initial set.  The real
+                        # non-overlap enforcement happens *after* dithering below.
+                        perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
+                        priority_catalogue = [priority_catalogue[int(i)] for i in perm[:min(k_sel * 2, len(priority_catalogue))]]
                     else:
                         perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
                         priority_catalogue = [priority_catalogue[int(i)] for i in perm[:k_sel]]
                     priority_good_candidates_bi = float(len(good_candidates))
                     priority_nonzero_mean_bi = float(nonzero_mean)
                     priority_auto_base_targets_bi = float(auto_base)
-                    priority_effective_targets_bi = float(k_sel)
+                    priority_effective_targets_bi = float(k_sel)  # updated below after non-overlap
             # Dither once per selected priority seed and reuse across scales.
             # This avoids per-scale micro-clusters around the same logical target.
             priority_centers_dithered: list[tuple[int, int]] = []
@@ -588,6 +602,20 @@ def make_pyramid_grid_context(
                         device=x_clean.device,
                     )
                     priority_centers_dithered.append((int(cy1), int(cx1)))
+
+                # Non-overlap enforcement on the *dithered* centres so that
+                # dithering cannot undo the protection.
+                if target_nonoverlap and len(priority_centers_dithered) > 1:
+                    priority_centers_dithered = _rejection_sample_targets(
+                        candidates=priority_centers_dithered,
+                        num_targets=k_sel,
+                        h=h,
+                        w=w,
+                        exclusion_box=max_box,
+                        device=x_clean.device,
+                        allow_partial_overlap=float(target_allow_partial_overlap),
+                    )
+                    priority_effective_targets_bi = float(len(priority_centers_dithered))
 
             num_cdd_ch = cdd_mod.shape[0]
             dip_field = np.zeros((h, w), dtype=np.float32)
@@ -624,8 +652,12 @@ def make_pyramid_grid_context(
                     max_count = max(0, base_count + extra)
                     if max_count <= 0:
                         continue
-                    shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
-                    shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
+                    if lattice_shift_override is not None:
+                        shift_y = int(lattice_shift_override[0]) % spacing
+                        shift_x = int(lattice_shift_override[1]) % spacing
+                    else:
+                        shift_y = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
+                        shift_x = int(torch.randint(0, max(1, spacing), (1,), device=x_clean.device).item())
                     y_start = margin + shift_y
                     x_start = margin + shift_x
                     y_centers = list(range(y_start, max(y_start + 1, h - margin), spacing))
@@ -637,7 +669,7 @@ def make_pyramid_grid_context(
 
                 for cy, cx in centers:
                     # In priority mode, centers were already dithered once above.
-                    if not (
+                    if enable_target_dithering and not (
                         (sampling_mode == "priority_sampling" and len(priority_centers_dithered) > 0)
                         or align_scales
                     ):
@@ -892,6 +924,8 @@ def prepare_context_batch(
     patch_size: int = 2,
     return_debug: bool = False,
     enable_grid_jitter: bool = True,
+    enable_target_dithering: bool = True,
+    lattice_shift_override: Optional[Tuple[int, int]] = None,
     target_invalid_region_skip: bool = False,
     target_invalid_region_values=(0.0, "nan"),
     target_sampling_mode: str = "grid",
@@ -931,6 +965,8 @@ def prepare_context_batch(
         inner_target_size=patch_size,
         return_debug=return_debug,
         enable_grid_jitter=enable_grid_jitter,
+        enable_target_dithering=enable_target_dithering,
+        lattice_shift_override=lattice_shift_override,
         target_invalid_region_skip=target_invalid_region_skip,
         target_invalid_region_values=target_invalid_region_values,
         invalid_pixel_mask=invalid_pixel_mask,

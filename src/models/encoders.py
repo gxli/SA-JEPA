@@ -50,6 +50,23 @@ def make_norm2d(channels: int, norm_type: str = "layernorm", norm_groups: int = 
     raise ValueError(f"Unsupported norm_type={norm_type}. Use 'layernorm' or 'groupnorm'.")
 
 
+def _normalize_convnext_dilations(dilations, depth: int) -> list[int]:
+    depth = int(depth)
+    if dilations is None:
+        return [1] * depth
+    values = [int(d) for d in dilations]
+    if not values:
+        raise ValueError("ConvNeXt dilations must contain at least one value.")
+    if any(d <= 0 for d in values):
+        raise ValueError(f"ConvNeXt dilations must be positive integers, got {values}.")
+    if len(values) < depth:
+        reps = (depth + len(values) - 1) // len(values)
+        values = (values * reps)[:depth]
+    elif len(values) > depth:
+        values = values[:depth]
+    return values
+
+
 class ConvNeXtDenseBlock(nn.Module):
     def __init__(
         self,
@@ -59,8 +76,10 @@ class ConvNeXtDenseBlock(nn.Module):
         dilation: int = 1,
         layer_scale_init: float = 1e-6,
         use_reflect_padding: bool = True,
+        use_grn: bool = True,
     ):
         super().__init__()
+        self.use_grn = bool(use_grn)
         self.dilation = int(dilation)
         pad = (int(kernel_size) // 2) * self.dilation
         if use_reflect_padding:
@@ -87,7 +106,7 @@ class ConvNeXtDenseBlock(nn.Module):
         self.norm = nn.LayerNorm(channels)
         self.pw1 = nn.Linear(channels, expansion * channels)
         self.act = nn.GELU()
-        self.grn = GRN(expansion * channels)
+        self.grn = GRN(expansion * channels) if self.use_grn else nn.Identity()
         self.pw2 = nn.Linear(expansion * channels, channels)
         self.gamma = nn.Parameter(layer_scale_init * torch.ones(channels))
 
@@ -116,25 +135,21 @@ class ConvNeXtDenseEncoder(nn.Module):
         expansion: int = 4,
         use_reflect_padding: bool = True,
         final_norm: bool = True,
+        final_norm_type: str = "layernorm",
+        head_bias: bool = True,
         dilations=None,
+        use_grn: bool = True,
+        stem_norm: bool = True,
     ):
         super().__init__()
         depth = int(depth)
-        if dilations is None:
-            dilations = [1] * depth
-        else:
-            dilations = [int(d) for d in dilations]
-            if len(dilations) < depth:
-                reps = (depth + len(dilations) - 1) // len(dilations)
-                dilations = (dilations * reps)[:depth]
-            elif len(dilations) > depth:
-                dilations = dilations[:depth]
+        dilations = _normalize_convnext_dilations(dilations, depth)
         self.dilations = tuple(dilations)
 
         self.stem = nn.Sequential(
             nn.ReflectionPad2d(1) if use_reflect_padding else nn.Identity(),
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=0 if use_reflect_padding else 1),
-            LayerNorm2d(hidden_channels),
+            LayerNorm2d(hidden_channels) if stem_norm else nn.Identity(),
             nn.GELU(),
         )
         self.blocks = nn.Sequential(
@@ -145,12 +160,25 @@ class ConvNeXtDenseEncoder(nn.Module):
                     kernel_size=kernel_size,
                     dilation=dilations[i],
                     use_reflect_padding=use_reflect_padding,
+                    use_grn=use_grn,
                 )
                 for i in range(depth)
             ]
         )
-        self.head = nn.Conv2d(hidden_channels, latent_channels, kernel_size=1)
-        self.final_norm = LayerNorm2d(latent_channels) if final_norm else nn.Identity()
+        self.head = nn.Conv2d(hidden_channels, latent_channels, kernel_size=1, bias=head_bias)
+        if not final_norm:
+            self.final_norm = nn.Identity()
+        else:
+            ntype = str(final_norm_type).lower()
+            if ntype == "batchnorm":
+                self.final_norm = nn.BatchNorm2d(latent_channels, track_running_stats=False)
+            elif ntype in ("layernorm", ""):
+                self.final_norm = LayerNorm2d(latent_channels)
+            else:
+                raise ValueError(
+                    f"Unsupported final_norm_type={final_norm_type}. "
+                    "Use 'layernorm' or 'batchnorm'."
+                )
 
     def forward(self, x):
         x = self.stem(x)
@@ -171,7 +199,7 @@ class D4InvariantWrapper(nn.Module):
     Then pool across the 4 responses (max or mean).
     """
 
-    def __init__(self, base_encoder: nn.Module, pool: str = "max"):
+    def __init__(self, base_encoder: nn.Module, pool: str = "mean"):
         super().__init__()
         self.base_encoder = base_encoder
         self.pool = str(pool).lower()
@@ -457,7 +485,13 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
         fusion_type: str = "concat",
         use_reflect_padding: bool = True,
         final_norm: bool = True,
+        final_norm_type: str = "layernorm",
+        head_bias: bool = True,
         cdd_append_last_residual: bool = True,
+        adapter_norm: bool = True,
+        use_grn: bool = True,
+        stem_norm: bool = True,
+        dilations=None,
     ):
         super().__init__()
         self.scales = tuple(float(s) for s in scales)
@@ -480,24 +514,34 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
 
         pad = int(adapter_kernel_size) // 2
         if use_reflect_padding and pad > 0:
-            self.adapter = nn.Sequential(
+            adapter_layers = [
                 nn.ReflectionPad2d(pad),
                 nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=0),
-                LayerNorm2d(self.scale_feat_channels),
+            ]
+            if adapter_norm:
+                adapter_layers.append(LayerNorm2d(self.scale_feat_channels))
+            adapter_layers += [
                 nn.GELU(),
                 nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1),
-                LayerNorm2d(self.scale_feat_channels),
-                nn.GELU(),
-            )
+            ]
+            if adapter_norm:
+                adapter_layers.append(LayerNorm2d(self.scale_feat_channels))
+            adapter_layers.append(nn.GELU())
+            self.adapter = nn.Sequential(*adapter_layers)
         else:
-            self.adapter = nn.Sequential(
+            adapter_layers = [
                 nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=pad),
-                LayerNorm2d(self.scale_feat_channels),
+            ]
+            if adapter_norm:
+                adapter_layers.append(LayerNorm2d(self.scale_feat_channels))
+            adapter_layers += [
                 nn.GELU(),
                 nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1),
-                LayerNorm2d(self.scale_feat_channels),
-                nn.GELU(),
-            )
+            ]
+            if adapter_norm:
+                adapter_layers.append(LayerNorm2d(self.scale_feat_channels))
+            adapter_layers.append(nn.GELU())
+            self.adapter = nn.Sequential(*adapter_layers)
 
         self.convnext = ConvNeXtDenseEncoder(
             in_channels=self.num_scales * self.scale_feat_channels,
@@ -508,6 +552,11 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
             expansion=expansion,
             use_reflect_padding=use_reflect_padding,
             final_norm=final_norm,
+            final_norm_type=final_norm_type,
+            head_bias=head_bias,
+            use_grn=use_grn,
+            stem_norm=stem_norm,
+            dilations=dilations,
         )
         if self.fusion_type == "topdown":
             self.fusion_proj = nn.ModuleList(
@@ -850,7 +899,12 @@ class CDDFiLMScaleAwareConvNeXtEncoder(nn.Module):
         use_per_scale_adapters: bool = False,
         use_reflect_padding: bool = True,
         final_norm: bool = True,
+        final_norm_type: str = "layernorm",
+        head_bias: bool = True,
         cdd_append_last_residual: bool = True,
+        adapter_norm: bool = True,
+        use_grn: bool = True,
+        dilations=None,
     ):
         super().__init__()
         self.scales = tuple(float(s) for s in scales)
@@ -872,35 +926,49 @@ class CDDFiLMScaleAwareConvNeXtEncoder(nn.Module):
         # Per-scale input adapter (shared across scales)
         pad = int(adapter_kernel_size) // 2
         if use_reflect_padding and pad > 0:
-            self.adapter = nn.Sequential(
+            adapter_layers = [
                 nn.ReflectionPad2d(pad),
                 nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=0),
-                LayerNorm2d(self.scale_feat_channels),
+            ]
+            if adapter_norm:
+                adapter_layers.append(LayerNorm2d(self.scale_feat_channels))
+            adapter_layers += [
                 nn.GELU(),
                 nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1),
-                LayerNorm2d(self.scale_feat_channels),
-                nn.GELU(),
-            )
+            ]
+            if adapter_norm:
+                adapter_layers.append(LayerNorm2d(self.scale_feat_channels))
+            adapter_layers.append(nn.GELU())
+            self.adapter = nn.Sequential(*adapter_layers)
         else:
-            self.adapter = nn.Sequential(
+            adapter_layers = [
                 nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=pad),
-                LayerNorm2d(self.scale_feat_channels),
+            ]
+            if adapter_norm:
+                adapter_layers.append(LayerNorm2d(self.scale_feat_channels))
+            adapter_layers += [
                 nn.GELU(),
                 nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1),
-                LayerNorm2d(self.scale_feat_channels),
-                nn.GELU(),
-            )
+            ]
+            if adapter_norm:
+                adapter_layers.append(LayerNorm2d(self.scale_feat_channels))
+            adapter_layers.append(nn.GELU())
+            self.adapter = nn.Sequential(*adapter_layers)
 
         # Shared ConvNeXt blocks with FiLM
         self.use_film = bool(use_film)
         self.use_per_scale_adapters = bool(use_per_scale_adapters)
         self.blocks = nn.ModuleList()
-        for _ in range(int(depth)):
+        dilations = _normalize_convnext_dilations(dilations, int(depth))
+        self.dilations = tuple(dilations)
+        for dilation in dilations:
             blk = ConvNeXtDenseBlock(
                 channels=self.scale_feat_channels,
                 expansion=expansion,
                 kernel_size=kernel_size,
+                dilation=dilation,
                 use_reflect_padding=use_reflect_padding,
+                use_grn=use_grn,
             )
             stage = SharedScaleConvNeXtStage2d(
                 block=blk,
@@ -923,8 +991,20 @@ class CDDFiLMScaleAwareConvNeXtEncoder(nn.Module):
 
         # Head
         fused_channels = self.num_scales * self.scale_feat_channels
-        self.head = nn.Conv2d(fused_channels, latent_channels, kernel_size=1)
-        self.final_norm = LayerNorm2d(latent_channels) if final_norm else nn.Identity()
+        self.head = nn.Conv2d(fused_channels, latent_channels, kernel_size=1, bias=head_bias)
+        if not final_norm:
+            self.final_norm = nn.Identity()
+        else:
+            ntype = str(final_norm_type).lower()
+            if ntype == "batchnorm":
+                self.final_norm = nn.BatchNorm2d(latent_channels, track_running_stats=False)
+            elif ntype in ("layernorm", ""):
+                self.final_norm = LayerNorm2d(latent_channels)
+            else:
+                raise ValueError(
+                    f"Unsupported final_norm_type={final_norm_type}. "
+                    "Use 'layernorm' or 'batchnorm'."
+                )
 
     def forward(self, fields: torch.Tensor, mask_tokens=None) -> torch.Tensor:
         if fields.ndim != 4:

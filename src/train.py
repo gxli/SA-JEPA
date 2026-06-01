@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import math
+
+from tqdm import tqdm
 import os
 import random
 import time
@@ -35,7 +37,8 @@ from src.losses import (
 from src.models.build_jepa import CDD_DEBUG_ENCODER_TYPES, PyramidGridJEPA
 from src.models.build_jepa3d import PyramidGridJEPA3D
 from src.models.masking import prepare_context_batch
-from src.utils.viz import save_inference_dashboard, save_loss_curve, save_volumetric_umap_embeddings
+from src.utils import log_error, set_error_log_path
+from src.utils.viz import save_inference_dashboard, save_volumetric_umap_embeddings
 
 def _fmt_metric(v: float) -> str:
     x = float(v)
@@ -112,7 +115,7 @@ def evaluate_validation(
     val_loader: DataLoader,
     device: torch.device,
     max_batches: int | None = None,
-    vicreg_spatial_mode: str = "dense",
+    vicreg_spatial_mode: str = "pooled",
     debug_context: bool = False,
 ) -> dict:
     model.eval()
@@ -124,9 +127,10 @@ def evaluate_validation(
         if max_batches is not None and batch_idx >= max_batches:
             break
         x_clean = batch.to(device, non_blocking=True)
-        x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
+        # Let _prepare_context_from_model → prepare_context_batch
+        # handle NaN detection internally before cleaning for CDD ops.
         context_result = _prepare_context_from_model(model, x_clean, return_debug=debug_context)
-        if debug_context:
+        if len(context_result) == 5:
             x_context, tloc, tscale, tvalid, debug = context_result
         else:
             x_context, tloc, tscale, tvalid = context_result
@@ -301,6 +305,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
             "cdd_opnet",
             "convnext_dense_pyramid",
             "cdd_film_scaleaware_convnext",
+            "rescnn_dense_pyramid",
         }
         if resolved_encoder_type not in allowed_pyramid:
             raise ValueError(
@@ -342,15 +347,17 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
         ema_momentum=model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996)),
         normalize_loss_l2=normalize_loss_l2,
-        predictor_layernorm=model_cfg.get("predictor_layernorm", False),
+        predictor_layernorm=model_cfg.get("predictor_layernorm", True),
         predictor_spatial_conv=model_cfg.get("predictor_spatial_conv", False),
-        predictor_residual=model_cfg.get("predictor_residual", True),
+        projector_conv=bool(model_cfg.get("projector_conv", True)),
+        predictor_residual=model_cfg.get("predictor_residual", False),
         use_image_mask_token=use_image_mask_token,
         mode=resolved_mode,
         encoder_type=resolved_encoder_type,
         encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
         encoder_depth=model_cfg.get("encoder_depth", 4),
         encoder_kernel_size=model_cfg.get("encoder_kernel_size", 7),
+        convnext_layer_dilations=model_cfg.get("convnext_layer_dilations"),
         encoder_norm_type=model_cfg.get("encoder_norm_type"),
         encoder_norm_groups=model_cfg.get("encoder_norm_groups"),
         encoder_norm_eps=model_cfg.get("encoder_norm_eps"),
@@ -358,6 +365,13 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         scaleaware_adapter_kernel_size=int(model_cfg.get("scaleaware_adapter_kernel_size", 3)),
         scaleaware_fusion_type=str(model_cfg.get("scaleaware_fusion_type", "concat")),
         scaleaware_norm_per_scale=bool(model_cfg.get("scaleaware_norm_per_scale", False)),
+        scaleaware_adapter_norm=bool(model_cfg.get("scaleaware_adapter_norm", True)),
+        scaleaware_final_norm=bool(model_cfg.get("scaleaware_final_norm", True)),
+        scaleaware_stem_norm=bool(model_cfg.get("scaleaware_stem_norm", True)),
+        encoder_final_norm_type=str(model_cfg.get("encoder_final_norm_type", "layernorm")),
+        encoder_head_bias=bool(model_cfg.get("encoder_head_bias", True)),
+        use_film=bool(model_cfg.get("use_film", True)),
+        use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
         opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
         opnet_dilations=model_cfg.get("opnet_dilations"),
         opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
@@ -375,6 +389,10 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         priority_min_targets_per_map=int(model_cfg.get("priority_min_targets_per_map", 0)),
         priority_dithering_pixels=int(model_cfg.get("priority_dithering_pixels", model_cfg.get("target_dithering_pixels", 6))),
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
+        target_nonoverlap=bool(model_cfg.get("target_nonoverlap", False)),
+        target_allow_partial_overlap=float(model_cfg.get("target_allow_partial_overlap", 0.0)),
+        mask_box_hardcap=model_cfg.get("mask_box_hardcap"),
+        use_grn=bool(model_cfg.get("use_grn", True)),
     ).to(device)
 
 
@@ -411,6 +429,8 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         slab_depth=int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
         slab_boundary_margin=int(model_cfg.get("slab_boundary_margin", model_cfg.get("encoder_depth", 3))),
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
+        use_film=bool(model_cfg.get("use_film", True)),
+        use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
     ).to(device)
 
 
@@ -433,6 +453,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     is_3d_mode = _is_3d_jepa_mode(model_cfg.get("mode", "image"))
 
     session_dir = make_session_dir(sessions_root, config_name)
+    set_error_log_path(os.path.join(session_dir, "errors.log"))
     os.makedirs(session_dir, exist_ok=True)
     model_ckpt_path = os.path.join(session_dir, "model_last.pt")
     resume_ckpt_path = os.path.join(session_dir, "checkpoint_last.pt")
@@ -440,6 +461,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     with open(os.path.join(session_dir, "config_used.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
+
+    input_type = str(data_cfg.get("input_type", "image")).lower()
+    allowed_input_types = {"image", "cube", "image_batch"}
+    if input_type not in allowed_input_types:
+        raise ValueError(
+            f"Unsupported data.input_type={input_type}. "
+            "Allowed: image, cube, image_batch."
+        )
+    if input_type == "cube" and not is_3d_mode:
+        raise ValueError(
+            "data.input_type='cube' requires a 3D model mode (pyramid3d, 3d, 2d, 3d_slice, 3d_slab)."
+        )
+    image_batch_inference = (input_type == "image_batch")
 
     dataset_apply_cdd, dataset_log_transform, _ = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
 
@@ -477,7 +511,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 missing, unexpected = model.load_state_dict(resume_state["model_state_dict"], strict=False)
             except RuntimeError as e:
                 # Common during architecture evolution (e.g. channel-count changes).
-                print(f"[{config_name}] resume_model load_state_dict_failed: {e}")
+                log_error("resume_model_load_state_dict", e)
                 missing, unexpected = ["__load_state_dict_failed__"], []
             print(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
             if missing:
@@ -510,7 +544,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             missing, unexpected = model.load_state_dict(torch.load(model_ckpt_path, map_location=device), strict=False)
         except RuntimeError as e:
             # Common during architecture evolution (e.g. channel-count changes).
-            print(f"[{config_name}] resume_model load_state_dict_failed: {e}")
+            log_error("resume_model_load_state_dict", e)
             missing, unexpected = ["__load_state_dict_failed__"], []
         print(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
         if missing:
@@ -550,6 +584,39 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     _mss = float(model_cfg.get("mask_spacing_scaling", 1.5))
     max_box = round(scale_max * _msb + _mb)
     auto_roll_max = max(1, int(round(float(max_box) * _mss)))
+
+    # --- image_batch pre-selection ---
+    image_batch_selected_indices = None
+    image_batch_n_sample = data_cfg.get("image_batch_n_sample", None)
+    if input_type == "image_batch" and image_batch_n_sample is not None:
+        import glob as _glob
+        data_root = data_cfg.get("data_root", "data")
+        npy_pattern = data_cfg.get("npy_pattern", "*.npy")
+        npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
+        selected = {}
+        sel_path = os.path.join(session_dir, "selected_slices.json")
+        rng = random.Random(int(train_cfg.get("split_seed", 42)))
+        for fpath in npy_files:
+            arr_mm = np.load(fpath, mmap_mode="r")
+            if arr_mm.ndim != 3:
+                continue
+            n_total = int(arr_mm.shape[0])
+            if str(image_batch_n_sample).strip().lower() == "full":
+                sel_idx = list(range(n_total))
+            else:
+                n_sel = int(image_batch_n_sample)
+                n_sel = max(1, min(n_sel, n_total))
+                sel_idx = sorted(rng.sample(range(n_total), n_sel))
+            selected[fpath] = sel_idx
+        image_batch_selected_indices = selected
+        with open(sel_path, "w", encoding="utf-8") as f:
+            json.dump({k: list(v) for k, v in selected.items()}, f, indent=2)
+        total_selected = sum(len(v) for v in selected.values())
+        print(
+            f"[{config_name}] image_batch_n_sample={image_batch_n_sample} "
+            f"files={len(selected)} total_selected={total_selected} "
+            f"saved_to={sel_path}"
+        )
 
     if is_3d_mode:
         dataset = JEPA3DCropDataset(
@@ -603,6 +670,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
             cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
             precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
+            input_type=input_type,
+            image_batch_selected_indices=image_batch_selected_indices,
         )
         val_fraction = float(train_cfg.get("val_fraction", 0.1))
         val_fraction = min(max(val_fraction, 0.0), 0.95)
@@ -647,6 +716,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
                 cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
                 precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
+                input_type=input_type,
+                image_batch_selected_indices=image_batch_selected_indices,
             )
             val_dataset.sample_index = val_idx
     print(
@@ -718,6 +789,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cdd_cache_dir=data_cfg.get("cdd_cache_dir"),
             cache_random_slices=bool(data_cfg.get("cache_random_slices", False)),
             precompute_cdd_cache_all_slices=bool(data_cfg.get("precompute_cdd_cache_all_slices", False)),
+            input_type=input_type,
+            image_batch_inference=image_batch_inference,
+            image_batch_selected_indices=image_batch_selected_indices,
         )
         inference_dataset.sample_index = list(train_idx)
         inference_dataset.num_samples = train_dataset.num_samples
@@ -746,8 +820,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 optimizer_state_loaded = True
             except ValueError as e:
                 # Model parameterization changed (e.g., architecture update): choose explicit behavior.
+                log_error("optimizer_state_incompatible", e)
                 if optimizer_mismatch_action == "restart_epoch0":
-                    print(f"[{config_name}] warning: optimizer_state_incompatible, restarting epoch counter at 0: {e}")
                     start_epoch = 0
                 else:
                     print(
@@ -758,7 +832,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             try:
                 scaler.load_state_dict(resume_state["scaler_state_dict"])
             except Exception as e:
-                print(f"[{config_name}] warning: scaler_state_incompatible, starting scaler fresh: {e}")
+                log_error("scaler_state_incompatible", e)
 
     epochs = train_cfg.get("epochs", 20)
     log_interval = train_cfg.get("log_interval", 10)
@@ -859,6 +933,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     visit_counts = None
     if start_epoch >= int(epochs):
         print(f"[{config_name}] checkpoint epoch {start_epoch} already >= configured epochs {epochs}, skipping training loop")
+    prev_epochs = []
     for epoch in range(start_epoch, epochs):
         epoch_total = 0.0
         epoch_mse = 0.0
@@ -872,14 +947,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         metrics_rows = []
         masked_scale_rows = []
         visited_rows = []
-        for batch_idx, batch in enumerate(dataloader):
+        pbar = tqdm(enumerate(dataloader), total=len(dataloader),
+                     desc=f"[{config_name}] E {epoch + 1}/{epochs}",
+                     unit="batch", dynamic_ncols=True, mininterval=0.1)
+        for batch_idx, batch in pbar:
             if is_3d_mode:
                 x_clean = batch.to(device, non_blocking=True)
                 x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
                 context_data = None
             else:
                 x_clean = batch.to(device, non_blocking=True)
-                x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
+                # Let _prepare_context_from_model → prepare_context_batch
+                # handle NaN detection internally before cleaning for CDD ops.
                 debug_context = bool(train_cfg.get("debug_masking_tensors", False))
                 context_result = _prepare_context_from_model(model, x_clean, return_debug=debug_context)
                 if len(context_result) == 5:
@@ -888,6 +967,20 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     x_context, tloc, tscale, tvalid = context_result
                     debug = {}
                 context_data = (x_context, tloc, tscale, tvalid, debug)
+
+            # Compute LR before forward/backward/step so the current batch
+            # actually uses the intended LR.
+            current_step = epoch * max(1, len(dataloader)) + batch_idx
+            total_steps = max(1, int(epochs) * max(1, len(dataloader)))
+            warmup_steps = int(warmup_epochs * max(1, len(dataloader)))
+            if current_step < warmup_steps:
+                lr = base_lr * float(current_step + 1) / max(1, warmup_steps)
+            else:
+                progress_lr = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+                progress_lr = min(1.0, max(0.0, float(progress_lr)))
+                lr = min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress_lr))
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -912,25 +1005,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             scaler.step(optimizer)
             scaler.update()
 
-            current_step = epoch * max(1, len(dataloader)) + batch_idx
-            total_steps = max(1, int(epochs) * max(1, len(dataloader)))
             progress = min(1.0, max(0.0, float(current_step) / float(total_steps)))
 
-            # Cosine LR schedule with linear warmup.
-            warmup_steps = int(warmup_epochs * max(1, len(dataloader)))
-            if current_step < warmup_steps:
-                lr = base_lr * (current_step / max(1, warmup_steps))
+            # Cosine EMA schedule: anneal from ema_base → ema_final over
+            # ema_warmup_fraction of training, then hold at ema_final.
+            ema_warmup_frac = float(train_cfg.get("ema_warmup_fraction", 1.0))
+            ema_warmup_frac = max(0.0, min(1.0, ema_warmup_frac))
+            if ema_warmup_frac <= 0.0:
+                ema_progress = 0.0
             else:
-                progress_lr = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
-                progress_lr = min(1.0, max(0.0, float(progress_lr)))
-                lr = min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress_lr))
-
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
-
-            # Cosine EMA schedule from base momentum toward final momentum.
+                ema_progress = min(1.0, progress / ema_warmup_frac)
             new_momentum = float(
-                ema_final - 0.5 * (ema_final - ema_base) * (1.0 + math.cos(math.pi * progress))
+                ema_final - 0.5 * (ema_final - ema_base) * (1.0 + math.cos(math.pi * ema_progress))
             )
             model.ema_momentum = new_momentum
             model.update_target_encoder()
@@ -1016,16 +1102,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                             float(tscale[bi, ki]),
                         ]
                     )
-            if batch_idx % log_interval == 0:
-                print(
-                    f"[{config_name}] Epoch {epoch + 1}/{epochs} Batch {batch_idx}/{len(dataloader)} "
-                    f"lr={_fmt_metric(lr)} total={_fmt_metric(total_loss.item())} mse={_fmt_metric(loss_mse.item())} "
-                    f"sigreg={_fmt_metric(loss_sigreg.item())} "
-                    f"sym={_fmt_metric(loss_symmetric.item())} "
-                    f"sim={_fmt_metric(sim_val)} var={_fmt_metric(var_val)} cov={_fmt_metric(cov_val)} "
-                    f"raw_mse={_fmt_metric(raw_mse_val)} norm_err={_fmt_metric(norm_err_val)} "
-                    f"valid_frac={_fmt_metric(valid_frac)}"
-                )
+            pbar.set_postfix(
+                total=f"{total_loss.item():.4f}",
+                mse=f"{loss_mse.item():.4f}",
+                sig=f"{loss_sigreg.item():.4f}",
+                sim=f"{sim_val:.4f}",
+                vfrac=f"{valid_frac:.3f}",
+                lr=f"{lr:.1e}",
+            )
             epoch_total += float(total_loss.item())
             epoch_mse += float(loss_mse.item())
             epoch_sim += float(sim_val)
@@ -1049,16 +1133,22 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
 
         if epoch_batches > 0:
-            print(
-                f"[{config_name}] Epoch {epoch + 1}/{epochs} summary "
-                f"avg_total={_fmt_metric(epoch_total/epoch_batches)} "
-                f"avg_mse={_fmt_metric(epoch_mse/epoch_batches)} "
-                f"avg_sigreg={_fmt_metric(epoch_sigreg/epoch_batches)} "
-                f"avg_sym={_fmt_metric(epoch_symmetric/epoch_batches)} "
-                f"avg_sim={_fmt_metric(epoch_sim/epoch_batches)} "
-                f"avg_var={_fmt_metric(epoch_var/epoch_batches)} "
-                f"avg_cov={_fmt_metric(epoch_cov/epoch_batches)} "
-                f"avg_valid_frac={_fmt_metric(epoch_valid_frac/epoch_batches)}"
+            avg_total = epoch_total / epoch_batches
+            avg_mse = epoch_mse / epoch_batches
+            prev_epochs.append(avg_total)
+            prev_str = " | ".join(
+                f"e{e_idx + 1}={prev_epochs[e_idx]:.4f}"
+                for e_idx in range(max(0, len(prev_epochs) - 5), len(prev_epochs) - 1)
+            )
+            if prev_str:
+                prev_str = f" [{prev_str}]"
+            tqdm.write(
+                f"[{config_name}] Epoch {epoch + 1}/{epochs} "
+                f"total={avg_total:.4f} mse={avg_mse:.4f} "
+                f"sig={_fmt_metric(epoch_sigreg/epoch_batches)} "
+                f"sim={_fmt_metric(epoch_sim/epoch_batches)} "
+                f"vfrac={_fmt_metric(epoch_valid_frac/epoch_batches)}"
+                f"{prev_str}"
             )
         val_loss = 0.0
         val_sim = 0.0
@@ -1075,10 +1165,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             val_loss = float(v["val_loss"])
             val_sim = float(v["val_sim"])
             val_error_by_scale = dict(v["val_error_by_scale"])
-            print(
-                f"[{config_name}] Epoch {epoch + 1}/{epochs} validation "
-                f"val_loss={_fmt_metric(val_loss)} val_sim={_fmt_metric(val_sim)} "
-                f"val_error_by_scale={json.dumps(val_error_by_scale, sort_keys=True)}"
+            tqdm.write(
+                f"[{config_name}] Epoch {epoch + 1}/{epochs} val "
+                f"loss={_fmt_metric(val_loss)} sim={_fmt_metric(val_sim)} "
+                f"err_by_scale={json.dumps(val_error_by_scale, sort_keys=True)}"
             )
         with open(epoch_summary_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -1105,7 +1195,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
         # Keep model_last in sync for inference-only resume paths.
         torch.save(model.state_dict(), model_ckpt_path)
-        print(f"[{config_name}] checkpoint_saved={resume_ckpt_path} epoch={epoch + 1}")
+        tqdm.write(f"[{config_name}] ckpt_saved epoch={epoch + 1}")
 
         # Per-epoch embedding snapshot for movie generation.
         if bool(train_cfg.get("movie_dump_every_epoch", False)):
@@ -1114,8 +1204,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             with torch.no_grad():
                 model.eval()
                 x_movie = next(iter(dataloader)).to(device, non_blocking=True)
-                x_movie = torch.nan_to_num(x_movie, nan=0.0, posinf=0.0, neginf=0.0)
+                # Let _prepare_context_from_model handle NaN internally.
                 if is_3d_mode:
+                    x_movie = torch.nan_to_num(x_movie, nan=0.0, posinf=0.0, neginf=0.0)
                     out_m = model(x_movie)
                 else:
                     context_result = _prepare_context_from_model(model, x_movie, return_debug=False)
@@ -1157,14 +1248,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             inference_tta_enabled=inference_tta_enabled,
             inference_tta_mode=inference_tta_mode,
         )
-    # Keep dashboard artifacts in sync with inference outputs for all runs.
-    # This writes session/results/* embedding files required by session_to_dash.py.
+    # Save NPY artifacts (PCA/UMAP/latent embeddings) required by session_to_dash.py.
+    # No PNG, HTML, or dashboard rendering is performed here.
     inf_path = os.path.join(session_dir, "inference_outputs.pt")
     if (not is_3d_mode) and os.path.exists(inf_path):
         try:
             outputs = torch.load(inf_path, map_location="cpu")
-            dash_path = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)
-            print(f"[{config_name}] dashboard_saved={dash_path}")
+            artifacts_dir = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)
+            print(f"[{config_name}] artifacts_saved={artifacts_dir}")
             effective_rank = ""
             rank_diag = {}
             try:
@@ -1172,7 +1263,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 with open(os.path.join(session_dir, "rank_diagnostics.json"), "w", encoding="utf-8") as f:
                     json.dump(rank_diag, f, indent=2)
             except Exception as er:
-                print(f"[{config_name}] warning: rank_diagnostics_failed: {type(er).__name__}: {er}")
+                log_error("rank_diagnostics", er)
             if compute_effective_rank:
                 try:
                     # Use target-branch rank as the primary effective-rank signal.
@@ -1180,13 +1271,25 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     if "gt" in rank_diag and "erank" in rank_diag["gt"]:
                         effective_rank = f"{float(rank_diag['gt']['erank']):.8f}"
                     else:
-                        pred_map = outputs.get("pred_map")
-                        if pred_map is not None:
-                            pm = torch.as_tensor(pred_map)
-                            z = pm[0].detach().cpu().permute(1, 2, 0).reshape(-1, int(pm.shape[1])).numpy()
-                            effective_rank = f"{compute_effective_rank_from_features(z):.8f}"
+                        # Fallback: compute effective rank on valid target patches
+                        # (not the full dense map — untrained/unpenalized pixels
+                        # would dominate the covariance).  Matches VICReg path.
+                        pred_patches = outputs.get("pred_patches")
+                        if pred_patches is not None:
+                            pp = torch.as_tensor(pred_patches)
+                            # pp: B x K x C x Ph x Pw → pool spatial dims → B*K x C
+                            pp_pooled = pp.mean(dim=(-2, -1))  # B x K x C
+                            tvalid = outputs.get("target_valid")
+                            if tvalid is not None:
+                                mask = torch.as_tensor(tvalid).bool()
+                                pp_pooled = pp_pooled[mask]
+                            else:
+                                pp_pooled = pp_pooled.reshape(-1, pp_pooled.shape[-1])
+                            if pp_pooled.shape[0] >= 2:
+                                z = pp_pooled.detach().cpu().numpy().astype(np.float64)
+                                effective_rank = f"{compute_effective_rank_from_features(z):.8f}"
                 except Exception as er:
-                    print(f"[{config_name}] warning: effective_rank_failed: {type(er).__name__}: {er}")
+                    log_error("effective_rank", er)
             # Dedicated artifact for simple downstream collection.
             # Empty string means rank was not computed for this run.
             with open(os.path.join(session_dir, "effective_rank.txt"), "w", encoding="utf-8") as f:
@@ -1209,7 +1312,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             with open(run_results_path, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow([int(time.time()), config_name, int(compute_effective_rank), effective_rank])
         except Exception as e:
-            print(f"[{config_name}] warning: dashboard generation failed: {type(e).__name__}: {e}")
+            log_error("artifact_generation", e)
     else:
         if is_3d_mode and os.path.exists(inf_path):
             try:
@@ -1217,16 +1320,16 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 umap_meta_path = save_volumetric_umap_embeddings(session_dir, outputs, umap_cfg=umap_cfg)
                 print(f"[{config_name}] volumetric_umap_saved={umap_meta_path}")
             except Exception as e:
-                print(f"[{config_name}] warning: volumetric UMAP generation failed: {type(e).__name__}: {e}")
+                log_error("volumetric_umap", e)
         else:
-            print(f"[{config_name}] warning: inference_outputs.pt missing; skip dashboard generation")
+            print(f"[{config_name}] warning: inference_outputs.pt missing; skip artifact generation")
 
     if not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)):
         try:
             from src.utils.scale_probe import probe_scale_response
 
             probe_batch = next(iter(dataloader)).to(device, non_blocking=True)
-            probe_batch = torch.nan_to_num(probe_batch, nan=0.0, posinf=0.0, neginf=0.0)
+            # Let _prepare_context_from_model handle NaN internally.
             model.eval()
             with torch.no_grad():
                 ctx_result = _prepare_context_from_model(model, probe_batch, return_debug=True)
@@ -1246,6 +1349,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         print(f"[{config_name}] scale_probe: cdd_channels not in debug, skipping")
             model.train()
         except Exception as e:
-            print(f"[{config_name}] warning: scale_probe_failed: {type(e).__name__}: {e}")
+            log_error("scale_probe", e)
 
     return session_dir

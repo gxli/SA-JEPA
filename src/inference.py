@@ -10,6 +10,15 @@ import torch
 from src.losses import representation_dense_energy
 
 
+def _save_npz(path: str, arr: np.ndarray) -> None:
+    """Save a single array as compressed .npz (zip archive, key='arr').
+
+    Replaces np.save(…, .npy) to drastically reduce disk footprint for spatial
+    maps that are sparse, zero-heavy, or contain structured data.
+    """
+    np.savez_compressed(path, arr=arr)
+
+
 def _tta_views_2d(x: torch.Tensor, mode: str) -> list[tuple[str, torch.Tensor]]:
     m = str(mode).lower().strip()
     if m in ("none", "", "off"):
@@ -166,10 +175,9 @@ def run_post_training_inference(
     inference_tta_mode: str = "flip4",
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
-    dashboard_html_path = os.path.join(session_dir, "dashboard.html")
-    if (not force_recompute_inference) and os.path.exists(dashboard_html_path):
+    if (not force_recompute_inference) and os.path.exists(inference_outputs_path):
         print(
-            f"[{config_name}] dashboard already exists; "
+            f"[{config_name}] inference_outputs.pt already exists; "
             "skipping post-training inference (set train.force_recompute_inference=true to recompute)"
         )
         return session_dir
@@ -241,6 +249,9 @@ def run_post_training_inference(
                 out_v = model(
                     xv,
                     return_debug=(pi == 0 and vi == 0),
+                    enable_grid_jitter=False,
+                    enable_target_dithering=False,
+                    lattice_shift_override=shift,
                     mask_inference=bool(mask_inference),
                 )
                 out_v["pred_map"] = _invert_tta_2d(vname, out_v["pred_map"])

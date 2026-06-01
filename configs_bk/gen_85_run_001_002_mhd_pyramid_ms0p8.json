@@ -1,0 +1,43 @@
+{
+  "base_config": "../base_pyramid_scaleaware_convnext.json",
+  "model": {
+    "mask_spacing_scaling": 2,
+    "normalize_loss_l2": true,
+    "use_symmetric_feature_loss": true,
+    "target_sampling_mode": "priority_sampling",
+    "priority_top_percent": 10,
+    "priority_n_target": 32,
+    "priority_min_targets_per_map": 8,
+    "priority_dithering_pixels": 8,
+    "target_nonoverlap": true,
+    "mask_box_hardcap": 17,
+    "predictor_spatial_conv": true,
+    "mode": "pyramid",
+    "mask_size_scaling": 0.8,
+    "mask_box_size": 0,
+    "model_key": "cdd_scaleaware_convnext",
+    "predictor_residual": true
+  },
+  "train": {
+    "epochs": 20,
+    "log_interval": 1,
+    "mse_loss_weight": 10,
+    "vicreg_var_weight": 5,
+    "vicreg_cov_weight": 1,
+    "sigreg_weight": 0.05,
+    "sigreg_sketch_dim": 128,
+    "vicreg_spatial_mode": "pooled",
+    "compute_effective_rank": true,
+    "inference_tta_enabled": true,
+    "inference_tta_mode": "flip4",
+    "scale_probe_enabled": true,
+    "umap": {
+      "n_neighbors": 15,
+      "min_dist": 0.02,
+      "metric": "cosine",
+      "l2_normalize": true,
+      "standardize": true,
+      "random_state": 42
+    }
+  }
+}

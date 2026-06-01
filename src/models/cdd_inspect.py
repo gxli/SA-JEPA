@@ -144,7 +144,9 @@ class CDDOperatorFeatures2D(nn.Module):
         base = torch.abs(x)
         base_std = torch.std(base, dim=(-2, -1), keepdim=True)
         log_floor = torch.clamp(base_std * float(self.log_std_floor_mult), min=eps)
-        return torch.sign(x) * torch.log(base + log_floor)
+        # log1p(base / floor) is always >= 0, preserving monotonicity and sign.
+        # log(base + floor) would flip sign when base + floor < 1.
+        return torch.sign(x) * torch.log1p(base / log_floor)
 
     def _lognorm_positive_with_floor(self, x: torch.Tensor, log_floor: torch.Tensor) -> torch.Tensor:
         base = torch.clamp(x, min=0.0)
@@ -152,7 +154,7 @@ class CDDOperatorFeatures2D(nn.Module):
 
     def _lognorm_signed_with_floor(self, x: torch.Tensor, log_floor: torch.Tensor) -> torch.Tensor:
         base = torch.abs(x)
-        return torch.sign(x) * torch.log(base + log_floor)
+        return torch.sign(x) * torch.log1p(base / log_floor)
 
     def _compute_unified_floor(self, maps: dict[str, torch.Tensor]) -> torch.Tensor:
         eps = max(1e-30, float(self.log_eps))

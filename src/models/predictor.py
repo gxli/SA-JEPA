@@ -11,7 +11,7 @@ class FullResPredictor(nn.Module):
         use_layernorm: bool = False,
         kernel_size: int = 3,
         spatial_conv: bool = True,
-        residual: bool = True,
+        residual: bool = False,
     ):
         super().__init__()
         self.residual = bool(residual)
@@ -24,7 +24,7 @@ class FullResPredictor(nn.Module):
                 nn.GELU(),
                 nn.Conv2d(hidden, channels, kernel_size=1),
             )
-            nn.init.zeros_(self.net[-1].weight)
+            nn.init.normal_(self.net[-1].weight, mean=0.0, std=1e-4)
             if self.net[-1].bias is not None:
                 nn.init.zeros_(self.net[-1].bias)
             return

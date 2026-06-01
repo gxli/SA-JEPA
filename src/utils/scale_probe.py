@@ -250,8 +250,7 @@ def save_scale_response_plots(
 
     # Per-scale sensitivity maps (sample 0).
     fig, axes = plt.subplots(1, S, figsize=(4 * S + 1, 4))
-    if S == 1:
-        axes = [axes]
+    axes = np.atleast_1d(axes)
     vmax = float(sensitivity_maps[0].max().item())
     for i in range(S):
         im = axes[i].imshow(
@@ -275,8 +274,7 @@ def save_scale_response_plots(
     if "scale_only_sim_maps" in data:
         sim_maps = data["scale_only_sim_maps"]
         fig, axes = plt.subplots(1, S, figsize=(4 * S + 1, 4))
-        if S == 1:
-            axes = [axes]
+        axes = np.atleast_1d(axes)
         for i in range(S):
             im = axes[i].imshow(sim_maps[0, i].numpy(), cmap="RdYlBu_r", origin="upper")
             axes[i].set_title(f"{scale_names[i]} only-sim")

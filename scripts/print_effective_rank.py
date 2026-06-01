@@ -12,26 +12,51 @@ from typing import List, Tuple
 def _read_model_inputs(session_dir: str) -> dict:
     cfg_path = os.path.join(session_dir, "config_used.json")
     if not os.path.exists(cfg_path):
-        return {
-            "mode": "NA",
-            "mask_fraction": "NA",
-            "mask_size": "NA",
-        }
+        return _missing_model_inputs()
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
+        d = cfg.get("data", {})
         m = cfg.get("model", {})
         return {
             "mode": str(m.get("mode", "NA")),
             "mask_fraction": str(m.get("active_target_fraction", m.get("mask_fraction", "NA"))),
-            "mask_size": str(m.get("mask_size", "NA")),
+            "mask_size": str(m.get("mask_size_scaling", m.get("mask_size", "NA"))),
+            "norm_before_cdd": _fmt_bool(d.get("norm_before_cdd", True)),
+            "normalize_loss_l2": _fmt_bool(m.get("normalize_loss_l2", m.get("normalize_loss", False))),
+            "predictor_layernorm": _fmt_bool(m.get("predictor_layernorm", True)),
+            "scaleaware_norm_per_scale": _fmt_bool(m.get("scaleaware_norm_per_scale", False)),
+            "scaleaware_adapter_norm": _fmt_bool(m.get("scaleaware_adapter_norm", True)),
+            "scaleaware_stem_norm": _fmt_bool(m.get("scaleaware_stem_norm", False)),
+            "scaleaware_final_norm": _fmt_bool(m.get("scaleaware_final_norm", False)),
+            "encoder_final_norm_type": str(m.get("encoder_final_norm_type", "layernorm")),
+            "encoder_norm_type": str(m.get("encoder_norm_type", "-") or "-"),
+            "use_grn": _fmt_bool(m.get("use_grn", True)),
         }
     except Exception:
-        return {
-            "mode": "NA",
-            "mask_fraction": "NA",
-            "mask_size": "NA",
-        }
+        return _missing_model_inputs()
+
+
+def _fmt_bool(value) -> str:
+    return "1" if bool(value) else "0"
+
+
+def _missing_model_inputs() -> dict:
+    return {
+        "mode": "NA",
+        "mask_fraction": "NA",
+        "mask_size": "NA",
+        "norm_before_cdd": "-",
+        "normalize_loss_l2": "-",
+        "predictor_layernorm": "-",
+        "scaleaware_norm_per_scale": "-",
+        "scaleaware_adapter_norm": "-",
+        "scaleaware_stem_norm": "-",
+        "scaleaware_final_norm": "-",
+        "encoder_final_norm_type": "-",
+        "encoder_norm_type": "-",
+        "use_grn": "-",
+    }
 
 
 def _read_effective_rank(session_dir: str) -> str:
@@ -169,6 +194,16 @@ def main() -> int:
                 inputs["mode"],
                 inputs["mask_fraction"],
                 inputs["mask_size"],
+                inputs["norm_before_cdd"],
+                inputs["normalize_loss_l2"],
+                inputs["predictor_layernorm"],
+                inputs["scaleaware_norm_per_scale"],
+                inputs["scaleaware_adapter_norm"],
+                inputs["scaleaware_stem_norm"],
+                inputs["scaleaware_final_norm"],
+                inputs["encoder_final_norm_type"],
+                inputs["encoder_norm_type"],
+                inputs["use_grn"],
                 rank,
                 c_er,
                 p_er,
@@ -188,20 +223,33 @@ def main() -> int:
     rows_sorted = sorted(rows, key=lambda x: x[0])
 
     print("Effective Rank Summary (sorted by session filename A->Z)")
-    session_w = 62
-    print(
-        f"{'session':<{session_w}} {'mode':<8} {'mfrac':>6} {'msize':>6} "
+    session_w = max([len("session"), *(len(row[0]) for row in rows_sorted)])
+    header = (
+        f"{'session':<{session_w}} {'mode':<8} {'mfrac':>6} {'mscale':>6} "
+        f"{'cddn':>4} {'l2n':>3} {'pln':>3} {'psn':>3} {'adn':>3} {'stn':>3} {'fin':>3} "
+        f"{'fin_type':<9} {'enc_norm':<9} {'grn':>3} "
         f"{'erank':>9} {'ctx_er':>9} {'pred_er':>9} {'gt_er':>9} "
         f"{'t1':>7} {'t4':>7} {'t8':>7} {'pred_pr':>9} {'gt_pr':>9} "
         f"{'dead_f':>8} {'dead_n':>6} {'er_ratio':>9} {'pr_ratio':>9}"
     )
-    print("-" * 214)
+    print(header)
+    print("-" * len(header))
     for row in rows_sorted:
         (
             s,
             mode,
             mf,
             ms,
+            norm_before_cdd,
+            normalize_loss_l2,
+            predictor_layernorm,
+            scaleaware_norm_per_scale,
+            scaleaware_adapter_norm,
+            scaleaware_stem_norm,
+            scaleaware_final_norm,
+            encoder_final_norm_type,
+            encoder_norm_type,
+            use_grn,
             rk,
             c_er,
             p_er,
@@ -218,15 +266,19 @@ def main() -> int:
         ) = row
         dead_n_str = p_dead_n if p_dead_n != "" else "-"
         print(
-            f"{_clip(s, session_w)} {mode:<8} {_fmt_float(mf,6,2)} {_fmt_float(ms,6,2)} "
+            f"{s:<{session_w}} {mode:<8} {_fmt_float(mf,6,2)} {_fmt_float(ms,6,2)} "
+            f"{norm_before_cdd:>4} {normalize_loss_l2:>3} {predictor_layernorm:>3} "
+            f"{scaleaware_norm_per_scale:>3} {scaleaware_adapter_norm:>3} "
+            f"{scaleaware_stem_norm:>3} {scaleaware_final_norm:>3} "
+            f"{encoder_final_norm_type:<9} {encoder_norm_type:<9} {use_grn:>3} "
             f"{_fmt_float(rk,9,4)} {_fmt_float(c_er,9,4)} {_fmt_float(p_er,9,4)} {_fmt_float(g_er,9,4)} "
             f"{_fmt_float(p_t1,7,3)} {_fmt_float(p_t4,7,3)} {_fmt_float(p_t8,7,3)} {_fmt_float(p_pr,9,4)} {_fmt_float(g_pr,9,4)} "
             f"{_fmt_float(p_dead,8,3)} {dead_n_str:>6} {_fmt_float(ratio_er,9,4)} {_fmt_float(ratio_pr,9,4)}"
         )
 
     n_total = len(rows_sorted)
-    n_rank = sum(1 for r in rows_sorted if r[4] != "")
-    print("-" * 214)
+    n_rank = sum(1 for r in rows_sorted if r[14] != "")
+    print("-" * len(header))
     print(f"sessions={n_total} with_rank={n_rank} missing_rank={n_total - n_rank}")
     return 0
 

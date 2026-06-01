@@ -62,6 +62,7 @@ def sketched_sigreg_loss(z: torch.Tensor, sketch_dim: int = 64) -> torch.Tensor:
     Lightweight SIGReg-style isotropic Gaussian regularization.
     Encourages projected embeddings to have mean 0 and variance 1.
     """
+    z = z.float()  # cast to fp32 to avoid underflow in fp16
     if z.numel() == 0:
         return z.sum() * 0.0
     if z.shape[0] < 2:
@@ -74,14 +75,13 @@ def sketched_sigreg_loss(z: torch.Tensor, sketch_dim: int = 64) -> torch.Tensor:
     a = a / a.norm(dim=0, keepdim=True).clamp_min(1e-6)
     y = z @ a  # N,sketch_dim
 
-    mean_loss = y.mean(dim=0).pow(2).mean()
     var_loss = (y.var(dim=0, unbiased=False) - 1.0).pow(2).mean()
-    return mean_loss + var_loss
+    return var_loss
 
 
 def compute_sim_var_cov(outputs: dict, spatial_mode: str = "dense") -> tuple[float, float, float]:
-    pred = outputs["pred_patches"].detach()  # B,K,C,P,P
-    gt = outputs["gt_patches"].detach()  # B,K,C,P,P
+    pred = outputs["pred_patches"].detach().float()  # B,K,C,P,P
+    gt = outputs["gt_patches"].detach().float()  # B,K,C,P,P
     valid = outputs["target_valid"].detach()  # B,K
 
     z1, z2 = _flatten_vicreg_samples(pred, gt, valid, spatial_mode=spatial_mode)
@@ -110,8 +110,8 @@ def compute_sim_var_cov(outputs: dict, spatial_mode: str = "dense") -> tuple[flo
 
 
 def compute_sim_var_cov_torch(outputs: dict, spatial_mode: str = "dense") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    pred = outputs["pred_patches"]  # keep graph
-    gt = outputs["gt_patches"]  # keep graph (target branch already no-grad in forward)
+    pred = outputs["pred_patches"].float()  # keep graph, cast to fp32 for safe norm
+    gt = outputs["gt_patches"].float()  # keep graph (target branch already no-grad in forward)
     valid = outputs["target_valid"]
 
     z1, z2 = _flatten_vicreg_samples(pred, gt, valid, spatial_mode=spatial_mode)
@@ -137,8 +137,8 @@ def compute_sim_var_cov_torch(outputs: dict, spatial_mode: str = "dense") -> tup
 
 
 def compute_raw_mse_and_norm_err(outputs: dict) -> tuple[float, float]:
-    pred = outputs["pred_patches"].detach()  # B,K,C,P,P
-    gt = outputs["gt_patches"].detach()  # B,K,C,P,P
+    pred = outputs["pred_patches"].detach().float()  # B,K,C,P,P
+    gt = outputs["gt_patches"].detach().float()  # B,K,C,P,P
     valid = outputs["target_valid"].detach()  # B,K
 
     if pred.dim() not in (5, 6):

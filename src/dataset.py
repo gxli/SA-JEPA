@@ -34,7 +34,19 @@ class JEPADataset(Dataset):
         cdd_cache_dir: str | None = None,
         cache_random_slices: bool = False,
         precompute_cdd_cache_all_slices: bool = False,
+        input_type: str = "image",
+        image_batch_inference: bool = False,
+        image_batch_selected_indices: dict | None = None,
     ):
+        self.input_type = str(input_type).lower()
+        allowed_input_types = {"image", "cube", "image_batch"}
+        if self.input_type not in allowed_input_types:
+            raise ValueError(
+                f"Unknown input_type={input_type}. "
+                "Use 'image', 'cube', or 'image_batch'."
+            )
+        self.image_batch_inference = bool(image_batch_inference)
+        self.image_batch_selected_indices = image_batch_selected_indices
         self.cube_slice_strategy = str(cube_slice_strategy).lower()
         allowed_strategies = {"auto", "random", "center", "fixed", "all"}
         if self.cube_slice_strategy not in allowed_strategies:
@@ -101,14 +113,25 @@ class JEPADataset(Dataset):
             if ndim == 2:
                 index.append((path, None))
             elif ndim == 3:
-                axis = self.cube_slice_axis % 3
-                depth = shape[axis]
-                if self.cube_slice_strategy == "all":
-                    for sidx in range(depth):
-                        index.append((path, sidx))
+                if self.input_type == "image_batch":
+                    if self.image_batch_selected_indices is not None and path in self.image_batch_selected_indices:
+                        sel = self.image_batch_selected_indices[path]
+                        for sidx in sel:
+                            index.append((path, int(sidx)))
+                    elif self.image_batch_inference:
+                        index.append((path, 0))
+                    else:
+                        # Dynamic random selection each __getitem__
+                        index.append((path, None))
                 else:
-                    # slice will be selected dynamically in __getitem__
-                    index.append((path, None))
+                    axis = self.cube_slice_axis % 3
+                    depth = shape[axis]
+                    if self.cube_slice_strategy == "all":
+                        for sidx in range(depth):
+                            index.append((path, sidx))
+                    else:
+                        # slice will be selected dynamically in __getitem__
+                        index.append((path, None))
             else:
                 raise ValueError(f"Expected 2D or 3D array in {path}, got shape {shape}")
         if not index:
@@ -133,6 +156,16 @@ class JEPADataset(Dataset):
     def _extract_2d_from_array(self, arr: np.ndarray, forced_slice_idx=None) -> tuple[np.ndarray, int | None]:
         if arr.ndim == 2:
             return arr, None
+        if self.input_type == "image_batch":
+            depth = arr.shape[0]
+            if self.image_batch_inference:
+                sidx = 0
+            elif forced_slice_idx is not None:
+                sidx = forced_slice_idx
+            else:
+                sidx = int(np.random.randint(0, depth))
+            sidx = int(np.clip(sidx, 0, depth - 1))
+            return arr[sidx], int(sidx)
         axis = self.cube_slice_axis % 3
         depth = arr.shape[axis]
         sidx = forced_slice_idx
@@ -204,8 +237,7 @@ class JEPADataset(Dataset):
         )
 
     def _load_sample(self, path: str, forced_slice_idx=None) -> torch.Tensor:
-        with open(path, "rb") as f:
-            arr_mm = np.load(f)
+        arr_mm = np.load(path, mmap_mode="r")
         arr2d, sidx = self._extract_2d_from_array(arr_mm, forced_slice_idx=forced_slice_idx)
 
         is_3d_random_slice = (arr_mm.ndim == 3) and (self.cube_slice_strategy in ("random", "auto"))

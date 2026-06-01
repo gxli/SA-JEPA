@@ -858,10 +858,10 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         lx = loss_x[:n]
         lt = loss_total[:n]
         lj = loss_jepa[:n]
-        fig_loss.add_trace(go.Scattergl(x=lx, y=lt, mode="lines", name="total_loss(raw)", line=dict(width=1), opacity=0.25))
-        fig_loss.add_trace(go.Scattergl(x=lx, y=_smooth(lt), mode="lines", name="total_loss(smooth)", line=dict(width=2)))
-        fig_loss.add_trace(go.Scattergl(x=lx, y=lj, mode="lines", name="loss_jepa(raw)", line=dict(width=1), opacity=0.2))
-        fig_loss.add_trace(go.Scattergl(x=lx, y=_smooth(lj), mode="lines", name="loss_jepa(smooth)", line=dict(width=2)))
+        fig_loss.add_trace(go.Scattergl(x=lx, y=lt, mode="lines", name="total_loss", line=dict(width=1), opacity=0.15, showlegend=False))
+        fig_loss.add_trace(go.Scattergl(x=lx, y=_smooth(lt), mode="lines", name="total_loss", line=dict(width=2)))
+        fig_loss.add_trace(go.Scattergl(x=lx, y=lj, mode="lines", name="loss_jepa", line=dict(width=1), opacity=0.15, showlegend=False))
+        fig_loss.add_trace(go.Scattergl(x=lx, y=_smooth(lj), mode="lines", name="loss_jepa", line=dict(width=2)))
     fig_loss.update_layout(
         template="plotly_white",
         title={"text": "Loss Curve", "x": 0.02},
@@ -877,8 +877,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         def _add_if(name: str, arr: np.ndarray):
             if arr.size >= n and np.isfinite(arr[:n]).any():
                 y = np.nan_to_num(arr[:n], nan=0.0)
-                fig_loss_components.add_trace(go.Scattergl(x=lx, y=y, mode="lines", name=f"{name}(raw)", line=dict(width=1), opacity=0.2))
-                fig_loss_components.add_trace(go.Scattergl(x=lx, y=_smooth(y), mode="lines", name=f"{name}(smooth)", line=dict(width=2)))
+                fig_loss_components.add_trace(go.Scattergl(x=lx, y=y, mode="lines", name=name, line=dict(width=1), opacity=0.12, showlegend=False))
+                fig_loss_components.add_trace(go.Scattergl(x=lx, y=_smooth(y), mode="lines", name=name, line=dict(width=2)))
         _add_if("loss_sigreg", loss_sigreg)
         _add_if("loss_symmetric", loss_symmetric)
         _add_if("loss_var", loss_var)
@@ -904,8 +904,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         ):
             if arr.size >= n and np.isfinite(arr[:n]).any():
                 y = np.nan_to_num(arr[:n], nan=0.0)
-                fig_weighted_components.add_trace(go.Scattergl(x=lx, y=y, mode="lines", name=f"{name}(raw)", line=dict(width=1), opacity=0.2))
-                fig_weighted_components.add_trace(go.Scattergl(x=lx, y=_smooth(y), mode="lines", name=f"{name}(smooth)", line=dict(width=2)))
+                fig_weighted_components.add_trace(go.Scattergl(x=lx, y=y, mode="lines", name=name, line=dict(width=1), opacity=0.12, showlegend=False))
+                fig_weighted_components.add_trace(go.Scattergl(x=lx, y=_smooth(y), mode="lines", name=name, line=dict(width=2)))
     fig_weighted_components.update_layout(
         template="plotly_white",
         title={"text": "Loss Components (Weighted into total_loss)", "x": 0.02},

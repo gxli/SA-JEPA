@@ -45,7 +45,7 @@
     "ema_momentum": 0.996,
     "normalize_loss_l2": false,
     "predictor_layernorm": true,
-    "predictor_residual": true,
+    "predictor_residual": false,
     "mask_size_scaling": 1.0,
     "mask_spacing_scaling": 2.0,
     "target_invalid_region_skip": false,
@@ -59,12 +59,11 @@
     "weight_decay": 1e-05,
     "num_workers": 0,
     "umap": {
-      "n_neighbors": 30,
-      "min_dist": 0.15,
       "metric": "euclidean",
-      "random_state": 42,
+      "standardize": true,
       "l2_normalize": false,
-      "standardize": false
+      "n_neighbors": 50,
+      "min_dist": 0.2
     },
     "viz_crop_border": true,
     "compute_effective_rank": true,

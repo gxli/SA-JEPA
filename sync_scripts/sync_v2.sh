@@ -128,7 +128,6 @@ case "$1" in
             ${RSYNC_RESUME_FLAG:+$RSYNC_RESUME_FLAG} \
             --delete --force \
             --exclude '.git' \
-            --exclude '/experiments/' \
             --exclude 'result_local/' \
             --exclude 'results/' \
             --exclude 'sessions/' \
@@ -145,7 +144,6 @@ case "$1" in
             --dry-run \
             --delete --force \
             --exclude '.git' \
-            --exclude '/experiments/' \
             --exclude 'result_local/' \
             --exclude 'results/' \
             --exclude 'sessions/' \

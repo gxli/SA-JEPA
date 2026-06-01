@@ -205,53 +205,62 @@ function percentile(sortedArr, pct) {{
   const t = idx - lo;
   return sortedArr[lo] * (1.0 - t) + sortedArr[hi] * t;
 }}
-function mapRgb(points, loPct, hiPct) {{
+function _pctRange(points, loPct, hiPct) {{
+  // Pre-compute sorted channel arrays and return lo/hi per channel.
   const n = points.length;
-  const d0 = new Array(n);
-  const d1 = new Array(n);
-  const d2 = new Array(n);
+  const d0 = new Array(n), d1 = new Array(n), d2 = new Array(n);
   for (let i = 0; i < n; i++) {{
-    d0[i] = points[i][0];
-    d1[i] = points[i][1];
-    d2[i] = points[i][2];
+    d0[i] = points[i][0]; d1[i] = points[i][1]; d2[i] = points[i][2];
   }}
-  // Filter NaN sentinels for percentile computation.
   const valid0 = d0.filter(v => !isNaN(v));
   const valid1 = d1.filter(v => !isNaN(v));
   const valid2 = d2.filter(v => !isNaN(v));
   const s0 = valid0.slice().sort((a, b) => a - b);
   const s1 = valid1.slice().sort((a, b) => a - b);
   const s2 = valid2.slice().sort((a, b) => a - b);
-  const lo0 = percentile(s0, loPct), hi0 = percentile(s0, hiPct);
-  const lo1 = percentile(s1, loPct), hi1 = percentile(s1, hiPct);
-  const lo2 = percentile(s2, loPct), hi2 = percentile(s2, hiPct);
-  const r = new Uint8Array(n), g = new Uint8Array(n), b = new Uint8Array(n);
-  const colors = new Array(n);
+  return {{
+    lo0: percentile(s0, loPct), hi0: percentile(s0, hiPct),
+    lo1: percentile(s1, loPct), hi1: percentile(s1, hiPct),
+    lo2: percentile(s2, loPct), hi2: percentile(s2, hiPct),
+  }};
+}}
+function mapRgbImage(points, loPct, hiPct) {{
+  const n = points.length;
+  const rng = _pctRange(points, loPct, hiPct);
   const rgbImage = new Array(H);
   for (let y = 0; y < H; y++) rgbImage[y] = new Array(W);
   for (let i = 0; i < n; i++) {{
-    if (isNaN(d0[i]) || isNaN(d1[i]) || isNaN(d2[i])) {{
-      r[i] = 0; g[i] = 0; b[i] = 0;
-      colors[i] = `rgb(${{r[i]}},${{g[i]}},${{b[i]}})`;
-      const yy = Math.floor(i / W);
-      const xx = i - yy * W;
-      rgbImage[yy][xx] = [r[i], g[i], b[i]];
-      continue;
+    const yy = Math.floor(i / W), xx = i - yy * W;
+    const v0 = points[i][0], v1 = points[i][1], v2 = points[i][2];
+    if (isNaN(v0) || isNaN(v1) || isNaN(v2)) {{
+      rgbImage[yy][xx] = [0, 0, 0]; continue;
     }}
-    const rr = clamp((d0[i] - lo0) / (Math.max(hi0 - lo0, 1e-8)), 0.0, 1.0);
-    const gg = clamp((d1[i] - lo1) / (Math.max(hi1 - lo1, 1e-8)), 0.0, 1.0);
-    const bb = clamp((d2[i] - lo2) / (Math.max(hi2 - lo2, 1e-8)), 0.0, 1.0);
-    r[i] = Math.round(rr * 255.0);
-    g[i] = Math.round(gg * 255.0);
-    b[i] = Math.round(bb * 255.0);
-    colors[i] = `rgb(${{r[i]}},${{g[i]}},${{b[i]}})`;
-    const yy = Math.floor(i / W);
-    const xx = i - yy * W;
-    rgbImage[yy][xx] = [r[i], g[i], b[i]];
+    rgbImage[yy][xx] = [
+      Math.round(clamp((v0 - rng.lo0) / Math.max(rng.hi0 - rng.lo0, 1e-8), 0, 1) * 255),
+      Math.round(clamp((v1 - rng.lo1) / Math.max(rng.hi1 - rng.lo1, 1e-8), 0, 1) * 255),
+      Math.round(clamp((v2 - rng.lo2) / Math.max(rng.hi2 - rng.lo2, 1e-8), 0, 1) * 255),
+    ];
   }}
   rgbImage.reverse();
-  return {{ rgbImage, colors }};
+  return rgbImage;
 }}
+function mapColors(points, loPct, hiPct) {{
+  const n = points.length;
+  const rng = _pctRange(points, loPct, hiPct);
+  const colors = new Array(n);
+  for (let i = 0; i < n; i++) {{
+    const v0 = points[i][0], v1 = points[i][1], v2 = points[i][2];
+    if (isNaN(v0) || isNaN(v1) || isNaN(v2)) {{ colors[i] = "rgb(0,0,0)"; continue; }}
+    const rr = clamp((v0 - rng.lo0) / Math.max(rng.hi0 - rng.lo0, 1e-8), 0, 1);
+    const gg = clamp((v1 - rng.lo1) / Math.max(rng.hi1 - rng.lo1, 1e-8), 0, 1);
+    const bb = clamp((v2 - rng.lo2) / Math.max(rng.hi2 - rng.lo2, 1e-8), 0, 1);
+    colors[i] = `rgb(${{Math.round(rr*255)}},${{Math.round(gg*255)}},${{Math.round(bb*255)}})`;
+  }}
+  return colors;
+}}
+// RGB images are fixed at full range — slider only affects scatter markers.
+const _pcaRgbImage = mapRgbImage(pca, 0.0, 100.0);
+const _umapRgbImage = mapRgbImage(umap, 0.0, 100.0);
 function mkScatter(points, colors, sceneName) {{
   return {{
     type: "scatter3d",
@@ -264,34 +273,42 @@ function mkScatter(points, colors, sceneName) {{
     showlegend: false,
   }};
 }}
+let _plotReady = false;
 function render(loPct, hiPct) {{
   const lo = Number.isFinite(loPct) ? loPct : 1.0;
   const hi = Number.isFinite(hiPct) ? hiPct : 99.0;
-  const pcaMapped = mapRgb(pca, lo, hi);
-  const umapMapped = mapRgb(umap, lo, hi);
-  const traces = [
-    {{ type: "image", z: pcaMapped.rgbImage, xaxis: "x", yaxis: "y", hoverinfo: "skip" }},
-    mkScatter(pca, pcaMapped.colors, "scene"),
-    {{ type: "image", z: umapMapped.rgbImage, xaxis: "x2", yaxis: "y2", hoverinfo: "skip" }},
-    mkScatter(umap, umapMapped.colors, "scene2"),
-  ];
-  const layout = {{
-    width: 1400, height: 920, template: "plotly_white",
-    margin: {{l: 30, r: 10, t: 70, b: 20}},
-    annotations: [
-      {{text: "PCA Color Map", x: 0.18, y: 1.03, xref: "paper", yref: "paper", showarrow: false}},
-      {{text: "PCA XYZ", x: 0.72, y: 1.03, xref: "paper", yref: "paper", showarrow: false}},
-      {{text: "UMAP Color Map", x: 0.18, y: 0.48, xref: "paper", yref: "paper", showarrow: false}},
-      {{text: "UMAP XYZ", x: 0.72, y: 0.48, xref: "paper", yref: "paper", showarrow: false}},
-    ],
-    xaxis: {{domain: [0.0, 0.44], showticklabels: false}},
-    yaxis: {{domain: [0.55, 1.0], showticklabels: false, scaleanchor: "x", scaleratio: 1}},
-    xaxis2: {{domain: [0.0, 0.44], showticklabels: false}},
-    yaxis2: {{domain: [0.0, 0.45], showticklabels: false, scaleanchor: "x2", scaleratio: 1}},
-    scene: {{domain: {{x: [0.52, 1.0], y: [0.55, 1.0]}}, aspectmode: "cube", xaxis: {{title: "PC1"}}, yaxis: {{title: "PC2"}}, zaxis: {{title: "PC3"}}}},
-    scene2: {{domain: {{x: [0.52, 1.0], y: [0.0, 0.45]}}, aspectmode: "cube", xaxis: {{title: "U1"}}, yaxis: {{title: "U2"}}, zaxis: {{title: "U3"}}}},
-  }};
-  Plotly.newPlot("plot", traces, layout, {{responsive: true}});
+  const pcaColors = mapColors(pca, lo, hi);
+  const umapColors = mapColors(umap, lo, hi);
+  if (!_plotReady) {{
+    const traces = [
+      {{ type: "image", z: _pcaRgbImage, xaxis: "x", yaxis: "y", hoverinfo: "skip" }},
+      mkScatter(pca, pcaColors, "scene"),
+      {{ type: "image", z: _umapRgbImage, xaxis: "x2", yaxis: "y2", hoverinfo: "skip" }},
+      mkScatter(umap, umapColors, "scene2"),
+    ];
+    const layout = {{
+      width: 1400, height: 920, template: "plotly_white",
+      margin: {{l: 30, r: 10, t: 70, b: 20}},
+      annotations: [
+        {{text: "PCA Color Map", x: 0.18, y: 1.03, xref: "paper", yref: "paper", showarrow: false}},
+        {{text: "PCA XYZ", x: 0.72, y: 1.03, xref: "paper", yref: "paper", showarrow: false}},
+        {{text: "UMAP Color Map", x: 0.18, y: 0.48, xref: "paper", yref: "paper", showarrow: false}},
+        {{text: "UMAP XYZ", x: 0.72, y: 0.48, xref: "paper", yref: "paper", showarrow: false}},
+      ],
+      xaxis: {{domain: [0.0, 0.44], showticklabels: false}},
+      yaxis: {{domain: [0.55, 1.0], showticklabels: false, scaleanchor: "x", scaleratio: 1}},
+      xaxis2: {{domain: [0.0, 0.44], showticklabels: false}},
+      yaxis2: {{domain: [0.0, 0.45], showticklabels: false, scaleanchor: "x2", scaleratio: 1}},
+      scene: {{domain: {{x: [0.52, 1.0], y: [0.55, 1.0]}}, aspectmode: "cube", xaxis: {{title: "PC1"}}, yaxis: {{title: "PC2"}}, zaxis: {{title: "PC3"}}}},
+      scene2: {{domain: {{x: [0.52, 1.0], y: [0.0, 0.45]}}, aspectmode: "cube", xaxis: {{title: "U1"}}, yaxis: {{title: "U2"}}, zaxis: {{title: "U3"}}}},
+    }};
+    Plotly.newPlot("plot", traces, layout, {{responsive: true}});
+    _plotReady = true;
+  }} else {{
+    // Update only scatter marker colors — RGB images are untouched.
+    Plotly.restyle("plot", {{ "marker.color": [pcaColors] }}, [1]);
+    Plotly.restyle("plot", {{ "marker.color": [umapColors] }}, [3]);
+  }}
   document.getElementById("status").textContent = `Applied range: low=${{lo.toFixed(1)}} high=${{hi.toFixed(1)}}`;
 }}
 document.getElementById("applyBtn").addEventListener("click", () => {{
@@ -481,7 +498,6 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     # Session plot compatibility artifacts.
     results_dir = os.path.join(session_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
-    save_context_reference_images(session_dir, x_clean_raw, x_context_display)
     np.save(os.path.join(results_dir, "latent_vectors_full.npy"), x.astype(np.float32))
     np.save(os.path.join(results_dir, "umap_x.npy"), umap_3d[:, 0].astype(np.float32))
     np.save(os.path.join(results_dir, "umap_y.npy"), umap_3d[:, 1].astype(np.float32))
@@ -548,463 +564,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     if context_map is not None:
         _save_branch_embeddings("context", context_map)
 
-    # Spatial latent map overview (sample-0 pred map only): PCA/UMAP colormap + XYZ scatter.
-    pred0 = pred_map[0].detach().cpu().permute(1, 2, 0).reshape(-1, pred_map.shape[1]).numpy().astype(np.float32)
-    pca0_3d = _filtered_embedding(pred0, valid_mask_flat, _compute_pca_3d).astype(np.float32)
-    if valid_mask_flat.all():
-        pred0_umap = _preprocess_latents_for_umap(
-            pred0,
-            l2_normalize=umap_l2_normalize,
-            standardize=umap_standardize,
-        )
-        umap0_3d = _compute_umap_nd(
-            pred0_umap,
-            n_components=3,
-            n_neighbors=umap_n_neighbors,
-            min_dist=umap_min_dist,
-            metric=umap_metric,
-            random_state=umap_random_state,
-            init=umap_init,
-        )
-    else:
-        pred0_valid = pred0[valid_mask_flat]
-        if pred0_valid.shape[0] == 0:
-            umap0_3d = np.full((pred0.shape[0], 3), np.nan, dtype=np.float32)
-        else:
-            pred0_umap_valid = _preprocess_latents_for_umap(
-                pred0_valid,
-                l2_normalize=umap_l2_normalize,
-                standardize=umap_standardize,
-            )
-            umap0_3d_valid = _compute_umap_nd(
-                pred0_umap_valid,
-                n_components=3,
-                n_neighbors=umap_n_neighbors,
-                min_dist=umap_min_dist,
-                metric=umap_metric,
-                random_state=umap_random_state,
-                init=umap_init,
-            )
-            umap0_3d = np.full((pred0.shape[0], 3), np.nan, dtype=np.float32)
-            umap0_3d[valid_mask_flat] = umap0_3d_valid
-    latent_html_path = _save_latent_overview_html(session_dir, pca0_3d, umap0_3d, pred_map.shape[-2], pred_map.shape[-1])
-
-    # Historical target-location heatmap loaded from session CSV log.
-    # Keep raw integer-like counts and expose a log-scaled NaN-masked view.
-    hist_counts = np.zeros_like(orig, dtype=np.float32)
-    hist_path = os.path.join(session_dir, "visited_target_locations_canonical.csv")
-    if not os.path.exists(hist_path):
-        hist_path = os.path.join(session_dir, "visited_target_locations.csv")
-    if os.path.exists(hist_path):
-        try:
-            with open(hist_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    cy = int(float(row["y"]))
-                    cx = int(float(row["x"]))
-                    if 0 <= cy < hist_counts.shape[0] and 0 <= cx < hist_counts.shape[1]:
-                        hist_counts[cy, cx] += 1.0
-        except Exception as e:
-            print(f"[warning] failed to read {hist_path}: {type(e).__name__}: {e}")
-    # NaN where never visited so "holes" stay explicit.
-    hist_log = np.full_like(hist_counts, np.nan, dtype=np.float32)
-    visited = hist_counts > 0.0
-    if np.any(visited):
-        hist_log[visited] = np.log1p(hist_counts[visited]).astype(np.float32)
-        vmax = float(np.nanmax(hist_log))
-        if vmax > 0.0:
-            hist_log[visited] = hist_log[visited] / vmax
-    np.save(os.path.join(results_dir, "target_locations_vis.npy"), target_vis.astype(np.float32))
-    np.save(os.path.join(results_dir, "target_locations_hist_vis.npy"), hist_log.astype(np.float32))
-    np.save(os.path.join(results_dir, "target_locations_hist_counts.npy"), hist_counts.astype(np.float32))
-    target_vis_img = os.path.join(results_dir, "target_locations_vis.png")
-    hist_vis_img = os.path.join(results_dir, "target_locations_hist_vis.png")
-    _save_png_with_colorbar(target_vis_img, target_vis, cmap="magma")
-    _save_png_with_colorbar(hist_vis_img, hist_log, cmap="viridis", nan_black=True)
-
-    # Optional channel-wise masking demo (16x16 center crop), 4 panels per row:
-    # [orig, masked, delta, abs-delta]. This is a quick visual reference.
-    mask_demo_rel = None
-    cdd_orig_t = outputs.get("cdd_channels_orig")
-    cdd_mask_t = outputs.get("cdd_channels_masked")
-    if cdd_orig_t is not None and cdd_mask_t is not None and cdd_orig_t.numel() > 0 and cdd_mask_t.numel() > 0:
-        cdd_orig = cdd_orig_t[0].detach().cpu().numpy().astype(np.float32)  # C,H,W
-        cdd_mask = cdd_mask_t[0].detach().cpu().numpy().astype(np.float32)  # C,H,W
-        if cdd_orig.ndim == 3 and cdd_mask.ndim == 3 and cdd_orig.shape == cdd_mask.shape:
-            c, h0, w0 = cdd_orig.shape
-            crop = 16
-            y0 = max(0, (h0 - crop) // 2)
-            x0 = max(0, (w0 - crop) // 2)
-            y1 = min(h0, y0 + crop)
-            x1 = min(w0, x0 + crop)
-            # Back-adjust to keep exact crop size when possible.
-            y0 = max(0, y1 - crop)
-            x0 = max(0, x1 - crop)
-
-            mask_demo_path = os.path.join(results_dir, "mask_demo_channels_16x16.png")
-            rows = []
-            for ch in range(c):
-                a = cdd_orig[ch, y0:y1, x0:x1]
-                b = cdd_mask[ch, y0:y1, x0:x1]
-                d = b - a
-                ad = np.abs(d)
-                pa = _apply_cmap(a, cmap="viridis")
-                pb = _apply_cmap(b, cmap="viridis")
-                pd = _apply_cmap(d, cmap="coolwarm")
-                pad = _apply_cmap(ad, cmap="magma")
-                rows.append(np.concatenate([pa, pb, pd, pad], axis=1))
-            canvas = np.concatenate(rows, axis=0)
-            scale = 12
-            Image.fromarray(canvas, mode="RGB").resize(
-                (canvas.shape[1] * scale, canvas.shape[0] * scale), resample=Image.NEAREST
-            ).save(mask_demo_path)
-            mask_demo_rel = os.path.join("results", "mask_demo_channels_16x16.png")
-
-    # Scale response probe: load .pt data for Plotly rendering.
-    scale_probe_script = ""
-    run_name = os.path.basename(session_dir)
-    scale_pt_path = os.path.join(session_dir, f"{run_name}_scale_response.pt")
-    if os.path.exists(scale_pt_path):
-        try:
-            sp_data = torch.load(scale_pt_path, map_location="cpu", weights_only=False)
-            sens_maps = sp_data["sensitivity_maps"][0].numpy()  # (S, H, W)
-            winner_map = sp_data.get("winner_map")
-            if winner_map is not None:
-                winner_map = winner_map.numpy()
-            S = sens_maps.shape[0]
-
-            # Per-scale sensitivity heatmaps with shared colorbar.
-            sens_div_id = f"scale-sens-{run_name}"
-            sens_traces = []
-            vmax = float(sens_maps.max())
-            for i in range(S):
-                sens_traces.append({
-                    "z": sens_maps[i].tolist(),
-                    "type": "heatmap",
-                    "colorscale": "Inferno",
-                    "zmin": 0,
-                    "zmax": vmax,
-                    "name": f"scale_{i}",
-                    "xaxis": f"x{i + 1}",
-                    "yaxis": f"y{i + 1}",
-                    "colorbar": {"len": 0.95, "y": 0.5, "thickness": 12, "tickfont": {"size": 9}} if i == S - 1 else None,
-                    "showscale": i == S - 1,
-                })
-            # Build subplot grid: 1 row × S columns.
-            annotations = []
-            for i in range(S):
-                annotations.append({
-                    "text": f"scale_{i}",
-                    "x": (i + 0.5) / S,
-                    "y": 1.02,
-                    "xref": "paper", "yref": "paper",
-                    "showarrow": False,
-                    "font": {"size": 11},
-                })
-            sens_layout = {
-                "grid": {"rows": 1, "columns": S, "pattern": "independent"},
-                "annotations": annotations,
-                "margin": {"l": 30, "r": 30, "t": 40, "b": 20},
-                "height": 380,
-                "template": "plotly_white",
-            }
-
-            # Winner map heatmap.
-            winner_div_id = f"scale-winner-{run_name}"
-            winner_traces = []
-            winner_layout = None
-            if winner_map is not None:
-                winner_traces.append({
-                    "z": winner_map.tolist(),
-                    "type": "heatmap",
-                    "colorscale": [[i / max(1, S - 1), f"hsl({int(360 * i / S)}, 70%, 50%)"] for i in range(S)],
-                    "zmin": 0,
-                    "zmax": S - 1,
-                    "colorbar": {"tickvals": list(range(S)), "ticktext": [f"scale_{i}" for i in range(S)], "len": 0.95, "thickness": 12},
-                })
-                winner_layout = {
-                    "margin": {"l": 30, "r": 30, "t": 20, "b": 20},
-                    "height": 400,
-                    "template": "plotly_white",
-                }
-
-            scale_probe_script = f"""
-<div id="{sens_div_id}" style="width:100%;height:400px;"></div>
-<div id="{winner_div_id}" style="width:100%;height:420px;"></div>
-<script>
-(function() {{
-  Plotly.newPlot('{sens_div_id}', {json.dumps(sens_traces)}, {json.dumps(sens_layout)}, {{ responsive: true }});
-  Plotly.newPlot('{winner_div_id}', {json.dumps(winner_traces)}, {json.dumps(winner_layout)}, {{ responsive: true }});
-}})();
-</script>
-"""
-        except Exception as e:
-            print(f"[warning] scale probe Plotly rendering failed: {type(e).__name__}: {e}")
-
-    # Energy map: target vs pred difference (Plotly heatmap).
-    energy_map_script = ""
-    energy_map_path = os.path.join(session_dir, "target_energy_map.npy")
-    if os.path.exists(energy_map_path):
-        try:
-            emap = np.load(energy_map_path)
-            if emap.ndim == 4:
-                emap = emap[0, 0]
-            elif emap.ndim == 3:
-                emap = emap[0]
-            energy_div_id = f"energy-map-{run_name}"
-            energy_traces = [{
-                "z": emap.tolist(),
-                "type": "heatmap",
-                "colorscale": "Inferno",
-                "colorbar": {"len": 0.95, "thickness": 12, "tickfont": {"size": 9}},
-            }]
-            energy_layout = {
-                "margin": {"l": 30, "r": 30, "t": 20, "b": 20},
-                "height": 400,
-                "template": "plotly_white",
-            }
-            energy_map_script = f"""
-<div id="{energy_div_id}" style="width:100%;height:420px;"></div>
-<script>
-(function() {{
-  Plotly.newPlot('{energy_div_id}', {json.dumps(energy_traces)}, {json.dumps(energy_layout)}, {{ responsive: true }});
-}})();
-</script>
-"""
-        except Exception as e:
-            print(f"[warning] energy map Plotly rendering failed: {type(e).__name__}: {e}")
-
-    # Read merged config for architecture summary.
-    arch_summary_html = ""
-    config_used_path = os.path.join(session_dir, "config_used.json")
-    if os.path.exists(config_used_path):
-        try:
-            with open(config_used_path, "r", encoding="utf-8") as f:
-                cfg_used = json.load(f)
-            mc = cfg_used.get("model", {})
-
-            enc = mc.get("model_key", mc.get("encoder_type", "?"))
-            enc_map = {
-                "cdd_scaleaware_convnext": "CDD Scale-Aware ConvNeXt",
-                "cdd_scaleaware_convnext_d4": "CDD Scale-Aware ConvNeXt (D4)",
-                "cdd_scaleaware_rescnn": "CDD Scale-Aware ResCNN",
-                "cdd_opnet": "CDD OpNet",
-            }
-            enc_label = enc_map.get(enc, enc)
-
-            sc = mc.get("predictor_spatial_conv", True)
-            pln = mc.get("predictor_layernorm", False)
-            pj = mc.get("projector_conv", True)
-            pred_label = (
-                f"{'3×3 conv' if sc else '1×1 channel-only'}"
-                f"{', LN' if pln else ', no LN'}"
-                ", + residual"
-            )
-            proj_label = f"{'1×1→GELU→1×1' if pj else 'Identity'}"
-
-            msc = mc.get("mask_size_scaling", 0.0)
-            mbox = mc.get("mask_box_size", 16)
-            if isinstance(mbox, list):
-                mbox_str = f"[{mbox[0]}, {mbox[1]}]"
-            else:
-                mbox_str = str(mbox)
-            mask_label = (
-                "pyramid" if msc > 0 else "random box"
-            ) + f" (scale={msc}, box={mbox_str})"
-
-            tsm = mc.get("target_sampling_mode", "grid")
-            no = mc.get("target_nonoverlap", False)
-            tgt_label = tsm
-            if tsm == "priority_sampling":
-                tgt_label += f" top{mc.get('priority_top_percent', 5):.0f}%"
-                pn = mc.get("priority_n_target", "auto")
-                tgt_label += f" n={pn}"
-            if no:
-                tgt_label += " nonoverlap"
-
-            arch_summary_html = f"""<div style="background:#f5f5f5; border-radius:6px; padding:12px 16px; margin-bottom:20px; font-size:14px; line-height:1.7;">
-<b>Encoder:</b> {enc_label}<br>
-<b>Projector:</b> {proj_label}<br>
-<b>Predictor:</b> {pred_label}<br>
-<b>Mask:</b> {mask_label}<br>
-<b>Targets:</b> {tgt_label}
-</div>"""
-        except Exception as e:
-            print(f"[warning] failed to build arch summary: {type(e).__name__}: {e}")
-
-    # Build a single assembled dashboard entrypoint for this session.
-    dashboard_path = os.path.join(session_dir, "dashboard.html")
-    latent_name = os.path.basename(latent_html_path)
-    metrics_path = os.path.join(session_dir, "metrics.csv")
-    loss_weights_path = os.path.join(session_dir, "loss_weights.json")
-    loss_weights = {}
-    if os.path.exists(loss_weights_path):
-        try:
-            with open(loss_weights_path, "r", encoding="utf-8") as f:
-                loss_weights = json.load(f)
-        except Exception as e:
-            print(f"[warning] failed to read {loss_weights_path}: {type(e).__name__}: {e}")
-
-    # Weight config key → (csv weighted column, short label)
-    WEIGHTED_COLUMN_MAP = [
-        ("mse_loss_weight", "weighted_mse", "mse"),
-        ("vicreg_var_weight", "weighted_var", "var"),
-        ("vicreg_cov_weight", "weighted_cov", "cov"),
-        ("sigreg_weight", "weighted_sigreg", "sigreg"),
-        ("symmetric_feature_loss_weight", "weighted_symmetric", "sym"),
-    ]
-
-    loss_x = []
-    loss_total = []
-    loss_weighted: dict[str, list[float]] = {}
-    if os.path.exists(metrics_path):
-        try:
-            with open(metrics_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                fieldnames = set(reader.fieldnames or [])
-                active_columns = []
-                for wkey, wcol, label in WEIGHTED_COLUMN_MAP:
-                    w = loss_weights.get(wkey, 0.0)
-                    if w is not None and float(w) > 0.0 and wcol in fieldnames:
-                        loss_weighted[wcol] = []
-                        active_columns.append((wcol, label, float(w)))
-                for row in reader:
-                    loss_x.append(float(row["epoch"]) + 0.001 * float(row["batch"]))
-                    loss_total.append(float(row.get("total_loss", 0.0)))
-                    for wcol, _, _ in active_columns:
-                        loss_weighted[wcol].append(float(row.get(wcol, 0.0)))
-        except Exception as e:
-            print(f"[warning] failed to read {metrics_path}: {type(e).__name__}: {e}")
-    ref_clean = os.path.join("results", "reference_000_clean.png")
-    ref_ctx_new = os.path.join("results", "reference_000_context_input.png")
-    ref_delta_new = os.path.join("results", "reference_000_clean_minus_context_input.png")
-    ref_ctx_old = os.path.join("results", "reference_000_context_blurred.png")
-    ref_delta_old = os.path.join("results", "reference_000_clean_minus_context.png")
-    ref_ctx = ref_ctx_new if os.path.exists(os.path.join(session_dir, ref_ctx_new)) else ref_ctx_old
-    ref_delta = ref_delta_new if os.path.exists(os.path.join(session_dir, ref_delta_new)) else ref_delta_old
-    target_vis_rel = os.path.join("results", "target_locations_vis.png")
-    hist_vis_rel = os.path.join("results", "target_locations_hist_vis.png")
-    loss_html = (
-        '<div id="loss-plot" style="width: 100%; height: 600px; border: 1px solid #ddd; border-radius: 6px;"></div>'
-        if len(loss_x) > 0
-        else "<p>Loss data not available yet.</p>"
-    )
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>JEPA Dashboard</title>
-  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 20px; color: #111; }}
-    h1, h2 {{ margin: 0 0 12px 0; }}
-    .section {{ margin: 0 0 24px 0; }}
-    .grid {{ display: grid; grid-template-columns: repeat(3, minmax(240px, 1fr)); gap: 12px; }}
-    .card {{ border: 1px solid #ddd; padding: 8px; border-radius: 6px; background: #fff; }}
-    img {{ width: 100%; height: auto; display: block; }}
-    iframe {{ width: 100%; height: 920px; border: 1px solid #ddd; border-radius: 6px; }}
-    .note {{ color: #555; font-size: 13px; margin: 0 0 8px 0; }}
-  </style>
-</head>
-<body>
-  <h1>JEPA Session Dashboard</h1>
-  {arch_summary_html}
-  <div class="section">
-    <h2>Loss Curve</h2>
-    {loss_html}
-  </div>
-  <div class="section">
-    <h2>Reference Images (Sample 0)</h2>
-    <div class="grid">
-      <div class="card"><p>Clean</p><img src="{ref_clean}" alt="reference_clean" /></div>
-      <div class="card"><p>Blurred Context</p><img src="{ref_ctx}" alt="reference_context" /></div>
-      <div class="card"><p>Clean - Context</p><img src="{ref_delta}" alt="reference_delta" /></div>
-    </div>
-  </div>
-  <div class="section">
-    <h2>Target Sampling Diagnostics</h2>
-    <div class="grid">
-      <div class="card"><p>Current Sample Target Locations</p><img src="{target_vis_rel}" alt="target_locations_vis" /></div>
-      <div class="card"><p>Historical Target Visit Heatmap (log1p, unvisited=NaN/black)</p><img src="{hist_vis_rel}" alt="target_locations_hist_vis" /></div>
-    </div>
-  </div>
-  <div class="section">
-    <h2>Latent Overview</h2>
-    <iframe src="{latent_name}" title="latent_overview_4panel"></iframe>
-  </div>
-  {
-    f'''
-  <div class="section">
-    <h2>Mask Demo (16x16 Channel Crops)</h2>
-    <div class="card">
-      <img src="{mask_demo_rel}" alt="mask_demo_channels_16x16" />
-    </div>
-  </div>
-''' if mask_demo_rel is not None else ""
-  }
-  {
-    f'''
-  <div class="section">
-    <h2>Scale Response Probe</h2>
-    {scale_probe_script}
-  </div>
-''' if scale_probe_script else ""
-  }
-  {
-    f'''
-  <div class="section">
-    <h2>Energy Map (target vs pred)</h2>
-    {energy_map_script}
-  </div>
-''' if energy_map_script else ""
-  }
-</body>
-</html>
-"""
-    if len(loss_x) > 0:
-        # Build trace name → weight mapping from loss_weights.json.
-        _weight_of_column = {}
-        for wkey, wcol, label in WEIGHTED_COLUMN_MAP:
-            w = loss_weights.get(wkey, 0.0)
-            if w is not None and float(w) > 0.0:
-                _weight_of_column[wcol] = (label, float(w))
-
-        traces = []
-        traces.append({"x": loss_x, "y": loss_total, "mode": "lines", "name": "total"})
-        for w_col in sorted(loss_weighted.keys()):
-            info = _weight_of_column.get(w_col)
-            if info is None:
-                continue
-            label, w = info
-            traces.append({
-                "x": loss_x,
-                "y": loss_weighted[w_col],
-                "mode": "lines",
-                "name": label,
-            })
-
-        script = f"""
-<script>
-(function() {{
-  const traces = {json.dumps(traces)};
-  if (traces.length === 0) return;
-
-  Plotly.newPlot('loss-plot', traces, {{
-    xaxis: {{ title: 'epoch + 0.001*batch' }},
-    yaxis: {{ title: 'weighted loss' }},
-    template: 'plotly_white',
-    margin: {{ l: 60, r: 20, t: 20, b: 55 }},
-    legend: {{ x: 1.02, y: 1.0, xanchor: 'left' }},
-    height: 420,
-  }}, {{ responsive: true }});
-}})();
-</script>
-"""
-        html = html.replace("</body>", script + "\n</body>")
-    with open(dashboard_path, "w", encoding="utf-8") as f:
-        f.write(html)
-    return dashboard_path
+    return results_dir
 
 
 def save_volumetric_umap_embeddings(session_dir: str, outputs: dict, umap_cfg: dict | None = None) -> str:

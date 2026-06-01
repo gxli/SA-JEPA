@@ -72,16 +72,17 @@ class PyramidGridJEPA(nn.Module):
         cdd_log_std_floor_mult: float = 0.05,
         ema_momentum: float = 0.996,
         normalize_loss_l2: bool = False,
-        predictor_layernorm: bool = False,
+        predictor_layernorm: bool = True,
         predictor_spatial_conv: bool = False,
         projector_conv: bool = True,
-        predictor_residual: bool = True,
+        predictor_residual: bool = False,
         use_image_mask_token: bool = False,
         mode: str = "image",
         encoder_type: str = "convnext_dense_masktoken",
         encoder_width: int = 32,
         encoder_depth: int = 4,
         encoder_kernel_size: int = 7,
+        convnext_layer_dilations=None,
         encoder_norm_type: Optional[str] = None,
         encoder_norm_groups: Optional[int] = None,
         encoder_norm_eps: Optional[float] = None,
@@ -89,6 +90,11 @@ class PyramidGridJEPA(nn.Module):
         scaleaware_adapter_kernel_size: int = 3,
         scaleaware_fusion_type: str = "concat",
         scaleaware_norm_per_scale: bool = False,
+        scaleaware_adapter_norm: bool = True,
+        scaleaware_final_norm: bool = True,
+        scaleaware_stem_norm: bool = True,
+        encoder_final_norm_type: str = "layernorm",
+        encoder_head_bias: bool = True,
         use_film: bool = True,
         use_per_scale_adapters: bool = False,
         opnet_dilation_mode: str = "half_cdd_scale",
@@ -111,6 +117,7 @@ class PyramidGridJEPA(nn.Module):
         target_nonoverlap: bool = False,
         target_allow_partial_overlap: float = 0.0,
         mask_box_hardcap: int | None = None,
+        use_grn: bool = True,
     ):
         super().__init__()
 
@@ -164,6 +171,9 @@ class PyramidGridJEPA(nn.Module):
         self.encoder_width = int(encoder_width)
         self.encoder_depth = int(encoder_depth)
         self.encoder_kernel_size = int(encoder_kernel_size)
+        self.convnext_layer_dilations = (
+            None if convnext_layer_dilations is None else tuple(int(d) for d in convnext_layer_dilations)
+        )
         self.encoder_norm_type = None if encoder_norm_type is None else str(encoder_norm_type).lower()
         self.encoder_norm_groups = None if encoder_norm_groups is None else int(encoder_norm_groups)
         self.encoder_norm_eps = None if encoder_norm_eps is None else float(encoder_norm_eps)
@@ -173,6 +183,12 @@ class PyramidGridJEPA(nn.Module):
         self.use_film = bool(use_film)
         self.use_per_scale_adapters = bool(use_per_scale_adapters)
         self.scaleaware_norm_per_scale = bool(scaleaware_norm_per_scale)
+        self.scaleaware_adapter_norm = bool(scaleaware_adapter_norm)
+        self.scaleaware_final_norm = bool(scaleaware_final_norm)
+        self.scaleaware_stem_norm = bool(scaleaware_stem_norm)
+        self.encoder_final_norm_type = str(encoder_final_norm_type).lower()
+        self.encoder_head_bias = bool(encoder_head_bias)
+        self.use_grn = bool(use_grn)
         self.opnet_dilation_mode = str(opnet_dilation_mode)
         self.opnet_dilations = opnet_dilations
         self.opnet_max_dilation = int(opnet_max_dilation)
@@ -258,6 +274,8 @@ class PyramidGridJEPA(nn.Module):
                 expansion=4,
                 use_reflect_padding=True,
                 final_norm=True,
+                use_grn=self.use_grn,
+                dilations=self.convnext_layer_dilations,
             )
         elif self.encoder_type == "rescnn_dense_pyramid":
             # Pyramid input = per-scale CDD channels + per-scale mask/indicator channels.
@@ -313,8 +331,14 @@ class PyramidGridJEPA(nn.Module):
                 adapter_kernel_size=self.scaleaware_adapter_kernel_size,
                 fusion_type=self.scaleaware_fusion_type,
                 use_reflect_padding=True,
-                final_norm=True,
+                final_norm=self.scaleaware_final_norm,
                 cdd_append_last_residual=self.cdd_append_last_residual,
+                adapter_norm=self.scaleaware_adapter_norm,
+                final_norm_type=self.encoder_final_norm_type,
+                head_bias=self.encoder_head_bias,
+                use_grn=self.use_grn,
+                stem_norm=self.scaleaware_stem_norm,
+                dilations=self.convnext_layer_dilations,
             )
         elif self.encoder_type == "cdd_scaleaware_convnext_d4":
             if self.mode != "pyramid":
@@ -330,10 +354,16 @@ class PyramidGridJEPA(nn.Module):
                 adapter_kernel_size=self.scaleaware_adapter_kernel_size,
                 fusion_type=self.scaleaware_fusion_type,
                 use_reflect_padding=True,
-                final_norm=True,
+                final_norm=self.scaleaware_final_norm,
                 cdd_append_last_residual=self.cdd_append_last_residual,
+                adapter_norm=self.scaleaware_adapter_norm,
+                final_norm_type=self.encoder_final_norm_type,
+                head_bias=self.encoder_head_bias,
+                use_grn=self.use_grn,
+                stem_norm=self.scaleaware_stem_norm,
+                dilations=self.convnext_layer_dilations,
             )
-            self.context_encoder = D4InvariantWrapper(base_encoder=base, pool="max")
+            self.context_encoder = D4InvariantWrapper(base_encoder=base, pool="mean")
         elif self.encoder_type == "cdd_scaleaware_rescnn":
             if self.mode != "pyramid":
                 raise ValueError("cdd_scaleaware_rescnn requires mode='pyramid'.")
@@ -369,6 +399,11 @@ class PyramidGridJEPA(nn.Module):
                 use_reflect_padding=True,
                 final_norm=True,
                 cdd_append_last_residual=self.cdd_append_last_residual,
+                adapter_norm=self.scaleaware_adapter_norm,
+                final_norm_type=self.encoder_final_norm_type,
+                head_bias=self.encoder_head_bias,
+                use_grn=self.use_grn,
+                dilations=self.convnext_layer_dilations,
             )
         elif self.encoder_type == "convnext_dense":
             self.context_encoder = ConvNeXtDenseEncoder(
@@ -380,6 +415,8 @@ class PyramidGridJEPA(nn.Module):
                 expansion=4,
                 use_reflect_padding=True,
                 final_norm=True,
+                use_grn=self.use_grn,
+                dilations=self.convnext_layer_dilations,
             )
         elif self.encoder_type == "convnext_dense_masktoken":
             # 2D ConvNeXt image mode with explicit hard-mask token channel.
@@ -392,6 +429,8 @@ class PyramidGridJEPA(nn.Module):
                 expansion=4,
                 use_reflect_padding=True,
                 final_norm=True,
+                use_grn=self.use_grn,
+                dilations=self.convnext_layer_dilations,
             )
         elif self.encoder_type == "convnext_dense_masktoken_d4":
             # 2D ConvNeXt image mode with hard-mask token channel + strict D4 pooling.
@@ -404,8 +443,10 @@ class PyramidGridJEPA(nn.Module):
                 expansion=4,
                 use_reflect_padding=True,
                 final_norm=True,
+                use_grn=self.use_grn,
+                dilations=self.convnext_layer_dilations,
             )
-            self.context_encoder = D4InvariantWrapper(base_encoder=base, pool="max")
+            self.context_encoder = D4InvariantWrapper(base_encoder=base, pool="mean")
         elif self.encoder_type == "rescnn_dense":
             norm_type = self.encoder_norm_type if self.encoder_norm_type is not None else "groupnorm"
             norm_groups = self.encoder_norm_groups if self.encoder_norm_groups is not None else 1
@@ -517,6 +558,8 @@ class PyramidGridJEPA(nn.Module):
         x_clean,
         return_debug: bool = False,
         enable_grid_jitter: bool = True,
+        enable_target_dithering: bool = True,
+        lattice_shift_override=None,
         mask_inference: bool = True,
         context_data=None,
     ):
@@ -571,6 +614,8 @@ class PyramidGridJEPA(nn.Module):
                     inner_target_size=self.patch_size,
                     return_debug=True,
                     enable_grid_jitter=enable_grid_jitter,
+                    enable_target_dithering=enable_target_dithering,
+                    lattice_shift_override=lattice_shift_override,
                     target_invalid_region_skip=self.target_invalid_region_skip,
                     target_invalid_region_values=self.target_invalid_region_values,
                     invalid_pixel_mask=invalid_pixel_mask,
@@ -600,6 +645,8 @@ class PyramidGridJEPA(nn.Module):
                     cdd_append_last_residual=self.cdd_append_last_residual,
                     inner_target_size=self.patch_size,
                     enable_grid_jitter=enable_grid_jitter,
+                    enable_target_dithering=enable_target_dithering,
+                    lattice_shift_override=lattice_shift_override,
                     target_invalid_region_skip=self.target_invalid_region_skip,
                     target_invalid_region_values=self.target_invalid_region_values,
                     invalid_pixel_mask=invalid_pixel_mask,
@@ -919,7 +966,11 @@ class PyramidGridJEPA(nn.Module):
 
     @torch.no_grad()
     def update_target_encoder(self):
-        for p_context, p_target in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+        # Use base_encoder directly when a D4 / other wrapper is present to avoid
+        # coupling the EMA to wrapper parameters that may appear in the future.
+        ctx_enc = getattr(self.context_encoder, "base_encoder", self.context_encoder)
+        tgt_enc = getattr(self.target_encoder, "base_encoder", self.target_encoder)
+        for p_context, p_target in zip(ctx_enc.parameters(), tgt_enc.parameters()):
             p_target.mul_(self.ema_momentum).add_(p_context.detach(), alpha=1.0 - self.ema_momentum)
         if self.projector_conv:
             for p_proj, p_target_proj in zip(self.projector.parameters(), self.target_projector.parameters()):
