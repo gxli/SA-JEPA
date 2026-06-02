@@ -47,11 +47,11 @@ def build_context(x_t: torch.Tensor, cfg: dict):
         x_clean=x_t,
         sigmas=tuple(m.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=float(m.get("active_target_fraction", m.get("mask_fraction", 1.0))),
-        mask_scale=float(m.get("mask_size_scaling", 1.0)),
+        mask_scale=float(m.get("mask_scale_factor", 1.0)),
         spacing_scale=float(m.get("mask_spacing_scaling", 1.5)),
         global_shift=bool(m.get("global_shift", True)),
         align_scales=bool(m.get("align_scales", True)),
-        mask_box_size=int(m.get("mask_box_size", 16)),
+        mask_box_size=int(m.get("mask_footprint_px", 16)),
         cdd_mode=str(m.get("cdd_mode", "log")),
         cdd_constrained=bool(m.get("cdd_constrained", True)),
         cdd_sm_mode=str(m.get("cdd_sm_mode", "reflect")),
@@ -115,9 +115,9 @@ def main():
         cfg.setdefault("model", {})["active_target_fraction"] = float(args.mask_fraction)
         cfg.setdefault("model", {})["mask_fraction"] = float(args.mask_fraction)
     if args.mask_scale is not None:
-        cfg.setdefault("model", {})["mask_size_scaling"] = float(args.mask_scale)
-    if args.mask_box_size is not None:
-        cfg.setdefault("model", {})["mask_box_size"] = int(args.mask_box_size)
+        cfg.setdefault("model", {})["mask_scale_factor"] = float(args.mask_scale)
+    if args.mask_footprint_px is not None:
+        cfg.setdefault("model", {})["mask_footprint_px"] = int(args.mask_footprint_px)
     ds = build_dataset(cfg.get("data", {}))
     x = ds[int(args.sample_index) % len(ds)][0].numpy().astype(np.float32)
     x_t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
@@ -241,8 +241,8 @@ def main():
     title = (
         f"Mask Diagnostic: {os.path.basename(args.config)} | "
         "masking=cdd "
-        f"mask_box={m.get('mask_box_size')} "
-        f"mask_size_scaling={m.get('mask_size_scaling')} "
+        f"mask_box={m.get('mask_footprint_px')} "
+        f"mask_scale={m.get('mask_scale_factor')} "
         f"active_target_fraction={m.get('active_target_fraction', m.get('mask_fraction'))} boxes={box_sizes}"
     )
     panel_px = max(160, int(args.panel_px))
@@ -260,8 +260,8 @@ def main():
         "pipeline_entry": "src.models.masking.prepare_context_batch",
         "masking_function": "src.models.masking.make_pyramid_grid_context",
         "masking_mode": "cdd",
-        "mask_box_size": int(m.get("mask_box_size", 0)),
-        "mask_size_scaling": float(m.get("mask_size_scaling", 1.0)),
+        "mask_footprint_px": int(m.get("mask_footprint_px", 0)),
+        "mask_scale_factor": float(m.get("mask_scale_factor", 1.0)),
         "mask_fraction": float(m.get("active_target_fraction", m.get("mask_fraction", 1.0))),
         "target_sampling_mode": str(m.get("target_sampling_mode", "grid")),
         "priority_n_target": m.get("priority_n_target", 20),

@@ -4,6 +4,39 @@ import torch
 import torch.nn.functional as F
 
 
+def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
+    removed_flat_keys = {
+        "spread_regularizer_weight",
+        "spread_sketch_dim",
+        "embed_spread_target",
+        "spread_regularizer_eps",
+        "spread_regularizer_noise_std",
+    }
+    stale_keys = removed_flat_keys & set(train_cfg)
+    assert not stale_keys, f"Use train.spread_regularizer instead of flat keys: {sorted(stale_keys)}"
+    cfg = dict(train_cfg.get("spread_regularizer", {}))
+    expected_keys = {"type", "target", "weight", "target_std", "eps"}
+    extra_keys = set(cfg) - expected_keys
+    assert not extra_keys, f"Unsupported train.spread_regularizer keys: {sorted(extra_keys)}"
+    sigreg_type = str(cfg.get("type", "std_hinge"))
+    sigreg_target = str(cfg.get("target", "context"))
+    sigreg_weight = float(cfg.get("weight", 0.0))
+    assert sigreg_type == "std_hinge"
+    assert sigreg_target == "context"
+    assert sigreg_weight >= 0
+    target_std = float(cfg.get("target_std", 1.0))
+    eps = float(cfg.get("eps", 1e-4))
+    assert target_std >= 0
+    assert eps > 0
+    return {
+        "type": sigreg_type,
+        "target": sigreg_target,
+        "weight": sigreg_weight,
+        "target_std": target_std,
+        "eps": eps,
+    }
+
+
 def _offdiag(x: torch.Tensor) -> torch.Tensor:
     n, m = x.shape
     if n != m:
@@ -57,17 +90,14 @@ def extract_valid_pooled_embeddings(outputs: dict, key: str = "context_patches")
     return z
 
 
-def sketched_sigreg_loss(
+def spread_regularizer_loss(
     z: torch.Tensor,
-    sketch_dim: int = 64,
     target_std: float = 1.0,
     eps: float = 1e-4,
-    noise_std: float = 0.0,
 ) -> torch.Tensor:
     """
-    Lightweight SIGReg-style isotropic Gaussian regularization.
-    Uses a VICReg-style standard-deviation hinge so gradients remain useful
-    close to collapse. Optional noise breaks exact sample symmetry at z == 0.
+    Standard-deviation hinge on context embeddings.
+    Gradients remain useful close to collapse without hidden projection modes.
     """
     z = z.float()  # cast to fp32 to avoid underflow in fp16
     if z.numel() == 0:
@@ -76,26 +106,26 @@ def sketched_sigreg_loss(
         return z.sum() * 0.0
 
     z = z - z.mean(dim=0, keepdim=True)
-    if float(noise_std) > 0.0:
-        noise = torch.randn_like(z) * float(noise_std)
-        z = z + (noise - noise.mean(dim=0, keepdim=True))
-    c = z.shape[1]
-    sketch_dim = int(max(1, sketch_dim))
-    if sketch_dim < c:
-        a = torch.randn((c, sketch_dim), device=z.device, dtype=z.dtype)
-        a = a / (float(c) ** 0.5)
-        z = z @ a
-
     std = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
     return torch.relu(float(target_std) - std).mean()
 
 
 @torch.no_grad()
-def embedding_spread_stats(z: torch.Tensor) -> dict[str, float]:
+def embedding_spread_stats(
+    z: torch.Tensor,
+    target_std: float = 1.0,
+    dead_channel_threshold: float = 1e-5,
+) -> dict[str, float]:
     """Compact collapse diagnostics for pooled context embeddings."""
     z = z.detach().float()
     if z.numel() == 0:
-        return {"ctx_std_mean": 0.0, "ctx_std_min": 0.0, "ctx_var_mean": 0.0, "ctx_rank": 0.0}
+        return {
+            "embed_spread_mean": 0.0,
+            "embed_spread_min": 0.0,
+            "embed_under_spread_frac": 1.0,
+            "dead_channel_count": 0,
+            "context_manifold_size": 0.0,
+        }
     z = z - z.mean(dim=0, keepdim=True)
     var = z.var(dim=0, unbiased=False)
     cov = (z.T @ z) / max(1, int(z.shape[0]))
@@ -106,47 +136,20 @@ def embedding_spread_stats(z: torch.Tensor) -> dict[str, float]:
     else:
         p = eig / eig_sum
         rank = float(torch.exp(-(p * p.clamp_min(1e-20).log()).sum()).item())
+    std = torch.sqrt(var + 1e-12)
     return {
-        "ctx_std_mean": float(torch.sqrt(var + 1e-12).mean().item()),
-        "ctx_std_min": float(torch.sqrt(var + 1e-12).min().item()),
-        "ctx_var_mean": float(var.mean().item()),
-        "ctx_rank": rank,
+        "embed_spread_mean": float(std.mean().item()),
+        "embed_spread_min": float(std.min().item()),
+        "embed_under_spread_frac": float((std < float(target_std)).float().mean().item()),
+        "dead_channel_count": int((std < float(dead_channel_threshold)).sum().item()),
+        "context_manifold_size": rank,
     }
 
 
-def compute_sim_var_cov(outputs: dict, spatial_mode: str = "dense") -> tuple[float, float, float]:
-    pred = outputs["pred_patches"].detach().float()  # B,K,C,P,P
-    ctx = outputs.get("context_patches", outputs["pred_patches"]).detach().float()  # B,K,C,P,P
-    gt = outputs["gt_patches"].detach().float()  # B,K,C,P,P
-    valid = outputs["target_valid"].detach()  # B,K
-
-    z_pred, z_gt = _flatten_vicreg_samples(pred, gt, valid, spatial_mode=spatial_mode)
-    z_ctx, _ = _flatten_vicreg_samples(ctx, gt, valid, spatial_mode=spatial_mode)
-    if z_pred.numel() == 0 or z_gt.numel() == 0:
-        return 0.0, 0.0, 0.0
-
-    # sim: cosine similarity (higher is better)
-    sim = torch.nn.functional.cosine_similarity(z_pred, z_gt, dim=1).mean()
-
-    if z_pred.shape[0] < 2:
-        return float(sim.item()), 0.0, 0.0
-
-    # var: VICReg variance regularizer term (lower is better; 0 ideal)
-    std_ctx = torch.sqrt(z_ctx.var(dim=0, unbiased=False) + 1e-4)
-    std_gt = torch.sqrt(z_gt.var(dim=0, unbiased=False) + 1e-4)
-    var_term = 0.5 * (torch.relu(1.0 - std_ctx).mean() + torch.relu(1.0 - std_gt).mean())
-
-    # cov: VICReg covariance regularizer term (lower is better; 0 ideal)
-    z1c = z_ctx - z_ctx.mean(dim=0, keepdim=True)
-    z2c = z_gt - z_gt.mean(dim=0, keepdim=True)
-    cov_z1 = (z1c.T @ z1c) / max(1, z1c.shape[0] - 1)
-    cov_z2 = (z2c.T @ z2c) / max(1, z2c.shape[0] - 1)
-    cov_term = 0.5 * ((_offdiag(cov_z1).pow(2).mean()) + (_offdiag(cov_z2).pow(2).mean()))
-
-    return float(sim.item()), float(var_term.item()), float(cov_term.item())
-
-
-def compute_sim_var_cov_torch(outputs: dict, spatial_mode: str = "dense") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _compute_sim_var_cov_tensors(
+    outputs: dict,
+    spatial_mode: str = "dense",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     pred = outputs["pred_patches"].float()  # keep graph, cast to fp32 for safe norm
     ctx = outputs.get("context_patches", outputs["pred_patches"]).float()  # regularize before predictor
     gt = outputs["gt_patches"].float()  # keep graph (target branch already no-grad in forward)
@@ -173,6 +176,15 @@ def compute_sim_var_cov_torch(outputs: dict, spatial_mode: str = "dense") -> tup
     cov_z2 = (z2c.T @ z2c) / max(1, z2c.shape[0] - 1)
     cov_term = 0.5 * ((_offdiag(cov_z1).pow(2).mean()) + (_offdiag(cov_z2).pow(2).mean()))
     return sim, var_term, cov_term
+
+
+def compute_sim_var_cov(outputs: dict, spatial_mode: str = "dense") -> tuple[float, float, float]:
+    values = _compute_sim_var_cov_tensors(outputs, spatial_mode=spatial_mode)
+    return tuple(float(value.detach().item()) for value in values)
+
+
+def compute_sim_var_cov_torch(outputs: dict, spatial_mode: str = "dense") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _compute_sim_var_cov_tensors(outputs, spatial_mode=spatial_mode)
 
 
 def compute_raw_mse_and_norm_err(outputs: dict) -> tuple[float, float]:

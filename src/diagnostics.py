@@ -60,12 +60,12 @@ def spectral_rank_stats(fmap: torch.Tensor, eps: float = 1e-12, dead_thresh: flo
 
     return {
         "erank": float(erank.item()),
-        "participation_rank": float(participation.item()),
+        "manifold_size": float(participation.item()),
         "top1_energy": float(top1.item()),
         "top4_energy": float(top4.item()),
         "top8_energy": float(top8.item()),
         "dead_channel_fraction": float(dead_frac),
-        "num_dead_channels": int(dead.sum().item()),
+        "dead_channel_count": int(dead.sum().item()),
         "mean_channel_std": float(ch_std.mean().item()),
         "min_channel_std": float(ch_std.min().item()),
         "max_channel_std": float(ch_std.max().item()),
@@ -83,9 +83,9 @@ def rank_dashboard(outputs: dict) -> dict:
         out["context"] = spectral_rank_stats(torch.as_tensor(context))
     out["pred"] = spectral_rank_stats(torch.as_tensor(pred))
     out["gt"] = spectral_rank_stats(torch.as_tensor(gt))
-    out["pred_gt_erank_ratio"] = out["pred"]["erank"] / max(out["gt"]["erank"], 1e-12)
-    out["pred_gt_participation_ratio"] = out["pred"]["participation_rank"] / max(
-        out["gt"]["participation_rank"], 1e-12
+    out["rank_match_ratio"] = out["pred"]["erank"] / max(out["gt"]["erank"], 1e-12)
+    out["volume_match_ratio"] = out["pred"]["manifold_size"] / max(
+        out["gt"]["manifold_size"], 1e-12
     )
     return out
 
@@ -107,5 +107,4 @@ def compute_error_by_scale(outputs: dict) -> dict[float, float]:
             s = round(float(scales[bi, ki].item()), 6)
             out[s].append(float(mse_bk[bi, ki].item()))
     return {float(s): float(np.mean(v)) for s, v in out.items() if len(v) > 0}
-
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate gen_68 cross-dataset configs at mask_size_scaling=1.2."""
+"""Generate gen_68 cross-dataset configs at mask_scale_factor=1.2."""
 from __future__ import annotations
 
 import json
@@ -21,9 +21,9 @@ def _base_cfg(npy_pattern: str) -> dict:
         "model": {
             "mode": "pyramid",
             "model_key": "cdd_scaleaware_convnext",
-            "mask_size_scaling": 1.2,
+            "mask_scale_factor": 1.2,
             "mask_spacing_scaling": 2.0,
-            "mask_box_size": 0,
+            "mask_footprint_px": 0,
             "normalize_loss_l2": True,
             "use_symmetric_feature_loss": True,
             "scaleaware_norm_per_scale": True,
@@ -36,11 +36,8 @@ def _base_cfg(npy_pattern: str) -> dict:
         "train": {
             "epochs": 10,
             "log_interval": 1,
-            "jepa_loss_weight": 100.0,
-            "vicreg_var_weight": 0.0,
-            "vicreg_cov_weight": 0.0,
-            "sigreg_weight": 1.0,
-            "sigreg_sketch_dim": 64,
+            "prediction_loss_weight": 100.0,
+            "spread_regularizer": {"type": "std_hinge", "target": "context", "weight": 1.0, "target_std": 1.0, "eps": 1e-4},
             "inference_tta_enabled": True,
             "inference_tta_mode": "flip4",
         },

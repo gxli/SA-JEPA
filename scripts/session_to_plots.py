@@ -16,9 +16,9 @@ def read_metrics(csv_path):
         for row in reader:
             step = len(total)
             epochs.append(step)
-            total.append(float(row["total_loss"]))
-            jepa.append(float(row["loss_jepa"]))
-            pixel.append(float(row["loss_pixel"]))
+            total.append(float(row.get("loss_total", row.get("total_loss"))))
+            jepa.append(float(row.get("loss_prediction", row.get("loss_jepa", row.get("loss_mse")))))
+            pixel.append(float(row.get("loss_spread", row.get("loss_pixel", 0.0))))
     return epochs, total, jepa, pixel
 
 
@@ -27,9 +27,9 @@ def plot_session(metrics_path, out_dir):
     x, total, jepa, pixel = read_metrics(metrics_path)
 
     plt.figure(figsize=(10, 6))
-    plt.plot(x, total, label="total_loss")
-    plt.plot(x, jepa, label="loss_jepa")
-    plt.plot(x, pixel, label="loss_pixel")
+    plt.plot(x, total, label="loss_total")
+    plt.plot(x, jepa, label="loss_prediction")
+    plt.plot(x, pixel, label="loss_spread")
     plt.xlabel("training step")
     plt.ylabel("loss")
     plt.title(f"Training Curves: {session_name}")

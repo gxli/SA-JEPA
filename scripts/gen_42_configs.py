@@ -29,11 +29,8 @@ BASE_TRAIN = {
     "weight_decay": 1e-05,
     "num_workers": 0,
     "log_interval": 1,
-    "jepa_loss_weight": 100.0,
-    "vicreg_var_weight": 0.0,
-    "vicreg_cov_weight": 0.0,
-    "sigreg_weight": 1.0,
-    "sigreg_sketch_dim": 64,
+    "prediction_loss_weight": 100.0,
+    "spread_regularizer": {"type": "std_hinge", "target": "context", "weight": 1.0, "target_std": 1.0, "eps": 1e-4},
     "force_recompute_inference": True,
     "umap": {
         "n_neighbors": 30,
@@ -65,7 +62,7 @@ PYRAMID_MODEL_BASE = {
     "cdd_append_last_residual": True,
     "global_shift": False,
     "align_scales": True,
-    "mask_box_size": 0,
+    "mask_footprint_px": 0,
     "cdd_mode": "log",
     "cdd_constrained": True,
     "cdd_sm_mode": "reflect",
@@ -75,7 +72,7 @@ PYRAMID_MODEL_BASE = {
     "ema_momentum": 0.996,
     "normalize_loss_l2": False,
     "predictor_layernorm": True,
-    "mask_size_scaling": 1.0,
+    "mask_scale_factor": 1.0,
     "mask_spacing_scaling": 2.0,
     "target_invalid_region_skip": False,
     "target_sampling_mode": "priority_sampling",
@@ -110,7 +107,7 @@ IMAGE_MODEL_BASE = {
     "ema_momentum": 0.996,
     "normalize_loss_l2": False,
     "predictor_layernorm": True,
-    "mask_size_scaling": 0.0,
+    "mask_scale_factor": 0.0,
     "mask_spacing_scaling": 2.0,
     "target_invalid_region_skip": False,
     "target_sampling_mode": "priority_sampling",
@@ -147,8 +144,8 @@ def main():
     for mfrac in [0.4, 0.8, 1.2, 1.6]:
         m = dict(PYRAMID_MODEL_BASE)
         m["mask_fraction"] = mfrac
-        m["mask_size_scaling"] = 1.0
-        m["mask_box_size"] = 0
+        m["mask_scale_factor"] = 1.0
+        m["mask_footprint_px"] = 0
         m.pop("constant_mask_box", None)
         name = f"gen_42_run_1_cdd_scaleaware_convnext-pyramid-scaleaware_mfrac_{_fmt(mfrac)}_mbox_00"
         write_config(name, m)
@@ -157,8 +154,8 @@ def main():
     for mbox in [5, 7, 9, 11]:
         m = dict(PYRAMID_MODEL_BASE)
         m["mask_fraction"] = 0.0
-        m["mask_size_scaling"] = 0.0
-        m["mask_box_size"] = mbox
+        m["mask_scale_factor"] = 0.0
+        m["mask_footprint_px"] = mbox
         m["constant_mask_box"] = True
         name = f"gen_42_run_2_cdd_scaleaware_convnext-pyramid-scaleaware_mfrac_0p0_mbox_{mbox:02d}"
         write_config(name, m)
@@ -166,7 +163,7 @@ def main():
     # ── Run 3: image convnext masked, mask pixels (box_size) ──
     for mbox in [5, 7, 9, 11]:
         m = dict(IMAGE_MODEL_BASE)
-        m["mask_box_size"] = mbox
+        m["mask_footprint_px"] = mbox
         name = f"gen_42_run_3_convnext_image_dense_masked_mfrac_0p0_mbox_{mbox:02d}"
         write_config(name, m)
 

@@ -31,7 +31,7 @@ def canonical_config_name(run: int, cfg: dict) -> str:
     train = cfg["train"]
     pred_type = "pred3x3" if bool(model["predictor_spatial_conv"]) else "pred1x1"
     sym_path = bool(model["use_symmetric_feature_loss"])
-    sym_weight = float(train["symmetric_feature_loss_weight"])
+    sym_weight = float(train["symmetry_loss_weight"])
     symloss = "symloss_on" if sym_path and sym_weight > 0.0 else "symloss_off"
     lognorm_on = bool(model.get("post_log_transform", True))
     dataset = _dataset_tag(cfg)
@@ -45,7 +45,7 @@ def canonical_config_name(run: int, cfg: dict) -> str:
         raise AssertionError(dataset)
     parts = [
         prefix,
-        f"ms{_float_tag(model['mask_size_scaling'])}",
+        f"ms{_float_tag(model['mask_scale_factor'])}",
         pred_type,
         f"h{int(model['predictor_hidden'])}",
         f"predln_{'on' if bool(model['predictor_layernorm']) else 'off'}",

@@ -29,9 +29,9 @@ def _base_config(dataset: str) -> dict:
         "model": {
             "mode": "pyramid",
             "model_key": "cdd_scaleaware_convnext",
-            "mask_size_scaling": 0.0,
+            "mask_scale_factor": 0.0,
             "mask_spacing_scaling": 2.0,
-            "mask_box_size": list(MASK_BOX_RANGE),
+            "mask_footprint_px": list(MASK_BOX_RANGE),
             "normalize_loss_l2": True,
             "use_symmetric_feature_loss": True,
             "priority_top_percent": 30.0,
@@ -43,11 +43,8 @@ def _base_config(dataset: str) -> dict:
         "train": {
             "epochs": 10,
             "log_interval": 1,
-            "jepa_loss_weight": 100.0,
-            "vicreg_var_weight": 0.0,
-            "vicreg_cov_weight": 0.0,
-            "sigreg_weight": 1.0,
-            "sigreg_sketch_dim": 64,
+            "prediction_loss_weight": 100.0,
+            "spread_regularizer": {"type": "std_hinge", "target": "context", "weight": 1.0, "target_std": 1.0, "eps": 1e-4},
             "inference_tta_enabled": True,
             "inference_tta_mode": "flip4",
             "umap": {
@@ -78,7 +75,7 @@ def main() -> None:
             ds = DATASETS[dataset]
             cfg = _base_config(dataset)
             cfg["model"]["active_target_fraction"] = float(frac)
-            name = f"gen_71_run_{run}_{ds['label']}_symmetric_sigreg_l2_mbox_toppct30_targetfrac_{str(frac).replace('.', 'p')}"
+            name = f"gen_71_run_{run}_{ds['label']}_symmetric_spread_l2_mbox_toppct30_targetfrac_{str(frac).replace('.', 'p')}"
             paths.append(write_config(name, cfg))
 
     for path in paths:

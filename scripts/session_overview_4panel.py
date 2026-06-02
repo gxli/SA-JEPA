@@ -159,9 +159,16 @@ def make_session_overview_plot(
     else:
         view_shape = umap_x.shape[-2], umap_x.shape[-1]
 
-    def rgb_from_ranges(points: np.ndarray, mins: np.ndarray, maxs: np.ndarray):
+    def rgb_from_ranges(
+        points: np.ndarray,
+        mins: np.ndarray,
+        maxs: np.ndarray,
+        bright_top: bool = True,
+    ):
         rng = np.maximum(maxs - mins, 1e-12)
         norm = np.clip((points - mins) / rng, 0.0, 1.0)
+        if not bright_top:
+            norm = 1.0 - norm
         # NaN sentinels → black (no-data marker)
         nan_mask = ~np.isfinite(norm).all(axis=1)
         norm[nan_mask] = 0.0
@@ -478,8 +485,8 @@ def main() -> None:
                     reader = csv.DictReader(f)
                     for row in reader:
                         tx.append(float(row["epoch"]) + 0.001 * float(row["batch"]))
-                        t_total.append(float(row["total_loss"]))
-                        t_jepa.append(float(row["loss_jepa"]))
+                        t_total.append(float(row.get("loss_total", row.get("total_loss"))))
+                        t_jepa.append(float(row.get("loss_prediction", row.get("loss_jepa", row.get("loss_mse")))))
                         t_sim.append(float(row.get("sim", 0.0)))
             except Exception:
                 tx, t_total, t_jepa, t_sim = [], [], [], []

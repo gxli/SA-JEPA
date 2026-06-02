@@ -41,8 +41,8 @@ def _base_config(npy_pattern: str) -> dict:
             "predictor_spatial_conv": True,
             "predictor_hidden": 96,
             "scaleaware_norm_per_scale": False,
-            "mask_size_scaling": 1.0,
-            "mask_box_size": 0,
+            "mask_scale_factor": 1.0,
+            "mask_footprint_px": 0,
             "use_symmetric_feature_loss": False,
             "post_log_transform": True,
         },
@@ -53,12 +53,9 @@ def _base_config(npy_pattern: str) -> dict:
             "ema_warmup_fraction": 0.25,
             "epochs": 5,
             "log_interval": 1,
-            "mse_loss_weight": 50.0,
-            "vicreg_var_weight": 0.0,
-            "vicreg_cov_weight": 0.0,
-            "sigreg_weight": 10.0,
-            "sigreg_sketch_dim": 64,
-            "symmetric_feature_loss_weight": 0.0,
+            "prediction_loss_weight": 50.0,
+            "spread_regularizer": {"type": "std_hinge", "target": "context", "weight": 10.0, "target_std": 1.0, "eps": 1e-4},
+            "symmetry_loss_weight": 0.0,
             "inference_tta_enabled": True,
             "inference_tta_mode": "flip4",
         },
@@ -71,11 +68,11 @@ def _base_config(npy_pattern: str) -> dict:
 # The ms1p0 entry is the real candidate. The other entries change one knob at a time.
 VARIANTS = [
     ({
-        "mask_size_scaling": 0.8,
+        "mask_scale_factor": 0.8,
     },),
     ({},),
     ({
-        "mask_size_scaling": 1.2,
+        "mask_scale_factor": 1.2,
     },),
     ({
         "scaleaware_norm_per_scale": True,
@@ -83,7 +80,7 @@ VARIANTS = [
     ({
         "use_symmetric_feature_loss": True,
     }, {
-        "symmetric_feature_loss_weight": 1.0,
+        "symmetry_loss_weight": 1.0,
     }),
     ({
         "predictor_spatial_conv": False,

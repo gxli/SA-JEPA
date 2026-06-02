@@ -17,7 +17,12 @@
   "model": {
     "mode": "pyramid",
     "model_key": "cdd_scaleaware_convnext",
-    "sigmas": [2, 4, 8, 16],
+    "sigmas": [
+      2,
+      4,
+      8,
+      16
+    ],
     "latent_channels": 32,
     "encoder_width": 64,
     "encoder_depth": 4,
@@ -31,14 +36,14 @@
     "cdd_append_last_residual": true,
     "global_shift": false,
     "align_scales": true,
-    "mask_box_size": 0,
+    "mask_footprint_px": 0,
     "post_log_transform": true,
     "cdd_log_std_floor_mult": 0.05,
     "ema_momentum": 0.996,
     "normalize_loss_l2": false,
     "predictor_layernorm": true,
     "predictor_residual": false,
-    "mask_size_scaling": 1.0,
+    "mask_scale_factor": 1.0,
     "mask_spacing_scaling": 2.0,
     "target_invalid_region_skip": false,
     "patch_size": 3,
@@ -50,12 +55,7 @@
     "lr": 0.0001,
     "weight_decay": 1e-05,
     "num_workers": 4,
-    "sigreg_weight": 10,
-    "sigreg_sketch_dim": 64,
-    "sigreg_target_std": 1.0,
-    "sigreg_eps": 0.0001,
-    "sigreg_noise_std": 0.0,
-    "symmetric_feature_loss_weight": 0,
+    "symmetry_loss_weight": 0,
     "umap": {
       "metric": "euclidean",
       "standardize": true,
@@ -66,6 +66,13 @@
     "viz_crop_border": true,
     "compute_effective_rank": true,
     "ema_momentum_base": 0.996,
-    "ema_momentum_final": 1.0
+    "ema_momentum_final": 1.0,
+    "spread_regularizer": {
+      "type": "std_hinge",
+      "target": "context",
+      "weight": 2,
+      "target_std": 1.0,
+      "eps": 0.0001
+    }
   }
 }

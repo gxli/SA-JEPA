@@ -790,6 +790,8 @@ def make_pyramid_grid_context(
         "priority_nonzero_mean": torch.tensor(all_priority_nonzero_mean, dtype=x_clean.dtype, device=x_clean.device),
         "priority_auto_base_targets": torch.tensor(all_priority_auto_base_targets, dtype=x_clean.dtype, device=x_clean.device),
         "priority_effective_targets": torch.tensor(all_priority_effective_targets, dtype=x_clean.dtype, device=x_clean.device),
+        "mask_scale_factor": torch.tensor(float(mask_scale), dtype=x_clean.dtype, device=x_clean.device),
+        "mask_footprint_px": torch.tensor(float(mask_box_size), dtype=x_clean.dtype, device=x_clean.device),
     }
     return x_context, target_locations, target_scales, target_valid, debug
 

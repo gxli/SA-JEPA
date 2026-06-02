@@ -41,8 +41,8 @@ def _pyramid_base() -> dict:
             "model_key": "cdd_scaleaware_convnext",
             "encoder_depth": 4,
             "mask_spacing_scaling": 2.0,
-            "mask_size_scaling": 1.1,
-            "mask_box_size": 0,
+            "mask_scale_factor": 1.1,
+            "mask_footprint_px": 0,
             "convnext_layer_dilations": [1, 1, 1, 1, 1, 1],
             "predictor_spatial_conv": True,
             "predictor_hidden": 96,
@@ -70,12 +70,9 @@ def _pyramid_base() -> dict:
             "ema_momentum_base": 0.99,
             "ema_momentum_final": 0.9999,
             "ema_warmup_fraction": 0.25,
-            "mse_loss_weight": 50.0,
-            "vicreg_var_weight": 0.0,
-            "vicreg_cov_weight": 0.0,
-            "sigreg_weight": 10.0,
-            "sigreg_sketch_dim": 64,
-            "symmetric_feature_loss_weight": 0.0,
+            "prediction_loss_weight": 50.0,
+            "spread_regularizer": {"type": "std_hinge", "target": "context", "weight": 10.0, "target_std": 1.0, "eps": 1e-4},
+            "symmetry_loss_weight": 0.0,
             "compute_effective_rank": True,
             "scale_probe_enabled": True,
             "inference_tta_enabled": True,
@@ -114,38 +111,38 @@ def main() -> None:
 
     for mask_scale in FIXED_MASK_SCALES:
         cfg = _pyramid_base()
-        cfg["model"]["mask_size_scaling"] = float(mask_scale)
+        cfg["model"]["mask_scale_factor"] = float(mask_scale)
         paths.append(_write(f"gen_102_mhd_run_{run:03d}_pyramid_ms{_float_tag(mask_scale)}", cfg))
         run += 1
 
     for mask_box in FIXED_MASK_BOXES:
         cfg = _pyramid_base()
-        cfg["model"]["mask_size_scaling"] = 0.0
-        cfg["model"]["mask_box_size"] = int(mask_box)
+        cfg["model"]["mask_scale_factor"] = 0.0
+        cfg["model"]["mask_footprint_px"] = int(mask_box)
         paths.append(_write(f"gen_102_mhd_run_{run:03d}_pyramid_fixed_mbox{mask_box}", cfg))
         run += 1
 
     cfg = _pyramid_base()
-    cfg["model"]["mask_size_scaling"] = list(RANDOM_MASK_SCALE_RANGE)
+    cfg["model"]["mask_scale_factor"] = list(RANDOM_MASK_SCALE_RANGE)
     paths.append(_write(f"gen_102_mhd_run_{run:03d}_pyramid_random_ms{_range_tag(RANDOM_MASK_SCALE_RANGE)}", cfg))
     run += 1
 
     cfg = _pyramid_base()
-    cfg["model"]["mask_size_scaling"] = 0.0
-    cfg["model"]["mask_box_size"] = list(RANDOM_MASK_BOX_RANGE)
+    cfg["model"]["mask_scale_factor"] = 0.0
+    cfg["model"]["mask_footprint_px"] = list(RANDOM_MASK_BOX_RANGE)
     paths.append(_write(f"gen_102_mhd_run_{run:03d}_pyramid_random_mbox{_int_range_tag(RANDOM_MASK_BOX_RANGE)}", cfg))
     run += 1
 
     for mask_box in FIXED_MASK_BOXES:
         cfg = _image_base()
-        cfg["model"]["mask_size_scaling"] = 0.0
-        cfg["model"]["mask_box_size"] = int(mask_box)
+        cfg["model"]["mask_scale_factor"] = 0.0
+        cfg["model"]["mask_footprint_px"] = int(mask_box)
         paths.append(_write(f"gen_102_mhd_run_{run:03d}_image_masktoken_fixed_mbox{mask_box}", cfg))
         run += 1
 
     cfg = _image_base()
-    cfg["model"]["mask_size_scaling"] = 0.0
-    cfg["model"]["mask_box_size"] = list(RANDOM_MASK_BOX_RANGE)
+    cfg["model"]["mask_scale_factor"] = 0.0
+    cfg["model"]["mask_footprint_px"] = list(RANDOM_MASK_BOX_RANGE)
     paths.append(_write(f"gen_102_mhd_run_{run:03d}_image_masktoken_random_mbox{_int_range_tag(RANDOM_MASK_BOX_RANGE)}", cfg))
 
     for path in paths:

@@ -8,8 +8,8 @@
     "model_key": "cdd_scaleaware_convnext",
     "encoder_depth": 4,
     "mask_spacing_scaling": 2.0,
-    "mask_size_scaling": 1.2,
-    "mask_box_size": 11,
+    "mask_scale_factor": 1.2,
+    "mask_footprint_px": 11,
     "normalize_loss_l2": true,
     "predictor_spatial_conv": true,
     "predictor_layernorm": false,
@@ -40,15 +40,18 @@
     "ema_momentum_base": 0.99,
     "ema_momentum_final": 0.9999,
     "ema_warmup_fraction": 0.25,
-    "mse_loss_weight": 50.0,
-    "vicreg_var_weight": 0.0,
-    "vicreg_cov_weight": 0.0,
-    "sigreg_weight": 10.0,
-    "sigreg_sketch_dim": 64,
-    "symmetric_feature_loss_weight": 0.003,
+    "prediction_loss_weight": 50.0,
+    "symmetry_loss_weight": 0.003,
     "compute_effective_rank": true,
     "scale_probe_enabled": true,
     "inference_tta_enabled": true,
-    "inference_tta_mode": "flip4"
+    "inference_tta_mode": "flip4",
+    "spread_regularizer": {
+      "type": "std_hinge",
+      "target": "context",
+      "weight": 10.0,
+      "target_std": 1.0,
+      "eps": 0.0001
+    }
   }
 }

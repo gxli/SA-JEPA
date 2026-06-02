@@ -20,7 +20,7 @@ DATASETS = {
     },
 }
 
-# (mask_size_scaling, mask_box_size, label_suffix)
+# (mask_scale_factor, mask_footprint_px, label_suffix)
 MASK_VARIANTS = [
     (0.8, 0, "pyramid_ms0p8"),
     (1.2, 0, "pyramid_ms1p2"),
@@ -53,11 +53,8 @@ def _base_config() -> dict:
         "train": {
             "epochs": 10,
             "log_interval": 1,
-            "jepa_loss_weight": 100.0,
-            "vicreg_var_weight": 0.0,
-            "vicreg_cov_weight": 0.0,
-            "sigreg_weight": 1.0,
-            "sigreg_sketch_dim": 64,
+            "prediction_loss_weight": 100.0,
+            "spread_regularizer": {"type": "std_hinge", "target": "context", "weight": 1.0, "target_std": 1.0, "eps": 1e-4},
             "inference_tta_enabled": True,
             "inference_tta_mode": "flip4",
             "umap": {"l2_normalize": True},
@@ -84,8 +81,8 @@ def main() -> None:
                     for pc in PROJECTOR_CONV_VALUES:
                         run += 1
                         cfg = _base_config()
-                        cfg["model"]["mask_size_scaling"] = mscale
-                        cfg["model"]["mask_box_size"] = mbox
+                        cfg["model"]["mask_scale_factor"] = mscale
+                        cfg["model"]["mask_footprint_px"] = mbox
 
                         if "npy_pattern" in ds:
                             cfg["data"] = cfg.get("data", {})
@@ -110,7 +107,7 @@ def main() -> None:
                             cfg["model"]["projector_conv"] = False
                             tags.append("proj_off")
 
-                        name = f"gen_72_run_{run}_{dkey}_symmetric_sigreg_l2_{mask_label}_{'_'.join(tags)}"
+                        name = f"gen_72_run_{run}_{dkey}_symmetric_spread_l2_{mask_label}_{'_'.join(tags)}"
                         paths.append(write_config(name, cfg))
 
     for path in paths:

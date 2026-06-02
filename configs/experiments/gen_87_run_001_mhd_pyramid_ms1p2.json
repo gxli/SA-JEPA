@@ -17,20 +17,23 @@
     "encoder_final_norm_type": "batchnorm",
     "encoder_head_bias": false,
     "mode": "pyramid",
-    "mask_size_scaling": 1.2,
-    "mask_box_size": 0,
+    "mask_scale_factor": 1.2,
+    "mask_footprint_px": 0,
     "model_key": "cdd_scaleaware_convnext"
   },
   "train": {
     "epochs": 10,
     "log_interval": 1,
-    "mse_loss_weight": 100.0,
-    "vicreg_var_weight": 0.0,
-    "vicreg_cov_weight": 0.0,
-    "sigreg_weight": 1.0,
-    "sigreg_sketch_dim": 32,
+    "prediction_loss_weight": 100.0,
     "inference_tta_enabled": true,
     "inference_tta_mode": "flip4",
-    "scale_probe_enabled": true
+    "scale_probe_enabled": true,
+    "spread_regularizer": {
+      "type": "std_hinge",
+      "target": "context",
+      "weight": 1.0,
+      "target_std": 1.0,
+      "eps": 0.0001
+    }
   }
 }

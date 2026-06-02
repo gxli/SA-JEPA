@@ -5,7 +5,7 @@ gen_48: cdd_scaleaware_convnext-pyramid-scaleaware
 gen_49: rescnn-pyramid-scaleaware
 
 For each generation:
-- Run 1: sweep mask_fraction in [0.2, 0.4, ..., 2.0] with mask_box_size=0
+- Run 1: sweep mask_fraction in [0.2, 0.4, ..., 2.0] with mask_footprint_px=0
 - Run 2: fixed mask box sizes [5, 9, 13]
 """
 from __future__ import annotations
@@ -38,11 +38,8 @@ BASE_TRAIN = {
     "weight_decay": 1e-05,
     "num_workers": 0,
     "log_interval": 1,
-    "jepa_loss_weight": 100.0,
-    "vicreg_var_weight": 0.0,
-    "vicreg_cov_weight": 0.0,
-    "sigreg_weight": 1.0,
-    "sigreg_sketch_dim": 64,
+    "prediction_loss_weight": 100.0,
+    "spread_regularizer": {"type": "std_hinge", "target": "context", "weight": 1.0, "target_std": 1.0, "eps": 1e-4},
     "force_recompute_inference": True,
     "umap": {
         "n_neighbors": 30,
@@ -74,7 +71,7 @@ BASE_MODEL_COMMON = {
     "global_shift": False,
     "align_scales": True,
     "constant_mask_box": False,
-    "mask_box_size": 0,
+    "mask_footprint_px": 0,
     "cdd_mode": "log",
     "cdd_constrained": True,
     "cdd_sm_mode": "reflect",
@@ -84,7 +81,7 @@ BASE_MODEL_COMMON = {
     "ema_momentum": 0.996,
     "normalize_loss_l2": False,
     "predictor_layernorm": True,
-    "mask_size_scaling": 1.0,
+    "mask_scale_factor": 1.0,
     "mask_spacing_scaling": 2.0,
     "target_invalid_region_skip": False,
     "target_sampling_mode": "priority_sampling",
@@ -123,13 +120,13 @@ def make_base_model(model_key: str) -> dict:
 def generate_gen(gen_id: int, model_key: str) -> int:
     count = 0
 
-    # Run 1: mask_fraction sweep with mask_box_size=0
+    # Run 1: mask_fraction sweep with mask_footprint_px=0
     for mfrac in MASK_FRACTIONS:
         m = make_base_model(model_key)
         m["mask_fraction"] = float(mfrac)
-        m["mask_box_size"] = 0
+        m["mask_footprint_px"] = 0
         m["constant_mask_box"] = False
-        m["mask_size_scaling"] = 1.0
+        m["mask_scale_factor"] = 1.0
         name = (
             f"gen_{gen_id}_run_1_{model_key}_"
             f"mfrac_{_fmt(mfrac)}_mbox_00"
@@ -141,9 +138,9 @@ def generate_gen(gen_id: int, model_key: str) -> int:
     for mbox in FIXED_BOX_SIZES:
         m = make_base_model(model_key)
         m["mask_fraction"] = 0.0
-        m["mask_box_size"] = int(mbox)
+        m["mask_footprint_px"] = int(mbox)
         m["constant_mask_box"] = True
-        m["mask_size_scaling"] = 0.0
+        m["mask_scale_factor"] = 0.0
         name = (
             f"gen_{gen_id}_run_2_{model_key}_"
             f"mfrac_0p0_mbox_{mbox:02d}"

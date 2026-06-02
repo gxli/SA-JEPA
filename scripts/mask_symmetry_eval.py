@@ -44,11 +44,11 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         x_clean=x,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
-        mask_scale=float(model_cfg.get("mask_size_scaling", 1.0)),
+        mask_scale=float(model_cfg.get("mask_scale_factor", 1.0)),
         spacing_scale=float(model_cfg.get("mask_spacing_scaling", 1.5)),
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
-        mask_box_size=int(model_cfg.get("mask_box_size", 16)),
+        mask_box_size=int(model_cfg.get("mask_footprint_px", 16)),
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
@@ -137,9 +137,9 @@ def main():
         mode = DEMO_MASK_FILL_MODE
     model_cfg["mask_fill_mode"] = mode
     if args.rigid_mask_box:
-        model_cfg["mask_size_scaling"] = 0.0
+        model_cfg["mask_scale_factor"] = 0.0
     else:
-        model_cfg["mask_size_scaling"] = float(model_cfg.get("mask_size_scaling", 1.0))
+        model_cfg["mask_scale_factor"] = float(model_cfg.get("mask_scale_factor", 1.0))
     if args.no_align_scales:
         model_cfg["align_scales"] = False
     model_cfg["full_grid"] = DEMO_FULL_GRID

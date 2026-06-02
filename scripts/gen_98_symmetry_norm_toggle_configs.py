@@ -43,8 +43,8 @@ def _config(
             "mode": "pyramid",
             "model_key": "cdd_scaleaware_convnext",
             "mask_spacing_scaling": 2.0,
-            "mask_size_scaling": MASK_SIZE_SCALING,
-            "mask_box_size": 0,
+            "mask_scale_factor": MASK_SIZE_SCALING,
+            "mask_footprint_px": 0,
             "normalize_loss_l2": True,
             "predictor_spatial_conv": True,
             "predictor_layernorm": False,
@@ -68,12 +68,9 @@ def _config(
             "ema_momentum_base": 0.99,
             "ema_momentum_final": 0.9999,
             "ema_warmup_fraction": 0.25,
-            "mse_loss_weight": 50.0,
-            "vicreg_var_weight": 0.0,
-            "vicreg_cov_weight": 0.0,
-            "sigreg_weight": 10.0,
-            "sigreg_sketch_dim": 64,
-            "symmetric_feature_loss_weight": SYMMETRY_WEIGHT,
+            "prediction_loss_weight": 50.0,
+            "spread_regularizer": {"type": "std_hinge", "target": "context", "weight": 10.0, "target_std": 1.0, "eps": 1e-4},
+            "symmetry_loss_weight": SYMMETRY_WEIGHT,
             "inference_tta_enabled": True,
             "inference_tta_mode": "flip4",
         },
@@ -91,7 +88,7 @@ def _name(dataset: str, run: int, norm_per_scale: bool, adapter_norm: bool) -> s
         f"_perscalenorm_{'on' if norm_per_scale else 'off'}"
         f"_adapternorm_{'on' if adapter_norm else 'off'}"
         "_symw0p02"
-        "_sigpred_on"
+        "_spread_on"
     )
 
 

@@ -15,8 +15,8 @@
     "predictor_layernorm": false,
     "predictor_spatial_conv": false,
     "scaleaware_adapter_norm": false,
-    "mask_size_scaling": 1.2,
-    "mask_box_size": 0
+    "mask_scale_factor": 1.2,
+    "mask_footprint_px": 0
   },
   "train": {
     "vicreg_spatial_mode": "pooled",
@@ -25,12 +25,15 @@
     "ema_warmup_fraction": 0.25,
     "epochs": 10,
     "log_interval": 1,
-    "mse_loss_weight": 50.0,
-    "vicreg_var_weight": 0.0,
-    "vicreg_cov_weight": 0.0,
-    "sigreg_weight": 10.0,
-    "sigreg_sketch_dim": 64,
+    "prediction_loss_weight": 50.0,
     "inference_tta_enabled": true,
-    "inference_tta_mode": "flip4"
+    "inference_tta_mode": "flip4",
+    "spread_regularizer": {
+      "type": "std_hinge",
+      "target": "context",
+      "weight": 10.0,
+      "target_std": 1.0,
+      "eps": 0.0001
+    }
   }
 }

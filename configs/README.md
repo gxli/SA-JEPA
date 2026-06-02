@@ -13,9 +13,9 @@ Use a shared base config and tiny experiment overrides.
 - data path/pattern, CDD/log policy, common UMAP, optimizer defaults.
 - Put run/session knobs in `experiments/*`:
 - model family/arch choice (`mode`, `model_key`, encoder depth/width/kernel),
-- masking behavior (`constant_mask_box`, `mask_box_size`, `mask_size_scaling`, `mask_spacing_scaling`),
+- masking behavior (`constant_mask_box`, `mask_footprint_px`, `mask_scale_factor`, `mask_spacing_scaling`),
 - target sampling policy (`target_sampling_mode`, priority knobs),
-- schedule/loss logging (`epochs`, `log_interval`, vicreg/sigreg/loss weights).
+- schedule/loss logging (`epochs`, `log_interval`, VICReg/spread/loss weights).
 
 Session configs always override base keys after merge.
 
@@ -31,7 +31,7 @@ Session configs always override base keys after merge.
 
 Use only:
 
-- `model.mask_size_scaling`
+- `model.mask_scale_factor`
 - `model.mask_spacing_scaling`
 
 Do not use legacy keys:
@@ -84,8 +84,18 @@ CDD always adds one leading scale dimension: `(H, W) -> (S, H, W)` and
 cached on the full cube first. The dataset then selects one aligned CDD slice
 and finally applies the 2D crop.
 
-SigReg always uses pre-predictor context patch embeddings when
-`sigreg_weight > 0`. Do not use the removed `sigreg_on_pred` selector.
-It uses a standard-deviation hinge controlled by `train.sigreg_target_std` and
-`train.sigreg_eps`. `train.sigreg_noise_std` defaults to `0`; set a small
-positive value only when exact-collapse symmetry breaking is desired.
+The spread regularizer uses pre-predictor context patch embeddings. Configure
+only the explicit standard-deviation hinge:
+
+```yaml
+spread_regularizer:
+  type: std_hinge
+  target: context
+  weight: 2
+  target_std: 1.0
+  eps: 1.0e-4
+```
+
+Variance and covariance regularizers are experimental. To enable them for an
+ablation, place `vicreg_var_weight` and `vicreg_cov_weight` under
+`train.experimental_losses`; they are not production loss terms.

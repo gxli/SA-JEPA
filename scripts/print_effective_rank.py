@@ -21,7 +21,7 @@ def _read_model_inputs(session_dir: str) -> dict:
         return {
             "mode": str(m.get("mode", "NA")),
             "mask_fraction": str(m.get("active_target_fraction", m.get("mask_fraction", "NA"))),
-            "mask_size": str(m.get("mask_size_scaling", m.get("mask_size", "NA"))),
+            "mask_size": str(m.get("mask_scale_factor", m.get("mask_size_scaling", m.get("mask_size", "NA")))),
             "normalize_loss_l2": _fmt_bool(m.get("normalize_loss_l2", m.get("normalize_loss", False))),
             "predictor_layernorm": _fmt_bool(m.get("predictor_layernorm", True)),
             "scaleaware_norm_per_scale": _fmt_bool(m.get("scaleaware_norm_per_scale", False)),
@@ -99,9 +99,10 @@ def _read_rank_diag(session_dir: str) -> dict:
         return {}
 
 
-def _diag_get(diag: dict, branch: str, key: str) -> str:
+def _diag_get(diag: dict, branch: str, key: str, legacy_key: str | None = None) -> str:
     try:
-        v = diag.get(branch, {}).get(key, "")
+        values = diag.get(branch, {})
+        v = values.get(key, values.get(legacy_key, ""))
         if isinstance(v, (int, float)):
             return f"{float(v):.6f}"
         return str(v)
@@ -168,22 +169,25 @@ def main() -> int:
         p_t1 = _diag_get(diag, "pred", "top1_energy")
         p_t4 = _diag_get(diag, "pred", "top4_energy")
         p_t8 = _diag_get(diag, "pred", "top8_energy")
-        p_pr = _diag_get(diag, "pred", "participation_rank")
-        g_pr = _diag_get(diag, "gt", "participation_rank")
+        p_pr = _diag_get(diag, "pred", "manifold_size", "participation_rank")
+        g_pr = _diag_get(diag, "gt", "manifold_size", "participation_rank")
         p_dead = _diag_get(diag, "pred", "dead_channel_fraction")
-        p_dead_n_raw = diag.get("pred", {}).get("num_dead_channels", "")
+        p_dead_channel_count_raw = diag.get("pred", {}).get(
+            "dead_channel_count",
+            diag.get("pred", {}).get("num_dead_channels", ""),
+        )
         try:
-            p_dead_n = str(int(p_dead_n_raw))
+            p_dead_channel_count = str(int(p_dead_channel_count_raw))
         except Exception:
-            p_dead_n = ""
+            p_dead_channel_count = ""
         ratio_er = ""
         ratio_pr = ""
         try:
-            ratio_er = f"{float(diag.get('pred_gt_erank_ratio', 'nan')):.6f}"
+            ratio_er = f"{float(diag.get('rank_match_ratio', diag.get('pred_gt_erank_ratio', 'nan'))):.6f}"
         except Exception:
             ratio_er = ""
         try:
-            ratio_pr = f"{float(diag.get('pred_gt_participation_ratio', 'nan')):.6f}"
+            ratio_pr = f"{float(diag.get('volume_match_ratio', diag.get('pred_gt_participation_ratio', 'nan'))):.6f}"
         except Exception:
             ratio_pr = ""
         rows.append(
@@ -211,7 +215,7 @@ def main() -> int:
                 p_pr,
                 g_pr,
                 p_dead,
-                p_dead_n,
+                p_dead_channel_count,
                 ratio_er,
                 ratio_pr,
             )
@@ -226,8 +230,8 @@ def main() -> int:
         f"{'l2n':>3} {'pln':>3} {'psn':>3} {'adn':>3} {'stn':>3} {'fin':>3} "
         f"{'fin_type':<9} {'enc_norm':<9} {'grn':>3} "
         f"{'erank':>9} {'ctx_er':>9} {'pred_er':>9} {'gt_er':>9} "
-        f"{'t1':>7} {'t4':>7} {'t8':>7} {'pred_pr':>9} {'gt_pr':>9} "
-        f"{'dead_f':>8} {'dead_n':>6} {'er_ratio':>9} {'pr_ratio':>9}"
+        f"{'t1':>7} {'t4':>7} {'t8':>7} {'pred_man':>9} {'tgt_man':>9} "
+        f"{'dead_f':>8} {'dead_ch':>6} {'rank_fit':>9} {'vol_fit':>9}"
     )
     print(header)
     print("-" * len(header))
@@ -256,11 +260,11 @@ def main() -> int:
             p_pr,
             g_pr,
             p_dead,
-            p_dead_n,
+            p_dead_channel_count,
             ratio_er,
             ratio_pr,
         ) = row
-        dead_n_str = p_dead_n if p_dead_n != "" else "-"
+        dead_channel_count_str = p_dead_channel_count if p_dead_channel_count != "" else "-"
         print(
             f"{s:<{session_w}} {mode:<8} {_fmt_float(mf,6,2)} {_fmt_float(ms,6,2)} "
             f"{normalize_loss_l2:>3} {predictor_layernorm:>3} "
@@ -269,7 +273,7 @@ def main() -> int:
             f"{encoder_final_norm_type:<9} {encoder_norm_type:<9} {use_grn:>3} "
             f"{_fmt_float(rk,9,4)} {_fmt_float(c_er,9,4)} {_fmt_float(p_er,9,4)} {_fmt_float(g_er,9,4)} "
             f"{_fmt_float(p_t1,7,3)} {_fmt_float(p_t4,7,3)} {_fmt_float(p_t8,7,3)} {_fmt_float(p_pr,9,4)} {_fmt_float(g_pr,9,4)} "
-            f"{_fmt_float(p_dead,8,3)} {dead_n_str:>6} {_fmt_float(ratio_er,9,4)} {_fmt_float(ratio_pr,9,4)}"
+            f"{_fmt_float(p_dead,8,3)} {dead_channel_count_str:>6} {_fmt_float(ratio_er,9,4)} {_fmt_float(ratio_pr,9,4)}"
         )
 
     n_total = len(rows_sorted)

@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 import torch
 
 
-DASHBOARD_VERSION = "aligned-loss-layout-v3"
+DASHBOARD_VERSION = "production-diagnostics-v6-spread-table"
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -210,7 +210,12 @@ def _extract_hw_map(src: dict, keys: tuple[str, ...], shape: tuple[int, int]) ->
     return None
 
 
-def _rgb_from_xyz(xyz: np.ndarray, h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
+def _rgb_from_xyz(
+    xyz: np.ndarray,
+    h: int,
+    w: int,
+    bright_top: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
     # Compute percentiles only on finite (non-NaN) entries so invalid-region
     # sentinels do not contaminate the colour range.
     fin = np.isfinite(xyz).all(axis=1)
@@ -222,6 +227,8 @@ def _rgb_from_xyz(xyz: np.ndarray, h: int, w: int) -> tuple[np.ndarray, np.ndarr
         hi = np.ones(xyz.shape[1], dtype=np.float64)
     den = np.clip(hi - lo, 1e-8, None)
     clipped = np.clip((xyz - lo) / den, 0.0, 1.0)
+    if not bright_top:
+        clipped = 1.0 - clipped
     # NaN sentinels → black (no-data marker)
     clipped[~fin] = 0.0
     rgb_flat = np.clip(np.round(clipped * 255.0), 0, 255).astype(np.uint8)
@@ -467,10 +474,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         }
 
     metrics_path = os.path.join(session_dir, "metrics.csv")
-    loss_x, loss_total, loss_jepa = [], [], []
-    loss_sigreg, loss_var, loss_cov = [], [], []
-    loss_symmetric, weighted_symmetric = [], []
-    weighted_jepa, weighted_sigreg, weighted_var, weighted_cov = [], [], [], []
+    loss_x, loss_total, loss_prediction = [], [], []
+    loss_spread = []
+    loss_symmetry, weighted_symmetry = [], []
+    weighted_prediction, weighted_spread = [], []
+    embed_spread_mean, embed_spread_min, embed_under_spread_frac, dead_channel_count = [], [], [], []
+    targets_per_image, mask_footprint_mean_px, mask_scale_factor = [], [], []
     if os.path.exists(metrics_path):
         with open(metrics_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -479,17 +488,20 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     ep = float(row.get("epoch", "nan"))
                     ba = float(row.get("batch", row.get("step", "nan")))
                     gs = float(row.get("global_step", "nan"))
-                    tl = float(row.get("total_loss", row.get("loss_total", row.get("loss", "nan"))))
-                    jl = float(row.get("loss_jepa", row.get("jepa_loss", row.get("loss_mse", "nan"))))
-                    sl = float(row.get("loss_sigreg", "nan"))
-                    syml = float(row.get("loss_symmetric", "nan"))
-                    vl = float(row.get("loss_var", "nan"))
-                    cl = float(row.get("loss_cov", "nan"))
-                    wj = float(row.get("weighted_jepa", row.get("weighted_mse", "nan")))
-                    ws = float(row.get("weighted_sigreg", "nan"))
-                    wsym = float(row.get("weighted_symmetric", "nan"))
-                    wv = float(row.get("weighted_var", "nan"))
-                    wc = float(row.get("weighted_cov", "nan"))
+                    tl = float(row.get("loss_total", row.get("total_loss", row.get("loss", "nan"))))
+                    jl = float(row.get("loss_prediction", row.get("loss_jepa", row.get("jepa_loss", row.get("loss_mse", "nan")))))
+                    sl = float(row.get("loss_spread", row.get("loss_sigreg", "nan")))
+                    syml = float(row.get("loss_symmetry", row.get("loss_symmetric", "nan")))
+                    wj = float(row.get("weighted_prediction", row.get("weighted_jepa", row.get("weighted_mse", "nan"))))
+                    ws = float(row.get("weighted_spread", row.get("weighted_sigreg", "nan")))
+                    wsym = float(row.get("weighted_symmetry", row.get("weighted_symmetric", "nan")))
+                    esm = float(row.get("embed_spread_mean", row.get("ctx_std_mean", "nan")))
+                    esmin = float(row.get("embed_spread_min", row.get("ctx_std_min", "nan")))
+                    euf = float(row.get("embed_under_spread_frac", "nan"))
+                    dcc = float(row.get("dead_channel_count", "nan"))
+                    tpi = float(row.get("targets_per_image", "nan"))
+                    mfpx = float(row.get("mask_footprint_mean_px", "nan"))
+                    msf = float(row.get("mask_scale_factor", "nan"))
                 except Exception:
                     continue
                 if np.isfinite(gs):
@@ -500,16 +512,19 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     continue
                 if np.isfinite(tl) and np.isfinite(jl):
                     loss_total.append(tl)
-                    loss_jepa.append(jl)
-                    loss_sigreg.append(sl if np.isfinite(sl) else np.nan)
-                    loss_symmetric.append(syml if np.isfinite(syml) else np.nan)
-                    loss_var.append(vl if np.isfinite(vl) else np.nan)
-                    loss_cov.append(cl if np.isfinite(cl) else np.nan)
-                    weighted_jepa.append(wj if np.isfinite(wj) else np.nan)
-                    weighted_sigreg.append(ws if np.isfinite(ws) else np.nan)
-                    weighted_symmetric.append(wsym if np.isfinite(wsym) else np.nan)
-                    weighted_var.append(wv if np.isfinite(wv) else np.nan)
-                    weighted_cov.append(wc if np.isfinite(wc) else np.nan)
+                    loss_prediction.append(jl)
+                    loss_spread.append(sl if np.isfinite(sl) else np.nan)
+                    loss_symmetry.append(syml if np.isfinite(syml) else np.nan)
+                    weighted_prediction.append(wj if np.isfinite(wj) else np.nan)
+                    weighted_spread.append(ws if np.isfinite(ws) else np.nan)
+                    weighted_symmetry.append(wsym if np.isfinite(wsym) else np.nan)
+                    embed_spread_mean.append(esm if np.isfinite(esm) else np.nan)
+                    embed_spread_min.append(esmin if np.isfinite(esmin) else np.nan)
+                    embed_under_spread_frac.append(euf if np.isfinite(euf) else np.nan)
+                    dead_channel_count.append(dcc if np.isfinite(dcc) else np.nan)
+                    targets_per_image.append(tpi if np.isfinite(tpi) else np.nan)
+                    mask_footprint_mean_px.append(mfpx if np.isfinite(mfpx) else np.nan)
+                    mask_scale_factor.append(msf if np.isfinite(msf) else np.nan)
     effective_rank_x, effective_rank_y = [], []
     run_results_path = os.path.join(session_dir, "run_results.csv")
     if os.path.exists(run_results_path):
@@ -535,12 +550,14 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 rank_diag = json.load(f)
         except Exception:
             rank_diag = {}
-    def _rd(branch: str, key: str, default: float = np.nan) -> float:
+    def _rd(branch: str, key: str, legacy_key: str | None = None, default: float = np.nan) -> float:
         try:
-            return float(rank_diag.get(branch, {}).get(key, default))
+            values = rank_diag.get(branch, {})
+            return float(values.get(key, values.get(legacy_key, default)))
         except Exception:
             return float(default)
-    rd_pred_gt_erank_ratio = float(rank_diag.get("pred_gt_erank_ratio", np.nan)) if isinstance(rank_diag, dict) else np.nan
+    rd_rank_match_ratio = float(rank_diag.get("rank_match_ratio", rank_diag.get("pred_gt_erank_ratio", np.nan))) if isinstance(rank_diag, dict) else np.nan
+    rd_volume_match_ratio = float(rank_diag.get("volume_match_ratio", rank_diag.get("pred_gt_participation_ratio", np.nan))) if isinstance(rank_diag, dict) else np.nan
 
     # Compute mask sizes per sigma from config
     cfg_used_path = os.path.join(session_dir, "config_used.json")
@@ -553,8 +570,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 cfg = json.load(f)
             mc = cfg.get("model", {})
             _sigmas = mc.get("sigmas", [2, 4, 8, 16])
-            _ms = float(mc.get("mask_size_scaling", 1.0))
-            _mb = int(mc.get("mask_box_size", 0))
+            _ms = float(mc.get("mask_scale_factor", mc.get("mask_size_scaling", 1.0)))
+            _mb = int(mc.get("mask_footprint_px", mc.get("mask_box_size", 0)))
             _mf = float(mc.get("active_target_fraction", mc.get("mask_fraction", 1.0)))
             _ps = int(mc.get("patch_size", 3))
             _symmetric = bool(mc.get("use_symmetric_feature_loss", False))
@@ -563,8 +580,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             _enc = str(mc.get("model_key", mc.get("encoder_type", "unknown")))
             mask_config_summary = [
                 f"encoder={_enc}",
-                f"mask_size_scaling={_ms}",
-                f"mask_box_size={_mb}",
+                f"mask_scale_factor={_ms}",
+                f"mask_footprint_px={_mb}",
                 f"active_target_fraction={_mf}",
                 f"patch_size={_ps}",
                 f"target_sampling={_sampling}",
@@ -626,24 +643,27 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         gt_umap_rgb_flat=bundles["gt"]["umap_rgb_flat"],
         loss_x=np.asarray(loss_x, dtype=np.float32),
         loss_total=np.asarray(loss_total, dtype=np.float32),
-        loss_jepa=np.asarray(loss_jepa, dtype=np.float32),
-        loss_sigreg=np.asarray(loss_sigreg, dtype=np.float32),
-        loss_symmetric=np.asarray(loss_symmetric, dtype=np.float32),
-        loss_var=np.asarray(loss_var, dtype=np.float32),
-        loss_cov=np.asarray(loss_cov, dtype=np.float32),
-        weighted_jepa=np.asarray(weighted_jepa, dtype=np.float32),
-        weighted_sigreg=np.asarray(weighted_sigreg, dtype=np.float32),
-        weighted_symmetric=np.asarray(weighted_symmetric, dtype=np.float32),
-        weighted_var=np.asarray(weighted_var, dtype=np.float32),
-        weighted_cov=np.asarray(weighted_cov, dtype=np.float32),
+        loss_prediction=np.asarray(loss_prediction, dtype=np.float32),
+        loss_spread=np.asarray(loss_spread, dtype=np.float32),
+        loss_symmetry=np.asarray(loss_symmetry, dtype=np.float32),
+        weighted_prediction=np.asarray(weighted_prediction, dtype=np.float32),
+        weighted_spread=np.asarray(weighted_spread, dtype=np.float32),
+        weighted_symmetry=np.asarray(weighted_symmetry, dtype=np.float32),
+        embed_spread_mean=np.asarray(embed_spread_mean, dtype=np.float32),
+        embed_spread_min=np.asarray(embed_spread_min, dtype=np.float32),
+        embed_under_spread_frac=np.asarray(embed_under_spread_frac, dtype=np.float32),
+        dead_channel_count=np.asarray(dead_channel_count, dtype=np.float32),
+        targets_per_image=np.asarray(targets_per_image, dtype=np.float32),
+        mask_footprint_mean_px=np.asarray(mask_footprint_mean_px, dtype=np.float32),
+        mask_scale_factor=np.asarray(mask_scale_factor, dtype=np.float32),
         effective_rank_x=np.asarray(effective_rank_x, dtype=np.float64),
         effective_rank_y=np.asarray(effective_rank_y, dtype=np.float32),
         rank_context_erank=np.asarray([_rd("context", "erank")], dtype=np.float32),
         rank_pred_erank=np.asarray([_rd("pred", "erank")], dtype=np.float32),
         rank_gt_erank=np.asarray([_rd("gt", "erank")], dtype=np.float32),
-        rank_context_pr=np.asarray([_rd("context", "participation_rank")], dtype=np.float32),
-        rank_pred_pr=np.asarray([_rd("pred", "participation_rank")], dtype=np.float32),
-        rank_gt_pr=np.asarray([_rd("gt", "participation_rank")], dtype=np.float32),
+        rank_context_manifold_size=np.asarray([_rd("context", "manifold_size", "participation_rank")], dtype=np.float32),
+        rank_predicted_manifold_size=np.asarray([_rd("pred", "manifold_size", "participation_rank")], dtype=np.float32),
+        rank_target_manifold_size=np.asarray([_rd("gt", "manifold_size", "participation_rank")], dtype=np.float32),
         rank_context_dead=np.asarray([_rd("context", "dead_channel_fraction")], dtype=np.float32),
         rank_pred_dead=np.asarray([_rd("pred", "dead_channel_fraction")], dtype=np.float32),
         rank_gt_dead=np.asarray([_rd("gt", "dead_channel_fraction")], dtype=np.float32),
@@ -656,7 +676,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         rank_context_top8=np.asarray([_rd("context", "top8_energy")], dtype=np.float32),
         rank_pred_top8=np.asarray([_rd("pred", "top8_energy")], dtype=np.float32),
         rank_gt_top8=np.asarray([_rd("gt", "top8_energy")], dtype=np.float32),
-        rank_pred_gt_erank_ratio=np.asarray([rd_pred_gt_erank_ratio], dtype=np.float32),
+        rank_match_ratio=np.asarray([rd_rank_match_ratio], dtype=np.float32),
+        volume_match_ratio=np.asarray([rd_volume_match_ratio], dtype=np.float32),
         pyramid_mask_cube=mask_cube.astype(np.float32),
         mask_sigma_names=np.array(mask_sigma_names, dtype=str),
         mask_sigma_sizes=np.asarray(mask_sigma_sizes, dtype=np.int32),
@@ -826,18 +847,31 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         )
         return fig
 
-    loss_x = np.asarray(data["loss_x"], dtype=np.float32) if "loss_x" in data.files else np.asarray([], dtype=np.float32)
+    def _npz_array(name: str, *legacy_names: str) -> np.ndarray:
+        for key in (name, *legacy_names):
+            if key in data.files:
+                return np.asarray(data[key], dtype=np.float32)
+        return np.asarray([], dtype=np.float32)
+
+    loss_x = _npz_array("loss_x")
     loss_total = np.asarray(data["loss_total"], dtype=np.float32) if "loss_total" in data.files else np.asarray([], dtype=np.float32)
-    loss_jepa = np.asarray(data["loss_jepa"], dtype=np.float32) if "loss_jepa" in data.files else np.asarray([], dtype=np.float32)
-    loss_sigreg = np.asarray(data["loss_sigreg"], dtype=np.float32) if "loss_sigreg" in data.files else np.asarray([], dtype=np.float32)
-    loss_symmetric = np.asarray(data["loss_symmetric"], dtype=np.float32) if "loss_symmetric" in data.files else np.asarray([], dtype=np.float32)
+    loss_prediction = _npz_array("loss_prediction", "loss_jepa")
+    loss_spread = _npz_array("loss_spread", "loss_sigreg")
+    loss_symmetry = _npz_array("loss_symmetry", "loss_symmetric")
     loss_var = np.asarray(data["loss_var"], dtype=np.float32) if "loss_var" in data.files else np.asarray([], dtype=np.float32)
     loss_cov = np.asarray(data["loss_cov"], dtype=np.float32) if "loss_cov" in data.files else np.asarray([], dtype=np.float32)
-    weighted_jepa = np.asarray(data["weighted_jepa"], dtype=np.float32) if "weighted_jepa" in data.files else np.asarray([], dtype=np.float32)
-    weighted_sigreg = np.asarray(data["weighted_sigreg"], dtype=np.float32) if "weighted_sigreg" in data.files else np.asarray([], dtype=np.float32)
-    weighted_symmetric = np.asarray(data["weighted_symmetric"], dtype=np.float32) if "weighted_symmetric" in data.files else np.asarray([], dtype=np.float32)
+    weighted_prediction = _npz_array("weighted_prediction", "weighted_jepa")
+    weighted_spread = _npz_array("weighted_spread", "weighted_sigreg")
+    weighted_symmetry = _npz_array("weighted_symmetry", "weighted_symmetric")
     weighted_var = np.asarray(data["weighted_var"], dtype=np.float32) if "weighted_var" in data.files else np.asarray([], dtype=np.float32)
     weighted_cov = np.asarray(data["weighted_cov"], dtype=np.float32) if "weighted_cov" in data.files else np.asarray([], dtype=np.float32)
+    embed_spread_mean = _npz_array("embed_spread_mean")
+    embed_spread_min = _npz_array("embed_spread_min")
+    embed_under_spread_frac = _npz_array("embed_under_spread_frac")
+    dead_channel_count = _npz_array("dead_channel_count")
+    targets_per_image = _npz_array("targets_per_image")
+    mask_footprint_mean_px = _npz_array("mask_footprint_mean_px")
+    mask_scale_factor = _npz_array("mask_scale_factor")
     def _smooth(y: np.ndarray, win: int = 25) -> np.ndarray:
         arr = np.asarray(y, dtype=np.float32).reshape(-1)
         if arr.size < 3 or win <= 1:
@@ -859,13 +893,11 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         out = np.divide(num, np.maximum(den, 1e-6), dtype=np.float32)
         out[den <= 0.0] = np.nan
         return out
-    n = min(loss_x.size, loss_total.size, loss_jepa.size) if (loss_x.size and loss_total.size and loss_jepa.size) else 0
+    n = min(loss_x.size, loss_total.size, loss_prediction.size) if (loss_x.size and loss_total.size and loss_prediction.size) else 0
     loss_terms = (
-        ("jepa", "mse_loss_weight", loss_jepa, weighted_jepa, "#636EFA"),
-        ("sigreg", "sigreg_weight", loss_sigreg, weighted_sigreg, "#EF553B"),
-        ("symmetric", "symmetric_feature_loss_weight", loss_symmetric, weighted_symmetric, "#00CC96"),
-        ("var", "vicreg_var_weight", loss_var, weighted_var, "#AB63FA"),
-        ("cov", "vicreg_cov_weight", loss_cov, weighted_cov, "#FFA15A"),
+        ("prediction", "prediction_loss_weight", loss_prediction, weighted_prediction, "#636EFA"),
+        ("spread", "spread_regularizer.weight", loss_spread, weighted_spread, "#EF553B"),
+        ("symmetry", "symmetry_loss_weight", loss_symmetry, weighted_symmetry, "#00CC96"),
     )
     loss_weights = {}
     loss_weights_path = os.path.join(session_dir, "loss_weights.json")
@@ -881,7 +913,18 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             if raw_arr.size < n or weighted_arr.size < n:
                 continue
             weighted = weighted_arr[:n]
-            weight = loss_weights.get(weight_key)
+            legacy_weight_keys = {
+                "prediction_loss_weight": "mse_loss_weight",
+                "spread_regularizer.weight": "spread_regularizer_weight",
+                "symmetry_loss_weight": "symmetric_feature_loss_weight",
+            }
+            if weight_key == "spread_regularizer.weight":
+                weight = loss_weights.get("spread_regularizer", {}).get(
+                    "weight",
+                    loss_weights.get(legacy_weight_keys[weight_key], loss_weights.get("sigreg_weight")),
+                )
+            else:
+                weight = loss_weights.get(weight_key, loss_weights.get(legacy_weight_keys.get(weight_key, "")))
             configured_active = weight is not None and abs(float(weight)) > 1e-12
             observed_active = np.isfinite(weighted).any() and np.nanmax(np.abs(weighted)) > 1e-12
             if configured_active or observed_active:
@@ -921,16 +964,93 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         lx = loss_x[:n]
         for name, _, weighted_arr, color in active_loss_terms:
             _add_loss_trace(fig_weighted_components, x=lx, y=weighted_arr, name=f"weighted_{name}", color=color)
-        _add_loss_trace(fig_weighted_components, x=lx, y=loss_total[:n], name="total_loss", color="#222222")
+        _add_loss_trace(fig_weighted_components, x=lx, y=loss_total[:n], name="loss_total", color="#222222")
     fig_weighted_components.update_layout(
         template="plotly_white",
-        title={"text": "Active Loss Terms (Weighted into total_loss)", "x": 0.02},
+        title={"text": "Active Loss Terms (Weighted into loss_total)", "x": 0.02},
         margin=dict(l=42, r=8, t=36, b=36),
         height=330,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
     )
     fig_weighted_components.update_xaxes(title_text="global_step")
     fig_weighted_components.update_yaxes(title_text="weighted contribution")
+    def _latest_finite(values: np.ndarray) -> float:
+        arr = np.asarray(values, dtype=np.float32).reshape(-1)
+        finite = arr[np.isfinite(arr)]
+        return float(finite[-1]) if finite.size > 0 else float("nan")
+
+    def _fmt_table_value(value: float, *, percent: bool = False, integer: bool = False) -> str:
+        if not np.isfinite(value):
+            return "-"
+        if percent:
+            return f"{100.0 * value:.1f}%"
+        if integer:
+            return str(int(round(value)))
+        return f"{value:.4g}"
+
+    spread_cfg = loss_weights.get("spread_regularizer", {})
+    spread_target = float(spread_cfg.get("target_std", loss_weights.get("embed_spread_target", 1.0)))
+    latest_step = _latest_finite(loss_x)
+    fig_spread_health = go.Figure(
+        data=[
+            go.Table(
+                header=dict(
+                    values=["Metric", "Latest", "Healthy direction"],
+                    fill_color="#E8EEF7",
+                    align=["left", "right", "left"],
+                    font=dict(size=13, color="#1F2D3D"),
+                ),
+                cells=dict(
+                    values=[
+                        [
+                            "Average embedding spread",
+                            "Weakest dimension spread",
+                            "Under-spread dimensions",
+                            "Dead channels",
+                        ],
+                        [
+                            _fmt_table_value(_latest_finite(embed_spread_mean)),
+                            _fmt_table_value(_latest_finite(embed_spread_min)),
+                            _fmt_table_value(_latest_finite(embed_under_spread_frac), percent=True),
+                            _fmt_table_value(_latest_finite(dead_channel_count), integer=True),
+                        ],
+                        [
+                            f">= {spread_target:g}",
+                            f">= {spread_target:g}",
+                            "toward 0%",
+                            "0",
+                        ],
+                    ],
+                    fill_color="#FFFFFF",
+                    align=["left", "right", "left"],
+                    height=31,
+                    font=dict(size=13, color="#263238"),
+                ),
+            )
+        ]
+    )
+    fig_spread_health.update_layout(
+        template="plotly_white",
+        title={"text": f"Embedding Spread Health (latest step: {_fmt_table_value(latest_step, integer=True)})", "x": 0.02},
+        margin=dict(l=8, r=8, t=42, b=8),
+        height=330,
+    )
+    fig_mask_geometry = go.Figure()
+    if loss_x.size > 0:
+        for values, name, color in (
+            (targets_per_image, "Targets per image", "#00CC96"),
+            (mask_footprint_mean_px, "Mask size", "#636EFA"),
+            (mask_scale_factor, "Mask scale", "#EF553B"),
+        ):
+            m = min(loss_x.size, values.size)
+            if m > 0:
+                _add_loss_trace(fig_mask_geometry, x=loss_x[:m], y=values[:m], name=name, color=color)
+    fig_mask_geometry.update_layout(
+        template="plotly_white",
+        title={"text": "Mask Geometry", "x": 0.02},
+        margin=dict(l=42, r=8, t=36, b=36),
+        height=330,
+    )
     er_x = np.asarray(data["effective_rank_x"], dtype=np.float64) if "effective_rank_x" in data.files else np.asarray([], dtype=np.float64)
     er_y = np.asarray(data["effective_rank_y"], dtype=np.float32) if "effective_rank_y" in data.files else np.asarray([], dtype=np.float32)
     fig_eff_rank = go.Figure()
@@ -945,33 +1065,39 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     )
     fig_eff_rank.update_xaxes(title_text="timestamp")
     fig_eff_rank.update_yaxes(title_text="effective_rank")
-    def _scalar(name: str) -> float:
-        if name in data.files:
-            arr = np.asarray(data[name]).reshape(-1)
+    def _scalar(name: str, *legacy_names: str) -> float:
+        for key in (name, *legacy_names):
+            if key not in data.files:
+                continue
+            arr = np.asarray(data[key]).reshape(-1)
             if arr.size > 0 and np.isfinite(arr[0]):
                 return float(arr[0])
         return float("nan")
 
     rank_branches = ["context", "pred", "gt"]
     rank_erank = [_scalar("rank_context_erank"), _scalar("rank_pred_erank"), _scalar("rank_gt_erank")]
-    rank_pr = [_scalar("rank_context_pr"), _scalar("rank_pred_pr"), _scalar("rank_gt_pr")]
+    rank_pr = [
+        _scalar("rank_context_manifold_size", "rank_context_pr"),
+        _scalar("rank_predicted_manifold_size", "rank_pred_pr"),
+        _scalar("rank_target_manifold_size", "rank_gt_pr"),
+    ]
     rank_dead = [_scalar("rank_context_dead"), _scalar("rank_pred_dead"), _scalar("rank_gt_dead")]
     rank_top1 = [_scalar("rank_context_top1"), _scalar("rank_pred_top1"), _scalar("rank_gt_top1")]
     rank_top4 = [_scalar("rank_context_top4"), _scalar("rank_pred_top4"), _scalar("rank_gt_top4")]
     rank_top8 = [_scalar("rank_context_top8"), _scalar("rank_pred_top8"), _scalar("rank_gt_top8")]
-    rank_ratio = _scalar("rank_pred_gt_erank_ratio")
+    rank_ratio = _scalar("rank_match_ratio", "rank_pred_gt_erank_ratio")
 
     fig_rank_diag = go.Figure()
-    fig_rank_diag.add_trace(go.Bar(name="erank", x=rank_branches, y=rank_erank))
-    fig_rank_diag.add_trace(go.Bar(name="participation_rank", x=rank_branches, y=rank_pr))
-    fig_rank_diag.add_trace(go.Bar(name="dead_channel_fraction", x=rank_branches, y=rank_dead))
+    fig_rank_diag.add_trace(go.Bar(name="effective rank", x=rank_branches, y=rank_erank))
+    fig_rank_diag.add_trace(go.Bar(name="manifold size", x=rank_branches, y=rank_pr))
+    fig_rank_diag.add_trace(go.Bar(name="dead channels", x=rank_branches, y=rank_dead))
     subtitle = ""
     if np.isfinite(rank_ratio):
-        subtitle = f" (pred/gt erank ratio={rank_ratio:.3f})"
+        subtitle = f" (rank match={rank_ratio:.3f})"
     fig_rank_diag.update_layout(
         barmode="group",
         template="plotly_white",
-        title={"text": f"Rank Diagnostics{subtitle}", "x": 0.02},
+        title={"text": f"Manifold Diagnostics{subtitle}", "x": 0.02},
         margin=dict(l=42, r=8, t=36, b=36),
         height=330,
     )
@@ -1012,9 +1138,21 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         pca_scatter, _, _ = scatter3d(f"{name} PCA 3D Scatter", data[f"{stem}_pca3d"], data[f"{stem}_pca_rgb_flat"])
         umap_scatter, _, _ = scatter3d(f"{name} UMAP 3D Scatter", data[f"{stem}_umap3d"], data[f"{stem}_umap_rgb_flat"])
         # Keep strict left-right pairing: RGB map (left), RGB scatter (right).
-        cards.append({"title": f"{name} PCA RGB", "fig": img(f"{name} PCA RGB", data[f"{stem}_pca_rgb"]), "group": f"{stem}-pca"})
+        cards.append(
+            {
+                "title": f"{name} PCA RGB",
+                "fig": img(f"{name} PCA RGB", data[f"{stem}_pca_rgb"]),
+                "group": f"{stem}-pca",
+            }
+        )
         cards.append({"title": f"{name} PCA RGB Scatter", "fig": pca_scatter, "group": f"{stem}-pca"})
-        cards.append({"title": f"{name} UMAP RGB", "fig": img(f"{name} UMAP RGB", data[f"{stem}_umap_rgb"]), "group": f"{stem}-umap"})
+        cards.append(
+            {
+                "title": f"{name} UMAP RGB",
+                "fig": img(f"{name} UMAP RGB", data[f"{stem}_umap_rgb"]),
+                "group": f"{stem}-umap",
+            }
+        )
         cards.append({"title": f"{name} UMAP RGB Scatter", "fig": umap_scatter, "group": f"{stem}-umap"})
     # Non-pair panels afterwards.
     cards.extend(
@@ -1023,7 +1161,9 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             {"title": "Effective Rank", "fig": fig_eff_rank, "group": "eff-rank"},
             {"title": "Active Loss Terms (Unweighted)", "fig": fig_loss_components, "group": "loss-components"},
             {"title": "Active Loss Terms (Weighted)", "fig": fig_weighted_components, "group": "weighted-loss-components"},
-            {"title": "Rank Diagnostics", "fig": fig_rank_diag, "group": "rank-diag"},
+            {"title": "Embedding Spread Health", "fig": fig_spread_health, "group": "spread-health"},
+            {"title": "Mask Geometry", "fig": fig_mask_geometry, "group": "mask-geometry"},
+            {"title": "Manifold Diagnostics", "fig": fig_rank_diag, "group": "rank-diag"},
             {"title": "Rank Energy Top-k", "fig": fig_rank_energy, "group": "rank-energy"},
             {"title": "Energy Distribution", "fig": fig_energy_dist, "group": "energy-dist"},
             {"title": "Target Locations", "fig": heat("Target Locations", data["target"], "Magma"), "group": "target-loc"},
@@ -1068,6 +1208,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 f'<label>ymax <input type="number" step="any" data-k="ymax" placeholder="auto"></label>'
                 f'<label>zmin <input type="number" step="any" data-k="zmin" placeholder="auto"></label>'
                 f'<label>zmax <input type="number" step="any" data-k="zmax" placeholder="auto"></label>'
+                f'<label><input type="checkbox" data-k="bright_top" checked> bright_top</label>'
                 f'<button class="apply-local" type="button" data-group="{group}">Apply</button>'
                 f"</div>"
             )
@@ -1147,6 +1288,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     const xmin = get("xmin"), xmax = get("xmax");
     const ymin = get("ymin"), ymax = get("ymax");
     const zmin = get("zmin"), zmax = get("zmax");
+    const brightTopEl = controls.querySelector('input[data-k="bright_top"]');
+    const brightTop = !brightTopEl || brightTopEl.checked;
     const sections = document.querySelectorAll('.card[data-group="' + group + '"] .js-plotly-plot');
     function clamp01(v) {{
       return Math.max(0.0, Math.min(1.0, v));
@@ -1154,6 +1297,10 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     function map01(v, lo, hi) {{
       const den = Math.max(1e-12, hi - lo);
       return clamp01((v - lo) / den);
+    }}
+    function color01(v, lo, hi) {{
+      const mapped = map01(v, lo, hi);
+      return brightTop ? mapped : 1.0 - mapped;
     }}
     function percentileRange(arr, loPct, hiPct) {{
       const vals = [];
@@ -1191,32 +1338,53 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         if (ymin !== null && ymax !== null) rl["scene.yaxis.range"] = [ymin, ymax];
         if (zmin !== null && zmax !== null) rl["scene.zaxis.range"] = [zmin, zmax];
         Plotly.relayout(gd, rl);
-        (gd.data || []).forEach((tr, i) => {{
-          if (!tr || tr.type !== "scatter3d") return;
-          const xs = tr.x || [];
-          const ys = tr.y || [];
-          const zs = tr.z || [];
-          // Robust recoloring from visible-range stats to avoid black collapse.
-          const xr = (xmin !== null && xmax !== null) ? [xmin, xmax] : percentileRange(xs, 0.01, 0.99);
-          const yr = (ymin !== null && ymax !== null) ? [ymin, ymax] : percentileRange(ys, 0.01, 0.99);
-          const zr = (zmin !== null && zmax !== null) ? [zmin, zmax] : percentileRange(zs, 0.01, 0.99);
-          const n = Math.min(xs.length || 0, ys.length || 0, zs.length || 0);
-          const colors = new Array(n);
-          for (let k = 0; k < n; k++) {{
-            const r = Math.round(map01(Number(xs[k]), xr[0], xr[1]) * 255.0);
-            const g = Math.round(map01(Number(ys[k]), yr[0], yr[1]) * 255.0);
-            const b = Math.round(map01(Number(zs[k]), zr[0], zr[1]) * 255.0);
-            colors[k] = `rgb(${{r}},${{g}},${{b}})`;
-          }}
-          Plotly.restyle(gd, {{"marker.color": [colors]}}, [i]);
-        }});
       }}
+      (gd.data || []).forEach((tr, i) => {{
+        if (!tr) return;
+        let xs = [], ys = [], zs = [];
+        if (tr.type === "image") {{
+          const currentBrightTop = tr._brightTop === undefined ? true : tr._brightTop;
+          if (currentBrightTop !== brightTop) {{
+            const recolored = (tr.z || []).map((row) => row.map((pixel) => [
+              255 - Number(pixel[0]),
+              255 - Number(pixel[1]),
+              255 - Number(pixel[2]),
+            ]));
+            tr._brightTop = brightTop;
+            Plotly.restyle(gd, {{"z": [recolored]}}, [i]);
+          }}
+          return;
+        }}
+        if (tr.type === "scatter3d") {{
+          xs = tr.x || [];
+          ys = tr.y || [];
+          zs = tr.z || [];
+        }} else {{
+          return;
+        }}
+        // Robust recoloring from visible-range stats to avoid black collapse.
+        const xr = (xmin !== null && xmax !== null) ? [xmin, xmax] : percentileRange(xs, 0.01, 0.99);
+        const yr = (ymin !== null && ymax !== null) ? [ymin, ymax] : percentileRange(ys, 0.01, 0.99);
+        const zr = (zmin !== null && zmax !== null) ? [zmin, zmax] : percentileRange(zs, 0.01, 0.99);
+        const n = Math.min(xs.length || 0, ys.length || 0, zs.length || 0);
+        const colors = new Array(n);
+        for (let k = 0; k < n; k++) {{
+          const r = Math.round(color01(Number(xs[k]), xr[0], xr[1]) * 255.0);
+          const g = Math.round(color01(Number(ys[k]), yr[0], yr[1]) * 255.0);
+          const b = Math.round(color01(Number(zs[k]), zr[0], zr[1]) * 255.0);
+          colors[k] = `rgb(${{r}},${{g}},${{b}})`;
+        }}
+        Plotly.restyle(gd, {{"marker.color": [colors]}}, [i]);
+      }});
     }});
   }}
 	  function initControlDefaults() {{
     document.querySelectorAll('.local-controls').forEach((controls) => {{
       const group = controls.getAttribute("data-group");
-      const gd = document.querySelector('.card[data-group="' + group + '"] .js-plotly-plot');
+      const gd = document.querySelector('.card[data-group="' + group + '"] .js-plotly-plot.scatter3d') ||
+        Array.from(document.querySelectorAll('.card[data-group="' + group + '"] .js-plotly-plot')).find(
+          (plot) => plot._fullLayout && plot._fullLayout.scene
+        );
       if (!gd || !gd._fullLayout || !gd._fullLayout.scene) return;
       const s = gd._fullLayout.scene;
       const defs = {{
@@ -1237,6 +1405,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
 	  window.addEventListener("load", initControlDefaults);
 	  document.querySelectorAll(".apply-local").forEach((btn) => {{
 	    btn.addEventListener("click", () => applyRangesForGroup(btn.getAttribute("data-group")));
+	  }});
+	  document.querySelectorAll('.local-controls input[data-k="bright_top"]').forEach((input) => {{
+	    input.addEventListener("change", () => {{
+	      const controls = input.closest(".local-controls");
+	      if (controls) applyRangesForGroup(controls.getAttribute("data-group"));
+	    }});
 	  }});
 	  function _safeFileName(name) {{
 	    return String(name || "panel")

@@ -17,7 +17,7 @@ DATASETS = [
     ("ngc", "ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy"),
 ]
 
-# (mask_size_scaling, symmetric_feature_loss_weight)
+# (mask_scale_factor, symmetry_loss_weight)
 VARIANTS = [
     (1.0, 0.0),
     (1.0, 0.003),
@@ -35,7 +35,7 @@ def _symmetry_tag(value: float) -> str:
     return "0" if float(value) == 0.0 else _float_tag(value)
 
 
-def _config(npy_pattern: str, mask_size_scaling: float, symmetry_weight: float) -> dict:
+def _config(npy_pattern: str, mask_scale_factor: float, symmetry_weight: float) -> dict:
     cfg = {
         "base_config": BASE_CONFIG,
         "data": {
@@ -45,8 +45,8 @@ def _config(npy_pattern: str, mask_size_scaling: float, symmetry_weight: float) 
             "mode": "pyramid",
             "model_key": "cdd_scaleaware_convnext",
             "mask_spacing_scaling": 2.0,
-            "mask_size_scaling": float(mask_size_scaling),
-            "mask_box_size": 0,
+            "mask_scale_factor": float(mask_scale_factor),
+            "mask_footprint_px": 0,
             "convnext_layer_dilations": [1, 1, 1, 1, 1, 1],
             "normalize_loss_l2": True,
             "predictor_spatial_conv": True,
@@ -74,12 +74,9 @@ def _config(npy_pattern: str, mask_size_scaling: float, symmetry_weight: float) 
             "ema_momentum_base": 0.99,
             "ema_momentum_final": 0.9999,
             "ema_warmup_fraction": 0.25,
-            "mse_loss_weight": 50.0,
-            "vicreg_var_weight": 0.0,
-            "vicreg_cov_weight": 0.0,
-            "sigreg_weight": 10.0,
-            "sigreg_sketch_dim": 64,
-            "symmetric_feature_loss_weight": float(symmetry_weight),
+            "prediction_loss_weight": 50.0,
+            "spread_regularizer": {"type": "std_hinge", "target": "context", "weight": 10.0, "target_std": 1.0, "eps": 1e-4},
+            "symmetry_loss_weight": float(symmetry_weight),
             "compute_effective_rank": True,
             "scale_probe_enabled": True,
             "inference_tta_enabled": True,
@@ -91,14 +88,14 @@ def _config(npy_pattern: str, mask_size_scaling: float, symmetry_weight: float) 
     return cfg
 
 
-def _name(dataset: str, run: int, mask_size_scaling: float, symmetry_weight: float) -> str:
+def _name(dataset: str, run: int, mask_scale_factor: float, symmetry_weight: float) -> str:
     return (
         f"gen_100_{dataset}_run_{run:03d}"
-        f"_ms{_float_tag(mask_size_scaling)}"
+        f"_ms{_float_tag(mask_scale_factor)}"
         "_pred3x3_h96_predln_off"
         "_psnorm_off_adnorm_on_grn_on"
         f"_symw{_symmetry_tag(symmetry_weight)}"
-        "_sigpred_on"
+        "_spread_on"
     )
 
 
@@ -109,9 +106,9 @@ def main() -> None:
 
     paths = []
     for dataset, npy_pattern in DATASETS:
-        for run, (mask_size_scaling, symmetry_weight) in enumerate(VARIANTS, start=1):
-            cfg = _config(npy_pattern, mask_size_scaling, symmetry_weight)
-            name = _name(dataset, run, mask_size_scaling, symmetry_weight)
+        for run, (mask_scale_factor, symmetry_weight) in enumerate(VARIANTS, start=1):
+            cfg = _config(npy_pattern, mask_scale_factor, symmetry_weight)
+            name = _name(dataset, run, mask_scale_factor, symmetry_weight)
             path = os.path.join(OUT_DIR, f"{name}.json")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(deepcopy(cfg), f, indent=2)

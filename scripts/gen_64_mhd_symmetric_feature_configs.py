@@ -23,9 +23,9 @@ def write_config(mscale: float) -> str:
         "model": {
             "mode": "pyramid",
             "model_key": "cdd_scaleaware_convnext",
-            "mask_size_scaling": float(mscale),
+            "mask_scale_factor": float(mscale),
             "mask_spacing_scaling": 2.0,
-            "mask_box_size": 0,
+            "mask_footprint_px": 0,
             "use_symmetric_feature_loss": True,
             "target_sampling_mode": "priority_sampling",
             "priority_top_percent": 15.0,

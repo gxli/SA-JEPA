@@ -33,7 +33,8 @@ from src.losses import (
     compute_target_energy_map,
     embedding_spread_stats,
     extract_valid_pooled_embeddings,
-    sketched_sigreg_loss,
+    parse_spread_regularizer_config,
+    spread_regularizer_loss,
 )
 from src.models.build_jepa import CDD_DEBUG_ENCODER_TYPES, PyramidGridJEPA
 from src.models.build_jepa3d import PyramidGridJEPA3D
@@ -59,7 +60,7 @@ def _flush_csv_rows(path: str, rows: list[list]) -> None:
     rows.clear()
 
 
-def _collate_pad_hw(batch: list[torch.Tensor]) -> torch.Tensor:
+def _collate_pad_spatial(batch: list[torch.Tensor]) -> torch.Tensor:
     if len(batch) == 0:
         raise ValueError("Empty batch is not supported")
     max_h = max(int(x.shape[-2]) for x in batch)
@@ -75,22 +76,6 @@ def _collate_pad_hw(batch: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack(out, dim=0)
 
 
-def _collate_pad_cdd(batch: list[torch.Tensor]) -> torch.Tensor:
-    """Collate CDD tensors (S, H, W) into a padded batch (B, S, H, W)."""
-    if len(batch) == 0:
-        raise ValueError("Empty batch is not supported")
-    max_h = max(int(x.shape[-2]) for x in batch)
-    max_w = max(int(x.shape[-1]) for x in batch)
-    out = []
-    for x in batch:
-        dh = max_h - int(x.shape[-2])
-        dw = max_w - int(x.shape[-1])
-        if dh > 0 or dw > 0:
-            x = F.pad(x, (0, dw, 0, dh), mode="constant", value=float("nan"))
-        out.append(x)
-    return torch.stack(out, dim=0)
-
-
 def _collate_for_inference(batch):
     """Collate inference batches — handles both (cdd_orig, x_clean) tuples and plain tensors."""
     if len(batch) == 0:
@@ -98,8 +83,8 @@ def _collate_for_inference(batch):
     if isinstance(batch[0], (tuple, list)) and len(batch[0]) == 2:
         cdd_list = [item[0] for item in batch]
         x_clean_list = [item[1] for item in batch]
-        return _collate_pad_cdd(cdd_list), _collate_pad_hw(x_clean_list)
-    return _collate_pad_hw(batch), None
+        return _collate_pad_spatial(cdd_list), _collate_pad_spatial(x_clean_list)
+    return _collate_pad_spatial(batch), None
 
 
 def _summarize_data_array(arr: np.ndarray) -> dict:
@@ -288,7 +273,6 @@ class _MaskingCollator:
         self.return_debug = bool(
             return_debug
             or enc_type in CDD_DEBUG_ENCODER_TYPES
-            or bool(getattr(model, "use_image_mask_token", False))
         )
         self.mask_scale = float(model.mask_scale)
         self.mask_scale_range = model.mask_scale_range
@@ -331,11 +315,11 @@ class _MaskingCollator:
         if use_cdd:
             cdd_list = [item[0] for item in batch]
             x_clean_list = [item[1] for item in batch]
-            cdd_orig_in = _collate_pad_cdd(cdd_list)
-            x_clean = _collate_pad_hw(x_clean_list)
+            cdd_orig_in = _collate_pad_spatial(cdd_list)
+            x_clean = _collate_pad_spatial(x_clean_list)
         else:
             cdd_orig_in = None
-            x_clean = _collate_pad_hw(batch)
+            x_clean = _collate_pad_spatial(batch)
         mask_scale, mask_box_size = self._sample_mask_params()
         context_data = prepare_context_batch(
             x_clean=x_clean,
@@ -357,7 +341,6 @@ def _prepare_context_from_model(
     need_debug = bool(
         return_debug
         or enc_type in CDD_DEBUG_ENCODER_TYPES
-        or bool(getattr(model, "use_image_mask_token", False))
     )
     mask_scale, mask_box_size = model.sample_mask_params(device=x_clean.device)
     return prepare_context_batch(
@@ -488,18 +471,6 @@ def load_config(path: str) -> dict:
             "[config migration] ignoring removed model.log_transform="
             f"{legacy_value!r}; use model.post_log_transform."
         )
-    for section in ("data", "model", "train"):
-        if "sigreg_on_pred" in cfg[section]:
-            raise ValueError(
-                "sigreg_on_pred was removed. "
-                "SigReg always uses pre-predictor context patch embeddings when sigreg_weight > 0."
-            )
-
-    # Keep shared CDD/log knobs in one place (data section) and mirror to model
-    # only when model did not set an explicit override.
-    for k in ("cdd_mode", "cdd_constrained", "cdd_sm_mode", "log_eps"):
-        if k in cfg["data"] and k not in cfg["model"]:
-            cfg["model"][k] = cfg["data"][k]
     return cfg
 
 
@@ -538,29 +509,19 @@ def _resolve_encoder_alias_2d(name: str) -> str:
     alias = {
         # Preferred naming convention (image / image_pyramid prefixes).
         "convnext_image_dense_masked": "convnext_dense_masktoken",
-        "convnext_image_dense_masked_d4": "convnext_dense_masktoken_d4",
-        "rescnn-image-plain": "rescnn_dense",
-        "cdd_opnet-pyramid-opnet": "cdd_opnet",
         "cdd_scaleaware_convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
         "cdd_scaleaware_convnext-pyramid-scaleaware-d4": "cdd_scaleaware_convnext_d4",
         "rescnn-pyramid-scaleaware": "cdd_scaleaware_rescnn",
-        "image_rescnn_dense": "rescnn_dense",
-        "image_pyramid_cdd_opnet": "cdd_opnet",
         "image_pyramid_cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
         "image_pyramid_cdd_scaleaware_convnext_d4": "cdd_scaleaware_convnext_d4",
         "image_pyramid_cdd_scaleaware_rescnn": "cdd_scaleaware_rescnn",
         # Supported canonical names.
-        "rescnn_dense": "rescnn_dense",
         "convnext_dense_masktoken": "convnext_dense_masktoken",
-        "convnext_dense_masktoken_d4": "convnext_dense_masktoken_d4",
         "cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
         "cdd_scaleaware_convnext_d4": "cdd_scaleaware_convnext_d4",
         "cdd_scaleaware_rescnn": "cdd_scaleaware_rescnn",
-        "cdd_opnet": "cdd_opnet",
         # Supported aliases.
-        "rescnn-image-base": "rescnn_dense",
         "convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
-        "opnet-image-scaleaware": "cdd_opnet",
     }
     return alias.get(key, str(name))
 
@@ -580,28 +541,25 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
     model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
     resolved_encoder_type = _resolve_encoder_alias_2d(resolve_encoder_type_default(model_cfg))
     resolved_mode = str(model_cfg.get("mode", "image")).lower()
-    use_image_mask_token = bool(model_cfg.get("use_image_mask_token", False))
     if resolved_mode == "image":
-        allowed_image = {"rescnn_dense", "convnext_dense_masktoken", "convnext_dense_masktoken_d4"}
+        allowed_image = {"convnext_dense_masktoken"}
         if resolved_encoder_type not in allowed_image:
             raise ValueError(
                 f"Unsupported image-mode encoder_type={resolved_encoder_type}. "
-                "Allowed: rescnn_dense, convnext_dense_masktoken."
+                "Allowed: convnext_dense_masktoken."
             )
     elif resolved_mode == "pyramid":
         allowed_pyramid = {
             "cdd_scaleaware_convnext",
             "cdd_scaleaware_convnext_d4",
             "cdd_scaleaware_rescnn",
-            "cdd_opnet",
             "convnext_dense_pyramid",
-            "cdd_film_scaleaware_convnext",
-            "rescnn_dense_pyramid",
         }
         if resolved_encoder_type not in allowed_pyramid:
             raise ValueError(
                 f"Unsupported pyramid-mode encoder_type={resolved_encoder_type}. "
-                "Allowed: cdd_scaleaware_convnext, cdd_opnet."
+                "Allowed: cdd_scaleaware_convnext, cdd_scaleaware_convnext_d4, "
+                "cdd_scaleaware_rescnn, convnext_dense_pyramid."
             )
     else:
         raise ValueError(f"Unsupported mode={resolved_mode}. Allowed: image, pyramid.")
@@ -621,16 +579,16 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         patch_size=patch_size,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=active_target_fraction,
-        mask_scale=model_cfg.get("mask_size_scaling", 1.0),
-        mask_scale_range=model_cfg.get("mask_size_scaling_range", model_cfg.get("mask_scale_range")),
+        mask_scale=model_cfg.get("mask_scale_factor", 1.0),
+        mask_scale_range=model_cfg.get("mask_scale_factor_range"),
         spacing_scale=mask_spacing_scaling,
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
-        mask_box_size=model_cfg.get("mask_box_size", 16),
-        mask_box_size_range=model_cfg.get("mask_box_size_range"),
-        cdd_mode=model_cfg.get("cdd_mode", "log"),
-        cdd_constrained=model_cfg.get("cdd_constrained", True),
-        cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
+        mask_box_size=model_cfg.get("mask_footprint_px", 16),
+        mask_box_size_range=model_cfg.get("mask_footprint_px_range"),
+        cdd_mode=model_cfg.get("cdd_mode", data_cfg.get("cdd_mode", "log")),
+        cdd_constrained=model_cfg.get("cdd_constrained", data_cfg.get("cdd_constrained", True)),
+        cdd_sm_mode=model_cfg.get("cdd_sm_mode", data_cfg.get("cdd_sm_mode", "reflect")),
         cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
         post_log_transform=model_cfg.get("post_log_transform", model_post_log),
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
@@ -641,7 +599,6 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         predictor_spatial_conv=model_cfg.get("predictor_spatial_conv", False),
         projector_conv=bool(model_cfg.get("projector_conv", True)),
         predictor_residual=model_cfg.get("predictor_residual", False),
-        use_image_mask_token=use_image_mask_token,
         mode=resolved_mode,
         encoder_type=resolved_encoder_type,
         encoder_width=model_cfg.get("encoder_width", model_cfg.get("latent_channels", 32)),
@@ -660,17 +617,6 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         scaleaware_stem_norm=bool(model_cfg.get("scaleaware_stem_norm", True)),
         encoder_final_norm_type=str(model_cfg.get("encoder_final_norm_type", "layernorm")),
         encoder_head_bias=bool(model_cfg.get("encoder_head_bias", True)),
-        use_film=bool(model_cfg.get("use_film", True)),
-        use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
-        opnet_dilation_mode=model_cfg.get("opnet_dilation_mode", "half_cdd_scale"),
-        opnet_dilations=model_cfg.get("opnet_dilations"),
-        opnet_max_dilation=int(model_cfg.get("opnet_max_dilation", 16)),
-        opnet_channel_mode=model_cfg.get("opnet_channel_mode", "multi"),
-        op_smoothing_mode=model_cfg.get("op_smoothing_mode", "sqrt_scale"),
-        op_smoothing_mult=float(model_cfg.get("op_smoothing_mult", 1.0)),
-        op_smoothing_padding_mode=model_cfg.get("op_smoothing_padding_mode", "reflect"),
-        opnet_cache_primitives=bool(model_cfg.get("opnet_cache_primitives", True)),
-        opnet_cache_detach=bool(model_cfg.get("opnet_cache_detach", True)),
         target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", False)),
         target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
         target_sampling_mode=str(model_cfg.get("target_sampling_mode", "grid")),
@@ -719,7 +665,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         post_log_transform=bool(model_cfg.get("post_log_transform", True)),
         log_eps=float(model_cfg.get("log_eps", 1e-6)),
         fusion=fusion,
-        mask_box_size=int(model_cfg.get("mask_box_size", 8)),
+        mask_box_size=int(model_cfg.get("mask_footprint_px", 8)),
         num_mask_boxes=int(model_cfg.get("num_mask_boxes", 8)),
         slab_depth=int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
@@ -778,8 +724,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         f"[{config_name}] Resolved pipeline: "
         "dataset_preprocess=normalize01, "
         f"model.post_log_transform={model_cfg.get('post_log_transform', True)}, "
-        f"data.cdd_mode={data_cfg.get('cdd_mode', 'log')}, "
-        f"model.cdd_mode={model_cfg.get('cdd_mode', 'log')}"
+        f"cdd_mode={model_cfg.get('cdd_mode', data_cfg.get('cdd_mode', 'log'))}"
     )
 
     model = build_model3d_from_config(model_cfg, train_cfg, device) if is_3d_mode else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
@@ -874,8 +819,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             return float(max(values))
         return float(values)
 
-    _msb = _param_or_range_max("mask_size_scaling", "mask_size_scaling_range", 1.0)
-    _mb = int(round(_param_or_range_max("mask_box_size", "mask_box_size_range", 16)))
+    _msb = _param_or_range_max("mask_scale_factor", "mask_scale_factor_range", 1.0)
+    _mb = int(round(_param_or_range_max("mask_footprint_px", "mask_footprint_px_range", 16)))
     _mss = float(model_cfg.get("mask_spacing_scaling", 1.5))
     max_box = round(scale_max * _msb + _mb)
     auto_roll_max = max(1, int(round(float(max_box) * _mss)))
@@ -1133,15 +1078,17 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     inference_tta_enabled = bool(train_cfg.get("inference_tta_enabled", False))
     inference_tta_mode = str(train_cfg.get("inference_tta_mode", "flip4"))
     print(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
-    mse_loss_weight = float(train_cfg.get("mse_loss_weight", 100.0))
-    vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", 1.0))
-    vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", 0.1))
-    sigreg_weight = float(train_cfg.get("sigreg_weight", 0.0))
-    sigreg_sketch_dim = int(train_cfg.get("sigreg_sketch_dim", 64))
-    sigreg_target_std = float(train_cfg.get("sigreg_target_std", 1.0))
-    sigreg_eps = float(train_cfg.get("sigreg_eps", 1e-4))
-    sigreg_noise_std = float(train_cfg.get("sigreg_noise_std", 0.0))
-    symmetric_feature_loss_weight = float(train_cfg.get("symmetric_feature_loss_weight", 0.0))
+    prediction_loss_weight = float(train_cfg.get("prediction_loss_weight", 100.0))
+    spread_regularizer = parse_spread_regularizer_config(train_cfg)
+    spread_regularizer_weight = float(spread_regularizer["weight"])
+    embed_spread_target = float(spread_regularizer["target_std"])
+    spread_regularizer_eps = float(spread_regularizer["eps"])
+    experimental_losses = dict(train_cfg.get("experimental_losses", {}))
+    assert "vicreg_var_weight" not in train_cfg
+    assert "vicreg_cov_weight" not in train_cfg
+    vicreg_var_weight = float(experimental_losses.get("vicreg_var_weight", 0.0))
+    vicreg_cov_weight = float(experimental_losses.get("vicreg_cov_weight", 0.0))
+    symmetry_loss_weight = float(train_cfg.get("symmetry_loss_weight", 0.0))
     vicreg_spatial_mode = str(train_cfg.get("vicreg_spatial_mode", "dense")).lower()
     if vicreg_spatial_mode not in ("dense", "pooled"):
         raise ValueError(
@@ -1155,40 +1102,67 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     warmup_epochs = float(train_cfg.get("warmup_epochs", 1.0))
 
     metrics_path = os.path.join(session_dir, "metrics.csv")
-    if not os.path.exists(metrics_path):
+    metrics_header = [
+        "epoch",
+        "batch",
+        "global_step",
+        "loss_total",
+        "loss_prediction",
+        "lr",
+        "loss_spread",
+        "loss_symmetry",
+        "weighted_prediction",
+        "weighted_spread",
+        "weighted_symmetry",
+        "ema_momentum",
+        "sim",
+        "var",
+        "cov",
+        "raw_mse",
+        "norm_err",
+        "valid_frac",
+        "embed_spread_mean",
+        "embed_spread_min",
+        "embed_under_spread_frac",
+        "dead_channel_count",
+        "context_manifold_size",
+        "targets_per_image",
+        "mask_footprint_mean_px",
+        "mask_footprint_min_px",
+        "mask_footprint_max_px",
+        "mask_scale_factor",
+        "time_sec",
+    ]
+    if os.path.exists(metrics_path):
+        with open(metrics_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            existing_rows = list(reader)
+            existing_header = list(reader.fieldnames or [])
+        if existing_header != metrics_header:
+            legacy_names = {
+                "loss_total": "total_loss",
+                "loss_prediction": "loss_mse",
+                "loss_spread": "loss_sigreg",
+                "loss_symmetry": "loss_symmetric",
+                "weighted_prediction": "weighted_mse",
+                "weighted_spread": "weighted_sigreg",
+                "weighted_symmetry": "weighted_symmetric",
+                "embed_spread_mean": "ctx_std_mean",
+                "embed_spread_min": "ctx_std_min",
+                "context_manifold_size": "ctx_rank",
+            }
+            with open(metrics_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=metrics_header)
+                writer.writeheader()
+                for row in existing_rows:
+                    writer.writerow({
+                        key: row.get(key, row.get(legacy_names.get(key, ""), ""))
+                        for key in metrics_header
+                    })
+    else:
         with open(metrics_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "epoch",
-                    "batch",
-                    "global_step",
-                    "total_loss",
-                    "loss_mse",
-                    "lr",
-                    "loss_sigreg",
-                    "loss_symmetric",
-                    "loss_var",
-                    "loss_cov",
-                    "weighted_mse",
-                    "weighted_sigreg",
-                    "weighted_symmetric",
-                    "weighted_var",
-                    "weighted_cov",
-                    "ema_momentum",
-                    "sim",
-                    "var",
-                    "cov",
-                    "raw_mse",
-                    "norm_err",
-                    "valid_frac",
-                    "ctx_std_mean",
-                    "ctx_std_min",
-                    "ctx_var_mean",
-                    "ctx_rank",
-                    "time_sec",
-                ]
-            )
+            writer.writerow(metrics_header)
     masked_scales_log_path = os.path.join(session_dir, "masked_scales_log.csv")
     if not os.path.exists(masked_scales_log_path):
         with open(masked_scales_log_path, "w", newline="", encoding="utf-8") as f:
@@ -1210,14 +1184,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         with open(loss_weights_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
-                    "mse_loss_weight": mse_loss_weight,
-                    "vicreg_var_weight": vicreg_var_weight,
-                    "vicreg_cov_weight": vicreg_cov_weight,
-                    "sigreg_weight": sigreg_weight,
-                    "sigreg_target_std": sigreg_target_std,
-                    "sigreg_eps": sigreg_eps,
-                    "sigreg_noise_std": sigreg_noise_std,
-                    "symmetric_feature_loss_weight": symmetric_feature_loss_weight,
+                    "prediction_loss_weight": prediction_loss_weight,
+                    "spread_regularizer": spread_regularizer,
+                    "symmetry_loss_weight": symmetry_loss_weight,
+                    "experimental_losses": experimental_losses,
                 },
                 f,
                 indent=2,
@@ -1236,15 +1206,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     prev_epochs = []
     for epoch in range(start_epoch, epochs):
         epoch_total = 0.0
-        epoch_mse = 0.0
+        epoch_prediction = 0.0
         epoch_sim = 0.0
         epoch_var = 0.0
         epoch_cov = 0.0
-        epoch_sigreg = 0.0
+        epoch_spread = 0.0
         epoch_symmetric = 0.0
         epoch_valid_frac = 0.0
-        epoch_ctx_std_mean = 0.0
-        epoch_ctx_rank = 0.0
+        epoch_embed_spread_mean = 0.0
+        epoch_context_manifold_size = 0.0
         epoch_batches = 0
         metrics_rows = []
         masked_scale_rows = []
@@ -1295,27 +1265,25 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
             with autocast(device_type=autocast_device, enabled=use_amp):
                 outputs = model(x_clean, context_data=context_data) if not is_3d_mode else model(x_clean)
-                loss_mse = model.compute_loss(outputs)
+                loss_prediction = model.compute_loss(outputs)
                 _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
                     outputs,
                     spatial_mode=vicreg_spatial_mode,
                 )
                 z_ctx_key = "context_patches" if "context_patches" in outputs else "pred_patches"
                 z_ctx = extract_valid_pooled_embeddings(outputs, key=z_ctx_key)
-                loss_sigreg = sketched_sigreg_loss(
+                loss_spread = spread_regularizer_loss(
                     z_ctx,
-                    sketch_dim=sigreg_sketch_dim,
-                    target_std=sigreg_target_std,
-                    eps=sigreg_eps,
-                    noise_std=sigreg_noise_std,
+                    target_std=embed_spread_target,
+                    eps=spread_regularizer_eps,
                 )
-                loss_symmetric = model.compute_symmetric_loss(outputs)
+                loss_symmetry = model.compute_symmetric_loss(outputs)
                 total_loss = (
-                    (mse_loss_weight * loss_mse)
+                    (prediction_loss_weight * loss_prediction)
                     + (vicreg_var_weight * var_term_t)
                     + (vicreg_cov_weight * cov_term_t)
-                    + (sigreg_weight * loss_sigreg)
-                    + (symmetric_feature_loss_weight * loss_symmetric)
+                    + (spread_regularizer_weight * loss_spread)
+                    + (symmetry_loss_weight * loss_symmetry)
                 )
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -1342,7 +1310,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             )
             raw_mse_val, norm_err_val = compute_raw_mse_and_norm_err(outputs)
             valid_frac = float(outputs["target_valid"].float().mean().item())
-            ctx_stats = embedding_spread_stats(z_ctx)
+            ctx_stats = embedding_spread_stats(z_ctx, target_std=embed_spread_target)
+            targets_per_image = float(outputs["target_valid"].float().sum(dim=1).mean().item())
+            footprint_values = outputs.get("cdd_box_sizes")
+            if footprint_values is None or footprint_values.numel() == 0:
+                footprint_values = torch.as_tensor(
+                    [outputs.get("mask_footprint_px", model.mask_box_size)],
+                    device=x_clean.device,
+                    dtype=x_clean.dtype,
+                )
+            mask_footprint_mean_px = float(footprint_values.float().mean().item())
+            mask_footprint_min_px = float(footprint_values.float().min().item())
+            mask_footprint_max_px = float(footprint_values.float().max().item())
+            mask_scale_factor = float(outputs.get("mask_scale_factor", model.mask_scale))
 
             elapsed = time.time() - start
             metrics_rows.append(
@@ -1351,17 +1331,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     batch_idx,
                     epoch * max(1, len(dataloader)) + batch_idx,
                     float(total_loss.item()),
-                    float(loss_mse.item()),
+                    float(loss_prediction.item()),
                     float(lr),
-                    float(loss_sigreg.item()),
-                    float(loss_symmetric.item()),
-                    float(var_term_t.item()),
-                    float(cov_term_t.item()),
-                    float((mse_loss_weight * loss_mse).item()),
-                    float((sigreg_weight * loss_sigreg).item()),
-                    float((symmetric_feature_loss_weight * loss_symmetric).item()),
-                    float((vicreg_var_weight * var_term_t).item()),
-                    float((vicreg_cov_weight * cov_term_t).item()),
+                    float(loss_spread.item()),
+                    float(loss_symmetry.item()),
+                    float((prediction_loss_weight * loss_prediction).item()),
+                    float((spread_regularizer_weight * loss_spread).item()),
+                    float((symmetry_loss_weight * loss_symmetry).item()),
                     float(new_momentum),
                     float(sim_val),
                     float(var_val),
@@ -1369,10 +1345,16 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     float(raw_mse_val),
                     float(norm_err_val),
                     float(valid_frac),
-                    ctx_stats["ctx_std_mean"],
-                    ctx_stats["ctx_std_min"],
-                    ctx_stats["ctx_var_mean"],
-                    ctx_stats["ctx_rank"],
+                    ctx_stats["embed_spread_mean"],
+                    ctx_stats["embed_spread_min"],
+                    ctx_stats["embed_under_spread_frac"],
+                    ctx_stats["dead_channel_count"],
+                    ctx_stats["context_manifold_size"],
+                    targets_per_image,
+                    mask_footprint_mean_px,
+                    mask_footprint_min_px,
+                    mask_footprint_max_px,
+                    mask_scale_factor,
                     round(elapsed, 4),
                 ]
             )
@@ -1425,22 +1407,23 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
                 _flush_csv_rows(visited_targets_log_path, visited_rows)
             metrics_bar.set_description_str(
-                f"tot={total_loss.item():.4f} mse={loss_mse.item():.4f} "
-                f"sig={loss_sigreg.item():.4f} sim={sim_val:.4f} "
-                f"cstd={ctx_stats['ctx_std_mean']:.3e} crank={ctx_stats['ctx_rank']:.2f} "
+                f"total={total_loss.item():.4f} prediction={loss_prediction.item():.4f} "
+                f"spread={loss_spread.item():.4f} sim={sim_val:.4f} "
+                f"embed_spread={ctx_stats['embed_spread_mean']:.3e} "
+                f"manifold={ctx_stats['context_manifold_size']:.2f} "
                 f"vf={valid_frac:.3f} lr={lr:.1e}",
                 refresh=True,
             )
             epoch_total += float(total_loss.item())
-            epoch_mse += float(loss_mse.item())
+            epoch_prediction += float(loss_prediction.item())
             epoch_sim += float(sim_val)
             epoch_var += float(var_val)
             epoch_cov += float(cov_val)
-            epoch_sigreg += float(loss_sigreg.item())
-            epoch_symmetric += float(loss_symmetric.item())
+            epoch_spread += float(loss_spread.item())
+            epoch_symmetric += float(loss_symmetry.item())
             epoch_valid_frac += float(valid_frac)
-            epoch_ctx_std_mean += ctx_stats["ctx_std_mean"]
-            epoch_ctx_rank += ctx_stats["ctx_rank"]
+            epoch_embed_spread_mean += ctx_stats["embed_spread_mean"]
+            epoch_context_manifold_size += ctx_stats["context_manifold_size"]
             epoch_batches += 1
 
         metrics_bar.close()
@@ -1454,7 +1437,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
         if epoch_batches > 0:
             avg_total = epoch_total / epoch_batches
-            avg_mse = epoch_mse / epoch_batches
+            avg_prediction = epoch_prediction / epoch_batches
             prev_epochs.append(avg_total)
             prev_str = " | ".join(
                 f"e{e_idx + 1}={prev_epochs[e_idx]:.4f}"
@@ -1464,11 +1447,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 prev_str = f" [{prev_str}]"
             tqdm.write(
                 f"[{config_name}] Epoch {epoch + 1}/{epochs} "
-                f"total={avg_total:.4f} mse={avg_mse:.4f} "
-                f"sig={_fmt_metric(epoch_sigreg/epoch_batches)} "
+                f"total={avg_total:.4f} prediction={avg_prediction:.4f} "
+                f"spread={_fmt_metric(epoch_spread/epoch_batches)} "
                 f"sim={_fmt_metric(epoch_sim/epoch_batches)} "
-                f"cstd={_fmt_metric(epoch_ctx_std_mean/epoch_batches)} "
-                f"crank={_fmt_metric(epoch_ctx_rank/epoch_batches)} "
+                f"embed_spread={_fmt_metric(epoch_embed_spread_mean/epoch_batches)} "
+                f"manifold={_fmt_metric(epoch_context_manifold_size/epoch_batches)} "
                 f"vfrac={_fmt_metric(epoch_valid_frac/epoch_batches)}"
                 f"{prev_str}"
             )

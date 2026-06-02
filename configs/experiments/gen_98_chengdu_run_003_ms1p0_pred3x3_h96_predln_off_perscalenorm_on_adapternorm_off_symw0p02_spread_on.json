@@ -1,0 +1,48 @@
+{
+  "base_config": "../base_pyramid_scaleaware_convnext.json",
+  "data": {
+    "npy_pattern": "chengdu.npy"
+  },
+  "model": {
+    "mode": "pyramid",
+    "model_key": "cdd_scaleaware_convnext",
+    "mask_spacing_scaling": 2.0,
+    "mask_scale_factor": 1.0,
+    "mask_footprint_px": 0,
+    "normalize_loss_l2": true,
+    "predictor_spatial_conv": true,
+    "predictor_layernorm": false,
+    "predictor_hidden": 96,
+    "scaleaware_norm_per_scale": true,
+    "scaleaware_adapter_norm": false,
+    "post_log_transform": true,
+    "use_grn": true,
+    "use_symmetric_feature_loss": true,
+    "target_sampling_mode": "priority_sampling",
+    "priority_top_percent": 15.0,
+    "priority_n_target": "auto",
+    "priority_min_targets_per_map": 10,
+    "priority_dithering_pixels": 6,
+    "target_nonoverlap": true
+  },
+  "train": {
+    "epochs": 5,
+    "log_interval": 1,
+    "vicreg_spatial_mode": "pooled",
+    "ema_momentum_base": 0.99,
+    "ema_momentum_final": 0.9999,
+    "ema_warmup_fraction": 0.25,
+    "prediction_loss_weight": 50.0,
+    "symmetry_loss_weight": 0.02,
+    "inference_tta_enabled": true,
+    "inference_tta_mode": "flip4",
+    "batch_size": 1,
+    "spread_regularizer": {
+      "type": "std_hinge",
+      "target": "context",
+      "weight": 10.0,
+      "target_std": 1.0,
+      "eps": 0.0001
+    }
+  }
+}

@@ -60,10 +60,10 @@ def main():
 
     sigmas = tuple(float(v) for v in model_cfg.get("sigmas", [2, 4, 8, 16]))
     largest_sigma = float(max(sigmas))
-    mask_scale = float(model_cfg.get("mask_size_scaling", 1.0))
+    mask_scale = float(model_cfg.get("mask_scale_factor", 1.0))
     spacing_scale = float(model_cfg.get("mask_spacing_scaling", 1.5))
-    mask_box_size = int(model_cfg.get("mask_box_size", 16))
-    max_box = round(largest_sigma * mask_scale + mask_box_size)
+    mask_footprint_px = int(model_cfg.get("mask_footprint_px", 16))
+    max_box = round(largest_sigma * mask_scale + mask_footprint_px)
     hardcap = model_cfg.get("mask_box_hardcap")
     if hardcap is not None and int(hardcap) > 0:
         max_box = min(max_box, int(hardcap))
@@ -93,7 +93,7 @@ def main():
             spacing_scale=spacing_scale,
             global_shift=bool(model_cfg.get("global_shift", True)),
             align_scales=bool(model_cfg.get("align_scales", True)),
-            mask_box_size=mask_box_size,
+            mask_box_size=mask_footprint_px,
             cdd_mode=model_cfg.get("cdd_mode", "log"),
             cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
             cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),

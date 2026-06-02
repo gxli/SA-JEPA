@@ -46,11 +46,6 @@ def _apply_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
     raise ValueError(name)
 
 
-def _invert_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
-    """Invert a TTA view transform (flip is self-inverse, same as _apply_tta_2d)."""
-    return _apply_tta_2d(name, z)
-
-
 def _mask_invalid_targets_from_input(
     *,
     outputs: dict,
@@ -270,10 +265,10 @@ def run_post_training_inference(
                     mask_inference=bool(mask_inference),
                     cdd_orig=cdv,
                 )
-                out_v["pred_map"] = _invert_tta_2d(vname, out_v["pred_map"])
-                out_v["gt_map"] = _invert_tta_2d(vname, out_v["gt_map"])
+                out_v["pred_map"] = _apply_tta_2d(vname, out_v["pred_map"])
+                out_v["gt_map"] = _apply_tta_2d(vname, out_v["gt_map"])
                 if "context_map" in out_v:
-                    out_v["context_map"] = _invert_tta_2d(vname, out_v["context_map"])
+                    out_v["context_map"] = _apply_tta_2d(vname, out_v["context_map"])
                 per_view.append(out_v)
             out_i = per_view[0]
             if len(per_view) > 1:
