@@ -10,6 +10,7 @@
     "cube_slice_strategy": "center",
     "cube_slice_axis": 0,
     "cube_slice_index": 0,
+    "crop_mode": "none",
     "random_roll_max": 0,
     "d4_augment": true
   },
@@ -50,6 +51,10 @@
     "weight_decay": 1e-05,
     "num_workers": 4,
     "sigreg_weight": 10,
+    "sigreg_sketch_dim": 64,
+    "sigreg_target_std": 1.0,
+    "sigreg_eps": 0.0001,
+    "sigreg_noise_std": 0.0,
     "symmetric_feature_loss_weight": 0,
     "umap": {
       "metric": "euclidean",

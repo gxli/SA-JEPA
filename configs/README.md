@@ -70,8 +70,22 @@ Dataset preprocessing is always linear `normalize01`. Do not use
 `data.log_transform`; `model.post_log_transform` is the only runtime log
 switch. The model applies it after masking.
 
-`JEPADataset` always preserves native input resolution. Do not use the removed
-`data.image_size` key; there is no implicit resize step.
+`JEPADataset` preserves native input resolution by default. Do not use the
+removed `data.image_size` key; there is no implicit resize step. To train large
+2D images on random crops, set:
+
+- `data.crop_mode`: `"random"`
+- `data.crop_size`: an integer for square crops or `[height, width]`
+
+Validation uses a deterministic center crop of the same size. Post-training
+inference keeps native resolution so exported maps cover the full image.
+CDD always adds one leading scale dimension: `(H, W) -> (S, H, W)` and
+`(D, H, W) -> (S, D, H, W)`. For a 3D array consumed as 2D slices, CDD is
+cached on the full cube first. The dataset then selects one aligned CDD slice
+and finally applies the 2D crop.
 
 SigReg always uses pre-predictor context patch embeddings when
 `sigreg_weight > 0`. Do not use the removed `sigreg_on_pred` selector.
+It uses a standard-deviation hinge controlled by `train.sigreg_target_std` and
+`train.sigreg_eps`. `train.sigreg_noise_std` defaults to `0`; set a small
+positive value only when exact-collapse symmetry breaking is desired.

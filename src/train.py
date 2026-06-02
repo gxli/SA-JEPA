@@ -31,6 +31,7 @@ from src.losses import (
     compute_sim_var_cov,
     compute_sim_var_cov_torch,
     compute_target_energy_map,
+    embedding_spread_stats,
     extract_valid_pooled_embeddings,
     sketched_sigreg_loss,
 )
@@ -101,6 +102,100 @@ def _collate_for_inference(batch):
     return _collate_pad_hw(batch), None
 
 
+def _summarize_data_array(arr: np.ndarray) -> dict:
+    raw = np.asarray(arr)
+    finite = np.isfinite(raw)
+    finite_values = raw[finite]
+    clean = np.nan_to_num(raw.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    amin = float(clean.min()) if clean.size > 0 else 0.0
+    amax = float(clean.max()) if clean.size > 0 else 0.0
+    normalized = (clean - amin) / (amax - amin) if amax - amin > 1e-20 else np.zeros_like(clean)
+    nonzero_coords = np.where(normalized > 0.0)
+    bbox = None
+    if len(nonzero_coords) > 0 and nonzero_coords[0].size > 0:
+        bbox = [[int(axis.min()), int(axis.max())] for axis in nonzero_coords]
+    quantiles = {}
+    if finite_values.size > 0:
+        quantiles = {
+            str(q): float(np.quantile(finite_values, q))
+            for q in (0.0, 0.5, 0.9, 0.99, 1.0)
+        }
+    return {
+        "shape": [int(v) for v in raw.shape],
+        "ndim": int(raw.ndim),
+        "dtype": str(raw.dtype),
+        "size": int(raw.size),
+        "finite_count": int(finite.sum()),
+        "nan_count": int(np.isnan(raw).sum()),
+        "posinf_count": int(np.isposinf(raw).sum()),
+        "neginf_count": int(np.isneginf(raw).sum()),
+        "raw_finite_zero_count": int(np.count_nonzero(finite_values == 0.0)),
+        "raw_finite_zero_fraction": float(np.mean(finite_values == 0.0)) if finite_values.size > 0 else 0.0,
+        "raw_quantiles": quantiles,
+        "normalized_zero_count": int(np.count_nonzero(normalized == 0.0)),
+        "normalized_zero_fraction": float(np.mean(normalized == 0.0)) if normalized.size > 0 else 0.0,
+        "normalized_positive_count": int(np.count_nonzero(normalized > 0.0)),
+        "normalized_nonzero_bbox": bbox,
+        "aspect_ratio_h_over_w": (
+            float(raw.shape[-2]) / float(raw.shape[-1])
+            if raw.ndim >= 2 and int(raw.shape[-1]) > 0
+            else None
+        ),
+    }
+
+
+def _write_data_profile(*, data_cfg: dict, session_dir: str, config_name: str) -> None:
+    import glob as _glob
+
+    pattern = os.path.join(data_cfg.get("data_root", "data"), data_cfg.get("npy_pattern", "*.npy"))
+    files = sorted(_glob.glob(pattern))
+    profile = {
+        "pattern": pattern,
+        "crop_mode": str(data_cfg.get("crop_mode", "none")),
+        "crop_size": data_cfg.get("crop_size"),
+        "files": [],
+    }
+    for path in files:
+        item = {"path": path}
+        item.update(_summarize_data_array(np.load(path, mmap_mode="r")))
+        profile["files"].append(item)
+        print(
+            f"[{config_name}] Data profile: path={path} shape={tuple(item['shape'])} "
+            f"nan={item['nan_count']} normalized_zero_fraction={item['normalized_zero_fraction']:.4f} "
+            f"aspect_h_over_w={item['aspect_ratio_h_over_w']}"
+        )
+    with open(os.path.join(session_dir, "data_profile.json"), "w", encoding="utf-8") as f:
+        json.dump(profile, f, indent=2)
+        f.write("\n")
+
+
+def _write_cdd_cache_profile(*, cdd_cache: dict | None, session_dir: str, config_name: str) -> None:
+    entries = []
+    for (path, slice_idx), value in sorted((cdd_cache or {}).items()):
+        arr = np.asarray(value)
+        finite = np.isfinite(arr)
+        item = {
+            "path": path,
+            "slice_idx": slice_idx,
+            "shape": [int(v) for v in arr.shape],
+            "finite_count": int(finite.sum()),
+            "nan_count": int(np.isnan(arr).sum()),
+            "zero_count": int(np.count_nonzero(arr == 0.0)),
+            "zero_fraction": float(np.mean(arr == 0.0)) if arr.size > 0 else 0.0,
+            "positive_count": int(np.count_nonzero(arr > 0.0)),
+            "min": float(arr[finite].min()) if finite.any() else None,
+            "max": float(arr[finite].max()) if finite.any() else None,
+        }
+        entries.append(item)
+        print(
+            f"[{config_name}] CDD cache profile: path={path} shape={tuple(item['shape'])} "
+            f"nan={item['nan_count']} zero_fraction={item['zero_fraction']:.4f} max={item['max']}"
+        )
+    with open(os.path.join(session_dir, "cdd_cache_profile.json"), "w", encoding="utf-8") as f:
+        json.dump({"entries": entries}, f, indent=2)
+        f.write("\n")
+
+
 def _precompute_cdd_cache(
     *,
     data_cfg: dict,
@@ -130,38 +225,44 @@ def _precompute_cdd_cache(
     cache = {}
     for path in npy_files:
         arr = np.load(path, mmap_mode="r").astype(np.float32)
-        # Normalize01 (same as JEPADataset._normalize01)
+        # Normalize01 (same order as JEPADataset._preprocess_arr2d).
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         amin, amax = float(arr.min()), float(arr.max())
         if amax - amin > 1e-20:
             arr = (arr - amin) / (amax - amin)
         else:
             arr = np.zeros_like(arr, dtype=np.float32)
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-        if arr.ndim == 2:
-            slices = [(arr2d, None) for arr2d in [arr]]
-        elif arr.ndim == 3:
-            # Pre-compute all slices along axis 0 for 3D data.
-            depth = arr.shape[0]
-            slices = [(arr[i], i) for i in range(depth)]
-        else:
+        if arr.ndim not in (2, 3):
             raise ValueError(f"Unexpected ndim={arr.ndim} for {path}")
-        for arr2d, slice_idx in slices:
-            cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(
-                arr2d,
-                num_channels=len(sigmas),
-                max_scale=max(float(s) for s in sigmas),
-                mode=cdd_mode,
-                constrained=cdd_constrained,
-                sm_mode=cdd_sm_mode,
-                return_scales=False,
-                verbose=False,
-                use_gpu=True,
+        # Preserve volumetric context: decompose a cube once, then let the
+        # dataset choose a 2D slice from every cached CDD channel together.
+        cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(
+            arr,
+            num_channels=len(sigmas),
+            max_scale=max(float(s) for s in sigmas),
+            mode=cdd_mode,
+            constrained=cdd_constrained,
+            sm_mode=cdd_sm_mode,
+            return_scales=False,
+            verbose=False,
+            use_gpu=True,
+        )
+        # CDD always introduces one leading scale axis:
+        # image (H,W) -> (S,H,W), cube (D,H,W) -> (S,D,H,W).
+        cdd_orig = np.clip(np.stack(cdd_channels_arr, axis=0).astype(np.float32), a_min=0.0, a_max=None)
+        if cdd_orig.ndim != arr.ndim + 1 or cdd_orig.shape[1:] != arr.shape:
+            raise ValueError(
+                f"CDD output for {path} must have one leading scale axis over input shape {arr.shape}, "
+                f"got {cdd_orig.shape}"
             )
-            cdd_orig = np.clip(np.asarray(cdd_channels_arr, dtype=np.float32), a_min=0.0, a_max=None)
-            if cdd_append_last_residual:
-                cdd_orig[-1] = cdd_orig[-1] + np.asarray(cdd_residual, dtype=np.float32)
-            cache_key = (path, slice_idx)  # matches JEPADataset.sample_index key format
-            cache[cache_key] = cdd_orig.astype(np.float32, copy=False)
+        if cdd_append_last_residual:
+            cdd_residual = np.asarray(cdd_residual, dtype=np.float32)
+            if cdd_residual.shape != arr.shape:
+                raise ValueError(
+                    f"CDD residual for {path} must match input shape {arr.shape}, got {cdd_residual.shape}"
+                )
+            cdd_orig[-1] = cdd_orig[-1] + cdd_residual
+        cache[(path, None)] = cdd_orig.astype(np.float32, copy=False)
     # Free GPU memory used by CDD.
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -671,6 +772,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     image_batch_inference = (input_type == "image_batch")
 
     resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
+    _write_data_profile(data_cfg=data_cfg, session_dir=session_dir, config_name=config_name)
 
     print(
         f"[{config_name}] Resolved pipeline: "
@@ -818,6 +920,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         device=device,
         config_name=config_name,
     ) if not is_3d_mode else None
+    _write_cdd_cache_profile(cdd_cache=cdd_cache, session_dir=session_dir, config_name=config_name)
 
     if is_3d_mode:
         dataset = JEPA3DCropDataset(
@@ -843,6 +946,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         n_total = len(dataset.npy_files)
         val_fraction = 0.0
     else:
+        train_crop_mode = str(data_cfg.get("crop_mode", "none")).lower()
+        train_crop_size = data_cfg.get("crop_size")
+        val_crop_mode = "center" if train_crop_mode != "none" else "none"
         dataset = JEPADataset(
             num_samples=data_cfg.get("num_samples", 2000),
             data_root=data_cfg.get("data_root", "data"),
@@ -850,6 +956,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
             cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
             cube_slice_index=data_cfg.get("cube_slice_index", 0),
+            crop_mode=train_crop_mode,
+            crop_size=train_crop_size,
             random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
             d4_augment=bool(data_cfg.get("d4_augment", False)),
             input_type=input_type,
@@ -882,6 +990,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
                 cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
                 cube_slice_index=data_cfg.get("cube_slice_index", 0),
+                crop_mode=val_crop_mode,
+                crop_size=train_crop_size,
                 random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
                 d4_augment=False,
                 input_type=input_type,
@@ -897,6 +1007,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         print(
             f"[{config_name}] Data jitter: random_roll_max={dataset.random_roll_max} "
             f"(symmetric inclusive roll in [-max, +max])"
+        )
+    if (not is_3d_mode) and getattr(dataset, "crop_mode", "none") != "none":
+        print(
+            f"[{config_name}] Training crop: mode={dataset.crop_mode} "
+            f"size={dataset.crop_size}; validation=center; inference=native"
         )
     requested_workers = int(train_cfg.get("num_workers", 4))
     # macOS/MPS-safe default: avoid multiprocessing worker hangs unless explicitly set.
@@ -951,6 +1066,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
             cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
             cube_slice_index=data_cfg.get("cube_slice_index", 0),
+            crop_mode="none",
+            crop_size=None,
             random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
             d4_augment=False,
             input_type=input_type,
@@ -1021,6 +1138,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", 0.1))
     sigreg_weight = float(train_cfg.get("sigreg_weight", 0.0))
     sigreg_sketch_dim = int(train_cfg.get("sigreg_sketch_dim", 64))
+    sigreg_target_std = float(train_cfg.get("sigreg_target_std", 1.0))
+    sigreg_eps = float(train_cfg.get("sigreg_eps", 1e-4))
+    sigreg_noise_std = float(train_cfg.get("sigreg_noise_std", 0.0))
     symmetric_feature_loss_weight = float(train_cfg.get("symmetric_feature_loss_weight", 0.0))
     vicreg_spatial_mode = str(train_cfg.get("vicreg_spatial_mode", "dense")).lower()
     if vicreg_spatial_mode not in ("dense", "pooled"):
@@ -1062,6 +1182,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     "raw_mse",
                     "norm_err",
                     "valid_frac",
+                    "ctx_std_mean",
+                    "ctx_std_min",
+                    "ctx_var_mean",
+                    "ctx_rank",
                     "time_sec",
                 ]
             )
@@ -1090,6 +1214,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     "vicreg_var_weight": vicreg_var_weight,
                     "vicreg_cov_weight": vicreg_cov_weight,
                     "sigreg_weight": sigreg_weight,
+                    "sigreg_target_std": sigreg_target_std,
+                    "sigreg_eps": sigreg_eps,
+                    "sigreg_noise_std": sigreg_noise_std,
                     "symmetric_feature_loss_weight": symmetric_feature_loss_weight,
                 },
                 f,
@@ -1116,6 +1243,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         epoch_sigreg = 0.0
         epoch_symmetric = 0.0
         epoch_valid_frac = 0.0
+        epoch_ctx_std_mean = 0.0
+        epoch_ctx_rank = 0.0
         epoch_batches = 0
         metrics_rows = []
         masked_scale_rows = []
@@ -1173,7 +1302,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 )
                 z_ctx_key = "context_patches" if "context_patches" in outputs else "pred_patches"
                 z_ctx = extract_valid_pooled_embeddings(outputs, key=z_ctx_key)
-                loss_sigreg = sketched_sigreg_loss(z_ctx, sketch_dim=sigreg_sketch_dim)
+                loss_sigreg = sketched_sigreg_loss(
+                    z_ctx,
+                    sketch_dim=sigreg_sketch_dim,
+                    target_std=sigreg_target_std,
+                    eps=sigreg_eps,
+                    noise_std=sigreg_noise_std,
+                )
                 loss_symmetric = model.compute_symmetric_loss(outputs)
                 total_loss = (
                     (mse_loss_weight * loss_mse)
@@ -1207,6 +1342,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             )
             raw_mse_val, norm_err_val = compute_raw_mse_and_norm_err(outputs)
             valid_frac = float(outputs["target_valid"].float().mean().item())
+            ctx_stats = embedding_spread_stats(z_ctx)
 
             elapsed = time.time() - start
             metrics_rows.append(
@@ -1233,6 +1369,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     float(raw_mse_val),
                     float(norm_err_val),
                     float(valid_frac),
+                    ctx_stats["ctx_std_mean"],
+                    ctx_stats["ctx_std_min"],
+                    ctx_stats["ctx_var_mean"],
+                    ctx_stats["ctx_rank"],
                     round(elapsed, 4),
                 ]
             )
@@ -1287,6 +1427,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             metrics_bar.set_description_str(
                 f"tot={total_loss.item():.4f} mse={loss_mse.item():.4f} "
                 f"sig={loss_sigreg.item():.4f} sim={sim_val:.4f} "
+                f"cstd={ctx_stats['ctx_std_mean']:.3e} crank={ctx_stats['ctx_rank']:.2f} "
                 f"vf={valid_frac:.3f} lr={lr:.1e}",
                 refresh=True,
             )
@@ -1298,6 +1439,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_sigreg += float(loss_sigreg.item())
             epoch_symmetric += float(loss_symmetric.item())
             epoch_valid_frac += float(valid_frac)
+            epoch_ctx_std_mean += ctx_stats["ctx_std_mean"]
+            epoch_ctx_rank += ctx_stats["ctx_rank"]
             epoch_batches += 1
 
         metrics_bar.close()
@@ -1324,6 +1467,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"total={avg_total:.4f} mse={avg_mse:.4f} "
                 f"sig={_fmt_metric(epoch_sigreg/epoch_batches)} "
                 f"sim={_fmt_metric(epoch_sim/epoch_batches)} "
+                f"cstd={_fmt_metric(epoch_ctx_std_mean/epoch_batches)} "
+                f"crank={_fmt_metric(epoch_ctx_rank/epoch_batches)} "
                 f"vfrac={_fmt_metric(epoch_valid_frac/epoch_batches)}"
                 f"{prev_str}"
             )
@@ -1503,7 +1648,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         else:
             print(f"[{config_name}] warning: inference_outputs.pt missing; skip artifact generation")
 
-    if not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)):
+    if not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)) and model.mode == "pyramid":
         try:
             from src.utils.scale_probe import probe_scale_response
 

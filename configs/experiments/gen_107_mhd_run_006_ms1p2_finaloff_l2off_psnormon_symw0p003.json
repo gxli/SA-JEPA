@@ -34,7 +34,7 @@
     "log_interval": 1,
     "diagnostic_interval": 10,
     "batch_size": 4,
-    "num_workers": 8,
+    "num_workers": 0,
     "prefetch_factor": 2,
     "vicreg_spatial_mode": "pooled",
     "ema_momentum_base": 0.99,

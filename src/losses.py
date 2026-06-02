@@ -57,10 +57,17 @@ def extract_valid_pooled_embeddings(outputs: dict, key: str = "context_patches")
     return z
 
 
-def sketched_sigreg_loss(z: torch.Tensor, sketch_dim: int = 64) -> torch.Tensor:
+def sketched_sigreg_loss(
+    z: torch.Tensor,
+    sketch_dim: int = 64,
+    target_std: float = 1.0,
+    eps: float = 1e-4,
+    noise_std: float = 0.0,
+) -> torch.Tensor:
     """
     Lightweight SIGReg-style isotropic Gaussian regularization.
-    Encourages projected embeddings to have mean 0 and variance 1.
+    Uses a VICReg-style standard-deviation hinge so gradients remain useful
+    close to collapse. Optional noise breaks exact sample symmetry at z == 0.
     """
     z = z.float()  # cast to fp32 to avoid underflow in fp16
     if z.numel() == 0:
@@ -69,14 +76,42 @@ def sketched_sigreg_loss(z: torch.Tensor, sketch_dim: int = 64) -> torch.Tensor:
         return z.sum() * 0.0
 
     z = z - z.mean(dim=0, keepdim=True)
+    if float(noise_std) > 0.0:
+        noise = torch.randn_like(z) * float(noise_std)
+        z = z + (noise - noise.mean(dim=0, keepdim=True))
     c = z.shape[1]
     sketch_dim = int(max(1, sketch_dim))
-    a = torch.randn((c, sketch_dim), device=z.device, dtype=z.dtype)
-    a = a / a.norm(dim=0, keepdim=True).clamp_min(1e-6)
-    y = z @ a  # N,sketch_dim
+    if sketch_dim < c:
+        a = torch.randn((c, sketch_dim), device=z.device, dtype=z.dtype)
+        a = a / (float(c) ** 0.5)
+        z = z @ a
 
-    var_loss = (y.var(dim=0, unbiased=False) - 1.0).pow(2).mean()
-    return var_loss
+    std = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
+    return torch.relu(float(target_std) - std).mean()
+
+
+@torch.no_grad()
+def embedding_spread_stats(z: torch.Tensor) -> dict[str, float]:
+    """Compact collapse diagnostics for pooled context embeddings."""
+    z = z.detach().float()
+    if z.numel() == 0:
+        return {"ctx_std_mean": 0.0, "ctx_std_min": 0.0, "ctx_var_mean": 0.0, "ctx_rank": 0.0}
+    z = z - z.mean(dim=0, keepdim=True)
+    var = z.var(dim=0, unbiased=False)
+    cov = (z.T @ z) / max(1, int(z.shape[0]))
+    eig = torch.linalg.eigvalsh(cov).clamp_min(0.0)
+    eig_sum = eig.sum()
+    if float(eig_sum.item()) <= 1e-20:
+        rank = 0.0
+    else:
+        p = eig / eig_sum
+        rank = float(torch.exp(-(p * p.clamp_min(1e-20).log()).sum()).item())
+    return {
+        "ctx_std_mean": float(torch.sqrt(var + 1e-12).mean().item()),
+        "ctx_std_min": float(torch.sqrt(var + 1e-12).min().item()),
+        "ctx_var_mean": float(var.mean().item()),
+        "ctx_rank": rank,
+    }
 
 
 def compute_sim_var_cov(outputs: dict, spatial_mode: str = "dense") -> tuple[float, float, float]:

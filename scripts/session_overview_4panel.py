@@ -433,7 +433,9 @@ def main() -> None:
         visit_freq = None
         if image_shape is not None:
             vh, vw = int(image_shape[0]), int(image_shape[1])
-        visit_npy = session_dir / "visited_target_frequency.npy"
+        visit_npy = session_dir / "visited_target_frequency_canonical.npy"
+        if not visit_npy.exists():
+            visit_npy = session_dir / "visited_target_frequency.npy"
         if visit_npy.exists():
             try:
                 vf = to_native(np.load(visit_npy)).astype(np.float32)

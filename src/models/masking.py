@@ -92,12 +92,16 @@ def _build_priority_catalogue_from_cdd_ratio(
         numerator = cdd_orig[0]
     else:
         numerator = cdd_orig[0] + cdd_orig[1]
-    denom = np.maximum(np.sum(cdd_orig, axis=0), 1e-8)
+    total_flux = np.sum(cdd_orig, axis=0)
+    denom = np.maximum(total_flux, 1e-8)
     ratio = np.nan_to_num(numerator / denom, nan=0.0, posinf=0.0, neginf=0.0)
 
     half_lo = int(patch_size) // 2
     half_hi = int(patch_size) - half_lo
     valid = np.ones((h, w), dtype=bool)
+    # Empty background pixels have tied zero ratios and should never enter a
+    # priority catalogue merely because top_percent exceeds the signal area.
+    valid &= total_flux > 1e-8
     if half_lo > 0:
         valid[:half_lo, :] = False
         valid[:, :half_lo] = False

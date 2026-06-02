@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html as html_lib
+import json
 import os
 import re
 import shutil
@@ -15,7 +16,7 @@ import plotly.graph_objects as go
 import torch
 
 
-DASHBOARD_VERSION = "aligned-loss-layout-v2"
+DASHBOARD_VERSION = "aligned-loss-layout-v3"
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -859,39 +860,56 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         out[den <= 0.0] = np.nan
         return out
     n = min(loss_x.size, loss_total.size, loss_jepa.size) if (loss_x.size and loss_total.size and loss_jepa.size) else 0
-    fig_loss = go.Figure()
-    if n > 0:
-        lx = loss_x[:n]
-        lt = loss_total[:n]
-        lj = loss_jepa[:n]
-        fig_loss.add_trace(go.Scattergl(x=lx, y=lt, mode="lines", name="total_loss", line=dict(width=1), opacity=0.15, showlegend=False))
-        fig_loss.add_trace(go.Scattergl(x=lx, y=_smooth(lt), mode="lines", name="total_loss", line=dict(width=2)))
-        fig_loss.add_trace(go.Scattergl(x=lx, y=lj, mode="lines", name="loss_jepa", line=dict(width=1), opacity=0.15, showlegend=False))
-        fig_loss.add_trace(go.Scattergl(x=lx, y=_smooth(lj), mode="lines", name="loss_jepa", line=dict(width=2)))
-    fig_loss.update_layout(
-        template="plotly_white",
-        title={"text": "Loss Curve", "x": 0.02},
-        margin=dict(l=42, r=8, t=36, b=36),
-        height=330,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
+    loss_terms = (
+        ("jepa", "mse_loss_weight", loss_jepa, weighted_jepa, "#636EFA"),
+        ("sigreg", "sigreg_weight", loss_sigreg, weighted_sigreg, "#EF553B"),
+        ("symmetric", "symmetric_feature_loss_weight", loss_symmetric, weighted_symmetric, "#00CC96"),
+        ("var", "vicreg_var_weight", loss_var, weighted_var, "#AB63FA"),
+        ("cov", "vicreg_cov_weight", loss_cov, weighted_cov, "#FFA15A"),
     )
-    fig_loss.update_xaxes(title_text="global_step (or epoch+batch fallback)")
-    fig_loss.update_yaxes(title_text="loss")
+    loss_weights = {}
+    loss_weights_path = os.path.join(session_dir, "loss_weights.json")
+    if os.path.exists(loss_weights_path):
+        try:
+            with open(loss_weights_path, "r", encoding="utf-8") as f:
+                loss_weights = json.load(f)
+        except Exception:
+            loss_weights = {}
+    active_loss_terms = []
+    if n > 0:
+        for name, weight_key, raw_arr, weighted_arr, color in loss_terms:
+            if raw_arr.size < n or weighted_arr.size < n:
+                continue
+            weighted = weighted_arr[:n]
+            weight = loss_weights.get(weight_key)
+            configured_active = weight is not None and abs(float(weight)) > 1e-12
+            observed_active = np.isfinite(weighted).any() and np.nanmax(np.abs(weighted)) > 1e-12
+            if configured_active or observed_active:
+                active_loss_terms.append((name, raw_arr[:n], weighted, color))
+
+    def _add_loss_trace(fig: go.Figure, *, x: np.ndarray, y: np.ndarray, name: str, color: str) -> None:
+        values = np.where(np.isfinite(y), y, np.nan).astype(np.float32)
+        fig.add_trace(
+            go.Scattergl(
+                x=x, y=values, mode="lines", name=name,
+                line=dict(width=1, color=color), opacity=0.12, showlegend=False,
+            )
+        )
+        fig.add_trace(
+            go.Scattergl(
+                x=x, y=_smooth(values), mode="lines", name=name,
+                line=dict(width=2, color=color),
+            )
+        )
+
     fig_loss_components = go.Figure()
     if n > 0:
         lx = loss_x[:n]
-        def _add_if(name: str, arr: np.ndarray):
-            if arr.size >= n and np.isfinite(arr[:n]).any():
-                y = np.nan_to_num(arr[:n], nan=0.0)
-                fig_loss_components.add_trace(go.Scattergl(x=lx, y=y, mode="lines", name=name, line=dict(width=1), opacity=0.12, showlegend=False))
-                fig_loss_components.add_trace(go.Scattergl(x=lx, y=_smooth(y), mode="lines", name=name, line=dict(width=2)))
-        _add_if("loss_sigreg", loss_sigreg)
-        _add_if("loss_symmetric", loss_symmetric)
-        _add_if("loss_var", loss_var)
-        _add_if("loss_cov", loss_cov)
+        for name, raw_arr, _, color in active_loss_terms:
+            _add_loss_trace(fig_loss_components, x=lx, y=raw_arr, name=f"loss_{name}", color=color)
     fig_loss_components.update_layout(
         template="plotly_white",
-        title={"text": "Loss Components (Unweighted)", "x": 0.02},
+        title={"text": "Active Loss Terms (Unweighted)", "x": 0.02},
         margin=dict(l=42, r=8, t=36, b=36),
         height=330,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
@@ -901,20 +919,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     fig_weighted_components = go.Figure()
     if n > 0:
         lx = loss_x[:n]
-        for name, arr in (
-            ("weighted_jepa", weighted_jepa),
-            ("weighted_sigreg", weighted_sigreg),
-            ("weighted_symmetric", weighted_symmetric),
-            ("weighted_var", weighted_var),
-            ("weighted_cov", weighted_cov),
-        ):
-            if arr.size >= n and np.isfinite(arr[:n]).any():
-                y = np.nan_to_num(arr[:n], nan=0.0)
-                fig_weighted_components.add_trace(go.Scattergl(x=lx, y=y, mode="lines", name=name, line=dict(width=1), opacity=0.12, showlegend=False))
-                fig_weighted_components.add_trace(go.Scattergl(x=lx, y=_smooth(y), mode="lines", name=name, line=dict(width=2)))
+        for name, _, weighted_arr, color in active_loss_terms:
+            _add_loss_trace(fig_weighted_components, x=lx, y=weighted_arr, name=f"weighted_{name}", color=color)
+        _add_loss_trace(fig_weighted_components, x=lx, y=loss_total[:n], name="total_loss", color="#222222")
     fig_weighted_components.update_layout(
         template="plotly_white",
-        title={"text": "Loss Components (Weighted into total_loss)", "x": 0.02},
+        title={"text": "Active Loss Terms (Weighted into total_loss)", "x": 0.02},
         margin=dict(l=42, r=8, t=36, b=36),
         height=330,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
@@ -1011,9 +1021,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         [
             {"title": "Input (Log-Norm)", "fig": heat("Input (Log-Norm)", data["orig"], "Viridis"), "group": "input"},
             {"title": "Effective Rank", "fig": fig_eff_rank, "group": "eff-rank"},
-            {"title": "Loss Curve", "fig": fig_loss, "group": "loss"},
-            {"title": "Loss Components", "fig": fig_loss_components, "group": "loss-components"},
-            {"title": "Weighted Loss Components", "fig": fig_weighted_components, "group": "weighted-loss-components"},
+            {"title": "Active Loss Terms (Unweighted)", "fig": fig_loss_components, "group": "loss-components"},
+            {"title": "Active Loss Terms (Weighted)", "fig": fig_weighted_components, "group": "weighted-loss-components"},
             {"title": "Rank Diagnostics", "fig": fig_rank_diag, "group": "rank-diag"},
             {"title": "Rank Energy Top-k", "fig": fig_rank_energy, "group": "rank-energy"},
             {"title": "Energy Distribution", "fig": fig_energy_dist, "group": "energy-dist"},
@@ -1271,7 +1280,10 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     # Mandatory diagnostics summary output.
     print(f"dashboard_plot_summary_begin session={session_dir}")
     print(f"dashboard_plot_summary_cards={len(cards)}")
-    print(f"dashboard_plot_item=Loss Curve: {'ok' if n > 0 else 'empty'} (total_points={n} jepa_points={n})")
+    print(
+        f"dashboard_plot_item=Active Loss Terms: {'ok' if n > 0 else 'empty'} "
+        f"(points={n} active={','.join(name for name, _, _, _ in active_loss_terms)})"
+    )
     er_n = int(min(er_x.size, er_y.size)) if (er_x.size and er_y.size) else 0
     print(f"dashboard_plot_item=Effective Rank: {'ok' if er_n > 0 else 'empty'} (points={er_n})")
     for name, stem in (("Context", "context"), ("Predict", "pred"), ("Target", "gt")):

@@ -15,6 +15,8 @@ class JEPADataset(Dataset):
         cube_slice_strategy: str = "auto",
         cube_slice_axis: int = 0,
         cube_slice_index: int = 0,
+        crop_mode: str = "none",
+        crop_size: int | tuple[int, int] | list[int] | None = None,
         random_roll_max: int = 0,
         d4_augment: bool = False,
         input_type: str = "image",
@@ -41,9 +43,15 @@ class JEPADataset(Dataset):
         self.num_samples = num_samples
         self.cube_slice_axis = cube_slice_axis
         self.cube_slice_index = cube_slice_index
+        self.crop_mode = str(crop_mode).lower()
+        if self.crop_mode not in {"none", "random", "center"}:
+            raise ValueError("crop_mode must be one of: none, random, center")
+        self.crop_size = self._coerce_crop_size(crop_size)
+        if self.crop_mode != "none" and self.crop_size is None:
+            raise ValueError("crop_size is required when crop_mode is not 'none'")
         self.random_roll_max = int(random_roll_max)
         self.d4_augment = bool(d4_augment)
-        self.cdd_cache = cdd_cache
+        self.cdd_cache = cdd_cache or None
 
         pattern = os.path.join(data_root, npy_pattern)
         self.npy_files = sorted(glob.glob(pattern))
@@ -130,6 +138,30 @@ class JEPADataset(Dataset):
         slicer[axis] = int(np.clip(sidx, 0, depth - 1))
         return arr[tuple(slicer)], int(sidx)
 
+    def _extract_2d_from_cdd(self, cdd: np.ndarray, forced_slice_idx=None) -> np.ndarray:
+        if cdd.ndim == 3:
+            return cdd
+        if cdd.ndim != 4:
+            raise ValueError(f"Expected cached CDD shape (S,H,W) or (S,D,H,W), got {cdd.shape}")
+        if self.input_type == "image_batch":
+            axis = 0
+            depth = cdd.shape[axis + 1]
+            if self.image_batch_inference:
+                sidx = 0
+            elif forced_slice_idx is not None:
+                sidx = forced_slice_idx
+            else:
+                sidx = int(np.random.randint(0, depth))
+        else:
+            axis = self.cube_slice_axis % 3
+            depth = cdd.shape[axis + 1]
+            sidx = forced_slice_idx
+            if sidx is None:
+                sidx = self._pick_slice_index(depth)
+        slicer = [slice(None), slice(None), slice(None), slice(None)]
+        slicer[axis + 1] = int(np.clip(sidx, 0, depth - 1))
+        return cdd[tuple(slicer)]
+
     def _load_sample(self, path: str, forced_slice_idx=None) -> torch.Tensor:
         arr_mm = np.load(path, mmap_mode="r")
         arr2d, _ = self._extract_2d_from_array(arr_mm, forced_slice_idx=forced_slice_idx)
@@ -137,6 +169,42 @@ class JEPADataset(Dataset):
 
         # Keep native resolution (including non-square fields).
         return torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)  # 1 x H x W
+
+    @staticmethod
+    def _coerce_crop_size(crop_size) -> tuple[int, int] | None:
+        if crop_size is None:
+            return None
+        if isinstance(crop_size, (list, tuple)):
+            if len(crop_size) != 2:
+                raise ValueError(f"crop_size must be an int or [height, width], got {crop_size!r}")
+            crop_h, crop_w = int(crop_size[0]), int(crop_size[1])
+        else:
+            crop_h = crop_w = int(crop_size)
+        if crop_h <= 0 or crop_w <= 0:
+            raise ValueError(f"crop_size must be positive, got {crop_size!r}")
+        return crop_h, crop_w
+
+    def _crop_slices(self, h: int, w: int) -> tuple[slice, slice] | None:
+        if self.crop_mode == "none" or self.crop_size is None:
+            return None
+        crop_h, crop_w = self.crop_size
+        if crop_h > h or crop_w > w:
+            raise ValueError(f"crop_size={self.crop_size} exceeds image shape={(h, w)}")
+        if self.crop_mode == "center":
+            y0 = (h - crop_h) // 2
+            x0 = (w - crop_w) // 2
+        else:
+            # Crop origin stays inside the margin implied by the crop size.
+            y0 = int(np.random.randint(0, h - crop_h + 1))
+            x0 = int(np.random.randint(0, w - crop_w + 1))
+        return slice(y0, y0 + crop_h), slice(x0, x0 + crop_w)
+
+    def _crop_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        crop = self._crop_slices(int(x.shape[-2]), int(x.shape[-1]))
+        if crop is None:
+            return x
+        crop_y, crop_x = crop
+        return x[..., crop_y, crop_x]
 
     @staticmethod
     def _normalize01(arr: np.ndarray) -> np.ndarray:
@@ -154,12 +222,23 @@ class JEPADataset(Dataset):
         key = self.sample_index[idx % len(self.sample_index)]
 
         if self.cdd_cache is not None:
-            cdd_np = self.cdd_cache.get(key)
+            path, forced_slice_idx = key
+            # New caches retain full cubes at (path, None). Fall back to an
+            # exact key so existing 2D/per-slice caches remain usable.
+            cdd_np = self.cdd_cache.get((path, None))
+            if cdd_np is None:
+                cdd_np = self.cdd_cache.get(key)
             if cdd_np is None:
                 raise KeyError(f"CDD cache miss for key={key}")
-            # cdd_np is (S, H, W) float32
+            cdd_np = self._extract_2d_from_cdd(np.asarray(cdd_np), forced_slice_idx=forced_slice_idx)
+            # cdd_np is now (S, H, W) float32
             cdd_orig = torch.from_numpy(cdd_np.astype(np.float32))
             x_clean = cdd_orig.sum(dim=0, keepdim=True)  # 1 x H x W
+            crop = self._crop_slices(int(cdd_orig.shape[-2]), int(cdd_orig.shape[-1]))
+            if crop is not None:
+                crop_y, crop_x = crop
+                cdd_orig = cdd_orig[..., crop_y, crop_x]
+                x_clean = x_clean[..., crop_y, crop_x]
             if self.d4_augment:
                 if bool(np.random.randint(0, 2)):
                     cdd_orig = torch.flip(cdd_orig, dims=(-1,))
@@ -182,6 +261,7 @@ class JEPADataset(Dataset):
 
         path, forced_slice_idx = key
         sample = self._load_sample(path, forced_slice_idx=forced_slice_idx).clone()  # 1 x H x W
+        sample = self._crop_tensor(sample)
         if self.d4_augment:
             # Shape-safe augmentation for non-square inputs: random H/V flips only.
             if bool(np.random.randint(0, 2)):

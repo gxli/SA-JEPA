@@ -881,8 +881,16 @@ class PyramidGridJEPA(nn.Module):
             actual_target_in = target_in
 
             with torch.no_grad():
-                gt_map = self.target_encoder(target_in)
-            context_map = self.context_encoder(context_in)
+                if self.use_symmetric_feature_loss:
+                    gt_map, gt_var = symmetric_forward_2d(self.target_encoder, target_in, return_var=True)
+                    target_symmetric_var = gt_var if target_symmetric_var is None else target_symmetric_var + gt_var
+                else:
+                    gt_map = self.target_encoder(target_in)
+            if self.use_symmetric_feature_loss:
+                context_map, ctx_var = symmetric_forward_2d(self.context_encoder, context_in, return_var=True)
+                symmetric_var = ctx_var if symmetric_var is None else symmetric_var + ctx_var
+            else:
+                context_map = self.context_encoder(context_in)
         else:
             with torch.no_grad():
                 gt_map = self.target_encoder(enc_target)
