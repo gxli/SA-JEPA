@@ -11,9 +11,9 @@ def compute_effective_rank_from_features(z: np.ndarray) -> float:
     if z.ndim != 2 or z.shape[0] < 2 or z.shape[1] < 1:
         return 0.0
     z = z - z.mean(axis=0, keepdims=True)
-    cov = (z.T @ z) / max(1, z.shape[0] - 1)
-    evals = np.linalg.eigvalsh(cov)
-    evals = np.clip(evals, 0.0, None)
+    denom = max(1, z.shape[0] - 1)
+    svals = np.linalg.svd(z, full_matrices=False, compute_uv=False)
+    evals = np.square(svals) / denom
     s = float(evals.sum())
     if s <= 0.0:
         return 0.0
@@ -44,9 +44,8 @@ def spectral_rank_stats(fmap: torch.Tensor, eps: float = 1e-12, dead_thresh: flo
     dead = ch_std < float(dead_thresh)
     dead_frac = dead.float().mean().item()
 
-    cov = (z.T @ z) / max(1, z.shape[0] - 1)
-    eig = torch.linalg.eigvalsh(cov).clamp_min(0)
-    eig = torch.flip(eig, dims=(0,))
+    denom = max(1, z.shape[0] - 1)
+    eig = torch.linalg.svdvals(z).pow(2).div(float(denom)).clamp_min(0)
 
     total = eig.sum().clamp_min(eps)
     p = eig / total
@@ -107,4 +106,3 @@ def compute_error_by_scale(outputs: dict) -> dict[float, float]:
             s = round(float(scales[bi, ki].item()), 6)
             out[s].append(float(mse_bk[bi, ki].item()))
     return {float(s): float(np.mean(v)) for s, v in out.items() if len(v) > 0}
-

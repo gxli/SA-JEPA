@@ -25,8 +25,7 @@ class FullResPredictor(nn.Module):
                 nn.Conv2d(hidden, channels, kernel_size=1),
             )
             nn.init.normal_(self.net[-1].weight, mean=0.0, std=1e-4)
-            if self.net[-1].bias is not None:
-                nn.init.zeros_(self.net[-1].bias)
+            nn.init.zeros_(self.net[-1].bias)
             return
 
         k = int(kernel_size)

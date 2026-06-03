@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .encoders3d import ScaleAwareConvNeXt3DEncoder, ScaleFiLMConvNeXt3DEncoder
+from .masking import _fractional_spatial_target_budget
 from .masking3d import extract_location_cubes, sample_target_locations_3d
 from .predictor3d import FullResPredictor3D
 from .symmetry import symmetric_forward_3d
@@ -34,6 +35,7 @@ class PyramidGridJEPA3D(nn.Module):
         use_symmetric_feature_loss: bool = False,
         use_film: bool = True,
         use_per_scale_adapters: bool = False,
+        priority_candidate_oversample: float = 3.0,
     ):
         super().__init__()
         self.patch_size = int(patch_size)
@@ -49,6 +51,7 @@ class PyramidGridJEPA3D(nn.Module):
         self.use_symmetric_feature_loss = bool(use_symmetric_feature_loss)
         self.use_film = bool(use_film)
         self.use_per_scale_adapters = bool(use_per_scale_adapters)
+        self.priority_candidate_oversample = float(priority_candidate_oversample)
 
         if self.use_film or self.use_per_scale_adapters:
             self.context_encoder = ScaleFiLMConvNeXt3DEncoder(
@@ -193,12 +196,23 @@ class PyramidGridJEPA3D(nn.Module):
         gt_map = self._gather_slabs(gt_map_3d, slab_starts, slab_depth)
         pred_map = self.predictor3d(context_map)
         _, _, dz, hy, wx = pred_map.shape
+        target_budget = _fractional_spatial_target_budget(
+            height=hy,
+            width=wx,
+            box_size=max(1, int(self.mask_box_size)),
+            oversample=self.priority_candidate_oversample,
+            device=x_clean.device,
+            minimum=1,
+        )
+        num_targets = max(1, int(self.num_targets))
+        if target_budget is not None:
+            num_targets = max(1, min(num_targets, int(target_budget)))
         target_locations, target_valid = sample_target_locations_3d(
             batch_size=b,
             depth=dz,
             height=hy,
             width=wx,
-            num_targets=self.num_targets,
+            num_targets=num_targets,
             patch_size=self.patch_size,
             device=x_clean.device,
         )
@@ -212,7 +226,7 @@ class PyramidGridJEPA3D(nn.Module):
             "context_patches": context_patches,
             "target_locations": target_locations,
             "target_valid": target_valid,
-            "target_scales": torch.ones((b, self.num_targets), device=x_clean.device, dtype=x_clean.dtype),
+            "target_scales": torch.ones((b, num_targets), device=x_clean.device, dtype=x_clean.dtype),
             "context_map": context_map,
             "context_map_3d": context_map_3d,
             "pred_map": pred_map,

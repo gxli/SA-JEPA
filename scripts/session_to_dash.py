@@ -158,6 +158,21 @@ def _to_np(x: Any) -> np.ndarray:
     return np.asarray(x)
 
 
+def _load_array(path: str) -> np.ndarray:
+    loaded = np.load(path)
+    if isinstance(loaded, np.lib.npyio.NpzFile):
+        try:
+            return np.asarray(loaded["arr"])
+        finally:
+            loaded.close()
+    return np.asarray(loaded)
+
+
+def _prefer_npz(path: str) -> str:
+    npz_path = os.path.splitext(path)[0] + ".npz"
+    return npz_path if os.path.exists(npz_path) else path
+
+
 def _has_required_branch_artifacts(results_dir: str, branch: str) -> bool:
     required = (
         f"{branch}_pca_xyz.npy",
@@ -310,9 +325,9 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
     energy_map = _extract_hw_map(outputs, ("target_energy_map",), (h, w))
     if energy_map is None:
-        energy_npy = os.path.join(session_dir, "target_energy_map.npy")
+        energy_npy = _prefer_npz(os.path.join(session_dir, "target_energy_map.npy"))
         if os.path.exists(energy_npy):
-            energy_map = np.asarray(np.load(energy_npy), dtype=np.float32)
+            energy_map = np.asarray(_load_array(energy_npy), dtype=np.float32)
             if energy_map.ndim == 4:
                 energy_map = energy_map[0, 0]
             elif energy_map.ndim == 3:
@@ -322,18 +337,18 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         else:
             energy_map = np.zeros((h, w), dtype=np.float32)
 
-    visit_path = os.path.join(session_dir, "visited_target_frequency_canonical.npy")
+    visit_path = _prefer_npz(os.path.join(session_dir, "visited_target_frequency_canonical.npy"))
     if not os.path.exists(visit_path):
-        visit_path = os.path.join(session_dir, "visited_target_frequency.npy")
-    visit_heatmap = np.asarray(np.load(visit_path), dtype=np.float32) if os.path.exists(visit_path) else np.zeros((h, w), dtype=np.float32)
+        visit_path = _prefer_npz(os.path.join(session_dir, "visited_target_frequency.npy"))
+    visit_heatmap = np.asarray(_load_array(visit_path), dtype=np.float32) if os.path.exists(visit_path) else np.zeros((h, w), dtype=np.float32)
     if visit_heatmap.shape != (h, w):
         visit_heatmap = np.zeros((h, w), dtype=np.float32)
 
     # Load first-sample pyramid mask cube (S,H,W), save a canonical artifact in session dir.
     mask_cube = None
-    pmt_path = os.path.join(session_dir, "pyramid_mask_token.npy")
+    pmt_path = _prefer_npz(os.path.join(session_dir, "pyramid_mask_token.npy"))
     if os.path.exists(pmt_path):
-        arr = np.asarray(np.load(pmt_path), dtype=np.float32)
+        arr = np.asarray(_load_array(pmt_path), dtype=np.float32)
         # Expected saved inference artifact shape: B,S,H,W
         if arr.ndim == 4 and arr.shape[0] > 0:
             mask_cube = arr[0]
@@ -1208,7 +1223,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 f'<label>ymax <input type="number" step="any" data-k="ymax" placeholder="auto"></label>'
                 f'<label>zmin <input type="number" step="any" data-k="zmin" placeholder="auto"></label>'
                 f'<label>zmax <input type="number" step="any" data-k="zmax" placeholder="auto"></label>'
-                f'<label><input type="checkbox" data-k="bright_top" checked> bright_top</label>'
+                f'<label>color low <input type="number" step="any" data-k="color_low" placeholder="visible 1%"></label>'
+                f'<label>color high <input type="number" step="any" data-k="color_high" placeholder="visible 99%"></label>'
+                f'<label><input type="checkbox" data-k="invert_x"> invert x</label>'
+                f'<label><input type="checkbox" data-k="invert_y"> invert y</label>'
+                f'<label><input type="checkbox" data-k="invert_z"> invert z</label>'
+                f'<label><input type="checkbox" data-k="invert_color"> invert color</label>'
                 f'<button class="apply-local" type="button" data-group="{group}">Apply</button>'
                 f"</div>"
             )
@@ -1217,7 +1237,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             f'<section class="card" data-group="{group}">'
             f'<div class="card-tools"><button class="save-panel" type="button" data-panel-title="{panel_title_html}">Save PNG</button></div>'
             f'{controls}'
-            f'{fig.to_html(full_html=False, include_plotlyjs=("cdn" if i == 0 else False), config={"responsive": True, "displaylogo": False})}'
+            f'{fig.to_html(full_html=False, include_plotlyjs=(True if i == 0 else False), config={"responsive": True, "displaylogo": False})}'
             f'</section>'
         )
     # Keep grid alignment stable: if odd number of cards, append a dummy placeholder.
@@ -1258,6 +1278,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     .grid {{ display: grid; grid-template-columns: repeat(2, minmax(420px, 1fr)); gap: 12px; }}
     .controls {{ display:flex; flex-wrap:wrap; gap:8px; margin: 0 0 12px 2px; align-items:center; }}
     .controls input {{ width:88px; }}
+    .controls input[type="checkbox"] {{ width:auto; }}
     .local-controls {{ margin: 2px 2px 8px 2px; padding: 6px; background: #f7f9ff; border: 1px solid #dde3f0; border-radius: 6px; }}
     .card-tools {{ display: flex; justify-content: flex-end; margin: 2px 2px 6px 2px; }}
     .save-panel {{ border: 1px solid #c7d2e8; background: #ffffff; color: #23304f; border-radius: 6px; padding: 4px 10px; font-size: 12px; font-weight: 600; cursor: pointer; }}
@@ -1278,140 +1299,153 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     const v = parseFloat(el.value);
     return Number.isFinite(v) ? v : null;
   }}
+  function clamp01(v) {{
+    return Math.max(0.0, Math.min(1.0, v));
+  }}
+  function toArray(a) {{
+    return Array.from(a || [], Number);
+  }}
+  function percentileRange(arr, loPct, hiPct) {{
+    const vals = [];
+    for (let i = 0; i < arr.length; i++) {{
+      const v = Number(arr[i]);
+      if (Number.isFinite(v)) vals.push(v);
+    }}
+    if (vals.length === 0) return [0.0, 1.0];
+    vals.sort((a, b) => a - b);
+    const q = (p) => {{
+      const idx = (vals.length - 1) * Math.max(0.0, Math.min(1.0, p));
+      const i0 = Math.floor(idx);
+      const i1 = Math.ceil(idx);
+      if (i0 === i1) return vals[i0];
+      const t = idx - i0;
+      return vals[i0] * (1.0 - t) + vals[i1] * t;
+    }};
+    let lo = q(loPct);
+    let hi = q(hiPct);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) {{
+      lo = vals[0];
+      hi = vals[vals.length - 1];
+    }}
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return [0.0, 1.0];
+    return [lo, hi];
+  }}
+  function map255(v, lo, hi, invertColor) {{
+    const den = Math.max(1e-12, hi - lo);
+    let y = clamp01((Number(v) - lo) / den);
+    if (invertColor) y = 1.0 - y;
+    return Math.round(y * 255.0);
+  }}
+  function normalizeChannel(v, lo, hi, invertAxis) {{
+    const den = Math.max(1e-12, hi - lo);
+    let y = clamp01((Number(v) - lo) / den);
+    return invertAxis ? 1.0 - y : y;
+  }}
+  function ensureTraceBases(gd) {{
+    (gd.data || []).forEach((tr) => {{
+      if (!tr) return;
+      if (tr.type === "scatter3d") {{
+        if (!tr._jepaBaseX) tr._jepaBaseX = toArray(tr.x);
+        if (!tr._jepaBaseY) tr._jepaBaseY = toArray(tr.y);
+        if (!tr._jepaBaseZCoord) tr._jepaBaseZCoord = toArray(tr.z);
+      }} else if (tr.type === "image") {{
+        if (!tr._jepaBaseImage) {{
+          tr._jepaBaseImage = (tr.z || []).map((row) => Array.from(row || []).map((pixel) => {{
+            if (Array.isArray(pixel) || ArrayBuffer.isView(pixel)) {{
+              return [Number(pixel[0]) || 0, Number(pixel[1]) || 0, Number(pixel[2]) || 0];
+            }}
+            return [0, 0, 0];
+          }}));
+        }}
+      }}
+    }});
+  }}
   function applyRangesForGroup(group) {{
     const controls = document.querySelector('.local-controls[data-group="' + group + '"]');
-    if (!controls) return;
+    if (!controls || !window.Plotly) return;
     const get = (k) => {{
       const el = controls.querySelector('input[data-k="' + k + '"]');
       return el ? num(el) : null;
     }};
-    const xmin = get("xmin"), xmax = get("xmax");
-    const ymin = get("ymin"), ymax = get("ymax");
-    const zmin = get("zmin"), zmax = get("zmax");
-    const brightTopEl = controls.querySelector('input[data-k="bright_top"]');
-    const brightTop = !brightTopEl || brightTopEl.checked;
-    const sections = document.querySelectorAll('.card[data-group="' + group + '"] .js-plotly-plot');
-    function clamp01(v) {{
-      return Math.max(0.0, Math.min(1.0, v));
-    }}
-    function map01(v, lo, hi) {{
-      const den = Math.max(1e-12, hi - lo);
-      return clamp01((v - lo) / den);
-    }}
-    function color01(v, lo, hi) {{
-      const mapped = map01(v, lo, hi);
-      return brightTop ? mapped : 1.0 - mapped;
-    }}
-    function percentileRange(arr, loPct, hiPct) {{
-      const vals = [];
-      for (let i = 0; i < arr.length; i++) {{
-        const v = Number(arr[i]);
-        if (Number.isFinite(v)) vals.push(v);
-      }}
-      if (vals.length === 0) return [0.0, 1.0];
-      vals.sort((a, b) => a - b);
-      const q = (p) => {{
-        const idx = (vals.length - 1) * p;
-        const i0 = Math.floor(idx);
-        const i1 = Math.ceil(idx);
-        if (i0 === i1) return vals[i0];
-        const t = idx - i0;
-        return vals[i0] * (1 - t) + vals[i1] * t;
-      }};
-      let lo = q(Math.max(0.0, Math.min(1.0, loPct)));
-      let hi = q(Math.max(0.0, Math.min(1.0, hiPct)));
-      if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) {{
-        lo = vals[0];
-        hi = vals[vals.length - 1];
-      }}
-      if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return [0.0, 1.0];
-      return [lo, hi];
-    }}
-    sections.forEach((gd) => {{
-      const fl = gd._fullLayout || {{}};
-      if (fl.scene) {{
-        const rl = {{
-          "scene.camera.projection.type": "orthographic",
-          "scene.aspectmode": "cube",
-        }};
-        if (xmin !== null && xmax !== null) rl["scene.xaxis.range"] = [xmin, xmax];
-        if (ymin !== null && ymax !== null) rl["scene.yaxis.range"] = [ymin, ymax];
-        if (zmin !== null && zmax !== null) rl["scene.zaxis.range"] = [zmin, zmax];
-        Plotly.relayout(gd, rl);
-      }}
+    const colorLow = get("color_low");
+    const colorHigh = get("color_high");
+    const invertX = !!(controls.querySelector('input[data-k="invert_x"]') || {{}}).checked;
+    const invertY = !!(controls.querySelector('input[data-k="invert_y"]') || {{}}).checked;
+    const invertZ = !!(controls.querySelector('input[data-k="invert_z"]') || {{}}).checked;
+    const invertColor = !!(controls.querySelector('input[data-k="invert_color"]') || {{}}).checked;
+    const plots = document.querySelectorAll('.card[data-group="' + group + '"] .js-plotly-plot');
+    plots.forEach((gd) => {{
+      ensureTraceBases(gd);
       (gd.data || []).forEach((tr, i) => {{
         if (!tr) return;
-        let xs = [], ys = [], zs = [];
         if (tr.type === "image") {{
-          const currentBrightTop = tr._brightTop === undefined ? true : tr._brightTop;
-          if (currentBrightTop !== brightTop) {{
-            const recolored = (tr.z || []).map((row) => row.map((pixel) => [
-              255 - Number(pixel[0]),
-              255 - Number(pixel[1]),
-              255 - Number(pixel[2]),
-            ]));
-            tr._brightTop = brightTop;
-            Plotly.restyle(gd, {{"z": [recolored]}}, [i]);
-          }}
+          const lo = colorLow !== null ? colorLow : 0.0;
+          const hi = colorHigh !== null ? colorHigh : 255.0;
+          const recolored = tr._jepaBaseImage.map((row) => row.map((pixel) => {{
+            let r = invertX ? 255.0 - pixel[0] : pixel[0];
+            let g = invertY ? 255.0 - pixel[1] : pixel[1];
+            let b = invertZ ? 255.0 - pixel[2] : pixel[2];
+            return [map255(r, lo, hi, invertColor), map255(g, lo, hi, invertColor), map255(b, lo, hi, invertColor)];
+          }}));
+          Plotly.restyle(gd, {{ z: [recolored] }}, [i]);
           return;
         }}
-        if (tr.type === "scatter3d") {{
-          xs = tr.x || [];
-          ys = tr.y || [];
-          zs = tr.z || [];
-        }} else {{
-          return;
-        }}
-        // Robust recoloring from visible-range stats to avoid black collapse.
-        const xr = (xmin !== null && xmax !== null) ? [xmin, xmax] : percentileRange(xs, 0.01, 0.99);
-        const yr = (ymin !== null && ymax !== null) ? [ymin, ymax] : percentileRange(ys, 0.01, 0.99);
-        const zr = (zmin !== null && zmax !== null) ? [zmin, zmax] : percentileRange(zs, 0.01, 0.99);
-        const n = Math.min(xs.length || 0, ys.length || 0, zs.length || 0);
+        if (tr.type !== "scatter3d") return;
+        const bx = tr._jepaBaseX;
+        const by = tr._jepaBaseY;
+        const bz = tr._jepaBaseZCoord;
+        const x = invertX ? bx.map((v) => -v) : bx.slice();
+        const y = invertY ? by.map((v) => -v) : by.slice();
+        const z = invertZ ? bz.map((v) => -v) : bz.slice();
+        const xr = percentileRange(bx, 0.01, 0.99);
+        const yr = percentileRange(by, 0.01, 0.99);
+        const zr = percentileRange(bz, 0.01, 0.99);
+        const lo = colorLow !== null ? colorLow : 0.0;
+        const hi = colorHigh !== null ? colorHigh : 255.0;
+        const n = Math.min(bx.length, by.length, bz.length);
         const colors = new Array(n);
         for (let k = 0; k < n; k++) {{
-          const r = Math.round(color01(Number(xs[k]), xr[0], xr[1]) * 255.0);
-          const g = Math.round(color01(Number(ys[k]), yr[0], yr[1]) * 255.0);
-          const b = Math.round(color01(Number(zs[k]), zr[0], zr[1]) * 255.0);
-          colors[k] = `rgb(${{r}},${{g}},${{b}})`;
+          const r0 = normalizeChannel(bx[k], xr[0], xr[1], invertX) * 255.0;
+          const g0 = normalizeChannel(by[k], yr[0], yr[1], invertY) * 255.0;
+          const b0 = normalizeChannel(bz[k], zr[0], zr[1], invertZ) * 255.0;
+          colors[k] = `rgb(${{map255(r0, lo, hi, invertColor)}},${{map255(g0, lo, hi, invertColor)}},${{map255(b0, lo, hi, invertColor)}})`;
         }}
-        Plotly.restyle(gd, {{"marker.color": [colors]}}, [i]);
+        Plotly.restyle(gd, {{ x: [x], y: [y], z: [z], "marker.color": [colors] }}, [i]);
+        Plotly.relayout(gd, {{
+          "scene.xaxis.autorange": true,
+          "scene.yaxis.autorange": true,
+          "scene.zaxis.autorange": true,
+          "scene.camera.projection.type": "orthographic",
+          "scene.aspectmode": "cube",
+        }});
       }});
     }});
   }}
-	  function initControlDefaults() {{
-    document.querySelectorAll('.local-controls').forEach((controls) => {{
-      const group = controls.getAttribute("data-group");
-      const gd = document.querySelector('.card[data-group="' + group + '"] .js-plotly-plot.scatter3d') ||
-        Array.from(document.querySelectorAll('.card[data-group="' + group + '"] .js-plotly-plot')).find(
-          (plot) => plot._fullLayout && plot._fullLayout.scene
-        );
-      if (!gd || !gd._fullLayout || !gd._fullLayout.scene) return;
-      const s = gd._fullLayout.scene;
-      const defs = {{
-        xmin: s.xaxis && s.xaxis.range ? s.xaxis.range[0] : null,
-        xmax: s.xaxis && s.xaxis.range ? s.xaxis.range[1] : null,
-        ymin: s.yaxis && s.yaxis.range ? s.yaxis.range[0] : null,
-        ymax: s.yaxis && s.yaxis.range ? s.yaxis.range[1] : null,
-        zmin: s.zaxis && s.zaxis.range ? s.zaxis.range[0] : null,
-        zmax: s.zaxis && s.zaxis.range ? s.zaxis.range[1] : null,
-      }};
-      Object.keys(defs).forEach((k) => {{
-        const el = controls.querySelector('input[data-k="' + k + '"]');
-        const v = defs[k];
-        if (el && Number.isFinite(v)) el.value = String(v);
+  function initControlDefaults() {{
+    document.querySelectorAll('.card .js-plotly-plot').forEach(ensureTraceBases);
+  }}
+  function bindLocalControls() {{
+    document.querySelectorAll(".apply-local").forEach((btn) => {{
+      btn.addEventListener("click", () => applyRangesForGroup(btn.getAttribute("data-group")));
+    }});
+    document.querySelectorAll('.local-controls input').forEach((input) => {{
+      input.addEventListener("change", () => {{
+        const controls = input.closest(".local-controls");
+        if (controls) applyRangesForGroup(controls.getAttribute("data-group"));
       }});
     }});
+    initControlDefaults();
   }}
-	  window.addEventListener("load", initControlDefaults);
-	  document.querySelectorAll(".apply-local").forEach((btn) => {{
-	    btn.addEventListener("click", () => applyRangesForGroup(btn.getAttribute("data-group")));
-	  }});
-	  document.querySelectorAll('.local-controls input[data-k="bright_top"]').forEach((input) => {{
-	    input.addEventListener("change", () => {{
-	      const controls = input.closest(".local-controls");
-	      if (controls) applyRangesForGroup(controls.getAttribute("data-group"));
-	    }});
-	  }});
+  window.JEPADashboardControls = {{
+    applyRangesForGroup,
+    bindLocalControls,
+  }};
+  window.applyRangesForGroup = applyRangesForGroup;
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", bindLocalControls);
+  }} else {{
+    bindLocalControls();
+  }}
 	  function _safeFileName(name) {{
 	    return String(name || "panel")
 	      .toLowerCase()

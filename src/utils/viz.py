@@ -145,12 +145,9 @@ def _compute_umap_nd(
     except Exception as e:
         print(f"[warning] umap-learn failed: {type(e).__name__}: {e}")
 
-    if n_components == 2:
-        return _compute_pca_2d(x)
-    p2 = _compute_pca_2d(x)
-    z = np.zeros((p2.shape[0], n_components), dtype=np.float32)
-    z[:, :2] = p2.astype(np.float32)
-    return z
+    if n_components == 3:
+        return _compute_pca_3d(x)
+    return _compute_pca_2d(x)
 
 
 def _save_latent_overview_html(session_dir: str, pca_points: np.ndarray, umap_points: np.ndarray, h: int, w: int) -> str:

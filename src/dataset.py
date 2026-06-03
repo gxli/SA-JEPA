@@ -179,7 +179,10 @@ class JEPADataset(Dataset):
                 raise ValueError(f"crop_size must be an int or [height, width], got {crop_size!r}")
             crop_h, crop_w = int(crop_size[0]), int(crop_size[1])
         else:
-            crop_h = crop_w = int(crop_size)
+            crop_size_int = int(crop_size)
+            if crop_size_int <= 0:
+                raise ValueError(f"crop_size must be positive, got {crop_size!r}")
+            return crop_size_int, crop_size_int
         if crop_h <= 0 or crop_w <= 0:
             raise ValueError(f"crop_size must be positive, got {crop_size!r}")
         return crop_h, crop_w
@@ -215,6 +218,30 @@ class JEPADataset(Dataset):
             return (arr - amin) / denom
         return np.zeros_like(arr, dtype=np.float32)
 
+    def _apply_augmentations(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Apply d4 flips + random_roll to all tensors identically. Shared by both data paths."""
+        if not tensors:
+            return tensors
+        if self.d4_augment:
+            if bool(np.random.randint(0, 2)):
+                tensors = tuple(torch.flip(t, dims=(-1,)) for t in tensors)
+            if bool(np.random.randint(0, 2)):
+                tensors = tuple(torch.flip(t, dims=(-2,)) for t in tensors)
+        if self.random_roll_max > 0:
+            h, w = tensors[0].shape[-2], tensors[0].shape[-1]
+            pad_val = int(min(self.random_roll_max, max(0, h - 1), max(0, w - 1)))
+            if pad_val <= 0:
+                return tensors
+            dy = int(np.random.randint(-pad_val, pad_val + 1))
+            dx = int(np.random.randint(-pad_val, pad_val + 1))
+            padded = tuple(
+                torch.nn.functional.pad(t, (pad_val, pad_val, pad_val, pad_val), mode='reflect')
+                for t in tensors
+            )
+            y0, x0 = pad_val - dy, pad_val - dx
+            tensors = tuple(p[..., y0:y0 + h, x0:x0 + w] for p in padded)
+        return tensors
+
     def __len__(self):
         return self.num_samples
 
@@ -239,42 +266,11 @@ class JEPADataset(Dataset):
                 crop_y, crop_x = crop
                 cdd_orig = cdd_orig[..., crop_y, crop_x]
                 x_clean = x_clean[..., crop_y, crop_x]
-            if self.d4_augment:
-                if bool(np.random.randint(0, 2)):
-                    cdd_orig = torch.flip(cdd_orig, dims=(-1,))
-                    x_clean = torch.flip(x_clean, dims=(-1,))
-                if bool(np.random.randint(0, 2)):
-                    cdd_orig = torch.flip(cdd_orig, dims=(-2,))
-                    x_clean = torch.flip(x_clean, dims=(-2,))
-            if self.random_roll_max > 0:
-                dy = int(np.random.randint(-self.random_roll_max, self.random_roll_max + 1))
-                dx = int(np.random.randint(-self.random_roll_max, self.random_roll_max + 1))
-                pad_val = self.random_roll_max
-                padded_cdd = torch.nn.functional.pad(cdd_orig, (pad_val, pad_val, pad_val, pad_val), mode='reflect')
-                padded_img = torch.nn.functional.pad(x_clean, (pad_val, pad_val, pad_val, pad_val), mode='reflect')
-                h, w = cdd_orig.shape[-2], cdd_orig.shape[-1]
-                y0 = pad_val - dy
-                x0 = pad_val - dx
-                cdd_orig = padded_cdd[..., y0:y0+h, x0:x0+w]
-                x_clean = padded_img[..., y0:y0+h, x0:x0+w]
+            cdd_orig, x_clean = self._apply_augmentations(cdd_orig, x_clean)
             return cdd_orig, x_clean
 
         path, forced_slice_idx = key
         sample = self._load_sample(path, forced_slice_idx=forced_slice_idx).clone()  # 1 x H x W
         sample = self._crop_tensor(sample)
-        if self.d4_augment:
-            # Shape-safe augmentation for non-square inputs: random H/V flips only.
-            if bool(np.random.randint(0, 2)):
-                sample = torch.flip(sample, dims=(-1,))  # horizontal
-            if bool(np.random.randint(0, 2)):
-                sample = torch.flip(sample, dims=(-2,))  # vertical
-        if self.random_roll_max > 0:
-            dy = int(np.random.randint(-self.random_roll_max, self.random_roll_max + 1))
-            dx = int(np.random.randint(-self.random_roll_max, self.random_roll_max + 1))
-            pad_val = self.random_roll_max
-            padded = torch.nn.functional.pad(sample, (pad_val, pad_val, pad_val, pad_val), mode='reflect')
-            h, w = sample.shape[-2], sample.shape[-1]
-            y0 = pad_val - dy
-            x0 = pad_val - dx
-            sample = padded[..., y0:y0+h, x0:x0+w]
+        (sample,) = self._apply_augmentations(sample)
         return sample

@@ -229,6 +229,90 @@ class D4InvariantWrapper(nn.Module):
         return torch.mean(y, dim=2)
 
 
+class EscnnC4PyramidEncoder(nn.Module):
+    """
+    C4 rotation-equivariant pyramid encoder using escnn.
+
+    Input is a normal BCHW tensor with the same channel contract as
+    convnext_dense_pyramid: per-scale CDD channels concatenated with per-scale
+    mask-token channels. escnn lifts those trivial input fields into regular
+    C4 fields, applies equivariant R2Conv blocks, then group-pools to return a
+    standard invariant BCHW tensor.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int = 32,
+        latent_channels: int = 32,
+        depth: int = 4,
+        kernel_size: int = 7,
+        final_norm: bool = True,
+        final_norm_type: str = "layernorm",
+    ):
+        super().__init__()
+        try:
+            from escnn import gspaces
+            from escnn import nn as enn
+        except ImportError as exc:
+            raise ImportError(
+                "escnn_c4_pyramid requires the optional dependency 'escnn'. "
+                "Install it with: pip install escnn"
+            ) from exc
+
+        depth = int(depth)
+        hidden_channels = int(hidden_channels)
+        latent_channels = int(latent_channels)
+        kernel_size = int(kernel_size)
+        padding = kernel_size // 2
+
+        self.enn = enn
+        self.r2_act = gspaces.rot2dOnR2(N=4)
+        self.in_type = enn.FieldType(self.r2_act, int(in_channels) * [self.r2_act.trivial_repr])
+        self.hidden_type = enn.FieldType(self.r2_act, hidden_channels * [self.r2_act.regular_repr])
+        self.out_type = enn.FieldType(self.r2_act, latent_channels * [self.r2_act.regular_repr])
+
+        self.lift = enn.SequentialModule(
+            enn.R2Conv(self.in_type, self.hidden_type, kernel_size=3, padding=1, bias=False),
+            enn.InnerBatchNorm(self.hidden_type),
+            enn.ReLU(self.hidden_type, inplace=True),
+        )
+        self.blocks = nn.ModuleList(
+            [
+                enn.SequentialModule(
+                    enn.R2Conv(self.hidden_type, self.hidden_type, kernel_size=kernel_size, padding=padding, bias=False),
+                    enn.InnerBatchNorm(self.hidden_type),
+                    enn.ReLU(self.hidden_type, inplace=True),
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.head = enn.R2Conv(self.hidden_type, self.out_type, kernel_size=1, padding=0, bias=True)
+        self.gpool = enn.GroupPooling(self.out_type)
+        if not final_norm:
+            self.final_norm = nn.Identity()
+        else:
+            ntype = str(final_norm_type).lower()
+            if ntype == "batchnorm":
+                self.final_norm = nn.BatchNorm2d(latent_channels, track_running_stats=False)
+            elif ntype in ("layernorm", ""):
+                self.final_norm = LayerNorm2d(latent_channels)
+            else:
+                raise ValueError(
+                    f"Unsupported final_norm_type={final_norm_type}. "
+                    "Use 'layernorm' or 'batchnorm'."
+                )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gx = self.enn.GeometricTensor(x, self.in_type)
+        gx = self.lift(gx)
+        for block in self.blocks:
+            gx = gx + block(gx)
+        gx = self.head(gx)
+        gx = self.gpool(gx)
+        return self.final_norm(gx.tensor)
+
+
 class ResCNNBlock(nn.Module):
     def __init__(
         self,

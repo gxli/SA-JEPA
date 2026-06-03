@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -12,6 +14,21 @@ def to_native(arr: np.ndarray) -> np.ndarray:
         # NumPy 2.0 removed ndarray.newbyteorder(); use dtype.newbyteorder instead.
         arr = arr.byteswap().view(arr.dtype.newbyteorder("="))
     return np.asarray(arr)
+
+
+def load_array(path: Path) -> np.ndarray:
+    loaded = np.load(path)
+    if isinstance(loaded, np.lib.npyio.NpzFile):
+        try:
+            return np.asarray(loaded["arr"])
+        finally:
+            loaded.close()
+    return np.asarray(loaded)
+
+
+def prefer_npz(path: Path) -> Path:
+    npz_path = path.with_suffix(".npz")
+    return npz_path if npz_path.exists() else path
 
 
 def pca_3d(latents: np.ndarray) -> np.ndarray:
@@ -440,12 +457,12 @@ def main() -> None:
         visit_freq = None
         if image_shape is not None:
             vh, vw = int(image_shape[0]), int(image_shape[1])
-        visit_npy = session_dir / "visited_target_frequency_canonical.npy"
+        visit_npy = prefer_npz(session_dir / "visited_target_frequency_canonical.npy")
         if not visit_npy.exists():
-            visit_npy = session_dir / "visited_target_frequency.npy"
+            visit_npy = prefer_npz(session_dir / "visited_target_frequency.npy")
         if visit_npy.exists():
             try:
-                vf = to_native(np.load(visit_npy)).astype(np.float32)
+                vf = to_native(load_array(visit_npy)).astype(np.float32)
                 if vf.shape == (vh, vw):
                     visit_freq = vf
             except Exception:
@@ -467,10 +484,10 @@ def main() -> None:
                 except Exception:
                     visit_freq = None
         energy_map = None
-        epath = session_dir / "target_energy_map.npy"
+        epath = prefer_npz(session_dir / "target_energy_map.npy")
         if epath.exists():
             try:
-                em = to_native(np.load(epath))
+                em = to_native(load_array(epath))
                 em = tile_maps_batch(em)
                 energy_map = em.astype(np.float32)
             except Exception:

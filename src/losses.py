@@ -44,14 +44,15 @@ def _offdiag(x: torch.Tensor) -> torch.Tensor:
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 
-def _flatten_vicreg_samples(
+def _reshape_patch_pairs(
     pred: torch.Tensor,
     gt: torch.Tensor,
     valid: torch.Tensor,
     spatial_mode: str = "dense",
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten B×K×C×P×P (or ×P×P×P) to (N, C) tokens, filter by valid."""
     if pred.dim() not in (5, 6):
-        raise ValueError(f"Expected pred/gt rank 5 (2D patches) or 6 (3D cubes), got pred.rank={pred.dim()}")
+        raise ValueError(f"Expected pred/gt rank 5 or 6, got {pred.dim()}")
     b, k, c = pred.shape[:3]
     spatial_shape = pred.shape[3:]
     spatial_n = 1
@@ -60,14 +61,13 @@ def _flatten_vicreg_samples(
     mode = str(spatial_mode).lower()
     if mode == "pooled":
         reduce_dims = tuple(range(3, pred.dim()))
-        pred_v = pred.mean(dim=reduce_dims)  # B,K,C
-        gt_v = gt.mean(dim=reduce_dims)  # B,K,C
+        pred_v = pred.mean(dim=reduce_dims)
+        gt_v = gt.mean(dim=reduce_dims)
         vm = valid.reshape(-1)
         z1 = pred_v.reshape(-1, c)[vm]
         z2 = gt_v.reshape(-1, c)[vm]
         return z1, z2
-    if mode != "dense":
-        raise ValueError(f"Unsupported spatial_mode={spatial_mode}. Use 'dense' or 'pooled'.")
+    # dense mode: keep spatial tokens
     if pred.dim() == 5:
         pred_v = pred.permute(0, 1, 3, 4, 2).reshape(b, k, spatial_n, c)
         gt_v = gt.permute(0, 1, 3, 4, 2).reshape(b, k, spatial_n, c)
@@ -78,6 +78,17 @@ def _flatten_vicreg_samples(
     z1 = pred_v.reshape(-1, c)[vm]
     z2 = gt_v.reshape(-1, c)[vm]
     return z1, z2
+
+
+def _flatten_vicreg_samples(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    valid: torch.Tensor,
+    spatial_mode: str = "dense",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if spatial_mode not in ("dense", "pooled"):
+        raise ValueError(f"Unsupported spatial_mode={spatial_mode}. Use 'dense' or 'pooled'.")
+    return _reshape_patch_pairs(pred, gt, valid, spatial_mode=spatial_mode)
 
 
 def extract_valid_pooled_embeddings(outputs: dict, key: str = "context_patches") -> torch.Tensor:
@@ -100,10 +111,8 @@ def spread_regularizer_loss(
     Gradients remain useful close to collapse without hidden projection modes.
     """
     z = z.float()  # cast to fp32 to avoid underflow in fp16
-    if z.numel() == 0:
-        return z.sum() * 0.0
-    if z.shape[0] < 2:
-        return z.sum() * 0.0
+    if z.numel() == 0 or z.shape[0] < 2:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
 
     z = z - z.mean(dim=0, keepdim=True)
     std = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
@@ -174,7 +183,8 @@ def _compute_sim_var_cov_tensors(
     z2c = z_gt - z_gt.mean(dim=0, keepdim=True)
     cov_z1 = (z1c.T @ z1c) / max(1, z1c.shape[0] - 1)
     cov_z2 = (z2c.T @ z2c) / max(1, z2c.shape[0] - 1)
-    cov_term = 0.5 * ((_offdiag(cov_z1).pow(2).mean()) + (_offdiag(cov_z2).pow(2).mean()))
+    dim = max(1, int(cov_z1.shape[0]))
+    cov_term = 0.5 * ((_offdiag(cov_z1).pow(2).sum() / dim) + (_offdiag(cov_z2).pow(2).sum() / dim))
     return sim, var_term, cov_term
 
 
@@ -188,29 +198,12 @@ def compute_sim_var_cov_torch(outputs: dict, spatial_mode: str = "dense") -> tup
 
 
 def compute_raw_mse_and_norm_err(outputs: dict) -> tuple[float, float]:
-    pred = outputs["pred_patches"].detach().float()  # B,K,C,P,P
-    gt = outputs["gt_patches"].detach().float()  # B,K,C,P,P
-    valid = outputs["target_valid"].detach()  # B,K
-
-    if pred.dim() not in (5, 6):
-        raise ValueError(f"Expected pred/gt rank 5 or 6, got {pred.dim()}")
-    b, k, c = pred.shape[:3]
-    spatial_shape = pred.shape[3:]
-    spatial_n = 1
-    for s in spatial_shape:
-        spatial_n *= int(s)
-    if pred.dim() == 5:
-        pred_v = pred.permute(0, 1, 3, 4, 2).reshape(b, k, spatial_n, c)
-        gt_v = gt.permute(0, 1, 3, 4, 2).reshape(b, k, spatial_n, c)
-    else:
-        pred_v = pred.permute(0, 1, 3, 4, 5, 2).reshape(b, k, spatial_n, c)
-        gt_v = gt.permute(0, 1, 3, 4, 5, 2).reshape(b, k, spatial_n, c)
-    vm = valid.unsqueeze(-1).unsqueeze(-1).expand(b, k, spatial_n, 1).reshape(-1)
-    z1 = pred_v.reshape(-1, c)[vm]
-    z2 = gt_v.reshape(-1, c)[vm]
+    pred = outputs["pred_patches"].detach().float()
+    gt = outputs["gt_patches"].detach().float()
+    valid = outputs["target_valid"].detach()
+    z1, z2 = _reshape_patch_pairs(pred, gt, valid, spatial_mode="dense")
     if z1.numel() == 0 or z2.numel() == 0:
         return 0.0, 0.0
-
     raw_mse = torch.mean((z1 - z2) ** 2)
     norm_err = torch.mean(torch.abs(torch.norm(z1, dim=1) - torch.norm(z2, dim=1)))
     return float(raw_mse.item()), float(norm_err.item())

@@ -117,10 +117,31 @@ def _build_priority_catalogue_from_cdd_ratio(
     k = max(1, min(k, int(valid_idx.size)))
     valid_ratio = ratio.reshape(-1)[valid_idx]
     top_local = np.argpartition(valid_ratio, -k)[-k:]
+    top_local = top_local[np.argsort(valid_ratio[top_local])[::-1]]
     selected = valid_idx[top_local]
     ys = (selected // w).astype(np.int64)
     xs = (selected % w).astype(np.int64)
     return [(int(y), int(x)) for y, x in zip(ys, xs)]
+
+
+def _fractional_spatial_target_budget(
+    height: int,
+    width: int,
+    box_size: int,
+    oversample: float,
+    device: torch.device,
+    minimum: int = 0,
+) -> int | None:
+    """Budget candidates as f * image_area / box_area with stochastic rounding."""
+    f = float(oversample)
+    if f <= 0.0:
+        return None
+    box = max(1, int(box_size))
+    desired = f * float(max(1, int(height)) * max(1, int(width))) / float(box * box)
+    base = int(math.floor(desired))
+    frac = float(desired - base)
+    extra = int(torch.rand(1, device=device).item() < frac)
+    return max(int(minimum), base + extra)
 
 
 def _dither_target_center(
@@ -155,8 +176,9 @@ def _odd_box(v: int, minimum: int = 3, bump_up: bool = True) -> int:
     x = int(max(minimum, v))
     if x % 2 == 0:
         x += 1 if bump_up else -1
-    if x < minimum:
-        x = minimum
+    x = max(x, minimum)
+    if x % 2 == 0:
+        x += 1
     return x
 
 
@@ -286,6 +308,7 @@ def make_pyramid_grid_context(
     priority_n_target: int | str = 20,
     priority_min_targets_per_map: int = 0,
     priority_dithering_pixels: Optional[int] = None,
+    priority_candidate_oversample: float = 3.0,
     target_nonoverlap: bool = False,
     target_allow_partial_overlap: float = 0.0,
     mask_box_hardcap: int | None = None,
@@ -345,6 +368,7 @@ def make_pyramid_grid_context(
     all_cdd_blur_sigmas = []
     all_priority_good_candidates = []
     all_priority_nonzero_mean = []
+    all_priority_prescreen_candidates = []
     all_priority_auto_base_targets = []
     all_priority_effective_targets = []
 
@@ -353,6 +377,7 @@ def make_pyramid_grid_context(
         sample_invalid_mask = invalid_pixel_mask[bi, 0].cpu().numpy() if invalid_pixel_mask is not None else None
         priority_good_candidates_bi = 0.0
         priority_nonzero_mean_bi = 1.0
+        priority_prescreen_candidates_bi = 0.0
         priority_auto_base_targets_bi = 0.0
         priority_effective_targets_bi = 0.0
 
@@ -493,6 +518,17 @@ def make_pyramid_grid_context(
                             continue
                         good_candidates.append((int(cy), int(cx)))
                     priority_catalogue = good_candidates
+                    prescreen_count = _fractional_spatial_target_budget(
+                        height=h,
+                        width=w,
+                        box_size=max_box,
+                        oversample=float(priority_candidate_oversample),
+                        device=x_clean.device,
+                        minimum=int(priority_min_targets_per_map),
+                    )
+                    if prescreen_count is not None and len(priority_catalogue) > prescreen_count:
+                        priority_catalogue = priority_catalogue[:prescreen_count]
+                    priority_prescreen_candidates_bi = float(len(priority_catalogue))
 
                     # Auto target-count estimate from overlap density:
                     # N_auto = (#good_candidates) / mean(nonzero(dummy_map)).
@@ -736,6 +772,7 @@ def make_pyramid_grid_context(
             all_cdd_blur_sigmas.append(torch.tensor(cdd_blur_sigmas, dtype=torch.float32))
             all_priority_good_candidates.append(priority_good_candidates_bi)
             all_priority_nonzero_mean.append(priority_nonzero_mean_bi)
+            all_priority_prescreen_candidates.append(priority_prescreen_candidates_bi)
             all_priority_auto_base_targets.append(priority_auto_base_targets_bi)
             all_priority_effective_targets.append(priority_effective_targets_bi)
 
@@ -788,6 +825,7 @@ def make_pyramid_grid_context(
         "cdd_blur_sigmas": _safe_stack(all_cdd_blur_sigmas),
         "priority_good_candidates": torch.tensor(all_priority_good_candidates, dtype=x_clean.dtype, device=x_clean.device),
         "priority_nonzero_mean": torch.tensor(all_priority_nonzero_mean, dtype=x_clean.dtype, device=x_clean.device),
+        "priority_prescreen_candidates": torch.tensor(all_priority_prescreen_candidates, dtype=x_clean.dtype, device=x_clean.device),
         "priority_auto_base_targets": torch.tensor(all_priority_auto_base_targets, dtype=x_clean.dtype, device=x_clean.device),
         "priority_effective_targets": torch.tensor(all_priority_effective_targets, dtype=x_clean.dtype, device=x_clean.device),
         "mask_scale_factor": torch.tensor(float(mask_scale), dtype=x_clean.dtype, device=x_clean.device),
@@ -822,6 +860,7 @@ def prepare_context_batch(
     priority_n_target: int | str = 20,
     priority_min_targets_per_map: int = 0,
     priority_dithering_pixels: Optional[int] = None,
+    priority_candidate_oversample: float = 3.0,
     target_nonoverlap: bool = False,
     target_allow_partial_overlap: float = 0.0,
     mask_box_hardcap: int | None = None,
@@ -864,6 +903,7 @@ def prepare_context_batch(
         priority_n_target=priority_n_target,
         priority_min_targets_per_map=priority_min_targets_per_map,
         priority_dithering_pixels=priority_dithering_pixels,
+        priority_candidate_oversample=priority_candidate_oversample,
         target_nonoverlap=target_nonoverlap,
         target_allow_partial_overlap=target_allow_partial_overlap,
         mask_box_hardcap=mask_box_hardcap,

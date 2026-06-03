@@ -188,7 +188,7 @@ def _precompute_cdd_cache(
     device: torch.device,
     config_name: str,
 ) -> dict:
-    """Pre-compute CDD decomposition for all data files on GPU, store in CPU RAM."""
+    """Pre-compute a bounded CDD decomposition cache on GPU, store in CPU RAM."""
     import glob as _glob
     import constrained_diffusion as cdd
 
@@ -206,6 +206,29 @@ def _precompute_cdd_cache(
     if not npy_files:
         print(f"[{config_name}] CDD precompute: no files found, skipping")
         return {}
+    enabled = bool(data_cfg.get("cdd_precompute", True))
+    if not enabled:
+        print(f"[{config_name}] CDD precompute: disabled by data.cdd_precompute=false")
+        return {}
+    max_files = int(data_cfg.get("cdd_precompute_max_files", 4096))
+    if max_files > 0 and len(npy_files) > max_files:
+        print(
+            f"[{config_name}] CDD precompute: {len(npy_files)} files exceeds "
+            f"data.cdd_precompute_max_files={max_files}; using on-the-fly loading"
+        )
+        return {}
+    max_gb = float(data_cfg.get("cdd_precompute_max_gb", 8.0))
+    if max_gb > 0:
+        sample_shape = np.load(npy_files[0], mmap_mode="r").shape
+        n_channels = len(sigmas) + (1 if cdd_append_last_residual else 0)
+        est_bytes_per = int(n_channels) * int(np.prod(sample_shape)) * np.dtype(np.float32).itemsize
+        est_total_gb = (est_bytes_per * len(npy_files)) / float(1024 ** 3)
+        if est_total_gb > max_gb:
+            print(
+                f"[{config_name}] CDD precompute: estimated cache {est_total_gb:.2f} GiB exceeds "
+                f"data.cdd_precompute_max_gb={max_gb:.2f}; using on-the-fly loading"
+            )
+            return {}
     print(f"[{config_name}] CDD precompute: {len(npy_files)} file(s) on GPU...")
     cache = {}
     for path in npy_files:
@@ -293,6 +316,7 @@ class _MaskingCollator:
             "priority_n_target": model.priority_n_target,
             "priority_min_targets_per_map": model.priority_min_targets_per_map,
             "priority_dithering_pixels": model.priority_dithering_pixels,
+            "priority_candidate_oversample": model.priority_candidate_oversample,
             "target_nonoverlap": getattr(model, "target_nonoverlap", False),
             "target_allow_partial_overlap": getattr(model, "target_allow_partial_overlap", 0.0),
             "mask_box_hardcap": getattr(model, "mask_box_hardcap", None),
@@ -365,6 +389,7 @@ def _prepare_context_from_model(
         priority_n_target=model.priority_n_target,
         priority_min_targets_per_map=model.priority_min_targets_per_map,
         priority_dithering_pixels=model.priority_dithering_pixels,
+        priority_candidate_oversample=model.priority_candidate_oversample,
         target_nonoverlap=getattr(model, "target_nonoverlap", False),
         target_allow_partial_overlap=getattr(model, "target_allow_partial_overlap", 0.0),
         mask_box_hardcap=getattr(model, "mask_box_hardcap", None),
@@ -392,11 +417,8 @@ def evaluate_validation(
         x_clean, context_result = batch
         x_clean = x_clean.to(device, non_blocking=True)
         context_result = _move_to_device(context_result, device)
-        if len(context_result) == 5:
-            x_context, tloc, tscale, tvalid, debug = context_result
-        else:
-            x_context, tloc, tscale, tvalid = context_result
-            debug = {}
+        x_context, tloc, tscale, tvalid = context_result[:4]
+        debug = context_result[4] if len(context_result) == 5 else {}
         context_data = (x_context, tloc, tscale, tvalid, debug)
         outputs = model(x_clean, context_data=context_data)
         loss = model.compute_loss(outputs)
@@ -520,8 +542,10 @@ def _resolve_encoder_alias_2d(name: str) -> str:
         "cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
         "cdd_scaleaware_convnext_d4": "cdd_scaleaware_convnext_d4",
         "cdd_scaleaware_rescnn": "cdd_scaleaware_rescnn",
+        "escnn_c4_pyramid": "escnn_c4_pyramid",
         # Supported aliases.
         "convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
+        "escnn-c4-pyramid": "escnn_c4_pyramid",
     }
     return alias.get(key, str(name))
 
@@ -554,12 +578,13 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
             "cdd_scaleaware_convnext_d4",
             "cdd_scaleaware_rescnn",
             "convnext_dense_pyramid",
+            "escnn_c4_pyramid",
         }
         if resolved_encoder_type not in allowed_pyramid:
             raise ValueError(
                 f"Unsupported pyramid-mode encoder_type={resolved_encoder_type}. "
                 "Allowed: cdd_scaleaware_convnext, cdd_scaleaware_convnext_d4, "
-                "cdd_scaleaware_rescnn, convnext_dense_pyramid."
+                "cdd_scaleaware_rescnn, convnext_dense_pyramid, escnn_c4_pyramid."
             )
     else:
         raise ValueError(f"Unsupported mode={resolved_mode}. Allowed: image, pyramid.")
@@ -624,6 +649,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         priority_n_target=model_cfg.get("priority_n_target", 20),
         priority_min_targets_per_map=int(model_cfg.get("priority_min_targets_per_map", 0)),
         priority_dithering_pixels=int(model_cfg.get("priority_dithering_pixels", model_cfg.get("target_dithering_pixels", 6))),
+        priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
         target_nonoverlap=bool(model_cfg.get("target_nonoverlap", False)),
         target_allow_partial_overlap=float(model_cfg.get("target_allow_partial_overlap", 0.0)),
@@ -671,6 +697,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
         use_film=bool(model_cfg.get("use_film", True)),
         use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
+        priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
     ).to(device)
 
 
@@ -681,10 +708,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-    mps_available = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
     print(
         f"[{config_name}] Backend discovered: device={device.type}, "
-        f"cuda_available={torch.cuda.is_available()}, mps_available={mps_available}"
+        f"cuda_available={torch.cuda.is_available()}, "
+        f"mps_available={device.type == 'mps'}"
     )
 
     train_cfg = config["train"]
@@ -1084,10 +1111,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     embed_spread_target = float(spread_regularizer["target_std"])
     spread_regularizer_eps = float(spread_regularizer["eps"])
     experimental_losses = dict(train_cfg.get("experimental_losses", {}))
-    assert "vicreg_var_weight" not in train_cfg
-    assert "vicreg_cov_weight" not in train_cfg
-    vicreg_var_weight = float(experimental_losses.get("vicreg_var_weight", 0.0))
-    vicreg_cov_weight = float(experimental_losses.get("vicreg_cov_weight", 0.0))
+    vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", experimental_losses.get("vicreg_var_weight", 0.0)))
+    vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", experimental_losses.get("vicreg_cov_weight", 0.0)))
     symmetry_loss_weight = float(train_cfg.get("symmetry_loss_weight", 0.0))
     vicreg_spatial_mode = str(train_cfg.get("vicreg_spatial_mode", "dense")).lower()
     if vicreg_spatial_mode not in ("dense", "pooled"):
@@ -1240,11 +1265,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 x_clean, context_result = batch
                 x_clean = x_clean.to(device, non_blocking=True)
                 context_result = _move_to_device(context_result, device)
-                if len(context_result) == 5:
-                    x_context, tloc, tscale, tvalid, debug = context_result
-                else:
-                    x_context, tloc, tscale, tvalid = context_result
-                    debug = {}
+                x_context, tloc, tscale, tvalid = context_result[:4]
+                debug = context_result[4] if len(context_result) == 5 else {}
                 context_data = (x_context, tloc, tscale, tvalid, debug)
 
             # Compute LR before forward/backward/step so the current batch

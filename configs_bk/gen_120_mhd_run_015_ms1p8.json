@@ -1,0 +1,59 @@
+{
+  "base_config": "../base_pyramid_scaleaware_convnext.json",
+  "data": {
+    "npy_pattern": "C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy"
+  },
+  "model": {
+    "mode": "pyramid",
+    "model_key": "cdd_scaleaware_convnext",
+    "encoder_depth": 4,
+    "mask_spacing_scaling": 2.0,
+    "mask_size_scaling": 1.8,
+    "mask_box_size": 0,
+    "normalize_loss_l2": false,
+    "predictor_spatial_conv": false,
+    "predictor_layernorm": false,
+    "predictor_hidden": 96,
+    "scaleaware_norm_per_scale": true,
+    "scaleaware_adapter_norm": true,
+    "scaleaware_stem_norm": true,
+    "scaleaware_final_norm": true,
+    "use_grn": true,
+    "post_log_transform": true,
+    "use_symmetric_feature_loss": true,
+    "target_sampling_mode": "priority_sampling",
+    "priority_top_percent": 15.0,
+    "priority_n_target": "auto",
+    "priority_min_targets_per_map": 10,
+    "priority_dithering_pixels": 6,
+    "target_nonoverlap": true,
+    "target_allow_partial_overlap": 0.0
+  },
+  "train": {
+    "epochs": 10,
+    "log_interval": 1,
+    "diagnostic_interval": 10,
+    "batch_size": 4,
+    "num_workers": 8,
+    "prefetch_factor": 2,
+    "vicreg_spatial_mode": "pooled",
+    "ema_momentum_base": 0.99,
+    "ema_momentum_final": 0.9999,
+    "ema_warmup_fraction": 0.25,
+    "mse_loss_weight": 50.0,
+    "vicreg_var_weight": 0.0,
+    "vicreg_cov_weight": 0.0,
+    "spread_regularizer": {
+      "type": "std_hinge",
+      "target": "context",
+      "weight": 5.0,
+      "target_std": 1.0,
+      "eps": 1.0e-4
+    },
+    "symmetric_feature_loss_weight": 0.003,
+    "compute_effective_rank": true,
+    "scale_probe_enabled": true,
+    "inference_tta_enabled": true,
+    "inference_tta_mode": "flip4"
+  }
+}

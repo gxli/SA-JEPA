@@ -16,21 +16,20 @@ def _read_model_inputs(session_dir: str) -> dict:
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        d = cfg.get("data", {})
         m = cfg.get("model", {})
+        t = cfg.get("train", {})
+        spread = t.get("spread_regularizer", {})
         return {
             "mode": str(m.get("mode", "NA")),
-            "mask_fraction": str(m.get("active_target_fraction", m.get("mask_fraction", "NA"))),
-            "mask_size": str(m.get("mask_scale_factor", m.get("mask_size_scaling", m.get("mask_size", "NA")))),
-            "normalize_loss_l2": _fmt_bool(m.get("normalize_loss_l2", m.get("normalize_loss", False))),
-            "predictor_layernorm": _fmt_bool(m.get("predictor_layernorm", True)),
-            "scaleaware_norm_per_scale": _fmt_bool(m.get("scaleaware_norm_per_scale", False)),
-            "scaleaware_adapter_norm": _fmt_bool(m.get("scaleaware_adapter_norm", True)),
-            "scaleaware_stem_norm": _fmt_bool(m.get("scaleaware_stem_norm", False)),
-            "scaleaware_final_norm": _fmt_bool(m.get("scaleaware_final_norm", False)),
-            "encoder_final_norm_type": str(m.get("encoder_final_norm_type", "layernorm")),
-            "encoder_norm_type": str(m.get("encoder_norm_type", "-") or "-"),
-            "use_grn": _fmt_bool(m.get("use_grn", True)),
+            "ms": str(m.get("mask_size_scaling", m.get("mask_size_scaling_range", "NA"))),
+            "mbox": str(m.get("mask_box_size", m.get("mask_box_size_range", "NA"))),
+            "l2": _fmt_bool(m.get("normalize_loss_l2", False)),
+            "psn": _fmt_bool(m.get("scaleaware_norm_per_scale", False)),
+            "fin": _fmt_bool(m.get("scaleaware_final_norm", False)),
+            "spread_w": str(spread.get("weight", t.get("sigreg_weight", "NA"))),
+            "sigtype": str(spread.get("type", "NA")),
+            "symw": str(t.get("symmetric_feature_loss_weight", "NA")),
+            "depth": str(m.get("encoder_depth", "NA")),
         }
     except Exception:
         return _missing_model_inputs()
@@ -41,20 +40,9 @@ def _fmt_bool(value) -> str:
 
 
 def _missing_model_inputs() -> dict:
-    return {
-        "mode": "NA",
-        "mask_fraction": "NA",
-        "mask_size": "NA",
-        "normalize_loss_l2": "-",
-        "predictor_layernorm": "-",
-        "scaleaware_norm_per_scale": "-",
-        "scaleaware_adapter_norm": "-",
-        "scaleaware_stem_norm": "-",
-        "scaleaware_final_norm": "-",
-        "encoder_final_norm_type": "-",
-        "encoder_norm_type": "-",
-        "use_grn": "-",
-    }
+    return {k: "NA" for k in (
+        "mode", "ms", "mbox", "l2", "psn", "fin", "spread_w", "sigtype", "symw", "depth",
+    )}
 
 
 def _read_effective_rank(session_dir: str) -> str:
@@ -65,7 +53,6 @@ def _read_effective_rank(session_dir: str) -> str:
                 return f.read().strip()
         except Exception:
             return ""
-
     rr = os.path.join(session_dir, "run_results.csv")
     if os.path.exists(rr):
         try:
@@ -81,13 +68,6 @@ def _read_effective_rank(session_dir: str) -> str:
     return ""
 
 
-def _parse_rank(v: str) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return float("-inf")
-
-
 def _read_rank_diag(session_dir: str) -> dict:
     path = os.path.join(session_dir, "rank_diagnostics.json")
     if not os.path.exists(path):
@@ -99,10 +79,10 @@ def _read_rank_diag(session_dir: str) -> dict:
         return {}
 
 
-def _diag_get(diag: dict, branch: str, key: str, legacy_key: str | None = None) -> str:
+def _diag_get(diag: dict, branch: str, key: str) -> str:
     try:
         values = diag.get(branch, {})
-        v = values.get(key, values.get(legacy_key, ""))
+        v = values.get(key, "")
         if isinstance(v, (int, float)):
             return f"{float(v):.6f}"
         return str(v)
@@ -110,7 +90,7 @@ def _diag_get(diag: dict, branch: str, key: str, legacy_key: str | None = None) 
         return ""
 
 
-def _fmt_float(v: str, width: int = 9, digits: int = 4) -> str:
+def _fmt_float(v: str, width: int = 8, digits: int = 4) -> str:
     try:
         x = float(v)
         if not math.isfinite(x):
@@ -118,15 +98,6 @@ def _fmt_float(v: str, width: int = 9, digits: int = 4) -> str:
         return f"{x:>{width}.{digits}f}"
     except Exception:
         return f"{'-':>{width}}"
-
-
-def _clip(s: str, width: int) -> str:
-    s = str(s)
-    if len(s) <= width:
-        return s.ljust(width)
-    if width <= 1:
-        return s[:width]
-    return (s[: width - 1] + "…")
 
 
 def main() -> int:
@@ -167,117 +138,53 @@ def main() -> int:
         p_er = _diag_get(diag, "pred", "erank")
         g_er = _diag_get(diag, "gt", "erank")
         p_t1 = _diag_get(diag, "pred", "top1_energy")
-        p_t4 = _diag_get(diag, "pred", "top4_energy")
-        p_t8 = _diag_get(diag, "pred", "top8_energy")
-        p_pr = _diag_get(diag, "pred", "manifold_size", "participation_rank")
-        g_pr = _diag_get(diag, "gt", "manifold_size", "participation_rank")
+        p_pr = _diag_get(diag, "pred", "manifold_size")
+        g_pr = _diag_get(diag, "gt", "manifold_size")
+        pr_match = ""
+        try:
+            pr_match = f"{float(diag.get('volume_match_ratio', 'nan')):.4f}"
+        except Exception:
+            pr_match = ""
         p_dead = _diag_get(diag, "pred", "dead_channel_fraction")
-        p_dead_channel_count_raw = diag.get("pred", {}).get(
-            "dead_channel_count",
-            diag.get("pred", {}).get("num_dead_channels", ""),
-        )
+        p_dead_n = diag.get("pred", {}).get("dead_channel_count",
+                    diag.get("pred", {}).get("num_dead_channels", 0))
         try:
-            p_dead_channel_count = str(int(p_dead_channel_count_raw))
+            p_dead_str = str(int(p_dead_n))
         except Exception:
-            p_dead_channel_count = ""
-        ratio_er = ""
-        ratio_pr = ""
-        try:
-            ratio_er = f"{float(diag.get('rank_match_ratio', diag.get('pred_gt_erank_ratio', 'nan'))):.6f}"
-        except Exception:
-            ratio_er = ""
-        try:
-            ratio_pr = f"{float(diag.get('volume_match_ratio', diag.get('pred_gt_participation_ratio', 'nan'))):.6f}"
-        except Exception:
-            ratio_pr = ""
+            p_dead_str = "-"
         rows.append(
-            (
-                name,
-                inputs["mode"],
-                inputs["mask_fraction"],
-                inputs["mask_size"],
-                inputs["normalize_loss_l2"],
-                inputs["predictor_layernorm"],
-                inputs["scaleaware_norm_per_scale"],
-                inputs["scaleaware_adapter_norm"],
-                inputs["scaleaware_stem_norm"],
-                inputs["scaleaware_final_norm"],
-                inputs["encoder_final_norm_type"],
-                inputs["encoder_norm_type"],
-                inputs["use_grn"],
-                rank,
-                c_er,
-                p_er,
-                g_er,
-                p_t1,
-                p_t4,
-                p_t8,
-                p_pr,
-                g_pr,
-                p_dead,
-                p_dead_channel_count,
-                ratio_er,
-                ratio_pr,
-            )
+            (name,
+             inputs["mode"], inputs["ms"], inputs["mbox"],
+             inputs["l2"], inputs["psn"], inputs["fin"],
+             inputs["spread_w"], inputs["symw"], inputs["depth"],
+             rank, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_str)
         )
 
     rows_sorted = sorted(rows, key=lambda x: x[0])
 
-    print("Effective Rank Summary (sorted by session filename A->Z)")
-    session_w = max([len("session"), *(len(row[0]) for row in rows_sorted)])
+    print("Effective Rank Summary (sorted by session filename A-Z)")
+    session_w = max(len("session"), *(len(row[0]) for row in rows_sorted))
     header = (
-        f"{'session':<{session_w}} {'mode':<8} {'mfrac':>6} {'mscale':>6} "
-        f"{'l2n':>3} {'pln':>3} {'psn':>3} {'adn':>3} {'stn':>3} {'fin':>3} "
-        f"{'fin_type':<9} {'enc_norm':<9} {'grn':>3} "
-        f"{'erank':>9} {'ctx_er':>9} {'pred_er':>9} {'gt_er':>9} "
-        f"{'t1':>7} {'t4':>7} {'t8':>7} {'pred_man':>9} {'tgt_man':>9} "
-        f"{'dead_f':>8} {'dead_ch':>6} {'rank_fit':>9} {'vol_fit':>9}"
+        f"{'session':<{session_w}} {'mode':<9} {'mask_scale':>9} {'mask_box':>9} "
+        f"{'l2_norm':>7} {'psnorm':>6} {'final_norm':>10} {'sigreg':>7} {'sym_loss':>9} {'depth':>6} "
+        f"{'erank':>8} {'context':>9} {'predictor':>10} {'target':>9} "
+        f"{'top1':>7} {'pred_part':>10} {'target_part':>11} {'part_ratio':>10} {'dead_frac':>10} {'dead_ch':>7}"
     )
     print(header)
     print("-" * len(header))
     for row in rows_sorted:
-        (
-            s,
-            mode,
-            mf,
-            ms,
-            normalize_loss_l2,
-            predictor_layernorm,
-            scaleaware_norm_per_scale,
-            scaleaware_adapter_norm,
-            scaleaware_stem_norm,
-            scaleaware_final_norm,
-            encoder_final_norm_type,
-            encoder_norm_type,
-            use_grn,
-            rk,
-            c_er,
-            p_er,
-            g_er,
-            p_t1,
-            p_t4,
-            p_t8,
-            p_pr,
-            g_pr,
-            p_dead,
-            p_dead_channel_count,
-            ratio_er,
-            ratio_pr,
-        ) = row
-        dead_channel_count_str = p_dead_channel_count if p_dead_channel_count != "" else "-"
+        (s, mode, ms, mbox, l2, psn, fin, sigw, symw, d,
+         rk, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_n) = row
         print(
-            f"{s:<{session_w}} {mode:<8} {_fmt_float(mf,6,2)} {_fmt_float(ms,6,2)} "
-            f"{normalize_loss_l2:>3} {predictor_layernorm:>3} "
-            f"{scaleaware_norm_per_scale:>3} {scaleaware_adapter_norm:>3} "
-            f"{scaleaware_stem_norm:>3} {scaleaware_final_norm:>3} "
-            f"{encoder_final_norm_type:<9} {encoder_norm_type:<9} {use_grn:>3} "
-            f"{_fmt_float(rk,9,4)} {_fmt_float(c_er,9,4)} {_fmt_float(p_er,9,4)} {_fmt_float(g_er,9,4)} "
-            f"{_fmt_float(p_t1,7,3)} {_fmt_float(p_t4,7,3)} {_fmt_float(p_t8,7,3)} {_fmt_float(p_pr,9,4)} {_fmt_float(g_pr,9,4)} "
-            f"{_fmt_float(p_dead,8,3)} {dead_channel_count_str:>6} {_fmt_float(ratio_er,9,4)} {_fmt_float(ratio_pr,9,4)}"
+            f"{s:<{session_w}} {mode:<9} {ms:>9} {mbox:>9} "
+            f"{l2:>7} {psn:>6} {fin:>10} {_fmt_float(sigw,7,2)} {_fmt_float(symw,9,4)} {d:>6} "
+            f"{_fmt_float(rk,8,4)} {_fmt_float(c_er,9,4)} {_fmt_float(p_er,10,4)} {_fmt_float(g_er,9,4)} "
+            f"{_fmt_float(p_t1,7,3)} {_fmt_float(p_pr,10,2)} {_fmt_float(g_pr,11,2)} {_fmt_float(pr_match,10,4)} "
+            f"{_fmt_float(p_dead,10,3)} {p_dead_n:>7}"
         )
 
     n_total = len(rows_sorted)
-    n_rank = sum(1 for r in rows_sorted if r[13] != "")
+    n_rank = sum(1 for r in rows_sorted if r[10] != "")
     print("-" * len(header))
     print(f"sessions={n_total} with_rank={n_rank} missing_rank={n_total - n_rank}")
     return 0
