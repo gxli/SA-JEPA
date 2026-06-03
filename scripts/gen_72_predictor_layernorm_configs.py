@@ -43,7 +43,7 @@ def _base_config() -> dict:
             "normalize_loss_l2": True,
             "use_symmetric_feature_loss": True,
             "priority_top_percent": 15.0,
-            "target_sampling_mode": "priority_sampling",
+            "target_sampling_mode": "priority",
             "priority_n_target": "auto",
             "priority_min_targets_per_map": 10,
             "priority_dithering_pixels": 6,

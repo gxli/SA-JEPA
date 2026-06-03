@@ -31,7 +31,7 @@ def _base_config(npy_pattern: str) -> dict:
             "model_key": "cdd_scaleaware_convnext",
             "mask_spacing_scaling": 2.0,
             "normalize_loss_l2": True,
-            "target_sampling_mode": "priority_sampling",
+            "target_sampling_mode": "priority",
             "priority_top_percent": 15.0,
             "priority_n_target": "auto",
             "priority_min_targets_per_map": 10,

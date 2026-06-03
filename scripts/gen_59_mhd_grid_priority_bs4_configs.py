@@ -98,14 +98,14 @@ def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
 
     m_grid = deepcopy(BASE_MODEL)
-    m_grid["target_sampling_mode"] = "grid"
+    m_grid["target_sampling_mode"] = "lattice"
     write_config(
         "gen_59_run_1_mhd_cdd_scaleaware_convnext-pyramid-scaleaware_grid_mscale_1p0_bs4",
         m_grid,
     )
 
     m_priority = deepcopy(BASE_MODEL)
-    m_priority["target_sampling_mode"] = "priority_sampling"
+    m_priority["target_sampling_mode"] = "priority"
     m_priority["priority_top_percent"] = 15.0
     m_priority["priority_n_target"] = "auto"
     m_priority["priority_dithering_pixels"] = 6

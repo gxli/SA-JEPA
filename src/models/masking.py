@@ -1,10 +1,28 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+
+
+PRIMARY_TARGET_SAMPLING_MODES = ("random", "priority")
+LEGACY_TARGET_SAMPLING_MODES = ("lattice",)
+LEGACY_TARGET_SAMPLING_ALIASES = {
+    "grid": "lattice",
+    "priority_sampling": "priority",
+}
+ALLOWED_TARGET_SAMPLING_MODES = PRIMARY_TARGET_SAMPLING_MODES + LEGACY_TARGET_SAMPLING_MODES
+
+
+def normalize_target_sampling_mode(mode: str) -> str:
+    sampling_mode = str(mode).strip().lower()
+    sampling_mode = LEGACY_TARGET_SAMPLING_ALIASES.get(sampling_mode, sampling_mode)
+    if sampling_mode not in ALLOWED_TARGET_SAMPLING_MODES:
+        allowed = ", ".join(ALLOWED_TARGET_SAMPLING_MODES)
+        raise ValueError(f"target_sampling_mode must be one of: {allowed}; got {mode!r}")
+    return sampling_mode
 
 
 def norm_per_sample_channel(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -121,6 +139,33 @@ def _build_priority_catalogue_from_cdd_ratio(
     selected = valid_idx[top_local]
     ys = (selected // w).astype(np.int64)
     xs = (selected % w).astype(np.int64)
+    return [(int(y), int(x)) for y, x in zip(ys, xs)]
+
+
+def _build_random_catalogue_from_cdd(
+    cdd_orig: np.ndarray,
+    patch_size: int,
+    h: int,
+    w: int,
+) -> list[tuple[int, int]]:
+    """All valid signal pixels, shuffled later by torch for random sampling."""
+    if cdd_orig.ndim != 3 or cdd_orig.shape[0] <= 0:
+        return []
+    total_flux = np.sum(cdd_orig, axis=0)
+    half_lo = int(patch_size) // 2
+    half_hi = int(patch_size) - half_lo
+    valid = total_flux > 1e-8
+    if half_lo > 0:
+        valid[:half_lo, :] = False
+        valid[:, :half_lo] = False
+    if half_hi > 0:
+        valid[h - half_hi :, :] = False
+        valid[:, w - half_hi :] = False
+    valid_idx = np.flatnonzero(valid.reshape(-1))
+    if valid_idx.size == 0:
+        return []
+    ys = (valid_idx // w).astype(np.int64)
+    xs = (valid_idx % w).astype(np.int64)
     return [(int(y), int(x)) for y, x in zip(ys, xs)]
 
 
@@ -260,6 +305,80 @@ def _effective_mask_box_size(
     return _odd_box(box, bump_up=not capped)
 
 
+def _manual_mask_box_size(
+    manual_mask_box_sizes: Sequence[int] | None,
+    index: int,
+    inner_target_size: int,
+    hardcap: int | None = None,
+) -> int | None:
+    if manual_mask_box_sizes is None:
+        return None
+    if len(manual_mask_box_sizes) <= 0:
+        return None
+    raw = manual_mask_box_sizes[min(int(index), len(manual_mask_box_sizes) - 1)]
+    box = max(int(round(float(raw))), int(inner_target_size))
+    capped = False
+    if hardcap is not None and hardcap > 0 and box > int(hardcap):
+        box = int(hardcap)
+        capped = True
+    return _odd_box(box, bump_up=not capped)
+
+
+def _effective_mask_box_size_for_index(
+    index: int,
+    sigma: float,
+    mask_scale: float,
+    mask_box_size: int,
+    inner_target_size: int,
+    hardcap: int | None = None,
+    manual_mask_box_sizes: Sequence[int] | None = None,
+) -> int:
+    manual = _manual_mask_box_size(
+        manual_mask_box_sizes=manual_mask_box_sizes,
+        index=index,
+        inner_target_size=inner_target_size,
+        hardcap=hardcap,
+    )
+    if manual is not None:
+        return manual
+    return _effective_mask_box_size(
+        sigma=sigma,
+        mask_scale=mask_scale,
+        mask_box_size=mask_box_size,
+        inner_target_size=inner_target_size,
+        hardcap=hardcap,
+    )
+
+
+def _max_effective_mask_box_size(
+    sigmas: Sequence[float],
+    mask_scale: float,
+    mask_box_size: int,
+    inner_target_size: int,
+    hardcap: int | None = None,
+    manual_mask_box_sizes: Sequence[int] | None = None,
+) -> int:
+    boxes = [
+        _effective_mask_box_size_for_index(
+            index=i,
+            sigma=float(s),
+            mask_scale=mask_scale,
+            mask_box_size=mask_box_size,
+            inner_target_size=inner_target_size,
+            hardcap=hardcap,
+            manual_mask_box_sizes=manual_mask_box_sizes,
+        )
+        for i, s in enumerate(sigmas)
+    ]
+    return max(boxes) if boxes else _effective_mask_box_size(
+        sigma=1.0,
+        mask_scale=mask_scale,
+        mask_box_size=mask_box_size,
+        inner_target_size=inner_target_size,
+        hardcap=hardcap,
+    )
+
+
 def _ensure_target_patches_masked(
     sample_locations: list[tuple[int, int]],
     mask_map: np.ndarray,
@@ -282,6 +401,40 @@ def _ensure_target_patches_masked(
             )
 
 
+def _target_patch_has_valid_input(
+    arr: np.ndarray,
+    sample_invalid_mask: np.ndarray | None,
+    invalid_value_specs: Sequence[object],
+    cy: int,
+    cx: int,
+    inner_target_size: int,
+) -> bool:
+    patch_half_lo = int(inner_target_size) // 2
+    patch_half_hi = int(inner_target_size) - patch_half_lo
+    py0 = int(cy) - patch_half_lo
+    py1 = int(cy) + patch_half_hi
+    px0 = int(cx) - patch_half_lo
+    px1 = int(cx) + patch_half_hi
+    h, w = arr.shape
+    if py0 < 0 or px0 < 0 or py1 > h or px1 > w:
+        return False
+    patch = arr[py0:py1, px0:px1]
+    if patch.size == 0:
+        return False
+    invalid_mask = np.zeros_like(patch, dtype=bool)
+    if sample_invalid_mask is not None:
+        invalid_mask |= sample_invalid_mask[py0:py1, px0:px1]
+    for spec in invalid_value_specs:
+        if isinstance(spec, str) and spec.lower() == "nan":
+            invalid_mask |= np.isnan(patch)
+        else:
+            try:
+                invalid_mask |= np.isclose(patch, float(spec), equal_nan=False)
+            except (TypeError, ValueError):
+                continue
+    return bool(np.any(~invalid_mask))
+
+
 def make_pyramid_grid_context(
     x_clean: torch.Tensor,
     sigmas=(2, 4, 8, 16),
@@ -291,6 +444,7 @@ def make_pyramid_grid_context(
     global_shift: bool = True,
     align_scales: bool = True,
     mask_box_size: int = 16,
+    manual_mask_box_sizes: Optional[Sequence[int]] = None,
     cdd_mode: str = "log",
     cdd_constrained: bool = True,
     cdd_sm_mode: str = "reflect",
@@ -300,16 +454,16 @@ def make_pyramid_grid_context(
     enable_grid_jitter: bool = True,
     enable_target_dithering: bool = True,
     lattice_shift_override: Optional[Tuple[int, int]] = None,
-    target_invalid_region_skip: bool = False,
+    target_invalid_region_skip: bool = True,
     target_invalid_region_values=(0.0, "nan"),
     invalid_pixel_mask: Optional[torch.Tensor] = None,
-    target_sampling_mode: str = "grid",
+    target_sampling_mode: str = "random",
     priority_top_percent: float = 5.0,
     priority_n_target: int | str = 20,
     priority_min_targets_per_map: int = 0,
     priority_dithering_pixels: Optional[int] = None,
     priority_candidate_oversample: float = 3.0,
-    target_nonoverlap: bool = False,
+    target_nonoverlap: bool = True,
     target_allow_partial_overlap: float = 0.0,
     mask_box_hardcap: int | None = None,
     cdd_use_gpu: bool = False,
@@ -333,14 +487,17 @@ def make_pyramid_grid_context(
         inner_target_size = inner_target_size + 1
     if x_clean.shape[1] != 1:
         raise ValueError(f"Expected grayscale input with 1 channel, got {x_clean.shape[1]}")
-    sampling_mode = str(target_sampling_mode).strip().lower()
+    sampling_mode = normalize_target_sampling_mode(target_sampling_mode)
+    sampled_mode = sampling_mode in ("random", "priority")
+    random_sampling_mode = sampling_mode == "random"
+    priority_sampling_mode = sampling_mode == "priority"
     if priority_dithering_pixels is None or priority_dithering_pixels <= 0:
         priority_dithering_pixels = inner_target_size
     else:
         priority_dithering_pixels = int(priority_dithering_pixels)
     # Safeguard: global_shift is a lattice/grid concept only.
     # Priority sampling selects targets from ranked pixels, so disable it.
-    effective_global_shift = bool(global_shift) if sampling_mode != "priority_sampling" else False
+    effective_global_shift = bool(global_shift) if not sampled_mode else False
 
     b, _, h, w = x_clean.shape
     active_sigmas = tuple(float(s) for s in sigmas)
@@ -386,13 +543,13 @@ def make_pyramid_grid_context(
         applied_mask_hard = np.zeros((h, w), dtype=np.uint8)
 
         # Compute shared grid centers for scale alignment
-        max_sigma = max(float(s) for s in sigmas)
-        base_box = _effective_mask_box_size(
-            sigma=max_sigma,
+        base_box = _max_effective_mask_box_size(
+            sigmas=active_sigmas,
             mask_scale=mask_scale,
             mask_box_size=mask_box_size,
             inner_target_size=inner_target_size,
             hardcap=mask_box_hardcap,
+            manual_mask_box_sizes=manual_mask_box_sizes,
         )
         base_margin = base_box // 2 + 1
         spacing_px = int(max(1, round(float(base_box) * float(spacing_scale))))
@@ -407,15 +564,15 @@ def make_pyramid_grid_context(
             lattice_shift_override=lattice_shift_override,
         )
         shared_centers_dithered = None
-        if align_scales and sampling_mode != "priority_sampling" and len(shared_centers) > 0:
+        if align_scales and not sampled_mode and len(shared_centers) > 0:
             # Dither once and reuse across scales to keep target/mask centers aligned.
-            max_sigma = max(float(s) for s in active_sigmas)
-            max_box = _effective_mask_box_size(
-                sigma=max_sigma,
+            max_box = _max_effective_mask_box_size(
+                sigmas=active_sigmas,
                 mask_scale=mask_scale,
                 mask_box_size=mask_box_size,
                 inner_target_size=inner_target_size,
                 hardcap=mask_box_hardcap,
+                manual_mask_box_sizes=manual_mask_box_sizes,
             )
             max_half_lo = max_box // 2
             max_half_hi = max_box - max_half_lo
@@ -488,23 +645,32 @@ def make_pyramid_grid_context(
             all_cdd_orig.append(torch.from_numpy(cdd_orig.copy()))
 
             priority_catalogue = []
-            if sampling_mode == "priority_sampling":
-                priority_catalogue = _build_priority_catalogue_from_cdd_ratio(
-                    cdd_orig=cdd_orig,
-                    top_percent=float(priority_top_percent),
-                    patch_size=int(inner_target_size),
-                    h=h,
-                    w=w,
-                )
+            if sampled_mode:
+                if priority_sampling_mode:
+                    priority_catalogue = _build_priority_catalogue_from_cdd_ratio(
+                        cdd_orig=cdd_orig,
+                        top_percent=float(priority_top_percent),
+                        patch_size=int(inner_target_size),
+                        h=h,
+                        w=w,
+                    )
+                else:
+                    priority_catalogue = _build_random_catalogue_from_cdd(
+                        cdd_orig=cdd_orig,
+                        patch_size=int(inner_target_size),
+                        h=h,
+                        w=w,
+                    )
                 if len(priority_catalogue) > 0:
                     # Reject candidates too close to boundary for the largest
                     # possible mask footprint across pyramid scales.
-                    max_box = _effective_mask_box_size(
-                        sigma=max(float(s) for s in active_sigmas),
+                    max_box = _max_effective_mask_box_size(
+                        sigmas=active_sigmas,
                         mask_scale=mask_scale,
                         mask_box_size=mask_box_size,
                         inner_target_size=inner_target_size,
                         hardcap=mask_box_hardcap,
+                        manual_mask_box_sizes=manual_mask_box_sizes,
                     )
                     max_half_lo = max_box // 2
                     max_half_hi = max_box - max_half_lo
@@ -516,38 +682,43 @@ def make_pyramid_grid_context(
                         x1 = int(cx) + int(max_half_hi)
                         if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
                             continue
+                        if not _target_patch_has_valid_input(
+                            arr=arr,
+                            sample_invalid_mask=sample_invalid_mask,
+                            invalid_value_specs=invalid_value_specs,
+                            cy=int(cy),
+                            cx=int(cx),
+                            inner_target_size=inner_target_size,
+                        ):
+                            continue
                         good_candidates.append((int(cy), int(cx)))
                     priority_catalogue = good_candidates
-                    prescreen_count = _fractional_spatial_target_budget(
+                    if priority_sampling_mode:
+                        prescreen_count = _fractional_spatial_target_budget(
+                            height=h,
+                            width=w,
+                            box_size=max_box,
+                            oversample=float(priority_candidate_oversample),
+                            device=x_clean.device,
+                            minimum=int(priority_min_targets_per_map),
+                        )
+                        if prescreen_count is not None and len(priority_catalogue) > prescreen_count:
+                            perm = torch.randperm(len(priority_catalogue), device=x_clean.device)[:prescreen_count]
+                            priority_catalogue = [priority_catalogue[int(i)] for i in perm]
+                    priority_prescreen_candidates_bi = float(len(priority_catalogue))
+
+                    # Rule of thumb: start from image_area / max_mask_area.
+                    # The candidate list decides where targets may land; auto
+                    # target count should not depend on rank density artifacts.
+                    nonzero_mean = 1.0
+                    auto_base = _fractional_spatial_target_budget(
                         height=h,
                         width=w,
                         box_size=max_box,
-                        oversample=float(priority_candidate_oversample),
+                        oversample=1.0,
                         device=x_clean.device,
-                        minimum=int(priority_min_targets_per_map),
-                    )
-                    if prescreen_count is not None and len(priority_catalogue) > prescreen_count:
-                        priority_catalogue = priority_catalogue[:prescreen_count]
-                    priority_prescreen_candidates_bi = float(len(priority_catalogue))
-
-                    # Auto target-count estimate from overlap density:
-                    # N_auto = (#good_candidates) / mean(nonzero(dummy_map)).
-                    dummy = np.zeros((h, w), dtype=np.float32)
-                    for cy, cx in priority_catalogue:
-                        y0 = max(0, int(cy) - int(max_half_lo))
-                        y1 = min(h, int(cy) + int(max_half_hi))
-                        x0 = max(0, int(cx) - int(max_half_lo))
-                        x1 = min(w, int(cx) + int(max_half_hi))
-                        if y1 <= y0 or x1 <= x0:
-                            continue
-                        dummy[y0:y1, x0:x1] += 1.0
-                    nonzero = dummy[dummy > 0]
-                    nonzero_mean = float(nonzero.mean()) if nonzero.size > 0 else 1.0
-                    auto_base = (
-                        int(round(float(len(priority_catalogue)) / max(nonzero_mean, 1e-6)))
-                        if len(priority_catalogue) > 0
-                        else 0
-                    )
+                        minimum=0,
+                    ) or 0
 
                     priority_n_raw = priority_n_target
                     if isinstance(priority_n_raw, str) and priority_n_raw.strip().lower() == "auto":
@@ -561,15 +732,14 @@ def make_pyramid_grid_context(
                     base_targets_scaled = max(0, int(round(float(base_targets_unscaled) * float(total_fraction))))
                     base_targets = max(min_targets, base_targets_scaled)
                     k_sel = min(base_targets, len(priority_catalogue))
-                    if target_nonoverlap:
-                        # Shuffle first, then non-overlap filter on undithered
-                        # centres to get a reasonable initial set.  The real
-                        # non-overlap enforcement happens *after* dithering below.
-                        perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
-                        priority_catalogue = [priority_catalogue[int(i)] for i in perm[:min(k_sel * 2, len(priority_catalogue))]]
-                    else:
-                        perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
-                        priority_catalogue = [priority_catalogue[int(i)] for i in perm[:k_sel]]
+                    # Shuffle first, then keep extra seeds because explicit
+                    # overlap rejection after dithering may discard some.
+                    perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
+                    preselect_mult = 8 if bool(target_nonoverlap) else 1
+                    priority_catalogue = [
+                        priority_catalogue[int(i)]
+                        for i in perm[:min(k_sel * preselect_mult, len(priority_catalogue))]
+                    ]
                     priority_good_candidates_bi = float(len(good_candidates))
                     priority_nonzero_mean_bi = float(nonzero_mean)
                     priority_auto_base_targets_bi = float(auto_base)
@@ -577,7 +747,7 @@ def make_pyramid_grid_context(
             # Dither once per selected priority seed and reuse across scales.
             # This avoids per-scale micro-clusters around the same logical target.
             priority_centers_dithered: list[tuple[int, int]] = []
-            if sampling_mode == "priority_sampling" and len(priority_catalogue) > 0:
+            if sampled_mode and len(priority_catalogue) > 0:
                 patch_half_lo = int(inner_target_size) // 2
                 patch_half_hi = int(inner_target_size) - patch_half_lo
                 for cy0, cx0 in priority_catalogue:
@@ -595,7 +765,7 @@ def make_pyramid_grid_context(
 
                 # Non-overlap enforcement on the *dithered* centres so that
                 # dithering cannot undo the protection.
-                if target_nonoverlap and len(priority_centers_dithered) > 1:
+                if bool(target_nonoverlap) and len(priority_centers_dithered) > 1:
                     priority_centers_dithered = _rejection_sample_targets(
                         candidates=priority_centers_dithered,
                         num_targets=k_sel,
@@ -616,19 +786,21 @@ def make_pyramid_grid_context(
             cdd_blur_sigmas = []
 
             for si, sigma in enumerate(active_sigmas):
-                box = _effective_mask_box_size(
+                box = _effective_mask_box_size_for_index(
+                    index=si,
                     sigma=float(sigma),
                     mask_scale=mask_scale,
                     mask_box_size=mask_box_size,
                     inner_target_size=inner_target_size,
                     hardcap=mask_box_hardcap,
+                    manual_mask_box_sizes=manual_mask_box_sizes,
                 )
                 ch = min(si, cdd_mod.shape[0] - 1)
                 half_lo = box // 2
                 half_hi = box - half_lo
                 cdd_box_sizes.append(float(box))
                 cdd_blur_sigmas.append(0.0)
-                if sampling_mode == "priority_sampling" and len(priority_centers_dithered) > 0:
+                if sampled_mode and len(priority_centers_dithered) > 0:
                     centers = priority_centers_dithered
                 elif align_scales:
                     centers = shared_centers_dithered if shared_centers_dithered is not None else shared_centers
@@ -659,9 +831,9 @@ def make_pyramid_grid_context(
                         centers = [centers[int(i)] for i in idx]
 
                 for cy, cx in centers:
-                    # In priority mode, centers were already dithered once above.
+                    # Priority/random modes dither centers once above.
                     if enable_target_dithering and not (
-                        (sampling_mode == "priority_sampling" and len(priority_centers_dithered) > 0)
+                        (sampled_mode and len(priority_centers_dithered) > 0)
                         or align_scales
                     ):
                         cy, cx = _dither_target_center(
@@ -704,7 +876,7 @@ def make_pyramid_grid_context(
             # In priority mode we still must keep the *dithered* centers.
             # applied_locations/applied_scales are populated after dithering,
             # while priority_catalogue holds the pre-dither seed centers.
-            if sampling_mode == "priority_sampling" and len(priority_centers_dithered) > 0:
+            if sampled_mode and len(priority_centers_dithered) > 0:
                 unique_loc_to_scale = {(int(cy), int(cx)): float(active_sigmas[0]) for cy, cx in priority_centers_dithered}
             else:
                 sample_locations = list(applied_locations)
@@ -725,26 +897,15 @@ def make_pyramid_grid_context(
                     continue
                 if iy + patch_half_hi > h or ix + patch_half_hi > w:
                     continue
-                if bool(target_invalid_region_skip):
-                    py0 = iy - patch_half_lo
-                    py1 = iy + patch_half_hi
-                    px0 = ix - patch_half_lo
-                    px1 = ix + patch_half_hi
-                    patch = arr[py0:py1, px0:px1]
-                    if patch.size == 0:
-                        continue
-                    invalid_mask = np.zeros_like(patch, dtype=bool)
-                    if sample_invalid_mask is not None:
-                        invalid_mask |= sample_invalid_mask[py0:py1, px0:px1]
-                    for spec in invalid_value_specs:
-                        if isinstance(spec, str) and spec.lower() == "nan":
-                            invalid_mask |= np.isnan(patch)
-                        else:
-                            try:
-                                invalid_mask |= np.isclose(patch, float(spec), equal_nan=False)
-                            except (TypeError, ValueError):
-                                continue
-                    if np.all(invalid_mask):
+                if bool(target_invalid_region_skip) or sampled_mode:
+                    if not _target_patch_has_valid_input(
+                        arr=arr,
+                        sample_invalid_mask=sample_invalid_mask,
+                        invalid_value_specs=invalid_value_specs,
+                        cy=iy,
+                        cx=ix,
+                        inner_target_size=inner_target_size,
+                    ):
                         continue
                 sample_locations.append((iy, ix))
                 sample_scales.append(float(unique_loc_to_scale[(cy, cx)]))
@@ -844,6 +1005,7 @@ def prepare_context_batch(
     global_shift: bool = True,
     align_scales: bool = True,
     mask_box_size: int = 16,
+    manual_mask_box_sizes: Optional[Sequence[int]] = None,
     cdd_mode: str = "log",
     cdd_constrained: bool = True,
     cdd_sm_mode: str = "reflect",
@@ -853,15 +1015,15 @@ def prepare_context_batch(
     enable_grid_jitter: bool = True,
     enable_target_dithering: bool = True,
     lattice_shift_override: Optional[Tuple[int, int]] = None,
-    target_invalid_region_skip: bool = False,
+    target_invalid_region_skip: bool = True,
     target_invalid_region_values=(0.0, "nan"),
-    target_sampling_mode: str = "grid",
+    target_sampling_mode: str = "random",
     priority_top_percent: float = 5.0,
     priority_n_target: int | str = 20,
     priority_min_targets_per_map: int = 0,
     priority_dithering_pixels: Optional[int] = None,
     priority_candidate_oversample: float = 3.0,
-    target_nonoverlap: bool = False,
+    target_nonoverlap: bool = True,
     target_allow_partial_overlap: float = 0.0,
     mask_box_hardcap: int | None = None,
     cdd_use_gpu: bool = False,
@@ -886,6 +1048,7 @@ def prepare_context_batch(
         global_shift=global_shift,
         align_scales=align_scales,
         mask_box_size=mask_box_size,
+        manual_mask_box_sizes=manual_mask_box_sizes,
         cdd_mode=cdd_mode,
         cdd_constrained=cdd_constrained,
         cdd_sm_mode=cdd_sm_mode,

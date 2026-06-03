@@ -61,7 +61,7 @@ def _config(
             "post_log_transform": True,
             "use_grn": True,
             "use_symmetric_feature_loss": symmetry_weight > 0.0,
-            "target_sampling_mode": "priority_sampling",
+            "target_sampling_mode": "priority",
             "priority_top_percent": 15.0,
             "priority_n_target": "auto",
             "priority_min_targets_per_map": 10,

@@ -47,6 +47,13 @@ DASH_DATA_REQUIRED = {
     "pyramid_mask_cube",
 }
 
+SCALE_PROBE_KEYS = {
+    "scale_probe_sensitivity_maps",
+    "scale_probe_scale_only_sim_maps",
+    "scale_probe_winner_map",
+    "scale_probe_names",
+}
+
 
 def _find_session_config(session_dir: str) -> str | None:
     name = os.path.basename(os.path.abspath(session_dir))
@@ -173,6 +180,94 @@ def _prefer_npz(path: str) -> str:
     return npz_path if os.path.exists(npz_path) else path
 
 
+def _find_scale_probe_artifacts(session_dir: str) -> tuple[str | None, str | None]:
+    run_name = os.path.basename(os.path.abspath(session_dir))
+    preferred_pt = os.path.join(session_dir, f"{run_name}_scale_response.pt")
+    preferred_json = os.path.join(session_dir, f"{run_name}_report.json")
+    if os.path.exists(preferred_pt):
+        return preferred_pt, preferred_json if os.path.exists(preferred_json) else None
+
+    pts = sorted(
+        os.path.join(session_dir, fn)
+        for fn in os.listdir(session_dir)
+        if fn.endswith("_scale_response.pt")
+    )
+    if not pts:
+        return None, None
+    pt_path = pts[0]
+    stem = os.path.basename(pt_path)[: -len("_scale_response.pt")]
+    report_path = os.path.join(session_dir, f"{stem}_report.json")
+    return pt_path, report_path if os.path.exists(report_path) else None
+
+
+def _load_scale_probe_dash_data(session_dir: str) -> dict[str, np.ndarray]:
+    pt_path, report_path = _find_scale_probe_artifacts(session_dir)
+    if pt_path is None:
+        return {}
+    try:
+        probe = torch.load(pt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        probe = torch.load(pt_path, map_location="cpu")
+    except Exception as e:
+        print(f"dashboard_scale_probe_skip={session_dir} reason={type(e).__name__}: {e}")
+        return {}
+
+    sensitivity = _to_np(probe.get("sensitivity_maps", np.asarray([]))).astype(np.float32)
+    if sensitivity.ndim != 4 or sensitivity.shape[0] <= 0 or sensitivity.shape[1] <= 0:
+        print(f"dashboard_scale_probe_skip={session_dir} reason=malformed_sensitivity shape={sensitivity.shape}")
+        return {}
+    scale_only = _to_np(probe.get("scale_only_sim_maps", np.zeros_like(sensitivity))).astype(np.float32)
+    if scale_only.shape != sensitivity.shape:
+        scale_only = np.zeros_like(sensitivity, dtype=np.float32)
+    winner = _to_np(probe.get("winner_map", sensitivity[0].argmax(axis=0))).astype(np.float32)
+    if winner.ndim != 2:
+        winner = sensitivity[0].argmax(axis=0).astype(np.float32)
+    pred_sensitivity = _to_np(probe.get("pred_sensitivity_maps", np.asarray([]))).astype(np.float32)
+    if pred_sensitivity.shape != sensitivity.shape:
+        pred_sensitivity = np.asarray([], dtype=np.float32)
+
+    scale_names: list[str] = []
+    report = {}
+    if report_path is not None:
+        try:
+            with open(report_path, "r", encoding="utf-8") as f:
+                report = json.load(f)
+            scale_names = [str(v) for v in report.get("scale_names", [])]
+        except Exception:
+            report = {}
+    if len(scale_names) != int(sensitivity.shape[1]):
+        scale_names = [f"scale_{i}" for i in range(int(sensitivity.shape[1]))]
+
+    sens_global = sensitivity.mean(axis=(0, 2, 3))
+    sens_frac = sens_global / max(float(np.sum(sens_global)), 1e-12)
+    pred_global = (
+        pred_sensitivity.mean(axis=(0, 2, 3))
+        if pred_sensitivity.size > 0
+        else np.asarray([], dtype=np.float32)
+    )
+    pred_frac = (
+        pred_global / max(float(np.sum(pred_global)), 1e-12)
+        if pred_global.size > 0
+        else np.asarray([], dtype=np.float32)
+    )
+    sim_global = scale_only.mean(axis=(0, 2, 3))
+
+    return {
+        "scale_probe_sensitivity_maps": sensitivity[0].astype(np.float32),
+        "scale_probe_scale_only_sim_maps": scale_only[0].astype(np.float32),
+        "scale_probe_winner_map": winner.astype(np.float32),
+        "scale_probe_pred_sensitivity_maps": pred_sensitivity[0].astype(np.float32) if pred_sensitivity.size > 0 else np.asarray([], dtype=np.float32),
+        "scale_probe_sensitivity_mean": sens_global.astype(np.float32),
+        "scale_probe_sensitivity_fraction": sens_frac.astype(np.float32),
+        "scale_probe_pred_sensitivity_mean": pred_global.astype(np.float32),
+        "scale_probe_pred_sensitivity_fraction": pred_frac.astype(np.float32),
+        "scale_probe_scale_only_similarity": sim_global.astype(np.float32),
+        "scale_probe_names": np.array(scale_names, dtype=str),
+        "scale_probe_source": np.array([os.path.basename(pt_path)], dtype=str),
+        "scale_probe_report_json": np.array([json.dumps(report, sort_keys=True)], dtype=str),
+    }
+
+
 def _has_required_branch_artifacts(results_dir: str, branch: str) -> bool:
     required = (
         f"{branch}_pca_xyz.npy",
@@ -278,6 +373,9 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         try:
             existing = np.load(out_npz)
             missing = sorted(DASH_DATA_REQUIRED.difference(existing.files))
+            scale_pt, _ = _find_scale_probe_artifacts(session_dir)
+            if scale_pt is not None:
+                missing.extend(sorted(SCALE_PROBE_KEYS.difference(existing.files)))
             existing.close()
             if not missing:
                 return out_npz
@@ -346,18 +444,36 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
     # Load first-sample pyramid mask cube (S,H,W), save a canonical artifact in session dir.
     mask_cube = None
-    pmt_path = _prefer_npz(os.path.join(session_dir, "pyramid_mask_token.npy"))
-    if os.path.exists(pmt_path):
-        arr = np.asarray(_load_array(pmt_path), dtype=np.float32)
-        # Expected saved inference artifact shape: B,S,H,W
-        if arr.ndim == 4 and arr.shape[0] > 0:
-            mask_cube = arr[0]
+    for mask_name in ("dip_field_per_channel", "pyramid_mask_token"):
+        mask_path = _prefer_npz(os.path.join(session_dir, f"{mask_name}.npy"))
+        if os.path.exists(mask_path):
+            arr = np.asarray(_load_array(mask_path), dtype=np.float32)
+            # Expected saved inference artifact shape: B,S,H,W
+            if arr.ndim == 4 and arr.shape[0] > 0:
+                mask_cube = arr[0]
+                break
     if mask_cube is None:
         tok = outputs.get("dip_field_per_channel", outputs.get("pyramid_mask_token"))
         if tok is not None:
             tok = _to_np(tok).astype(np.float32)
             if tok.ndim == 4 and tok.shape[0] > 0:
                 mask_cube = tok[0]
+    if mask_cube is None:
+        cdd_o = outputs.get("cdd_channels_orig")
+        cdd_m = outputs.get("cdd_channels_masked")
+        if cdd_o is not None and cdd_m is not None:
+            orig_arr = _to_np(cdd_o).astype(np.float32)
+            masked_arr = _to_np(cdd_m).astype(np.float32)
+            if orig_arr.ndim == 4 and masked_arr.shape == orig_arr.shape and orig_arr.shape[0] > 0:
+                mask_cube = (np.abs(orig_arr[0] - masked_arr[0]) > 1e-8).astype(np.float32)
+    if mask_cube is None:
+        cdd_o_path = _prefer_npz(os.path.join(session_dir, "cdd_channels_orig.npy"))
+        cdd_m_path = _prefer_npz(os.path.join(session_dir, "cdd_channels_masked.npy"))
+        if os.path.exists(cdd_o_path) and os.path.exists(cdd_m_path):
+            orig_arr = np.asarray(_load_array(cdd_o_path), dtype=np.float32)
+            masked_arr = np.asarray(_load_array(cdd_m_path), dtype=np.float32)
+            if orig_arr.ndim == 4 and masked_arr.shape == orig_arr.shape and orig_arr.shape[0] > 0:
+                mask_cube = (np.abs(orig_arr[0] - masked_arr[0]) > 1e-8).astype(np.float32)
     if mask_cube is None:
         tok = outputs.get("mask_cube")
         if tok is not None:
@@ -585,30 +701,52 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 cfg = json.load(f)
             mc = cfg.get("model", {})
             _sigmas = mc.get("sigmas", [2, 4, 8, 16])
-            _ms = float(mc.get("mask_scale_factor", mc.get("mask_size_scaling", 1.0)))
-            _mb = int(mc.get("mask_footprint_px", mc.get("mask_box_size", 0)))
+            _ms_raw = mc.get("mask_size_scaling", 1.0)
+            _ms = float(_ms_raw[0] if isinstance(_ms_raw, (list, tuple)) else _ms_raw)
+            _mb_raw = mc.get("mask_size", 0)
+            _mb = int(_mb_raw[0] if isinstance(_mb_raw, (list, tuple)) else _mb_raw)
+            _manual_boxes_raw = mc.get("mask_size_manual")
+            _manual_boxes = None
+            if _manual_boxes_raw is not None:
+                if isinstance(_manual_boxes_raw, str):
+                    _manual_boxes = [int(round(float(v.strip()))) for v in _manual_boxes_raw.split(",") if v.strip()]
+                else:
+                    try:
+                        _manual_boxes = [int(round(float(v))) for v in list(_manual_boxes_raw)]
+                    except TypeError:
+                        _manual_boxes = [int(round(float(_manual_boxes_raw)))]
             _mf = float(mc.get("active_target_fraction", mc.get("mask_fraction", 1.0)))
             _ps = int(mc.get("patch_size", 3))
             _symmetric = bool(mc.get("use_symmetric_feature_loss", False))
             _norm_l2 = bool(mc.get("normalize_loss_l2", mc.get("normalize_loss", False)))
-            _sampling = str(mc.get("target_sampling_mode", "grid"))
+            _sampling = str(mc.get("target_sampling_mode", "random"))
             _enc = str(mc.get("model_key", mc.get("encoder_type", "unknown")))
             mask_config_summary = [
                 f"encoder={_enc}",
-                f"mask_scale_factor={_ms}",
-                f"mask_footprint_px={_mb}",
+                f"mask_size_scaling={_ms_raw}",
+                f"mask_size={_mb_raw}",
+                f"mask_size_manual={_manual_boxes}" if _manual_boxes else "mask_size_manual=None",
                 f"active_target_fraction={_mf}",
                 f"patch_size={_ps}",
                 f"target_sampling={_sampling}",
                 f"use_symmetric_feature_loss={_symmetric}",
                 f"normalize_loss_l2={_norm_l2}",
             ]
-            for s in _sigmas:
-                box = max(_ps, round(float(s) * _ms + _mb))
+            if _manual_boxes:
+                if len(_manual_boxes) < len(_sigmas):
+                    mask_config_summary.append("mask_size_manual shorter than sigmas; last size reused")
+                elif len(_manual_boxes) > len(_sigmas):
+                    mask_config_summary.append("mask_size_manual longer than sigmas; extras ignored")
+            def _summary_box(i, s):
+                if _manual_boxes:
+                    return max(_ps, int(_manual_boxes[min(i, len(_manual_boxes) - 1)]))
+                return max(_ps, round(float(s) * _ms + _mb))
+            for i, s in enumerate(_sigmas):
+                box = _summary_box(i, s)
                 mask_sigma_names.append(f"σ={s}")
                 mask_sigma_sizes.append(box)
             # Add overall summary
-            _computed = ", ".join(f"σ={s}→{max(_ps, round(float(s)*_ms+_mb))}px" for s in _sigmas)
+            _computed = ", ".join(f"σ={s}→{_summary_box(i, s)}px" for i, s in enumerate(_sigmas))
             mask_config_summary.append(f"computed: {_computed}")
         except Exception:
             pass
@@ -630,8 +768,9 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         except Exception:
             pass
 
-    np.savez_compressed(
-        out_npz,
+    scale_probe_data = _load_scale_probe_dash_data(session_dir)
+
+    dash_payload = dict(
         orig=orig,
         blurred=blurred,
         target=target.astype(np.float32),
@@ -698,6 +837,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         mask_sigma_sizes=np.asarray(mask_sigma_sizes, dtype=np.int32),
         mask_config_summary=np.array(mask_config_summary, dtype=str),
     )
+    dash_payload.update(scale_probe_data)
+    np.savez_compressed(out_npz, **dash_payload)
     return out_npz
 
 
@@ -710,6 +851,9 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         compute_dash_data(session_dir, overwrite=False)
     data = np.load(npz_path)
     missing = sorted(DASH_DATA_REQUIRED.difference(data.files))
+    scale_pt, _ = _find_scale_probe_artifacts(session_dir)
+    if scale_pt is not None:
+        missing.extend(sorted(SCALE_PROBE_KEYS.difference(data.files)))
     if missing:
         data.close()
         print(f"dash_data_stale_recompute={npz_path} missing={','.join(missing)}")
@@ -828,10 +972,10 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         s, h0, w0 = c.shape
         zz, yy, xx = np.nonzero(c > 1e-6)
         if xx.size == 0:
-            xx = np.asarray([0], dtype=np.int32)
-            yy = np.asarray([0], dtype=np.int32)
-            zz = np.asarray([0], dtype=np.int32)
-            vv = np.asarray([0.0], dtype=np.float32)
+            xx = np.asarray([], dtype=np.float32)
+            yy = np.asarray([], dtype=np.float32)
+            zz = np.asarray([], dtype=np.float32)
+            vv = np.asarray([], dtype=np.float32)
         else:
             vv = c[zz, yy, xx]
         fig = go.Figure(
@@ -860,6 +1004,207 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 camera=dict(projection=dict(type="orthographic")),
             ),
         )
+        return fig
+
+    def scale_probe_bar(title: str, names: np.ndarray, sensitivity: np.ndarray, fraction: np.ndarray, sim: np.ndarray) -> go.Figure:
+        labels = [str(v) for v in np.asarray(names).reshape(-1)]
+        sens = np.asarray(sensitivity, dtype=np.float32).reshape(-1)
+        frac = np.asarray(fraction, dtype=np.float32).reshape(-1)
+        simv = np.asarray(sim, dtype=np.float32).reshape(-1)
+        n0 = min(len(labels), sens.size, frac.size)
+        labels = labels[:n0]
+        sens = sens[:n0]
+        frac = frac[:n0]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=labels, y=sens, name="drop sensitivity", marker=dict(color="#F58518")))
+        fig.add_trace(go.Scatter(x=labels, y=frac, mode="lines+markers", name="fraction", yaxis="y2", line=dict(color="#636EFA", width=2)))
+        if simv.size >= n0:
+            fig.add_trace(go.Scatter(x=labels, y=simv[:n0], mode="lines+markers", name="scale-only sim", yaxis="y2", line=dict(color="#00CC96", width=2)))
+        fig.update_layout(
+            template="plotly_white",
+            title={"text": title, "x": 0.02},
+            margin=dict(l=42, r=42, t=36, b=42),
+            height=330,
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
+            yaxis=dict(title="mean response drop"),
+            yaxis2=dict(title="fraction / similarity", overlaying="y", side="right", range=[0.0, 1.0]),
+        )
+        return fig
+
+    def scale_probe_importance_scatter(title: str, names: np.ndarray, sensitivity: np.ndarray, fraction: np.ndarray, sim: np.ndarray) -> go.Figure:
+        labels = [str(v) for v in np.asarray(names).reshape(-1)]
+        sens = np.asarray(sensitivity, dtype=np.float32).reshape(-1)
+        frac = np.asarray(fraction, dtype=np.float32).reshape(-1)
+        simv = np.asarray(sim, dtype=np.float32).reshape(-1)
+        n0 = min(len(labels), sens.size, frac.size)
+        labels = labels[:n0]
+        sens = sens[:n0]
+        frac = frac[:n0]
+        sim_plot = simv[:n0] if simv.size >= n0 else np.full(n0, np.nan, dtype=np.float32)
+        marker_size = 12.0 + 56.0 * np.clip(frac, 0.0, 1.0)
+        custom = np.stack([sens, frac, sim_plot], axis=1) if n0 > 0 else np.zeros((0, 3), dtype=np.float32)
+        fig = go.Figure(
+            [
+                go.Scatter(
+                    x=np.arange(n0),
+                    y=sens,
+                    mode="markers+text",
+                    text=labels,
+                    textposition="top center",
+                    customdata=custom,
+                    marker=dict(
+                        size=marker_size,
+                        color=frac,
+                        colorscale="Viridis",
+                        cmin=0.0,
+                        cmax=max(1.0, float(np.nanmax(frac)) if frac.size else 1.0),
+                        showscale=True,
+                        colorbar=dict(title="importance frac"),
+                        line=dict(color="#1f2937", width=1),
+                        opacity=0.86,
+                    ),
+                    hovertemplate=(
+                        "channel=%{text}<br>"
+                        "drop=%{customdata[0]:.5g}<br>"
+                        "importance=%{customdata[1]:.3f}<br>"
+                        "scale-only sim=%{customdata[2]:.3f}<extra></extra>"
+                    ),
+                    showlegend=False,
+                )
+            ]
+        )
+        fig.update_layout(
+            template="plotly_white",
+            title={"text": title, "x": 0.02},
+            margin=dict(l=42, r=42, t=46, b=42),
+            height=330,
+            xaxis=dict(title="CDD channel", tickmode="array", tickvals=list(range(n0)), ticktext=labels),
+            yaxis=dict(title="mean response drop"),
+        )
+        return fig
+
+    def scale_probe_spatial_scatter3d(title: str, maps: np.ndarray, names: np.ndarray) -> go.Figure:
+        arr = np.asarray(maps, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[0] <= 0:
+            arr = np.zeros((1, 1, 1), dtype=np.float32)
+        s, h0, w0 = arr.shape
+        labels = [str(v) for v in np.asarray(names).reshape(-1)]
+        if len(labels) != s:
+            labels = [f"scale_{i}" for i in range(s)]
+        finite = arr[np.isfinite(arr)]
+        threshold = 0.0
+        if finite.size > 0:
+            threshold = float(np.percentile(finite, 75.0))
+        zz, yy, xx = np.nonzero(np.isfinite(arr) & (arr >= threshold))
+        if xx.size == 0:
+            zz, yy, xx = np.nonzero(np.isfinite(arr))
+        if xx.size == 0:
+            xx = np.asarray([0], dtype=np.int32)
+            yy = np.asarray([0], dtype=np.int32)
+            zz = np.asarray([0], dtype=np.int32)
+            vv = np.asarray([0.0], dtype=np.float32)
+        else:
+            vv = arr[zz, yy, xx].astype(np.float32)
+        max_points = 65000
+        if vv.size > max_points:
+            order = np.argsort(vv)[-max_points:]
+            xx = xx[order]
+            yy = yy[order]
+            zz = zz[order]
+            vv = vv[order]
+        tickvals = list(range(s))
+        fig = go.Figure(
+            [
+                go.Scatter3d(
+                    x=xx.astype(np.float32),
+                    y=yy.astype(np.float32),
+                    z=zz.astype(np.float32),
+                    mode="markers",
+                    marker=dict(
+                        size=2,
+                        opacity=0.72,
+                        color=vv,
+                        colorscale="Inferno",
+                        showscale=True,
+                        colorbar=dict(title="response"),
+                    ),
+                    text=[labels[int(i)] for i in zz],
+                    hovertemplate="x=%{x}<br>y=%{y}<br>channel=%{text}<br>response=%{marker.color:.5g}<extra></extra>",
+                    showlegend=False,
+                )
+            ]
+        )
+        fig.update_layout(
+            template="plotly_white",
+            title={"text": title, "x": 0.02},
+            margin=dict(l=8, r=8, t=36, b=8),
+            height=430,
+            scene=dict(
+                xaxis_title="x",
+                yaxis_title="y",
+                zaxis=dict(title="CDD channel", tickmode="array", tickvals=tickvals, ticktext=labels),
+                aspectmode="manual",
+                aspectratio=dict(x=w0, y=h0, z=max(w0, h0)),
+                camera=dict(projection=dict(type="orthographic")),
+            ),
+        )
+        return fig
+
+    def scale_probe_maps(title: str, maps: np.ndarray, names: np.ndarray, colorscale: str, zmid: float | None = None) -> go.Figure:
+        arr = np.asarray(maps, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[0] <= 0:
+            return heat(title, np.zeros((1, 1), dtype=np.float32), colorscale)
+        labels = [str(v) for v in np.asarray(names).reshape(-1)]
+        if len(labels) != arr.shape[0]:
+            labels = [f"scale_{i}" for i in range(arr.shape[0])]
+        cols = min(4, int(arr.shape[0]))
+        rows = int(np.ceil(arr.shape[0] / max(1, cols)))
+        from plotly.subplots import make_subplots
+
+        fig = make_subplots(rows=rows, cols=cols, subplot_titles=labels)
+        finite = arr[np.isfinite(arr)]
+        if finite.size > 0:
+            zmin = float(np.percentile(finite, 1))
+            zmax = float(np.percentile(finite, 99))
+            if zmax <= zmin + 1e-12:
+                zmax = zmin + 1.0
+        else:
+            zmin, zmax = 0.0, 1.0
+        for i in range(arr.shape[0]):
+            r = i // cols + 1
+            c = i % cols + 1
+            kwargs = dict(z=arr[i], colorscale=colorscale, zmin=zmin, zmax=zmax, showscale=(i == arr.shape[0] - 1))
+            if zmid is not None:
+                kwargs["zmid"] = zmid
+            fig.add_trace(go.Heatmap(**kwargs), row=r, col=c)
+            fig.update_xaxes(showticklabels=False, row=r, col=c)
+            fig.update_yaxes(showticklabels=False, scaleanchor=f"x{i + 1}" if i > 0 else "x", scaleratio=1, autorange="reversed", row=r, col=c)
+        fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=56, b=8), height=max(330, 260 * rows))
+        return fig
+
+    def winner_heat(title: str, winner: np.ndarray, names: np.ndarray) -> go.Figure:
+        vals = np.asarray(winner, dtype=np.float32)
+        labels = [str(v) for v in np.asarray(names).reshape(-1)]
+        n_scales = max(1, len(labels))
+        fig = go.Figure(
+            [
+                go.Heatmap(
+                    z=vals,
+                    colorscale="Turbo",
+                    zmin=-0.5,
+                    zmax=float(n_scales) - 0.5,
+                    colorbar=dict(
+                        title="scale",
+                        tickmode="array",
+                        tickvals=list(range(n_scales)),
+                        ticktext=labels if labels else [str(i) for i in range(n_scales)],
+                    ),
+                )
+            ]
+        )
+        fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=36, b=8), height=330)
+        fig.update_xaxes(showticklabels=False, constrain="domain")
+        fig.update_yaxes(showticklabels=False, scaleanchor="x", scaleratio=1, constrain="domain", autorange="reversed")
         return fig
 
     def _npz_array(name: str, *legacy_names: str) -> np.ndarray:
@@ -1169,6 +1514,64 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             }
         )
         cards.append({"title": f"{name} UMAP RGB Scatter", "fig": umap_scatter, "group": f"{stem}-umap"})
+    if "scale_probe_sensitivity_maps" in data.files and "scale_probe_names" in data.files:
+        sp_names = data["scale_probe_names"]
+        sp_sens_maps = np.asarray(data["scale_probe_sensitivity_maps"], dtype=np.float32)
+        sp_sim_maps = np.asarray(data["scale_probe_scale_only_sim_maps"], dtype=np.float32) if "scale_probe_scale_only_sim_maps" in data.files else np.asarray([], dtype=np.float32)
+        sp_winner = np.asarray(data["scale_probe_winner_map"], dtype=np.float32) if "scale_probe_winner_map" in data.files else np.asarray([], dtype=np.float32)
+        sp_sens_mean = np.asarray(data["scale_probe_sensitivity_mean"], dtype=np.float32) if "scale_probe_sensitivity_mean" in data.files else np.asarray([], dtype=np.float32)
+        sp_sens_frac = np.asarray(data["scale_probe_sensitivity_fraction"], dtype=np.float32) if "scale_probe_sensitivity_fraction" in data.files else np.asarray([], dtype=np.float32)
+        sp_sim_mean = np.asarray(data["scale_probe_scale_only_similarity"], dtype=np.float32) if "scale_probe_scale_only_similarity" in data.files else np.asarray([], dtype=np.float32)
+        cards.extend(
+            [
+                {
+                    "title": "CDD Scale Response Summary",
+                    "fig": scale_probe_bar("CDD Scale Response Summary", sp_names, sp_sens_mean, sp_sens_frac, sp_sim_mean),
+                    "group": "scale-probe-summary",
+                },
+                {
+                    "title": "CDD Channel Importance Scatter",
+                    "fig": scale_probe_importance_scatter("CDD Channel Importance Scatter", sp_names, sp_sens_mean, sp_sens_frac, sp_sim_mean),
+                    "group": "scale-probe-importance-scatter",
+                },
+                {
+                    "title": "CDD Spatial Response Scatter",
+                    "fig": scale_probe_spatial_scatter3d("CDD Spatial Response Scatter (top quartile)", sp_sens_maps, sp_names),
+                    "group": "scale-probe-spatial-scatter",
+                },
+                {
+                    "title": "CDD Scale Drop Sensitivity",
+                    "fig": scale_probe_maps("CDD Scale Drop Sensitivity", sp_sens_maps, sp_names, "Inferno"),
+                    "group": "scale-probe-sensitivity",
+                },
+            ]
+        )
+        if sp_sim_maps.ndim == 3 and sp_sim_maps.size > 0:
+            cards.append(
+                {
+                    "title": "CDD Scale-Only Similarity",
+                    "fig": scale_probe_maps("CDD Scale-Only Similarity", sp_sim_maps, sp_names, "RdYlBu_r", zmid=0.0),
+                    "group": "scale-probe-only-sim",
+                }
+            )
+        if sp_winner.ndim == 2 and sp_winner.size > 0:
+            cards.append(
+                {
+                    "title": "Dominant CDD Scale Map",
+                    "fig": winner_heat("Dominant CDD Scale Map", sp_winner, sp_names),
+                    "group": "scale-probe-winner",
+                }
+            )
+        if "scale_probe_pred_sensitivity_maps" in data.files:
+            sp_pred_maps = np.asarray(data["scale_probe_pred_sensitivity_maps"], dtype=np.float32)
+            if sp_pred_maps.ndim == 3 and sp_pred_maps.size > 0:
+                cards.append(
+                    {
+                        "title": "Predictor CDD Scale Drop Sensitivity",
+                        "fig": scale_probe_maps("Predictor CDD Scale Drop Sensitivity", sp_pred_maps, sp_names, "Inferno"),
+                        "group": "scale-probe-pred-sensitivity",
+                    }
+                )
     # Non-pair panels afterwards.
     cards.extend(
         [
@@ -1494,6 +1897,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     )
     er_n = int(min(er_x.size, er_y.size)) if (er_x.size and er_y.size) else 0
     print(f"dashboard_plot_item=Effective Rank: {'ok' if er_n > 0 else 'empty'} (points={er_n})")
+    if "scale_probe_sensitivity_maps" in data.files:
+        sp = np.asarray(data["scale_probe_sensitivity_maps"], dtype=np.float32)
+        src = str(np.asarray(data["scale_probe_source"]).reshape(-1)[0]) if "scale_probe_source" in data.files and np.asarray(data["scale_probe_source"]).size else "unknown"
+        print(f"dashboard_plot_item=CDD Scale Response: ok (source={src} shape={tuple(sp.shape)})")
+    else:
+        print("dashboard_plot_item=CDD Scale Response: empty (missing *_scale_response.pt)")
     for name, stem in (("Context", "context"), ("Predict", "pred"), ("Target", "gt")):
         pca_arr = np.asarray(data[f"{stem}_pca3d"], dtype=np.float32)
         um_arr = np.asarray(data[f"{stem}_umap3d"], dtype=np.float32)

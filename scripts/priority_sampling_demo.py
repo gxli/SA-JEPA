@@ -53,7 +53,7 @@ def main():
     cfg = _load_config(args.config)
     model_cfg = dict(cfg.get("model", {}))
     data_cfg = dict(cfg.get("data", {}))
-    model_cfg.setdefault("target_sampling_mode", "priority_sampling")
+    model_cfg.setdefault("target_sampling_mode", "priority")
     if args.top_percent is not None:
         model_cfg["priority_top_percent"] = float(args.top_percent)
     if args.n_target is not None:
@@ -72,18 +72,19 @@ def main():
         x_clean=x,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
-        mask_scale=float(model_cfg.get("mask_scale_factor", 1.0)),
+        mask_scale=float(model_cfg.get("mask_size_scaling", 1.0)),
         spacing_scale=float(model_cfg.get("mask_spacing_scaling", 2.0)),
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
-        mask_box_size=int(model_cfg.get("mask_footprint_px", 16)),
+        mask_box_size=int(model_cfg.get("mask_size", 16)),
+        manual_mask_box_sizes=model_cfg.get("mask_size_manual"),
         cdd_mode=str(model_cfg.get("cdd_mode", "log")),
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=str(model_cfg.get("cdd_sm_mode", "reflect")),
         cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
         inner_target_size=int(model_cfg.get("patch_size", 2)),
         return_debug=True,
-        target_sampling_mode=str(model_cfg.get("target_sampling_mode", "priority_sampling")),
+        target_sampling_mode=str(model_cfg.get("target_sampling_mode", "priority")),
         priority_top_percent=float(model_cfg.get("priority_top_percent", 5.0)),
         priority_n_target=pnt_val,
     )
@@ -129,7 +130,7 @@ def main():
         json.dumps(
             {
                 "out": args.out,
-                "target_sampling_mode": str(model_cfg.get("target_sampling_mode", "priority_sampliyg")),
+                "target_sampling_mode": str(model_cfg.get("target_sampling_mode", "priority")),
                 "priority_top_percent": float(model_cfg.get("priority_top_percent", 5.0)),
                 "priority_n_target": model_cfg.get("priority_n_target", 20),
                 "n_valid_targets": int(valid.sum()),

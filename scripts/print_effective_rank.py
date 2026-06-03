@@ -9,6 +9,21 @@ import sys
 from typing import List, Tuple
 
 
+def _first_present(d: dict, keys: tuple[str, ...], default="NA"):
+    for key in keys:
+        if key in d:
+            return d.get(key)
+    return default
+
+
+def _fmt_cfg_value(value) -> str:
+    if value is None:
+        return "NA"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_fmt_cfg_value(v) for v in value) + "]"
+    return str(value)
+
+
 def _read_model_inputs(session_dir: str) -> dict:
     cfg_path = os.path.join(session_dir, "config_used.json")
     if not os.path.exists(cfg_path):
@@ -19,10 +34,21 @@ def _read_model_inputs(session_dir: str) -> dict:
         m = cfg.get("model", {})
         t = cfg.get("train", {})
         spread = t.get("spread_regularizer", {})
+        if not isinstance(spread, dict):
+            spread = {}
+        mask_scale = _first_present(
+            m,
+            ("mask_size_scaling",),
+        )
+        mask_box = _first_present(
+            m,
+            ("mask_size_manual", "mask_size"),
+        )
         return {
             "mode": str(m.get("mode", "NA")),
-            "ms": str(m.get("mask_size_scaling", m.get("mask_size_scaling_range", "NA"))),
-            "mbox": str(m.get("mask_box_size", m.get("mask_box_size_range", "NA"))),
+            "ms": _fmt_cfg_value(mask_scale),
+            "mbox": _fmt_cfg_value(mask_box),
+            "sampling": str(m.get("target_sampling_mode", "NA")),
             "l2": _fmt_bool(m.get("normalize_loss_l2", False)),
             "psn": _fmt_bool(m.get("scaleaware_norm_per_scale", False)),
             "fin": _fmt_bool(m.get("scaleaware_final_norm", False)),
@@ -41,7 +67,7 @@ def _fmt_bool(value) -> str:
 
 def _missing_model_inputs() -> dict:
     return {k: "NA" for k in (
-        "mode", "ms", "mbox", "l2", "psn", "fin", "spread_w", "sigtype", "symw", "depth",
+        "mode", "ms", "mbox", "sampling", "l2", "psn", "fin", "spread_w", "sigtype", "symw", "depth",
     )}
 
 
@@ -154,18 +180,21 @@ def main() -> int:
             p_dead_str = "-"
         rows.append(
             (name,
-             inputs["mode"], inputs["ms"], inputs["mbox"],
-             inputs["l2"], inputs["psn"], inputs["fin"],
-             inputs["spread_w"], inputs["symw"], inputs["depth"],
+             inputs.get("mode", "NA"), inputs.get("ms", "NA"), inputs.get("mbox", "NA"), inputs.get("sampling", "NA"),
+             inputs.get("l2", "NA"), inputs.get("psn", "NA"), inputs.get("fin", "NA"),
+             inputs.get("spread_w", "NA"), inputs.get("symw", "NA"), inputs.get("depth", "NA"),
              rank, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_str)
         )
 
     rows_sorted = sorted(rows, key=lambda x: x[0])
 
     print("Effective Rank Summary (sorted by session filename A-Z)")
+    if not rows_sorted:
+        print("No matching sessions found.")
+        return 0
     session_w = max(len("session"), *(len(row[0]) for row in rows_sorted))
     header = (
-        f"{'session':<{session_w}} {'mode':<9} {'mask_scale':>9} {'mask_box':>9} "
+        f"{'session':<{session_w}} {'mode':<9} {'sampling':<9} {'mask_scale':>12} {'mask_box':>9} "
         f"{'l2_norm':>7} {'psnorm':>6} {'final_norm':>10} {'sigreg':>7} {'sym_loss':>9} {'depth':>6} "
         f"{'erank':>8} {'context':>9} {'predictor':>10} {'target':>9} "
         f"{'top1':>7} {'pred_part':>10} {'target_part':>11} {'part_ratio':>10} {'dead_frac':>10} {'dead_ch':>7}"
@@ -173,10 +202,10 @@ def main() -> int:
     print(header)
     print("-" * len(header))
     for row in rows_sorted:
-        (s, mode, ms, mbox, l2, psn, fin, sigw, symw, d,
+        (s, mode, ms, mbox, sampling, l2, psn, fin, sigw, symw, d,
          rk, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_n) = row
         print(
-            f"{s:<{session_w}} {mode:<9} {ms:>9} {mbox:>9} "
+            f"{s:<{session_w}} {mode:<9} {sampling:<9} {ms:>12} {mbox:>9} "
             f"{l2:>7} {psn:>6} {fin:>10} {_fmt_float(sigw,7,2)} {_fmt_float(symw,9,4)} {d:>6} "
             f"{_fmt_float(rk,8,4)} {_fmt_float(c_er,9,4)} {_fmt_float(p_er,10,4)} {_fmt_float(g_er,9,4)} "
             f"{_fmt_float(p_t1,7,3)} {_fmt_float(p_pr,10,2)} {_fmt_float(g_pr,11,2)} {_fmt_float(pr_match,10,4)} "
@@ -184,7 +213,7 @@ def main() -> int:
         )
 
     n_total = len(rows_sorted)
-    n_rank = sum(1 for r in rows_sorted if r[10] != "")
+    n_rank = sum(1 for r in rows_sorted if r[11] != "")
     print("-" * len(header))
     print(f"sessions={n_total} with_rank={n_rank} missing_rank={n_total - n_rank}")
     return 0

@@ -59,7 +59,7 @@ def _config(npy_pattern: str, mask_scale_factor: float, symmetry_weight: float) 
             "use_grn": True,
             "post_log_transform": True,
             "use_symmetric_feature_loss": symmetry_weight > 0.0,
-            "target_sampling_mode": "priority_sampling",
+            "target_sampling_mode": "priority",
             "priority_top_percent": 15.0,
             "priority_n_target": "auto",
             "priority_min_targets_per_map": 10,

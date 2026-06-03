@@ -19,6 +19,7 @@ from .masking import (
     extract_location_patches,
     make_pyramid_grid_context,
     norm_per_sample_channel,
+    normalize_target_sampling_mode,
     prepare_context_batch,
 )
 from .predictor import FullResPredictor
@@ -53,6 +54,7 @@ class PyramidGridJEPA(nn.Module):
         align_scales: bool = True,
         mask_box_size: int = 16,
         mask_box_size_range=None,
+        manual_mask_box_sizes=None,
         cdd_mode: str = "log",
         cdd_constrained: bool = True,
         cdd_sm_mode: str = "reflect",
@@ -84,16 +86,16 @@ class PyramidGridJEPA(nn.Module):
         scaleaware_stem_norm: bool = True,
         encoder_final_norm_type: str = "layernorm",
         encoder_head_bias: bool = True,
-        target_invalid_region_skip: bool = False,
+        target_invalid_region_skip: bool = True,
         target_invalid_region_values=(0.0, "nan"),
-        target_sampling_mode: str = "grid",
+        target_sampling_mode: str = "random",
         priority_top_percent: float = 5.0,
         priority_n_target: int | str = 20,
         priority_min_targets_per_map: int = 0,
         priority_dithering_pixels: int = 6,
         priority_candidate_oversample: float = 3.0,
         use_symmetric_feature_loss: bool = False,
-        target_nonoverlap: bool = False,
+        target_nonoverlap: bool = True,
         target_allow_partial_overlap: float = 0.0,
         mask_box_hardcap: int | None = None,
         use_grn: bool = True,
@@ -131,6 +133,18 @@ class PyramidGridJEPA(nn.Module):
             mask_box_size_range if mask_box_size_range is not None else inline_mask_box_size_range,
             "mask_box_size_range",
         )
+        self.manual_mask_box_sizes = self._coerce_manual_mask_box_sizes(manual_mask_box_sizes)
+        if self.manual_mask_box_sizes is not None:
+            if len(self.manual_mask_box_sizes) < len(self.sigmas):
+                print(
+                    "[warning] manual_mask_box_sizes shorter than sigmas/CDD channels; "
+                    f"reusing last size for remaining channels: {self.manual_mask_box_sizes}"
+                )
+            elif len(self.manual_mask_box_sizes) > len(self.sigmas):
+                print(
+                    "[warning] manual_mask_box_sizes longer than sigmas/CDD channels; "
+                    f"extra sizes will be ignored: {self.manual_mask_box_sizes}"
+                )
         self.cdd_mode = str(cdd_mode)
         self.cdd_constrained = bool(cdd_constrained)
         self.cdd_sm_mode = str(cdd_sm_mode)
@@ -169,7 +183,7 @@ class PyramidGridJEPA(nn.Module):
             self.target_invalid_region_values = (0.0, "nan")
         else:
             self.target_invalid_region_values = tuple(target_invalid_region_values)
-        self.target_sampling_mode = str(target_sampling_mode)
+        self.target_sampling_mode = normalize_target_sampling_mode(str(target_sampling_mode))
         self.priority_top_percent = float(priority_top_percent)
         # Keep raw value to support non-numeric modes such as "auto".
         self.priority_n_target = priority_n_target
@@ -380,6 +394,27 @@ class PyramidGridJEPA(nn.Module):
 
         return float(mask_scale), int(mask_box_size)
 
+    @staticmethod
+    def _coerce_manual_mask_box_sizes(value) -> tuple[int, ...] | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            items = [v.strip() for v in stripped.split(",") if v.strip()]
+        else:
+            try:
+                items = list(value)
+            except TypeError:
+                items = [value]
+        if not items:
+            return None
+        sizes = tuple(int(round(float(v))) for v in items)
+        if any(v <= 0 for v in sizes):
+            raise ValueError(f"manual_mask_box_sizes must contain positive sizes, got {sizes}")
+        return sizes
+
     def forward(
         self,
         x_clean,
@@ -433,6 +468,7 @@ class PyramidGridJEPA(nn.Module):
                     global_shift=self.global_shift,
                     align_scales=self.align_scales,
                     mask_box_size=effective_mask_box_size,
+                    manual_mask_box_sizes=self.manual_mask_box_sizes,
                     cdd_mode=self.cdd_mode,
                     cdd_constrained=self.cdd_constrained,
                     cdd_sm_mode=self.cdd_sm_mode,
@@ -466,6 +502,7 @@ class PyramidGridJEPA(nn.Module):
                     global_shift=self.global_shift,
                     align_scales=self.align_scales,
                     mask_box_size=effective_mask_box_size,
+                    manual_mask_box_sizes=self.manual_mask_box_sizes,
                     cdd_mode=self.cdd_mode,
                     cdd_constrained=self.cdd_constrained,
                     cdd_sm_mode=self.cdd_sm_mode,

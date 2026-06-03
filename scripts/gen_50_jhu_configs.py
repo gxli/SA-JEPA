@@ -77,7 +77,7 @@ BASE_MODEL = {
     "mask_scale_factor": 1.0,
     "mask_spacing_scaling": 2.0,
     "target_invalid_region_skip": False,
-    "target_sampling_mode": "priority_sampling",
+    "target_sampling_mode": "priority",
     "priority_top_percent": 15.0,
     "priority_n_target": 20,
     "priority_dithering_pixels": 6,

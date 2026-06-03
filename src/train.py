@@ -301,6 +301,7 @@ class _MaskingCollator:
         self.mask_scale_range = model.mask_scale_range
         self.mask_box_size = int(model.mask_box_size)
         self.mask_box_size_range = model.mask_box_size_range
+        self.manual_mask_box_sizes = model.manual_mask_box_sizes
         self.context_kwargs = {
             "sigmas": model.sigmas,
             "mask_fraction": model.mask_fraction,
@@ -308,6 +309,7 @@ class _MaskingCollator:
             "global_shift": model.global_shift,
             "align_scales": model.align_scales,
             "patch_size": model.patch_size,
+            "manual_mask_box_sizes": self.manual_mask_box_sizes,
             "return_debug": self.return_debug,
             "target_invalid_region_skip": model.target_invalid_region_skip,
             "target_invalid_region_values": model.target_invalid_region_values,
@@ -376,6 +378,7 @@ def _prepare_context_from_model(
         global_shift=model.global_shift,
         align_scales=model.align_scales,
         mask_box_size=mask_box_size,
+        manual_mask_box_sizes=model.manual_mask_box_sizes,
         cdd_mode=model.cdd_mode,
         cdd_constrained=model.cdd_constrained,
         cdd_sm_mode=model.cdd_sm_mode,
@@ -596,6 +599,10 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         patch_size = patch_size + 1
         print(f"[warning] even patch_size requested; using odd patch_size={patch_size}")
 
+    mask_scale_cfg = model_cfg.get("mask_size_scaling", 1.0)
+    mask_box_cfg = model_cfg.get("mask_size", 16)
+    manual_mask_box_sizes_cfg = model_cfg.get("mask_size_manual")
+
     normalize_loss_l2 = bool(model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", False)))
     active_target_fraction = float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0)))
     return PyramidGridJEPA(
@@ -604,13 +611,14 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         patch_size=patch_size,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=active_target_fraction,
-        mask_scale=model_cfg.get("mask_scale_factor", 1.0),
-        mask_scale_range=model_cfg.get("mask_scale_factor_range"),
+        mask_scale=mask_scale_cfg,
+        mask_scale_range=None,
         spacing_scale=mask_spacing_scaling,
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
-        mask_box_size=model_cfg.get("mask_footprint_px", 16),
-        mask_box_size_range=model_cfg.get("mask_footprint_px_range"),
+        mask_box_size=mask_box_cfg,
+        mask_box_size_range=None,
+        manual_mask_box_sizes=manual_mask_box_sizes_cfg,
         cdd_mode=model_cfg.get("cdd_mode", data_cfg.get("cdd_mode", "log")),
         cdd_constrained=model_cfg.get("cdd_constrained", data_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", data_cfg.get("cdd_sm_mode", "reflect")),
@@ -642,16 +650,16 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         scaleaware_stem_norm=bool(model_cfg.get("scaleaware_stem_norm", True)),
         encoder_final_norm_type=str(model_cfg.get("encoder_final_norm_type", "layernorm")),
         encoder_head_bias=bool(model_cfg.get("encoder_head_bias", True)),
-        target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", False)),
+        target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", True)),
         target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
-        target_sampling_mode=str(model_cfg.get("target_sampling_mode", "grid")),
+        target_sampling_mode=str(model_cfg.get("target_sampling_mode", "random")),
         priority_top_percent=float(model_cfg.get("priority_top_percent", 5.0)),
         priority_n_target=model_cfg.get("priority_n_target", 20),
         priority_min_targets_per_map=int(model_cfg.get("priority_min_targets_per_map", 0)),
         priority_dithering_pixels=int(model_cfg.get("priority_dithering_pixels", model_cfg.get("target_dithering_pixels", 6))),
         priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
-        target_nonoverlap=bool(model_cfg.get("target_nonoverlap", False)),
+        target_nonoverlap=bool(model_cfg.get("target_nonoverlap", True)),
         target_allow_partial_overlap=float(model_cfg.get("target_allow_partial_overlap", 0.0)),
         mask_box_hardcap=model_cfg.get("mask_box_hardcap"),
         use_grn=bool(model_cfg.get("use_grn", True)),
@@ -691,7 +699,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         post_log_transform=bool(model_cfg.get("post_log_transform", True)),
         log_eps=float(model_cfg.get("log_eps", 1e-6)),
         fusion=fusion,
-        mask_box_size=int(model_cfg.get("mask_footprint_px", 8)),
+        mask_box_size=int(model_cfg.get("mask_size", 8)),
         num_mask_boxes=int(model_cfg.get("num_mask_boxes", 8)),
         slab_depth=int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
@@ -838,18 +846,29 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             print(f"resume_model={model_ckpt_path}")
 
     scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
-    def _param_or_range_max(value_key: str, range_key: str, default: float) -> float:
-        values = model_cfg.get(range_key, model_cfg.get(value_key, default))
+    def _param_max(value_key: str, default: float) -> float:
+        values = model_cfg.get(value_key, default)
         if isinstance(values, (list, tuple)):
             if len(values) != 2:
                 raise ValueError(f"{value_key} range must contain exactly two values, got {values!r}")
             return float(max(values))
         return float(values)
 
-    _msb = _param_or_range_max("mask_scale_factor", "mask_scale_factor_range", 1.0)
-    _mb = int(round(_param_or_range_max("mask_footprint_px", "mask_footprint_px_range", 16)))
+    _msb = _param_max("mask_size_scaling", 1.0)
+    _mb = int(round(_param_max("mask_size", 16)))
+    _manual_mask_sizes = model_cfg.get("mask_size_manual")
+    if _manual_mask_sizes is not None:
+        if isinstance(_manual_mask_sizes, str):
+            _manual_items = [v.strip() for v in _manual_mask_sizes.split(",") if v.strip()]
+        else:
+            try:
+                _manual_items = list(_manual_mask_sizes)
+            except TypeError:
+                _manual_items = [_manual_mask_sizes]
+        max_box = max(int(round(float(v))) for v in _manual_items)
+    else:
+        max_box = round(scale_max * _msb + _mb)
     _mss = float(model_cfg.get("mask_spacing_scaling", 1.5))
-    max_box = round(scale_max * _msb + _mb)
     auto_roll_max = max(1, int(round(float(max_box) * _mss)))
 
     # --- image_batch pre-selection ---

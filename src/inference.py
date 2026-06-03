@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from src.losses import representation_dense_energy
+from src.models.masking import _max_effective_mask_box_size
 
 
 def _save_npz(path: str, arr: np.ndarray) -> None:
@@ -213,15 +214,16 @@ def run_post_training_inference(
             x_raw = raw_batch if not isinstance(raw_batch, (tuple, list)) else raw_batch[0]
         x_raw = x_raw.to(next(model.parameters()).device)
         # Deterministic lattice sweep is only meaningful when mask inference is enabled.
-        largest_sigma = float(max(getattr(model, "sigmas", (16.0,))))
         mask_scale = float(getattr(model, "mask_scale", 1.0))
         mask_box_size = int(getattr(model, "mask_box_size", 16))
-        max_box = round(largest_sigma * mask_scale + mask_box_size)
-        hardcap = getattr(model, "mask_box_hardcap", None)
-        if hardcap is not None and int(hardcap) > 0:
-            max_box = min(max_box, int(hardcap))
-            if max_box % 2 == 0:
-                max_box -= 1
+        max_box = _max_effective_mask_box_size(
+            sigmas=tuple(float(s) for s in getattr(model, "sigmas", (16.0,))),
+            mask_scale=mask_scale,
+            mask_box_size=mask_box_size,
+            inner_target_size=int(getattr(model, "patch_size", 3)),
+            hardcap=getattr(model, "mask_box_hardcap", None),
+            manual_mask_box_sizes=getattr(model, "manual_mask_box_sizes", None),
+        )
         spacing = int(
             max(
                 1,
@@ -325,6 +327,8 @@ def run_post_training_inference(
         inference_outputs["cdd_channels_orig"] = outputs["cdd_channels_orig"][:8].detach().cpu()
     if "cdd_channels_masked" in outputs:
         inference_outputs["cdd_channels_masked"] = outputs["cdd_channels_masked"][:8].detach().cpu()
+    if "dip_field_per_channel" in outputs:
+        inference_outputs["dip_field_per_channel"] = outputs["dip_field_per_channel"][:8].detach().cpu()
     if "pyramid_mask_token" in outputs:
         inference_outputs["pyramid_mask_token"] = outputs["pyramid_mask_token"][:8].detach().cpu()
     for k in (
@@ -420,6 +424,16 @@ def run_post_training_inference(
         _save_npz(
             os.path.join(session_dir, "example_masked_channel_cube.npz"),
             inference_outputs["cdd_channels_masked"][0].numpy().astype(np.float32),
+        )
+    if "dip_field_per_channel" in inference_outputs:
+        _save_npz(
+            os.path.join(session_dir, "dip_field_per_channel.npz"),
+            inference_outputs["dip_field_per_channel"].numpy(),
+        )
+        # Backward-compatible dashboard artifact name.
+        _save_npz(
+            os.path.join(session_dir, "pyramid_mask_token.npz"),
+            inference_outputs["dip_field_per_channel"].numpy(),
         )
     if "pyramid_mask_token" in inference_outputs:
         _save_npz(os.path.join(session_dir, "pyramid_mask_token.npz"), inference_outputs["pyramid_mask_token"].numpy())

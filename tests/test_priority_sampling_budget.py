@@ -1,10 +1,13 @@
 import numpy as np
 import torch
 
+from scripts.session_to_dash import compute_dash_data
 from src.models.masking import (
+    ALLOWED_TARGET_SAMPLING_MODES,
     _build_priority_catalogue_from_cdd_ratio,
     _fractional_spatial_target_budget,
     make_pyramid_grid_context,
+    normalize_target_sampling_mode,
 )
 
 
@@ -56,7 +59,7 @@ def test_priority_sampling_prescreens_to_fractional_candidate_budget():
         return_debug=True,
         enable_grid_jitter=False,
         enable_target_dithering=False,
-        target_sampling_mode="priority_sampling",
+        target_sampling_mode="priority",
         priority_top_percent=100.0,
         priority_n_target="auto",
         priority_candidate_oversample=3.0,
@@ -66,3 +69,199 @@ def test_priority_sampling_prescreens_to_fractional_candidate_budget():
     debug = result[-1]
     assert debug["priority_good_candidates"].item() > 1000
     assert debug["priority_prescreen_candidates"].item() <= 55
+
+
+def test_random_sampling_uses_full_valid_candidate_pool_not_priority_prescreen():
+    torch.manual_seed(0)
+    x_clean = torch.ones((1, 1, 32, 32), dtype=torch.float32)
+    cdd_orig = torch.ones((1, 3, 32, 32), dtype=torch.float32)
+    cdd_orig[:, 0, :4, :4] = 100.0
+
+    result = make_pyramid_grid_context(
+        x_clean=x_clean,
+        sigmas=(1,),
+        mask_fraction=1.0,
+        mask_scale=0.0,
+        spacing_scale=1.0,
+        global_shift=False,
+        align_scales=True,
+        mask_box_size=5,
+        inner_target_size=1,
+        return_debug=True,
+        enable_grid_jitter=False,
+        enable_target_dithering=False,
+        target_sampling_mode="random",
+        priority_top_percent=1.0,
+        priority_n_target=32,
+        priority_candidate_oversample=1.0,
+        cdd_orig_in=cdd_orig,
+    )
+
+    _x_context, target_locations, _target_scales, target_valid, debug = result
+    valid_locs = target_locations[0][target_valid[0]]
+    assert debug["priority_good_candidates"].item() > 500
+    assert debug["priority_prescreen_candidates"].item() == debug["priority_good_candidates"].item()
+    assert 0 < valid_locs.shape[0] <= 32
+
+
+def test_allowed_target_sampling_modes_are_explicit():
+    assert ALLOWED_TARGET_SAMPLING_MODES == ("random", "priority", "lattice")
+    assert normalize_target_sampling_mode("priority_sampling") == "priority"
+    assert normalize_target_sampling_mode("grid") == "lattice"
+    for removed_mode in ("uniform", "random_uniform", "monte_carlo"):
+        try:
+            normalize_target_sampling_mode(removed_mode)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{removed_mode} should not be an allowed target sampling mode")
+
+
+def test_sampled_modes_reject_zero_and_nan_input_before_candidate_count():
+    torch.manual_seed(0)
+    x_clean = torch.zeros((1, 1, 32, 32), dtype=torch.float32)
+    x_clean[:, :, 8:24, 8:24] = 1.0
+    x_clean[:, :, 0, :] = float("nan")
+    cdd_orig = torch.ones((1, 3, 32, 32), dtype=torch.float32)
+
+    result = make_pyramid_grid_context(
+        x_clean=x_clean,
+        sigmas=(1,),
+        mask_fraction=1.0,
+        mask_scale=0.0,
+        spacing_scale=1.0,
+        global_shift=False,
+        align_scales=True,
+        mask_box_size=5,
+        inner_target_size=1,
+        return_debug=True,
+        enable_grid_jitter=False,
+        enable_target_dithering=False,
+        target_sampling_mode="random",
+        priority_n_target=32,
+        cdd_orig_in=cdd_orig,
+    )
+
+    _x_context, target_locations, _target_scales, target_valid, debug = result
+    valid_locs = target_locations[0][target_valid[0]]
+    assert debug["priority_good_candidates"].item() == 256
+    assert 0 < valid_locs.shape[0] <= 32
+    assert torch.all((valid_locs[:, 0] >= 8) & (valid_locs[:, 0] < 24))
+    assert torch.all((valid_locs[:, 1] >= 8) & (valid_locs[:, 1] < 24))
+
+
+def test_sampled_modes_reject_overlapping_pyramids_by_default():
+    torch.manual_seed(4)
+    x_clean = torch.ones((1, 1, 32, 32), dtype=torch.float32)
+    cdd_orig = torch.ones((1, 3, 32, 32), dtype=torch.float32)
+
+    result = make_pyramid_grid_context(
+        x_clean=x_clean,
+        sigmas=(1,),
+        mask_fraction=1.0,
+        mask_scale=0.0,
+        spacing_scale=1.0,
+        global_shift=False,
+        align_scales=True,
+        mask_box_size=7,
+        inner_target_size=1,
+        return_debug=True,
+        enable_grid_jitter=False,
+        enable_target_dithering=False,
+        target_sampling_mode="random",
+        priority_n_target=64,
+        cdd_orig_in=cdd_orig,
+    )
+
+    _x_context, target_locations, _target_scales, target_valid, _debug = result
+    valid_locs = target_locations[0][target_valid[0]]
+    occ = torch.zeros((32, 32), dtype=torch.bool)
+    half = 7 // 2
+    for cy_t, cx_t in valid_locs:
+        cy = int(cy_t.item())
+        cx = int(cx_t.item())
+        y0 = max(0, cy - half)
+        y1 = min(32, cy + 7 - half)
+        x0 = max(0, cx - half)
+        x1 = min(32, cx + 7 - half)
+        assert not occ[y0:y1, x0:x1].any()
+        occ[y0:y1, x0:x1] = True
+
+
+def test_manual_mask_box_sizes_reuse_last_when_shorter_than_cdd_channels():
+    x_clean = torch.ones((1, 1, 32, 32), dtype=torch.float32)
+    cdd_orig = torch.ones((1, 4, 32, 32), dtype=torch.float32)
+
+    result = make_pyramid_grid_context(
+        x_clean=x_clean,
+        sigmas=(2, 4, 8, 16),
+        mask_fraction=1.0,
+        mask_scale=99.0,
+        spacing_scale=1.0,
+        global_shift=False,
+        align_scales=True,
+        mask_box_size=99,
+        manual_mask_box_sizes=[5, 9],
+        inner_target_size=1,
+        return_debug=True,
+        enable_grid_jitter=False,
+        enable_target_dithering=False,
+        cdd_orig_in=cdd_orig,
+    )
+
+    debug = result[-1]
+    assert debug["cdd_box_sizes"][0].tolist() == [5.0, 9.0, 9.0, 9.0]
+
+
+def test_manual_mask_box_sizes_ignore_extra_values():
+    x_clean = torch.ones((1, 1, 32, 32), dtype=torch.float32)
+    cdd_orig = torch.ones((1, 2, 32, 32), dtype=torch.float32)
+
+    result = make_pyramid_grid_context(
+        x_clean=x_clean,
+        sigmas=(2, 4),
+        mask_fraction=1.0,
+        mask_scale=0.0,
+        spacing_scale=1.0,
+        global_shift=False,
+        align_scales=True,
+        mask_box_size=3,
+        manual_mask_box_sizes=[7, 11, 15, 19],
+        inner_target_size=1,
+        return_debug=True,
+        enable_grid_jitter=False,
+        enable_target_dithering=False,
+        cdd_orig_in=cdd_orig,
+    )
+
+    debug = result[-1]
+    assert debug["cdd_box_sizes"][0].tolist() == [7.0, 11.0]
+
+
+def test_dashboard_reconstructs_pyramid_mask_cube_from_cdd_diff(tmp_path):
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    cdd_orig = torch.ones((1, 3, 8, 8), dtype=torch.float32)
+    cdd_masked = cdd_orig.clone()
+    cdd_masked[:, 0, 1:3, 1:3] = 0.0
+    cdd_masked[:, 1, 4:6, 4:6] = 0.0
+    outputs = {
+        "x_clean": torch.ones((1, 1, 8, 8), dtype=torch.float32),
+        "x_context": torch.ones((1, 1, 8, 8), dtype=torch.float32),
+        "target_locations": torch.zeros((1, 1, 2), dtype=torch.long),
+        "target_valid": torch.ones((1, 1), dtype=torch.bool),
+        "pred_map": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
+        "gt_map": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
+        "pred_patches": torch.zeros((1, 1, 2, 1, 1), dtype=torch.float32),
+        "gt_patches": torch.zeros((1, 1, 2, 1, 1), dtype=torch.float32),
+        "cdd_channels_orig": cdd_orig,
+        "cdd_channels_masked": cdd_masked,
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+
+    dash_path = compute_dash_data(str(session_dir), overwrite=True)
+    with np.load(dash_path) as data:
+        cube = data["pyramid_mask_cube"]
+
+    assert cube.shape == (3, 8, 8)
+    assert int(np.count_nonzero(cube)) == 8

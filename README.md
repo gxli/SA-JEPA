@@ -46,6 +46,133 @@ Run a single config:
 python3 main.py --config configs/base_3090.json --sessions-dir sessions
 ```
 
+## Inference from a Trained Session
+
+Load any trained session checkpoint and run inference on arbitrary `.npy` data — supports large files via crop/tile and 3D volumes via slab mode. Two interfaces: config file or CLI flags.
+
+### Config-driven (recommended)
+
+```bash
+python -m src.inference_from_session --config configs/inference/chengdu.json
+```
+
+CLI flags override config values:
+
+```bash
+python -m src.inference_from_session --config configs/inference/chengdu.json --crop-size 128
+```
+
+### CLI flags
+
+```bash
+python -m src.inference_from_session \
+    --session sessions/gen_121_mhd_run_006_ms1p2 \
+    --input data/chengdu.npy \
+    --output-session sessions/inference_chengdu
+```
+
+### Inference config schema
+
+```json
+{
+  "session": "sessions/gen_121_mhd_run_006_ms1p2",
+  "input": "data/chengdu.npy",
+  "output_session": "sessions/inference_chengdu",
+  "crop_size": null,
+  "crop_mode": "center",
+  "mode": "image",
+  "slice_axis": 0,
+  "slice_index": null,
+  "batch_size": 2,
+  "tta": false,
+  "device": null
+}
+```
+
+### Crop / Tile for large data
+
+When input exceeds GPU memory, crop to a fixed size:
+
+```bash
+# Center crop (single patch)
+python -m src.inference_from_session \
+    --session sessions/gen_121_mhd_run_006_ms1p2 \
+    --input data/huge_mosaic.npy \
+    --crop-size 256 \
+    --crop-mode center \
+    --output-session sessions/inference_mosaic_center
+
+# Tiled (sliding window, 50% overlap, all tiles processed)
+python -m src.inference_from_session \
+    --session sessions/gen_121_mhd_run_006_ms1p2 \
+    --input data/huge_mosaic.npy \
+    --crop-size 256 \
+    --crop-mode tile \
+    --output-session sessions/inference_mosaic_tiled
+```
+
+### 3D slab mode
+
+For 3D volumes (e.g., NGC data), each depth slice is processed independently:
+
+```bash
+# All slices
+python -m src.inference_from_session \
+    --session sessions/gen_121_mhd_run_006_ms1p2 \
+    --input data/ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy \
+    --mode 3d_slab \
+    --slice-axis 0 \
+    --output-session sessions/inference_ngc_3d
+
+# Single slice
+python -m src.inference_from_session \
+    --session sessions/gen_121_mhd_run_006_ms1p2 \
+    --input data/ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy \
+    --mode 3d_slab \
+    --slice-axis 0 \
+    --slice-index 42 \
+    --output-session sessions/inference_ngc_slice42
+```
+
+### TTA (Test-Time Augmentation)
+
+Enable 4-way flip augmentation during inference for rotation-invariant embeddings:
+
+```bash
+python -m src.inference_from_session \
+    --session sessions/gen_121_mhd_run_006_ms1p2 \
+    --input data/chengdu.npy \
+    --tta \
+    --output-session sessions/inference_chengdu_tta
+```
+
+### CLI reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--session` | (required) | Path to trained session directory |
+| `--input` | (required) | Path to input `.npy` file |
+| `--output-session` | auto | Output session directory (auto-generates if omitted) |
+| `--crop-size` | `None` | Crop/tile size for large inputs |
+| `--crop-mode` | `center` | `center` (single patch) or `tile` (sliding window) |
+| `--mode` | `image` | `image` (2D) or `3d_slab` (3D volume) |
+| `--slice-axis` | `0` | Depth axis for 3D slab mode |
+| `--slice-index` | `None` | Specific slice for 3D mode (omitted = all) |
+| `--batch-size` | `2` | Batch size for inference |
+| `--tta` | disabled | Enable test-time flip4 augmentation |
+| `--device` | auto | Override device (`cuda`, `mps`, `cpu`) |
+
+### Inference session structure
+
+The output session at `sessions/<name>/` contains:
+
+- `config_used.json` — frozen config with `_inference.inference_only: true`
+- `inference_outputs.pt` — full output dict with `pred_map`, `gt_map`, `context_map`
+- `pred_map.npz`, `gt_map.npz`, `context_map.npz` — compressed latent maps
+- `network_input_clean.npz`, `network_input_context.npz` — input snapshots
+- `jepa_energy_summary.json` — scalar energy + metadata
+- `dash_data.npz` — dashboard-compatible visualization data
+
 ## Session Artifacts
 
 Each run creates/updates `sessions/<config_name>/` with:

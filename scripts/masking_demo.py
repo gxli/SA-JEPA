@@ -104,11 +104,12 @@ def make_context_and_debug(x: torch.Tensor, model_cfg: dict, seed: int):
         x_clean=x,
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=float(model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0))),
-        mask_scale=float(model_cfg.get("mask_scale_factor", 1.0)),
+        mask_scale=float(model_cfg.get("mask_size_scaling", 1.0)),
         spacing_scale=float(model_cfg.get("mask_spacing_scaling", 1.5)),
         global_shift=bool(model_cfg.get("global_shift", True)),
         align_scales=bool(model_cfg.get("align_scales", True)),
-        mask_box_size=int(model_cfg.get("mask_footprint_px", 16)),
+        mask_box_size=int(model_cfg.get("mask_size", 16)),
+        manual_mask_box_sizes=model_cfg.get("mask_size_manual"),
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=bool(model_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
@@ -415,11 +416,12 @@ def build_model(model_cfg: dict, data_cfg: dict) -> PyramidGridJEPA:
         patch_size=model_cfg.get("patch_size", 2),
         sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
         mask_fraction=model_cfg.get("active_target_fraction", model_cfg.get("mask_fraction", 1.0)),
-        mask_scale=model_cfg.get("mask_scale_factor", 1.0),
+        mask_scale=model_cfg.get("mask_size_scaling", 1.0),
         spacing_scale=model_cfg.get("mask_spacing_scaling", 1.5),
         global_shift=model_cfg.get("global_shift", True),
         align_scales=model_cfg.get("align_scales", True),
-        mask_box_size=model_cfg.get("mask_footprint_px", 16),
+        mask_box_size=model_cfg.get("mask_size", 16),
+        manual_mask_box_sizes=model_cfg.get("mask_size_manual"),
         cdd_mode=model_cfg.get("cdd_mode", "log"),
         cdd_constrained=model_cfg.get("cdd_constrained", True),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", "reflect"),
@@ -852,9 +854,10 @@ def main():
         model_cfg_run["mask_fill_mode"] = mode
         # Default demo behavior: adaptive per-scale box masks.
         if args.rigid_mask_box:
-            model_cfg_run["mask_scale_factor"] = 0.0
+            model_cfg_run["mask_size_scaling"] = 0.0
+            model_cfg_run["mask_size_scaling"] = 0.0
         else:
-            model_cfg_run["mask_scale_factor"] = float(model_cfg.get("mask_scale_factor", 1.0))
+            model_cfg_run["mask_size_scaling"] = float(model_cfg.get("mask_size_scaling", 1.0))
         suffix = f"_{mode}"
 
         x_ctx, target_locations, target_scales, target_valid, debug = make_context_and_debug(x_t, model_cfg_run, int(args.seed))
@@ -1022,7 +1025,7 @@ def main():
             "checkpoint_used": ckpt_used,
             "use_cdd": bool(data_cfg.get("use_cdd", True)),
             "mask_fraction": float(model_cfg_run.get("active_target_fraction", model_cfg_run.get("mask_fraction", 1.0))),
-            "mask_scale_factor": float(model_cfg_run.get("mask_scale_factor", 1.0)),
+            "mask_scale_factor": float(model_cfg_run.get("mask_size_scaling", 1.0)),
             "mask_spacing_scaling": float(model_cfg_run.get("mask_spacing_scaling", 1.5)),
             "sigmas": list(model_cfg_run.get("sigmas", [2, 4, 8, 16])),
             "global_realized_fraction": float(mask.mean()),

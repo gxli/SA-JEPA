@@ -40,7 +40,7 @@ def _base_config(dataset: str) -> dict:
             "mask_footprint_px": 0,
             "normalize_loss_l2": True,
             "use_symmetric_feature_loss": True,
-            "target_sampling_mode": "priority_sampling",
+            "target_sampling_mode": "priority",
             "priority_top_percent": 15.0,
             "priority_n_target": "auto",
             "priority_min_targets_per_map": 10,

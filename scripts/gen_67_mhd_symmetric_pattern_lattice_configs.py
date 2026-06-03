@@ -29,7 +29,7 @@ def write_config(mscale: float) -> str:
             "normalize_loss_l2": True,
             "use_symmetric_feature_loss": True,
             "scaleaware_norm_per_scale": True,
-            "target_sampling_mode": "grid",
+            "target_sampling_mode": "lattice",
         },
         "train": {
             "epochs": 10,
