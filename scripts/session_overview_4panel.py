@@ -34,7 +34,11 @@ def prefer_npz(path: Path) -> Path:
 def pca_3d(latents: np.ndarray) -> np.ndarray:
     x = to_native(latents).astype(np.float64, copy=False)
     x = x - x.mean(axis=0, keepdims=True)
-    _, _, vt = np.linalg.svd(x, full_matrices=False)
+    try:
+        _, _, vt = np.linalg.svd(x, full_matrices=False)
+    except np.linalg.LinAlgError:
+        x_jitter = x + np.eye(x.shape[0], x.shape[1]) * 1e-5
+        _, _, vt = np.linalg.svd(x_jitter, full_matrices=False)
     comps = vt[:3].T
     return x @ comps
 

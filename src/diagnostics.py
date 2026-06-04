@@ -12,7 +12,11 @@ def compute_effective_rank_from_features(z: np.ndarray) -> float:
         return 0.0
     z = z - z.mean(axis=0, keepdims=True)
     denom = max(1, z.shape[0] - 1)
-    svals = np.linalg.svd(z, full_matrices=False, compute_uv=False)
+    try:
+        svals = np.linalg.svd(z, full_matrices=False, compute_uv=False)
+    except np.linalg.LinAlgError:
+        z_jitter = z + np.random.normal(0, 1e-5, z.shape)
+        svals = np.linalg.svd(z_jitter, full_matrices=False, compute_uv=False)
     evals = np.square(svals) / denom
     s = float(evals.sum())
     if s <= 0.0:
@@ -45,7 +49,12 @@ def spectral_rank_stats(fmap: torch.Tensor, eps: float = 1e-12, dead_thresh: flo
     dead_frac = dead.float().mean().item()
 
     denom = max(1, z.shape[0] - 1)
-    eig = torch.linalg.svdvals(z).pow(2).div(float(denom)).clamp_min(0)
+    try:
+        eig_raw = torch.linalg.svdvals(z)
+    except RuntimeError:
+        z_jitter = z + torch.randn_like(z) * 1e-5
+        eig_raw = torch.linalg.svdvals(z_jitter)
+    eig = eig_raw.pow(2).div(float(denom)).clamp_min(0)
 
     total = eig.sum().clamp_min(eps)
     p = eig / total

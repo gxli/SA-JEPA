@@ -5,6 +5,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+try:
+    import h5py  # optional — enables chunked HDF5 reading for large 3D arrays
+except ImportError:
+    h5py = None
+
 
 class JEPADataset(Dataset):
     def __init__(
@@ -56,8 +61,14 @@ class JEPADataset(Dataset):
         pattern = os.path.join(data_root, npy_pattern)
         self.npy_files = sorted(glob.glob(pattern))
 
-        if not self.npy_files:
-            raise FileNotFoundError(f"No .npy files found with pattern: {pattern}")
+        # Also scan for .h5 files (preferred for fast random-access slicing)
+        h5_pattern = pattern.replace(".npy", ".h5") if pattern.endswith(".npy") else os.path.join(data_root, "*.h5")
+        self.h5_files = sorted(glob.glob(h5_pattern)) if h5py is not None else []
+        if self.h5_files:
+            print(f"[dataset] Found {len(self.h5_files)} .h5 file(s); using chunked HDF5 for fast I/O")
+
+        if not self.npy_files and not self.h5_files:
+            raise FileNotFoundError(f"No .npy or .h5 files found with pattern: {pattern}")
         self.sample_index = self._build_sample_index()
         if self.num_samples is None:
             self.num_samples = len(self.sample_index)
@@ -67,12 +78,27 @@ class JEPADataset(Dataset):
         arr = self._normalize01(arr)
         return arr.astype(np.float32, copy=False)
 
+    @staticmethod
+    def _probe_file_shape(path: str) -> tuple[int, ...]:
+        """Read array shape without loading full data. Supports .npy and .h5."""
+        if path.endswith(".h5"):
+            if h5py is None:
+                raise ImportError("h5py is required to read .h5 files; pip install h5py")
+            with h5py.File(path, "r") as f:
+                return tuple(f["data"].shape)
+        arr = np.load(path, mmap_mode="r")
+        return arr.shape
+
+    @staticmethod
+    def _is_h5(path: str) -> bool:
+        return path.endswith(".h5")
+
     def _build_sample_index(self):
+        all_files = list(self.npy_files) + list(self.h5_files)
         index = []
-        for path in self.npy_files:
-            arr = np.load(path, mmap_mode="r")
-            ndim = arr.ndim
-            shape = arr.shape
+        for path in all_files:
+            shape = self._probe_file_shape(path)
+            ndim = len(shape)
             if ndim == 2:
                 index.append((path, None))
             elif ndim == 3:
@@ -84,7 +110,6 @@ class JEPADataset(Dataset):
                     elif self.image_batch_inference:
                         index.append((path, 0))
                     else:
-                        # Dynamic random selection each __getitem__
                         index.append((path, None))
                 else:
                     axis = self.cube_slice_axis % 3
@@ -93,7 +118,6 @@ class JEPADataset(Dataset):
                         for sidx in range(depth):
                             index.append((path, sidx))
                     else:
-                        # slice will be selected dynamically in __getitem__
                         index.append((path, None))
             else:
                 raise ValueError(f"Expected 2D or 3D array in {path}, got shape {shape}")
@@ -163,8 +187,16 @@ class JEPADataset(Dataset):
         return cdd[tuple(slicer)]
 
     def _load_sample(self, path: str, forced_slice_idx=None) -> torch.Tensor:
-        arr_mm = np.load(path, mmap_mode="r")
-        arr2d, _ = self._extract_2d_from_array(arr_mm, forced_slice_idx=forced_slice_idx)
+        if self._is_h5(path):
+            if h5py is None:
+                raise ImportError("h5py is required to read .h5 files; pip install h5py")
+            with h5py.File(path, "r") as h5_file:
+                ds = h5_file["data"]
+                arr2d, _ = self._extract_2d_from_array(ds, forced_slice_idx=forced_slice_idx)
+                arr2d = np.asarray(arr2d, dtype=np.float32)
+        else:
+            arr_mm = np.load(path, mmap_mode="r")
+            arr2d, _ = self._extract_2d_from_array(arr_mm, forced_slice_idx=forced_slice_idx)
         arr = self._preprocess_arr2d(arr2d)
 
         # Keep native resolution (including non-square fields).

@@ -71,7 +71,11 @@ def _compute_pca_3d(x: np.ndarray) -> np.ndarray:
         return PCA(n_components=3).fit_transform(x)
     except Exception as e:
         print(f"[warning] sklearn PCA(3D) failed: {type(e).__name__}: {e}; falling back to numpy SVD")
-        u, s, _ = np.linalg.svd(x.astype(np.float64), full_matrices=False)
+        try:
+            u, s, _ = np.linalg.svd(x.astype(np.float64), full_matrices=False)
+        except np.linalg.LinAlgError:
+            x_jitter = x.astype(np.float64) + np.eye(x.shape[0], x.shape[1]) * 1e-5
+            u, s, _ = np.linalg.svd(x_jitter, full_matrices=False)
         z = (u[:, :3] * s[:3]).astype(np.float32)
         return z
 

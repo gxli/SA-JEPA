@@ -710,22 +710,57 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
 
 
 def run_training(config: dict, config_name: str, sessions_root: str = "sessions") -> str:
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
+    # ── DDP: detect torchrun-launched multi-GPU ──
+    is_ddp = "LOCAL_RANK" in os.environ
+    if is_ddp:
+        import torch.distributed as dist
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        from torch.utils.data.distributed import DistributedSampler
+
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
     else:
-        device = torch.device("cpu")
-    print(
-        f"[{config_name}] Backend discovered: device={device.type}, "
-        f"cuda_available={torch.cuda.is_available()}, "
-        f"mps_available={device.type == 'mps'}"
-    )
+        local_rank = 0
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    is_main_process = (local_rank == 0)
+
+    if is_main_process:
+        print(
+            f"[{config_name}] Backend discovered: device={device.type}, "
+            f"cuda_available={torch.cuda.is_available()}, "
+            f"mps_available={device.type == 'mps'}, "
+            f"ddp={'on' if is_ddp else 'off'}, "
+            f"local_rank={local_rank}"
+        )
 
     train_cfg = config["train"]
     model_cfg = config["model"]
     data_cfg = config["data"]
     is_3d_mode = _is_3d_jepa_mode(model_cfg.get("mode", "image"))
+
+    # Optional WandB logging (config-controlled, main process only)
+    _use_wandb = False
+    if is_main_process and bool(train_cfg.get("wandb_enabled", False)):
+        try:
+            import wandb
+
+            _use_wandb = True
+            wandb.init(
+                project=train_cfg.get("wandb_project", "jepa-training"),
+                name=config_name,
+                config=config,
+                dir=os.path.join(sessions_root, "wandb"),
+            )
+            print(f"[{config_name}] wandb initialized project={train_cfg.get('wandb_project', 'jepa-training')}")
+        except ImportError:
+            print(f"[{config_name}] wandb not installed; pip install wandb to enable")
 
     session_dir = make_session_dir(sessions_root, config_name)
     set_error_log_path(os.path.join(session_dir, "errors.log"))
@@ -755,14 +790,21 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
     _write_data_profile(data_cfg=data_cfg, session_dir=session_dir, config_name=config_name)
 
-    print(
-        f"[{config_name}] Resolved pipeline: "
-        "dataset_preprocess=normalize01, "
-        f"model.post_log_transform={model_cfg.get('post_log_transform', True)}, "
-        f"cdd_mode={model_cfg.get('cdd_mode', data_cfg.get('cdd_mode', 'log'))}"
-    )
+    if is_main_process:
+        print(
+            f"[{config_name}] Resolved pipeline: "
+            "dataset_preprocess=normalize01, "
+            f"model.post_log_transform={model_cfg.get('post_log_transform', True)}, "
+            f"cdd_mode={model_cfg.get('cdd_mode', data_cfg.get('cdd_mode', 'log'))}"
+        )
 
     model = build_model3d_from_config(model_cfg, train_cfg, device) if is_3d_mode else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
+
+    # DDP: wrap model for multi-GPU
+    model_without_ddp = model
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model_without_ddp = model.module
     allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
     resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
     if resume_mismatch_action not in ("skip", "error"):
@@ -793,7 +835,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 print(f"[{config_name}] resume_model missing_keys_list={missing}")
             if unexpected:
                 print(f"[{config_name}] resume_model unexpected_keys_list={unexpected}")
-            if (missing or unexpected) and not allow_partial_resume:
+            if missing or unexpected:
+                error_msg = (
+                    f"CRITICAL: Checkpoint architecture mismatch!\n"
+                    f"  Missing keys: {len(missing)} (e.g., {missing[:3]})\n"
+                    f"  Unexpected keys: {len(unexpected)} (e.g., {unexpected[:3]})"
+                )
+                if not allow_partial_resume:
+                    raise RuntimeError(error_msg + "\nSet train.allow_partial_resume=true if intentional.")
+                print("=" * 60)
+                print(f"[WARNING] {error_msg}")
+                print("[WARNING] Proceeding anyway due to allow_partial_resume=True")
+                print("=" * 60)
                 if resume_mismatch_action == "error":
                     raise RuntimeError(
                         "Checkpoint model-state mismatch detected and allow_partial_resume=False. "
@@ -810,6 +863,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     if is_3d_mode
                     else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
                 )
+                # Re-wrap in DDP if needed
+                model_without_ddp = model
+                if is_ddp:
+                    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+                    model_without_ddp = model.module
                 print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
             start_epoch = int(resume_state.get("epoch", 0))
@@ -826,12 +884,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             print(f"[{config_name}] resume_model missing_keys_list={missing}")
         if unexpected:
             print(f"[{config_name}] resume_model unexpected_keys_list={unexpected}")
-        if (missing or unexpected) and not allow_partial_resume:
-            if resume_mismatch_action == "error":
-                raise RuntimeError(
-                    "Model checkpoint mismatch detected and allow_partial_resume=False. "
-                    "Set train.allow_partial_resume=true to permit partial model resume."
-                )
+        if missing or unexpected:
+            error_msg = (
+                f"CRITICAL: Model checkpoint mismatch!\n"
+                f"  Missing keys: {len(missing)} (e.g., {missing[:3]})\n"
+                f"  Unexpected keys: {len(unexpected)} (e.g., {unexpected[:3]})"
+            )
+            if not allow_partial_resume:
+                raise RuntimeError(error_msg + "\nSet train.allow_partial_resume=true if intentional.")
+            print("=" * 60)
+            print(f"[WARNING] {error_msg}")
+            print("[WARNING] Proceeding anyway due to allow_partial_resume=True")
+            print("=" * 60)
             print(
                 f"[{config_name}] warning: model checkpoint mismatch; "
                 "ignoring model_last and starting fresh model/optimizer/scaler."
@@ -841,6 +905,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 if is_3d_mode
                 else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
             )
+            model_without_ddp = model
+            if is_ddp:
+                model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+                model_without_ddp = model.module
             print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
         else:
             print(f"resume_model={model_ckpt_path}")
@@ -1018,9 +1086,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         f"pin_memory={pin_memory}, persistent_workers={persistent_workers}, "
         f"prefetch_factor={prefetch_factor}"
     )
+    def _worker_init_fn(worker_id: int) -> None:
+        """Ensure each DataLoader worker has a unique NumPy and Python random seed."""
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
     loader_worker_kwargs = {}
     if num_workers > 0:
         loader_worker_kwargs["prefetch_factor"] = prefetch_factor
+        loader_worker_kwargs["worker_init_fn"] = _worker_init_fn
+
+    # DDP: distribute data across GPUs
+    train_sampler = DistributedSampler(train_dataset) if is_ddp else None
 
     masking_collate = None if is_3d_mode else _MaskingCollator(
         model,
@@ -1029,11 +1107,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     dataloader = DataLoader(
         train_dataset,
         batch_size=train_cfg.get("batch_size", 32),
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         collate_fn=masking_collate,
+        generator=torch.Generator().manual_seed(int(train_cfg.get("split_seed", 42))),
         **loader_worker_kwargs,
     )
     val_loader = None
@@ -1144,6 +1224,28 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     base_lr = float(train_cfg.get("lr", 1e-4))
     min_lr = float(train_cfg.get("min_lr", 1e-6))
     warmup_epochs = float(train_cfg.get("warmup_epochs", 1.0))
+
+    # PyTorch native LR scheduler: warmup → cosine decay
+    total_steps_sched = max(1, int(epochs) * max(1, len(dataloader)))
+    warmup_steps_sched = int(warmup_epochs * max(1, len(dataloader)))
+    from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
+    warmup_sched = LinearLR(
+        optimizer,
+        start_factor=min_lr / max(base_lr, 1e-12),
+        end_factor=1.0,
+        total_iters=warmup_steps_sched,
+    )
+    cosine_sched = CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps_sched - warmup_steps_sched,
+        eta_min=min_lr,
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_sched, cosine_sched],
+        milestones=[warmup_steps_sched],
+    )
 
     metrics_path = os.path.join(session_dir, "metrics.csv")
     metrics_header = [
@@ -1288,19 +1390,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 debug = context_result[4] if len(context_result) == 5 else {}
                 context_data = (x_context, tloc, tscale, tvalid, debug)
 
-            # Compute LR before forward/backward/step so the current batch
-            # actually uses the intended LR.
+            # DDP: advance distributed sampler epoch
+            if is_ddp:
+                train_sampler.set_epoch(epoch)
+            # PyTorch scheduler handles warmup + cosine automatically
             current_step = epoch * max(1, len(dataloader)) + batch_idx
-            total_steps = max(1, int(epochs) * max(1, len(dataloader)))
-            warmup_steps = int(warmup_epochs * max(1, len(dataloader)))
-            if current_step < warmup_steps:
-                lr = base_lr * float(current_step + 1) / max(1, warmup_steps)
-            else:
-                progress_lr = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
-                progress_lr = min(1.0, max(0.0, float(progress_lr)))
-                lr = min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress_lr))
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -1326,11 +1420,22 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     + (spread_regularizer_weight * loss_spread)
                     + (symmetry_loss_weight * loss_symmetry)
                 )
+            # DDP: sync a DETACHED clone for logging only (autograd must stay local)
+            if is_ddp:
+                log_loss = total_loss.detach().clone()
+                dist.all_reduce(log_loss, op=dist.ReduceOp.SUM)
+                log_loss_val = float((log_loss / dist.get_world_size()).item())
+            else:
+                log_loss_val = float(total_loss.item())
+
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
 
-            progress = min(1.0, max(0.0, float(current_step) / float(total_steps)))
+            total_steps_sched = max(1, int(epochs) * max(1, len(dataloader)))
+            progress = min(1.0, max(0.0, float(current_step) / float(total_steps_sched)))
 
             # Cosine EMA schedule: anneal from ema_base → ema_final over
             # ema_warmup_fraction of training, then hold at ema_final.
@@ -1343,8 +1448,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             new_momentum = float(
                 ema_final - 0.5 * (ema_final - ema_base) * (1.0 + math.cos(math.pi * ema_progress))
             )
-            model.ema_momentum = new_momentum
-            model.update_target_encoder()
+            model_without_ddp.ema_momentum = new_momentum
+            model_without_ddp.update_target_encoder()
             sim_val, var_val, cov_val = compute_sim_var_cov(
                 outputs,
                 spatial_mode=vicreg_spatial_mode,
@@ -1366,14 +1471,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             mask_scale_factor = float(outputs.get("mask_scale_factor", model.mask_scale))
 
             elapsed = time.time() - start
+            global_step = epoch * max(1, len(dataloader)) + batch_idx
             metrics_rows.append(
                 [
                     epoch + 1,
                     batch_idx,
-                    epoch * max(1, len(dataloader)) + batch_idx,
-                    float(total_loss.item()),
+                    global_step,
+                    log_loss_val,
                     float(loss_prediction.item()),
-                    float(lr),
+                    float(current_lr),
                     float(loss_spread.item()),
                     float(loss_symmetry.item()),
                     float((prediction_loss_weight * loss_prediction).item()),
@@ -1444,18 +1550,40 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                                 float(scales[bi, ki]),
                             ]
                         )
-            if (batch_idx + 1) % log_flush_interval == 0:
+            if is_main_process and (batch_idx + 1) % log_flush_interval == 0:
                 _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
                 _flush_csv_rows(visited_targets_log_path, visited_rows)
             metrics_bar.set_description_str(
-                f"total={total_loss.item():.4f} prediction={loss_prediction.item():.4f} "
+                f"total={log_loss_val:.4f} prediction={loss_prediction.item():.4f} "
                 f"spread={loss_spread.item():.4f} sim={sim_val:.4f} "
                 f"embed_spread={ctx_stats['embed_spread_mean']:.3e} "
                 f"manifold={ctx_stats['context_manifold_size']:.2f} "
-                f"vf={valid_frac:.3f} lr={lr:.1e}",
+                f"vf={valid_frac:.3f} lr={current_lr:.1e}",
                 refresh=True,
             )
-            epoch_total += float(total_loss.item())
+            if _use_wandb and (batch_idx + 1) % log_flush_interval == 0:
+                import wandb
+
+                wandb.log(
+                    {
+                        "train/loss_total": total_loss.item(),
+                        "train/loss_prediction": loss_prediction.item(),
+                        "train/loss_spread": loss_spread.item(),
+                        "train/loss_symmetry": loss_symmetry.item(),
+                        "train/lr": current_lr,
+                        "train/ema_momentum": new_momentum,
+                        "train/sim": sim_val,
+                        "metrics/valid_fraction": valid_frac,
+                        "metrics/manifold_size": ctx_stats["context_manifold_size"],
+                        "metrics/embed_spread": ctx_stats["embed_spread_mean"],
+                        "metrics/dead_channels": ctx_stats["dead_channel_count"],
+                        "metrics/targets_per_image": targets_per_image,
+                        "metrics/mask_footprint_mean_px": mask_footprint_mean_px,
+                        "epoch": epoch + 1,
+                    },
+                    step=global_step,
+                )
+            epoch_total += log_loss_val
             epoch_prediction += float(loss_prediction.item())
             epoch_sim += float(sim_val)
             epoch_var += float(var_val)
@@ -1468,13 +1596,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_batches += 1
 
         metrics_bar.close()
-        if metrics_rows:
-            with open(metrics_path, "a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerows(metrics_rows)
-        _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
-        _flush_csv_rows(visited_targets_log_path, visited_rows)
-        if visit_counts is not None:
-            np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
+        # Only the main process writes files in DDP mode
+        if is_main_process:
+            if metrics_rows:
+                with open(metrics_path, "a", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerows(metrics_rows)
+            _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
+            _flush_csv_rows(visited_targets_log_path, visited_rows)
+            if visit_counts is not None:
+                np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
 
         if epoch_batches > 0:
             avg_total = epoch_total / epoch_batches
@@ -1527,20 +1657,22 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 ]
             )
         model.train()
-        # Save resumable checkpoint at the end of every epoch.
-        torch.save(
-            {
-                "epoch": int(epoch + 1),
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "config_name": config_name,
-            },
-            resume_ckpt_path,
-        )
-        # Keep model_last in sync for inference-only resume paths.
-        torch.save(model.state_dict(), model_ckpt_path)
-        tqdm.write(f"[{config_name}] ckpt_saved epoch={epoch + 1}")
+        # Save resumable checkpoint at the end of every epoch (main process only).
+        if is_main_process:
+            torch.save(
+                {
+                    "epoch": int(epoch + 1),
+                    "model_state_dict": model_without_ddp.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "config_name": config_name,
+                },
+                resume_ckpt_path,
+            )
+            # Keep model_last in sync for inference-only resume paths.
+            torch.save(model_without_ddp.state_dict(), model_ckpt_path)
+            tqdm.write(f"[{config_name}] ckpt_saved epoch={epoch + 1}")
 
         # Per-epoch embedding snapshot for movie generation.
         if movie_dump_every_epoch:
@@ -1567,7 +1699,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 torch.save(frame, os.path.join(movie_dir, f"epoch_{epoch + 1:04d}.pt"))
             model.train()
 
-    torch.save(model.state_dict(), os.path.join(session_dir, "model_last.pt"))
+    if is_main_process:
+        torch.save(model_without_ddp.state_dict(), os.path.join(session_dir, "model_last.pt"))
 
     if is_3d_mode:
         session_dir = run_post_training_inference_3d(

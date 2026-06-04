@@ -7,11 +7,12 @@ import numpy as np
 import torch
 
 
-PRIMARY_TARGET_SAMPLING_MODES = ("random", "priority")
+PRIMARY_TARGET_SAMPLING_MODES = ("random", "priority", "priority_small_scale")
 LEGACY_TARGET_SAMPLING_MODES = ("lattice",)
 LEGACY_TARGET_SAMPLING_ALIASES = {
     "grid": "lattice",
     "priority_sampling": "priority",
+    "priority_small_scale": "priority_small_scale",
 }
 ALLOWED_TARGET_SAMPLING_MODES = PRIMARY_TARGET_SAMPLING_MODES + LEGACY_TARGET_SAMPLING_MODES
 
@@ -488,9 +489,10 @@ def make_pyramid_grid_context(
     if x_clean.shape[1] != 1:
         raise ValueError(f"Expected grayscale input with 1 channel, got {x_clean.shape[1]}")
     sampling_mode = normalize_target_sampling_mode(target_sampling_mode)
-    sampled_mode = sampling_mode in ("random", "priority")
+    sampled_mode = sampling_mode in ("random", "priority", "priority_small_scale")
     random_sampling_mode = sampling_mode == "random"
-    priority_sampling_mode = sampling_mode == "priority"
+    priority_sampling_mode = sampling_mode in ("priority", "priority_small_scale")
+    _use_linear_catalogue = sampling_mode == "priority_small_scale"
     if priority_dithering_pixels is None or priority_dithering_pixels <= 0:
         priority_dithering_pixels = inner_target_size
     else:
@@ -508,7 +510,6 @@ def make_pyramid_grid_context(
     per_scale_fraction = total_fraction / max(1, n_sigmas)
 
     x_context = x_clean.clone()
-    x_context_np = x_context.cpu().numpy()
     invalid_value_specs = tuple(target_invalid_region_values) if target_invalid_region_values is not None else tuple()
 
     all_locations = []
@@ -530,7 +531,7 @@ def make_pyramid_grid_context(
     all_priority_effective_targets = []
 
     for bi in range(b):
-        arr = x_context_np[bi, 0].copy()
+        arr = x_clean[bi, 0].cpu().numpy().copy()
         sample_invalid_mask = invalid_pixel_mask[bi, 0].cpu().numpy() if invalid_pixel_mask is not None else None
         priority_good_candidates_bi = 0.0
         priority_nonzero_mean_bi = 1.0
@@ -540,7 +541,7 @@ def make_pyramid_grid_context(
 
         applied_locations = []
         applied_scales = []
-        applied_mask_hard = np.zeros((h, w), dtype=np.uint8)
+        applied_mask_hard = torch.zeros((h, w), dtype=torch.uint8, device=x_clean.device)
 
         # Compute shared grid centers for scale alignment
         base_box = _max_effective_mask_box_size(
@@ -610,10 +611,9 @@ def make_pyramid_grid_context(
         # Masking is applied only after CDD decomposition.
         if active_sigmas:
             if cdd_orig_in is not None:
-                # Use pre-computed CDD channels (residual already baked in).
-                cdd_orig = cdd_orig_in[bi].cpu().numpy().astype(np.float32, copy=False)
-                cdd_mod = cdd_orig.copy()
-                cdd_residual = None  # unused — residual is in last channel
+                # Keep everything on GPU — no CPU transfer for CDD data.
+                cdd_orig_t = cdd_orig_in[bi].to(device=x_clean.device, dtype=x_clean.dtype)
+                cdd_residual_t = None
             else:
                 import constrained_diffusion as cdd
 
@@ -631,24 +631,26 @@ def make_pyramid_grid_context(
                     max_scale=max(active_sigmas),
                     **cdd_kwargs,
                 )
-                cdd_channels_arr = np.asarray(cdd_channels_arr, dtype=np.float32)
-                cdd_residual = np.asarray(cdd_residual, dtype=np.float32)
 
-                cdd_orig = np.clip(np.asarray(cdd_channels_arr, dtype=np.float32), a_min=0.0, a_max=None)
+                cdd_orig_np = np.clip(np.asarray(cdd_channels_arr, dtype=np.float32), a_min=0.0, a_max=None)
+                cdd_orig_t = torch.from_numpy(cdd_orig_np).to(device=x_clean.device, dtype=x_clean.dtype)
+                cdd_residual_t = torch.from_numpy(np.asarray(cdd_residual, dtype=np.float32)).to(device=x_clean.device, dtype=x_clean.dtype) if cdd_residual is not None else None
 
-                if cdd_append_last_residual:
-                    cdd_orig[-1] = cdd_orig[-1] + cdd_residual
+                if cdd_append_last_residual and cdd_residual_t is not None:
+                    cdd_orig_t[-1] = cdd_orig_t[-1] + cdd_residual_t
 
-                # Context branch starts from the exact same clipped+residual base as target.
-                cdd_mod = cdd_orig.copy()
+            # Mutable mask target stays on GPU
+            cdd_mod_t = cdd_orig_t.clone()
+            cdd_orig = cdd_orig_t.cpu().numpy()  # CPU copy strictly for catalogue sorting
 
-            all_cdd_orig.append(torch.from_numpy(cdd_orig.copy()))
+            all_cdd_orig.append(cdd_orig_t.clone().detach())
 
             priority_catalogue = []
             if sampled_mode:
                 if priority_sampling_mode:
+                    _cdd_for_catalogue = np.expm1(cdd_orig) if _use_linear_catalogue else cdd_orig
                     priority_catalogue = _build_priority_catalogue_from_cdd_ratio(
-                        cdd_orig=cdd_orig,
+                        cdd_orig=_cdd_for_catalogue,
                         top_percent=float(priority_top_percent),
                         patch_size=int(inner_target_size),
                         h=h,
@@ -777,11 +779,11 @@ def make_pyramid_grid_context(
                     )
                     priority_effective_targets_bi = float(len(priority_centers_dithered))
 
-            num_cdd_ch = cdd_mod.shape[0]
-            dip_field = np.zeros((h, w), dtype=np.float32)
-            dip_field_ch = np.zeros((num_cdd_ch, h, w), dtype=np.float32)
-            dip_proto_ch = np.zeros((num_cdd_ch, h, w), dtype=np.float32)
-            dip_proto_written = np.zeros(num_cdd_ch, dtype=np.int32)
+            num_cdd_ch = cdd_mod_t.shape[0]
+            dip_field_t = torch.zeros((h, w), dtype=x_clean.dtype, device=x_clean.device)
+            dip_field_ch_t = torch.zeros((num_cdd_ch, h, w), dtype=x_clean.dtype, device=x_clean.device)
+            dip_proto_ch_t = torch.zeros((num_cdd_ch, h, w), dtype=x_clean.dtype, device=x_clean.device)
+            dip_proto_written = torch.zeros(num_cdd_ch, dtype=torch.int32, device=x_clean.device)
             cdd_box_sizes = []
             cdd_blur_sigmas = []
 
@@ -795,7 +797,7 @@ def make_pyramid_grid_context(
                     hardcap=mask_box_hardcap,
                     manual_mask_box_sizes=manual_mask_box_sizes,
                 )
-                ch = min(si, cdd_mod.shape[0] - 1)
+                ch = min(si, cdd_mod_t.shape[0] - 1)
                 half_lo = box // 2
                 half_hi = box - half_lo
                 cdd_box_sizes.append(float(box))
@@ -853,24 +855,21 @@ def make_pyramid_grid_context(
                     x1 = min(w, cx + half_hi)
                     if y1 <= y0 or x1 <= x0:
                         continue
-                    cdd_mod[ch, y0:y1, x0:x1] = 0.0
-                    dip_field[y0:y1, x0:x1] = 1.0
-                    dip_field_ch[ch, y0:y1, x0:x1] = 1.0
+                    cdd_mod_t[ch, y0:y1, x0:x1] = 0.0
+                    dip_field_t[y0:y1, x0:x1] = 1.0
+                    dip_field_ch_t[ch, y0:y1, x0:x1] = 1.0
                     if dip_proto_written[ch] == 0:
-                        dip_proto_ch[ch, y0:y1, x0:x1] = 1.0
+                        dip_proto_ch_t[ch, y0:y1, x0:x1] = 1.0
                         dip_proto_written[ch] = 1
                     applied_mask_hard[y0:y1, x0:x1] = 1
                     applied_locations.append((cy, cx))
                     applied_scales.append(float(sigma))
 
-            # If residual is already baked into cdd_mod[-1], don't double-add it.
-            # Pre-computed CDD always has residual in the last channel.
-            if cdd_residual is None or cdd_append_last_residual:
-                recon = np.sum(cdd_mod, axis=0)
-            else:
-                recon = np.sum(cdd_mod, axis=0) + cdd_residual
-            recon = np.clip(recon, a_min=0.0, a_max=None)
-            x_context[bi, 0] = torch.from_numpy(recon).to(device=x_clean.device, dtype=x_clean.dtype)
+            # Reconstruct entirely on GPU
+            recon_t = torch.sum(cdd_mod_t, dim=0)
+            if cdd_residual_t is not None and not cdd_append_last_residual:
+                recon_t = recon_t + cdd_residual_t
+            x_context[bi, 0] = torch.clamp(recon_t, min=0.0)
 
             # IMPORTANT:
             # In priority mode we still must keep the *dithered* centers.
@@ -910,7 +909,7 @@ def make_pyramid_grid_context(
                 sample_locations.append((iy, ix))
                 sample_scales.append(float(unique_loc_to_scale[(cy, cx)]))
             sample_valid = [1] * len(sample_locations)
-            _ensure_target_patches_masked(sample_locations, applied_mask_hard, inner_target_size)
+            _ensure_target_patches_masked(sample_locations, applied_mask_hard.cpu().numpy(), inner_target_size)
 
             all_locations.append(sample_locations)
             all_scales.append(sample_scales)
@@ -924,11 +923,11 @@ def make_pyramid_grid_context(
                         seen.add(key)
                         uniq.append((cy, cx))
                 all_unique_centers.append(torch.tensor(uniq, dtype=torch.long))
-            all_mask_maps.append(torch.from_numpy(applied_mask_hard.copy()))
-            all_cdd_masked.append(torch.from_numpy(cdd_mod.copy()))
-            all_dip_fields.append(torch.from_numpy(dip_field))
-            all_dip_fields_per_channel.append(torch.from_numpy(dip_field_ch))
-            all_dip_proto_per_channel.append(torch.from_numpy(dip_proto_ch))
+            all_mask_maps.append(applied_mask_hard.cpu().clone())
+            all_cdd_masked.append(cdd_mod_t.cpu().clone())
+            all_dip_fields.append(dip_field_t.cpu())
+            all_dip_fields_per_channel.append(dip_field_ch_t.cpu())
+            all_dip_proto_per_channel.append(dip_proto_ch_t.cpu())
             all_cdd_box_sizes.append(torch.tensor(cdd_box_sizes, dtype=torch.float32))
             all_cdd_blur_sigmas.append(torch.tensor(cdd_blur_sigmas, dtype=torch.float32))
             all_priority_good_candidates.append(priority_good_candidates_bi)
