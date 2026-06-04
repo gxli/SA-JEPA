@@ -7,6 +7,9 @@ import json
 import os
 import sys
 
+import matplotlib
+matplotlib.use("Agg")  # headless — no display required
+
 import numpy as np
 import torch
 from sklearn.decomposition import PCA
@@ -50,6 +53,8 @@ def _render_frame(
     umap_reducer,
     epoch: int,
     out_path: str,
+    dpi: int = 100,
+    figsize: tuple = (12, 10),
 ):
     """Render a 2x2 frame: pred PCA | gt PCA / pred UMAP | gt UMAP."""
     from matplotlib import pyplot as plt
@@ -76,7 +81,7 @@ def _render_frame(
         pred_umap = pred_pca
         gt_umap = gt_pca
 
-    fig = plt.figure(figsize=(12, 10))
+    fig = plt.figure(figsize=figsize)
     gs = GridSpec(2, 2, figure=fig)
 
     ax1 = fig.add_subplot(gs[0, 0])
@@ -105,7 +110,7 @@ def _render_frame(
 
     fig.suptitle(f"Epoch {epoch}", fontsize=13, y=0.98)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=100, bbox_inches="tight")
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -168,11 +173,37 @@ def collect_all_frames(movie_dir: str) -> tuple[list[int], list[str], np.ndarray
 def main():
     parser = argparse.ArgumentParser(description="Convert session movie frames to PNGs")
     parser.add_argument("session_dir", help="Path to session directory containing movie_frames/")
+    parser.add_argument("--config", default=None, help="Path to movie config JSON (overrides defaults)")
     parser.add_argument("--out-dir", default=None, help="Output directory for PNG frames")
     parser.add_argument("--dump-only", action="store_true", help="Save PCA/UMAP NPZ dumps without rendering PNGs")
     parser.add_argument("--make-mp4", action="store_true", help="Generate MP4 with ffmpeg")
     parser.add_argument("--fps", type=int, default=5, help="Frames per second for MP4")
+    parser.add_argument("--seed", type=int, default=42, help="UMAP random seed")
+    parser.add_argument("--n-neighbors", type=int, default=30, help="UMAP n_neighbors")
+    parser.add_argument("--min-dist", type=float, default=0.15, help="UMAP min_dist")
+    parser.add_argument("--dpi", type=int, default=100, help="PNG DPI")
+    parser.add_argument("--figsize", nargs=2, type=float, default=[12, 10], help="Figure size in inches")
     args = parser.parse_args()
+
+    # Load config file if provided (CLI flags override config values)
+    if args.config:
+        if not os.path.exists(args.config):
+            print(f"[session_to_movie] config not found: {args.config}")
+            sys.exit(1)
+        with open(args.config) as f:
+            cfg = json.load(f)
+        # Config sets defaults; CLI args override
+        for key in ("seed", "n_neighbors", "min_dist", "dpi", "fps"):
+            cli_val = getattr(args, key.replace("-", "_"))
+            cfg_val = cfg.get(f"umap_{key}" if key != "fps" and key != "dpi" and key != "seed" else key)
+            if cli_val == parser.get_default(key.replace("-", "_")) and cfg_val is not None:
+                setattr(args, key.replace("-", "_"), cfg_val)
+        if args.out_dir is None and "output_dir" in cfg:
+            args.out_dir = cfg["output_dir"]
+        if args.fps == 5 and "fps" in cfg:
+            args.fps = cfg["fps"]
+        if "figsize" in cfg:
+            args.figsize = cfg["figsize"]
     if args.dump_only and args.make_mp4:
         parser.error("--dump-only cannot be combined with --make-mp4")
 
@@ -192,11 +223,13 @@ def main():
 
     print(f"[session_to_movie] loading frames from {movie_dir}")
     epochs, frame_paths, all_pred, all_gt = collect_all_frames(movie_dir)
-    print(f"[session_to_movie] loaded {len(epochs)} frames, fitting PCA...")
+    print(f"[session_to_movie] loaded {len(epochs)} frames, fitting PCA (seed=42)...")
 
     pca = _fit_pca_2d(all_pred, all_gt)
-    print(f"[session_to_movie] PCA fit done, fitting UMAP...")
-    umap_reducer = _fit_umap_2d(all_pred, all_gt)
+    print(f"[session_to_movie] PCA fit done, fitting UMAP (seed={args.seed}, n_neighbors={args.n_neighbors}, min_dist={args.min_dist})...")
+    umap_reducer = _fit_umap_2d(all_pred, all_gt, n_neighbors=args.n_neighbors, min_dist=args.min_dist)
+    if umap_reducer is not None and hasattr(umap_reducer, 'random_state'):
+        umap_reducer.random_state = args.seed
     print(f"[session_to_movie] UMAP {'fit done' if umap_reducer else 'skipped'}")
 
     # Load loss weights for annotation
@@ -215,7 +248,7 @@ def main():
         if args.dump_only:
             continue
         out_path = os.path.join(out_dir, f"frame_{i:04d}.png")
-        _render_frame(pm, gm, pca, umap_reducer, ep, out_path)
+        _render_frame(pm, gm, pca, umap_reducer, ep, out_path, dpi=args.dpi, figsize=tuple(args.figsize))
         if (i + 1) % 20 == 0 or i == 0:
             print(f"[session_to_movie] rendered {i + 1}/{len(epochs)} frames")
 

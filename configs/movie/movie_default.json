@@ -1,0 +1,9 @@
+{
+  "seed": 42,
+  "umap_n_neighbors": 50,
+  "umap_min_dist": 0.2,
+  "dpi": 150,
+  "figsize": [12, 10],
+  "fps": 5,
+  "output_dir": "results/movie_png"
+}

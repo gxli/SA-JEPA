@@ -1770,6 +1770,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
       const el = controls.querySelector('input[data-k="' + k + '"]');
       return el ? num(el) : null;
     }};
+    const xmin = get("xmin");
+    const xmax = get("xmax");
+    const ymin = get("ymin");
+    const ymax = get("ymax");
+    const zmin = get("zmin");
+    const zmax = get("zmax");
     const colorLow = get("color_low");
     const colorHigh = get("color_high");
     const invertX = !!(controls.querySelector('input[data-k="invert_x"]') || {{}}).checked;
@@ -1791,6 +1797,11 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             return [map255(r, lo, hi, invertColor), map255(g, lo, hi, invertColor), map255(b, lo, hi, invertColor)];
           }}));
           Plotly.restyle(gd, {{ z: [recolored] }}, [i]);
+          const relImg = {{}};
+          if (xmin !== null || xmax !== null) relImg["xaxis.range"] = [xmin !== null ? xmin : 0, xmax !== null ? xmax : recolored[0].length];
+          if (ymin !== null || ymax !== null) relImg["yaxis.range"] = [ymin !== null ? ymin : 0, ymax !== null ? ymax : recolored.length];
+          if (Object.keys(relImg).length > 0) Plotly.relayout(gd, relImg);
+          Plotly.redraw(gd);
           return;
         }}
         if (tr.type !== "scatter3d") return;
@@ -1814,13 +1825,21 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
           colors[k] = `rgb(${{map255(r0, lo, hi, invertColor)}},${{map255(g0, lo, hi, invertColor)}},${{map255(b0, lo, hi, invertColor)}})`;
         }}
         Plotly.restyle(gd, {{ x: [x], y: [y], z: [z], "marker.color": [colors] }}, [i]);
-        Plotly.relayout(gd, {{
-          "scene.xaxis.autorange": true,
-          "scene.yaxis.autorange": true,
-          "scene.zaxis.autorange": true,
+        const relayoutOpts = {{
           "scene.camera.projection.type": "orthographic",
           "scene.aspectmode": "cube",
-        }});
+        }};
+        if (xmin !== null) relayoutOpts["scene.xaxis.range"] = [xmin, xmax !== null ? xmax : xr[1]];
+        else if (xmax !== null) relayoutOpts["scene.xaxis.range"] = [xr[0], xmax];
+        else relayoutOpts["scene.xaxis.autorange"] = true;
+        if (ymin !== null) relayoutOpts["scene.yaxis.range"] = [ymin, ymax !== null ? ymax : yr[1]];
+        else if (ymax !== null) relayoutOpts["scene.yaxis.range"] = [yr[0], ymax];
+        else relayoutOpts["scene.yaxis.autorange"] = true;
+        if (zmin !== null) relayoutOpts["scene.zaxis.range"] = [zmin, zmax !== null ? zmax : zr[1]];
+        else if (zmax !== null) relayoutOpts["scene.zaxis.range"] = [zr[0], zmax];
+        else relayoutOpts["scene.zaxis.autorange"] = true;
+        Plotly.relayout(gd, relayoutOpts);
+        Plotly.redraw(gd);
       }});
     }});
   }}
