@@ -43,6 +43,13 @@ def build_context(x_t: torch.Tensor, cfg: dict):
         pnt_val = int(pnt_raw)
     except (TypeError, ValueError):
         pnt_val = 20
+    mask_box_raw = m.get("mask_size", 16)
+    mask_box_range = None
+    if isinstance(mask_box_raw, (list, tuple)):
+        mask_box_range = tuple(int(round(float(v))) for v in mask_box_raw[:2])
+        mask_box_size = int(round(sum(mask_box_range) / 2.0))
+    else:
+        mask_box_size = int(mask_box_raw)
     return prepare_context_batch(
         x_clean=x_t,
         sigmas=tuple(m.get("sigmas", [2, 4, 8, 16])),
@@ -51,7 +58,9 @@ def build_context(x_t: torch.Tensor, cfg: dict):
         spacing_scale=float(m.get("mask_spacing_scaling", 1.5)),
         global_shift=bool(m.get("global_shift", True)),
         align_scales=bool(m.get("align_scales", True)),
-        mask_box_size=int(m.get("mask_size", 16)),
+        mask_box_size=mask_box_size,
+        mask_box_size_range=mask_box_range,
+        random_mask_box_per_target=bool(m.get("random_mask_box_per_target", False)),
         manual_mask_box_sizes=m.get("mask_size_manual"),
         cdd_mode=str(m.get("cdd_mode", "log")),
         cdd_constrained=bool(m.get("cdd_constrained", True)),
@@ -64,7 +73,12 @@ def build_context(x_t: torch.Tensor, cfg: dict):
         target_sampling_mode=str(m.get("target_sampling_mode", "random")),
         priority_top_percent=float(m.get("priority_top_percent", 5.0)),
         priority_n_target=pnt_val,
+        priority_min_targets_per_map=int(m.get("priority_min_targets_per_map", 0)),
         priority_dithering_pixels=int(m.get("priority_dithering_pixels", m.get("target_dithering_pixels", 6))),
+        priority_candidate_oversample=float(m.get("priority_candidate_oversample", 3.0)),
+        target_nonoverlap=bool(m.get("target_nonoverlap", True)),
+        target_allow_partial_overlap=float(m.get("target_allow_partial_overlap", 0.0)),
+        mask_box_hardcap=m.get("mask_box_hardcap"),
         cdd_use_gpu=False,
     )
 

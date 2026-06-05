@@ -32,6 +32,21 @@ def test_mask_size_scaling_and_mask_size_accept_inline_ranges():
     assert model.mask_box_size_range == (3, 15)
 
 
+def test_random_mask_box_per_target_keeps_range_for_candidate_sampling():
+    model = _build(
+        {
+            "mask_size_scaling": 0,
+            "mask_size": [3, 15],
+            "random_mask_box_per_target": True,
+        }
+    )
+
+    assert model.random_mask_box_per_target is True
+    assert model.mask_box_size == 9
+    assert model.mask_box_size_range == (3, 15)
+    assert model.sample_mask_params(device=torch.device("cpu")) == (0.0, 9)
+
+
 def test_mask_size_manual_overrides_with_fixed_per_channel_sizes():
     model = _build(
         {

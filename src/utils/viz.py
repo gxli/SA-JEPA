@@ -108,6 +108,7 @@ def _compute_umap_nd(
     try:
         from cuml.manifold import UMAP as CuMLUMAP
 
+        print("[inference] UMAP backend: cuML (GPU)")
         return CuMLUMAP(
             n_components=n_components,
             n_neighbors=int(n_neighbors),

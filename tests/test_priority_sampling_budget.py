@@ -105,7 +105,7 @@ def test_random_sampling_uses_full_valid_candidate_pool_not_priority_prescreen()
 
 
 def test_allowed_target_sampling_modes_are_explicit():
-    assert ALLOWED_TARGET_SAMPLING_MODES == ("random", "priority", "lattice")
+    assert ALLOWED_TARGET_SAMPLING_MODES == ("random", "priority", "priority_small_scale", "lattice")
     assert normalize_target_sampling_mode("priority_sampling") == "priority"
     assert normalize_target_sampling_mode("grid") == "lattice"
     for removed_mode in ("uniform", "random_uniform", "monte_carlo"):
@@ -184,6 +184,54 @@ def test_sampled_modes_reject_overlapping_pyramids_by_default():
         y1 = min(32, cy + 7 - half)
         x0 = max(0, cx - half)
         x1 = min(32, cx + 7 - half)
+        assert not occ[y0:y1, x0:x1].any()
+        occ[y0:y1, x0:x1] = True
+
+
+def test_random_mask_box_per_target_assigns_candidate_footprints_before_rejection():
+    torch.manual_seed(7)
+    x_clean = torch.ones((1, 1, 48, 48), dtype=torch.float32)
+    cdd_orig = torch.ones((1, 2, 48, 48), dtype=torch.float32)
+
+    result = make_pyramid_grid_context(
+        x_clean=x_clean,
+        sigmas=(1,),
+        mask_fraction=1.0,
+        mask_scale=0.0,
+        spacing_scale=1.0,
+        global_shift=False,
+        align_scales=True,
+        mask_box_size=9,
+        mask_box_size_range=(3, 15),
+        random_mask_box_per_target=True,
+        inner_target_size=1,
+        return_debug=True,
+        enable_grid_jitter=False,
+        enable_target_dithering=False,
+        target_sampling_mode="random",
+        priority_n_target=48,
+        cdd_orig_in=cdd_orig,
+    )
+
+    _x_context, target_locations, _target_scales, target_valid, debug = result
+    valid_boxes = debug["target_box_sizes"][0][target_valid[0]]
+    valid_locs = target_locations[0][target_valid[0]]
+    assert valid_boxes.numel() > 1
+    assert torch.all(valid_boxes >= 3)
+    assert torch.all(valid_boxes <= 15)
+    assert torch.all((valid_boxes % 2) == 1)
+    assert torch.unique(valid_boxes).numel() > 1
+
+    occ = torch.zeros((48, 48), dtype=torch.bool)
+    for (cy_t, cx_t), box_t in zip(valid_locs, valid_boxes):
+        cy = int(cy_t.item())
+        cx = int(cx_t.item())
+        box = int(box_t.item())
+        half = box // 2
+        y0 = max(0, cy - half)
+        y1 = min(48, cy + box - half)
+        x0 = max(0, cx - half)
+        x1 = min(48, cx + box - half)
         assert not occ[y0:y1, x0:x1].any()
         occ[y0:y1, x0:x1] = True
 

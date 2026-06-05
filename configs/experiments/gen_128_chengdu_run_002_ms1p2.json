@@ -1,7 +1,7 @@
 {
   "base_config": "../base_pyramid_scaleaware_convnext.json",
   "data": {
-    "npy_pattern": "C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy"
+    "npy_pattern": "chengdu.npy"
   },
   "model": {
     "mode": "pyramid",
@@ -28,14 +28,14 @@
     "target_allow_partial_overlap": 0.0,
     "priority_candidate_oversample": 0,
     "target_invalid_region_skip": true,
-    "mask_size_scaling": 0,
-    "mask_size": 5
+    "mask_size_scaling": 1.2,
+    "mask_size": 0
   },
   "train": {
     "epochs": 10,
     "log_interval": 1,
     "diagnostic_interval": 10,
-    "batch_size": 4,
+    "batch_size": 2,
     "num_workers": 8,
     "prefetch_factor": 2,
     "vicreg_spatial_mode": "pooled",
@@ -46,16 +46,16 @@
     "vicreg_var_weight": 0,
     "vicreg_cov_weight": 0,
     "spread_regularizer": {
-      "type": "std_hinge",
+      "type": "weak_sigreg",
       "target": "context",
-      "weight": 2,
-      "target_std": 1,
+      "weight": 0.5,
+      "target_std": 1.0,
+      "sketch_dim": 64,
+      "sketch_seed": 0,
       "eps": 0.0001
     },
     "symmetric_feature_loss_weight": 0.003,
     "compute_effective_rank": true,
-    "movie_dump_every_epoch": true,
-    "movie_fixed_targets": false,
     "scale_probe_enabled": true,
     "inference_tta_enabled": true,
     "inference_tta_mode": "flip4"

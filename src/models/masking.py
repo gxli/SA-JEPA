@@ -276,6 +276,54 @@ def _rejection_sample_targets(
     return accepted
 
 
+def _rejection_sample_targets_with_boxes(
+    candidates: list[tuple[int, int]],
+    candidate_boxes: list[int],
+    num_targets: int,
+    h: int,
+    w: int,
+    device: torch.device,
+    max_tries: int = 4096,
+    allow_partial_overlap: float = 0.0,
+) -> tuple[list[tuple[int, int]], list[int]]:
+    """Select targets using each candidate's pre-designated square footprint."""
+    if len(candidates) == 0:
+        return [], []
+    if len(candidate_boxes) != len(candidates):
+        raise ValueError("candidate_boxes must have the same length as candidates")
+
+    occ = torch.zeros((h, w), dtype=torch.bool, device=device)
+    accepted: list[tuple[int, int]] = []
+    accepted_boxes: list[int] = []
+    tries = 0
+
+    perm = torch.randperm(len(candidates), device=device)
+    idx = 0
+    while len(accepted) < num_targets and tries < max_tries and idx < len(candidates):
+        tries += 1
+        src_idx = int(perm[idx])
+        idx += 1
+        cy, cx = candidates[src_idx]
+        box = int(candidate_boxes[src_idx])
+        half = box // 2
+
+        y0 = max(0, int(cy) - half)
+        y1 = min(h, int(cy) + box - half)
+        x0 = max(0, int(cx) - half)
+        x1 = min(w, int(cx) + box - half)
+        if y1 <= y0 or x1 <= x0:
+            continue
+
+        footprint = occ[y0:y1, x0:x1]
+        overlap_frac = float(footprint.float().mean().item())
+        if overlap_frac <= float(allow_partial_overlap):
+            accepted.append((int(cy), int(cx)))
+            accepted_boxes.append(int(box))
+            occ[y0:y1, x0:x1] = True
+
+    return accepted, accepted_boxes
+
+
 def _effective_mask_box_size(
     sigma: float,
     mask_scale: float,
@@ -380,6 +428,32 @@ def _max_effective_mask_box_size(
     )
 
 
+def _sample_random_mask_box_sizes(
+    n: int,
+    mask_box_size_range: tuple[int, int] | None,
+    inner_target_size: int,
+    hardcap: int | None,
+    device: torch.device,
+) -> list[int]:
+    if n <= 0:
+        return []
+    if mask_box_size_range is None:
+        return []
+    lo, hi = sorted((int(mask_box_size_range[0]), int(mask_box_size_range[1])))
+    if hi < lo:
+        hi = lo
+    raw = torch.randint(lo, hi + 1, (int(n),), device=device) if hi > lo else torch.full((int(n),), lo, device=device)
+    boxes: list[int] = []
+    for v in raw.detach().cpu().tolist():
+        box = max(int(round(float(v))), int(inner_target_size))
+        capped = False
+        if hardcap is not None and hardcap > 0 and box > int(hardcap):
+            box = int(hardcap)
+            capped = True
+        boxes.append(_odd_box(box, bump_up=not capped))
+    return boxes
+
+
 def _ensure_target_patches_masked(
     sample_locations: list[tuple[int, int]],
     mask_map: np.ndarray,
@@ -445,6 +519,8 @@ def make_pyramid_grid_context(
     global_shift: bool = True,
     align_scales: bool = True,
     mask_box_size: int = 16,
+    mask_box_size_range: Optional[Tuple[int, int]] = None,
+    random_mask_box_per_target: bool = False,
     manual_mask_box_sizes: Optional[Sequence[int]] = None,
     cdd_mode: str = "log",
     cdd_constrained: bool = True,
@@ -529,6 +605,7 @@ def make_pyramid_grid_context(
     all_priority_prescreen_candidates = []
     all_priority_auto_base_targets = []
     all_priority_effective_targets = []
+    all_target_box_sizes = []
 
     for bi in range(b):
         arr = x_clean[bi, 0].cpu().numpy().copy()
@@ -538,9 +615,11 @@ def make_pyramid_grid_context(
         priority_prescreen_candidates_bi = 0.0
         priority_auto_base_targets_bi = 0.0
         priority_effective_targets_bi = 0.0
+        priority_center_boxes: list[int] = []
 
         applied_locations = []
         applied_scales = []
+        applied_boxes = []
         applied_mask_hard = torch.zeros((h, w), dtype=torch.uint8, device=x_clean.device)
 
         # Compute shared grid centers for scale alignment
@@ -674,14 +753,22 @@ def make_pyramid_grid_context(
                         hardcap=mask_box_hardcap,
                         manual_mask_box_sizes=manual_mask_box_sizes,
                     )
-                    max_half_lo = max_box // 2
-                    max_half_hi = max_box - max_half_lo
+                    candidate_boxes = _sample_random_mask_box_sizes(
+                        n=len(priority_catalogue),
+                        mask_box_size_range=mask_box_size_range,
+                        inner_target_size=inner_target_size,
+                        hardcap=mask_box_hardcap,
+                        device=x_clean.device,
+                    ) if bool(random_mask_box_per_target) and mask_box_size_range is not None else [int(max_box)] * len(priority_catalogue)
                     good_candidates = []
-                    for cy, cx in priority_catalogue:
-                        y0 = int(cy) - int(max_half_lo)
-                        y1 = int(cy) + int(max_half_hi)
-                        x0 = int(cx) - int(max_half_lo)
-                        x1 = int(cx) + int(max_half_hi)
+                    good_candidate_boxes = []
+                    for (cy, cx), cand_box in zip(priority_catalogue, candidate_boxes):
+                        cand_half_lo = int(cand_box) // 2
+                        cand_half_hi = int(cand_box) - cand_half_lo
+                        y0 = int(cy) - int(cand_half_lo)
+                        y1 = int(cy) + int(cand_half_hi)
+                        x0 = int(cx) - int(cand_half_lo)
+                        x1 = int(cx) + int(cand_half_hi)
                         if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
                             continue
                         if not _target_patch_has_valid_input(
@@ -694,12 +781,15 @@ def make_pyramid_grid_context(
                         ):
                             continue
                         good_candidates.append((int(cy), int(cx)))
+                        good_candidate_boxes.append(int(cand_box))
                     priority_catalogue = good_candidates
+                    candidate_boxes = good_candidate_boxes
                     if priority_sampling_mode:
+                        budget_box = int(round(float(np.mean(candidate_boxes)))) if candidate_boxes else int(max_box)
                         prescreen_count = _fractional_spatial_target_budget(
                             height=h,
                             width=w,
-                            box_size=max_box,
+                            box_size=budget_box,
                             oversample=float(priority_candidate_oversample),
                             device=x_clean.device,
                             minimum=int(priority_min_targets_per_map),
@@ -707,16 +797,18 @@ def make_pyramid_grid_context(
                         if prescreen_count is not None and len(priority_catalogue) > prescreen_count:
                             perm = torch.randperm(len(priority_catalogue), device=x_clean.device)[:prescreen_count]
                             priority_catalogue = [priority_catalogue[int(i)] for i in perm]
+                            candidate_boxes = [candidate_boxes[int(i)] for i in perm]
                     priority_prescreen_candidates_bi = float(len(priority_catalogue))
 
                     # Rule of thumb: start from image_area / max_mask_area.
                     # The candidate list decides where targets may land; auto
                     # target count should not depend on rank density artifacts.
                     nonzero_mean = 1.0
+                    budget_box = int(round(float(np.mean(candidate_boxes)))) if candidate_boxes else int(max_box)
                     auto_base = _fractional_spatial_target_budget(
                         height=h,
                         width=w,
-                        box_size=max_box,
+                        box_size=budget_box,
                         oversample=1.0,
                         device=x_clean.device,
                         minimum=0,
@@ -738,10 +830,13 @@ def make_pyramid_grid_context(
                     # overlap rejection after dithering may discard some.
                     perm = torch.randperm(len(priority_catalogue), device=x_clean.device)
                     preselect_mult = 8 if bool(target_nonoverlap) else 1
+                    selected_idx = perm[:min(k_sel * preselect_mult, len(priority_catalogue))]
                     priority_catalogue = [
                         priority_catalogue[int(i)]
-                        for i in perm[:min(k_sel * preselect_mult, len(priority_catalogue))]
+                        for i in selected_idx
                     ]
+                    candidate_boxes = [candidate_boxes[int(i)] for i in selected_idx]
+                    priority_center_boxes = list(candidate_boxes)
                     priority_good_candidates_bi = float(len(good_candidates))
                     priority_nonzero_mean_bi = float(nonzero_mean)
                     priority_auto_base_targets_bi = float(auto_base)
@@ -752,32 +847,50 @@ def make_pyramid_grid_context(
             if sampled_mode and len(priority_catalogue) > 0:
                 patch_half_lo = int(inner_target_size) // 2
                 patch_half_hi = int(inner_target_size) - patch_half_lo
-                for cy0, cx0 in priority_catalogue:
+                dithered_boxes: list[int] = []
+                for idx0, (cy0, cx0) in enumerate(priority_catalogue):
+                    cand_box = int(priority_center_boxes[idx0]) if idx0 < len(priority_center_boxes) else max_box
+                    cand_half_lo = cand_box // 2
+                    cand_half_hi = cand_box - cand_half_lo
                     cy1, cx1 = _dither_target_center(
                         cy=int(cy0),
                         cx=int(cx0),
                         h=h,
                         w=w,
-                        half_lo=patch_half_lo,
-                        half_hi=patch_half_hi,
+                        half_lo=cand_half_lo,
+                        half_hi=cand_half_hi,
                         dithering_pixels=priority_dithering_pixels,
                         device=x_clean.device,
                     )
                     priority_centers_dithered.append((int(cy1), int(cx1)))
+                    dithered_boxes.append(int(cand_box))
 
                 # Non-overlap enforcement on the *dithered* centres so that
                 # dithering cannot undo the protection.
                 if bool(target_nonoverlap) and len(priority_centers_dithered) > 1:
-                    priority_centers_dithered = _rejection_sample_targets(
-                        candidates=priority_centers_dithered,
-                        num_targets=k_sel,
-                        h=h,
-                        w=w,
-                        exclusion_box=max_box,
-                        device=x_clean.device,
-                        allow_partial_overlap=float(target_allow_partial_overlap),
-                    )
+                    if bool(random_mask_box_per_target):
+                        priority_centers_dithered, dithered_boxes = _rejection_sample_targets_with_boxes(
+                            candidates=priority_centers_dithered,
+                            candidate_boxes=dithered_boxes,
+                            num_targets=k_sel,
+                            h=h,
+                            w=w,
+                            device=x_clean.device,
+                            allow_partial_overlap=float(target_allow_partial_overlap),
+                        )
+                    else:
+                        priority_centers_dithered = _rejection_sample_targets(
+                            candidates=priority_centers_dithered,
+                            num_targets=k_sel,
+                            h=h,
+                            w=w,
+                            exclusion_box=max_box,
+                            device=x_clean.device,
+                            allow_partial_overlap=float(target_allow_partial_overlap),
+                        )
+                        dithered_boxes = dithered_boxes[:len(priority_centers_dithered)]
                     priority_effective_targets_bi = float(len(priority_centers_dithered))
+                priority_center_boxes = dithered_boxes
 
             num_cdd_ch = cdd_mod_t.shape[0]
             dip_field_t = torch.zeros((h, w), dtype=x_clean.dtype, device=x_clean.device)
@@ -832,7 +945,12 @@ def make_pyramid_grid_context(
                         idx = torch.randperm(len(centers), device=x_clean.device)[:max_count]
                         centers = [centers[int(i)] for i in idx]
 
-                for cy, cx in centers:
+                for center_idx, (cy, cx) in enumerate(centers):
+                    applied_box = int(box)
+                    if sampled_mode and bool(random_mask_box_per_target) and center_idx < len(priority_center_boxes):
+                        applied_box = int(priority_center_boxes[center_idx])
+                        half_lo = applied_box // 2
+                        half_hi = applied_box - half_lo
                     # Priority/random modes dither centers once above.
                     if enable_target_dithering and not (
                         (sampled_mode and len(priority_centers_dithered) > 0)
@@ -864,6 +982,7 @@ def make_pyramid_grid_context(
                     applied_mask_hard[y0:y1, x0:x1] = 1
                     applied_locations.append((cy, cx))
                     applied_scales.append(float(sigma))
+                    applied_boxes.append(float(applied_box))
 
             # Reconstruct entirely on GPU
             recon_t = torch.sum(cdd_mod_t, dim=0)
@@ -930,6 +1049,7 @@ def make_pyramid_grid_context(
             all_dip_proto_per_channel.append(dip_proto_ch_t.cpu())
             all_cdd_box_sizes.append(torch.tensor(cdd_box_sizes, dtype=torch.float32))
             all_cdd_blur_sigmas.append(torch.tensor(cdd_blur_sigmas, dtype=torch.float32))
+            all_target_box_sizes.append(list(applied_boxes))
             all_priority_good_candidates.append(priority_good_candidates_bi)
             all_priority_nonzero_mean.append(priority_nonzero_mean_bi)
             all_priority_prescreen_candidates.append(priority_prescreen_candidates_bi)
@@ -945,6 +1065,7 @@ def make_pyramid_grid_context(
     loc_np = np.zeros((b, k_fixed, 2), dtype=np.int64)
     sca_np = np.zeros((b, k_fixed), dtype=np.float32)
     val_np = np.zeros((b, k_fixed), dtype=np.bool_)
+    box_np = np.zeros((b, k_fixed), dtype=np.float32)
 
     for bi in range(b):
         n_total = len(all_locations[bi])
@@ -954,10 +1075,13 @@ def make_pyramid_grid_context(
         loc_np[bi, :n, :] = np.asarray(all_locations[bi][:n], dtype=np.int64)
         sca_np[bi, :n] = np.asarray(all_scales[bi][:n], dtype=np.float32)
         val_np[bi, :n] = True
+        if bi < len(all_target_box_sizes) and len(all_target_box_sizes[bi]) > 0:
+            box_np[bi, :n] = np.asarray(all_target_box_sizes[bi][:n], dtype=np.float32)
 
     target_locations = torch.from_numpy(loc_np).to(device=x_clean.device, dtype=torch.long)
     target_scales = torch.from_numpy(sca_np).to(device=x_clean.device, dtype=x_clean.dtype)
     target_valid = torch.from_numpy(val_np).to(device=x_clean.device, dtype=torch.bool)
+    target_box_sizes = torch.from_numpy(box_np).to(device=x_clean.device, dtype=x_clean.dtype)
 
     if not return_debug:
         return x_context, target_locations, target_scales, target_valid
@@ -983,6 +1107,7 @@ def make_pyramid_grid_context(
         "dip_proto_per_channel": _safe_stack(all_dip_proto_per_channel),
         "cdd_box_sizes": _safe_stack(all_cdd_box_sizes),
         "cdd_blur_sigmas": _safe_stack(all_cdd_blur_sigmas),
+        "target_box_sizes": target_box_sizes,
         "priority_good_candidates": torch.tensor(all_priority_good_candidates, dtype=x_clean.dtype, device=x_clean.device),
         "priority_nonzero_mean": torch.tensor(all_priority_nonzero_mean, dtype=x_clean.dtype, device=x_clean.device),
         "priority_prescreen_candidates": torch.tensor(all_priority_prescreen_candidates, dtype=x_clean.dtype, device=x_clean.device),
@@ -990,6 +1115,7 @@ def make_pyramid_grid_context(
         "priority_effective_targets": torch.tensor(all_priority_effective_targets, dtype=x_clean.dtype, device=x_clean.device),
         "mask_scale_factor": torch.tensor(float(mask_scale), dtype=x_clean.dtype, device=x_clean.device),
         "mask_footprint_px": torch.tensor(float(mask_box_size), dtype=x_clean.dtype, device=x_clean.device),
+        "random_mask_box_per_target": torch.tensor(float(bool(random_mask_box_per_target)), dtype=x_clean.dtype, device=x_clean.device),
     }
     return x_context, target_locations, target_scales, target_valid, debug
 
@@ -1004,6 +1130,8 @@ def prepare_context_batch(
     global_shift: bool = True,
     align_scales: bool = True,
     mask_box_size: int = 16,
+    mask_box_size_range: Optional[Tuple[int, int]] = None,
+    random_mask_box_per_target: bool = False,
     manual_mask_box_sizes: Optional[Sequence[int]] = None,
     cdd_mode: str = "log",
     cdd_constrained: bool = True,
@@ -1047,6 +1175,8 @@ def prepare_context_batch(
         global_shift=global_shift,
         align_scales=align_scales,
         mask_box_size=mask_box_size,
+        mask_box_size_range=mask_box_size_range,
+        random_mask_box_per_target=random_mask_box_per_target,
         manual_mask_box_sizes=manual_mask_box_sizes,
         cdd_mode=cdd_mode,
         cdd_constrained=cdd_constrained,

@@ -28,8 +28,11 @@
     "target_allow_partial_overlap": 0.0,
     "priority_candidate_oversample": 0,
     "target_invalid_region_skip": true,
-    "mask_size_scaling": 0,
-    "mask_size": 5
+    "mask_size_scaling": [
+      0.4,
+      1.6
+    ],
+    "mask_size": 0
   },
   "train": {
     "epochs": 10,
@@ -54,8 +57,6 @@
     },
     "symmetric_feature_loss_weight": 0.003,
     "compute_effective_rank": true,
-    "movie_dump_every_epoch": true,
-    "movie_fixed_targets": false,
     "scale_probe_enabled": true,
     "inference_tta_enabled": true,
     "inference_tta_mode": "flip4"

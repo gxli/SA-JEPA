@@ -28,8 +28,8 @@
     "target_allow_partial_overlap": 0.0,
     "priority_candidate_oversample": 0,
     "target_invalid_region_skip": true,
-    "mask_size_scaling": 0,
-    "mask_size": 5
+    "mask_size_scaling": 0.8,
+    "mask_size": 0
   },
   "train": {
     "epochs": 10,
@@ -46,16 +46,16 @@
     "vicreg_var_weight": 0,
     "vicreg_cov_weight": 0,
     "spread_regularizer": {
-      "type": "std_hinge",
+      "type": "weak_sigreg",
       "target": "context",
-      "weight": 2,
-      "target_std": 1,
+      "weight": 0.5,
+      "target_std": 1.0,
+      "sketch_dim": 64,
+      "sketch_seed": 0,
       "eps": 0.0001
     },
     "symmetric_feature_loss_weight": 0.003,
     "compute_effective_rank": true,
-    "movie_dump_every_epoch": true,
-    "movie_fixed_targets": false,
     "scale_probe_enabled": true,
     "inference_tta_enabled": true,
     "inference_tta_mode": "flip4"

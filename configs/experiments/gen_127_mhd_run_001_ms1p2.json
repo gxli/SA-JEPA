@@ -19,20 +19,20 @@
     "use_grn": true,
     "post_log_transform": true,
     "use_symmetric_feature_loss": true,
-    "target_sampling_mode": "random",
-    "priority_top_percent": 100,
+    "target_sampling_mode": "priority_small_scale",
+    "priority_top_percent": 30,
     "priority_n_target": "auto",
     "priority_min_targets_per_map": 10,
     "priority_dithering_pixels": 6,
     "target_nonoverlap": true,
     "target_allow_partial_overlap": 0.0,
-    "priority_candidate_oversample": 0,
+    "priority_candidate_oversample": 3.0,
     "target_invalid_region_skip": true,
-    "mask_size_scaling": 0,
-    "mask_size": 5
+    "mask_size_scaling": 1.2,
+    "mask_size": 0
   },
   "train": {
-    "epochs": 10,
+    "epochs": 200,
     "log_interval": 1,
     "diagnostic_interval": 10,
     "batch_size": 4,
@@ -53,9 +53,10 @@
       "eps": 0.0001
     },
     "symmetric_feature_loss_weight": 0.003,
-    "compute_effective_rank": true,
     "movie_dump_every_epoch": true,
+    "movie_dump_every_n_batches": 20,
     "movie_fixed_targets": false,
+    "compute_effective_rank": true,
     "scale_probe_enabled": true,
     "inference_tta_enabled": true,
     "inference_tta_mode": "flip4"

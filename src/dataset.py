@@ -28,6 +28,7 @@ class JEPADataset(Dataset):
         image_batch_inference: bool = False,
         image_batch_selected_indices: dict | None = None,
         cdd_cache: dict | None = None,
+        crop_min_valid_fraction: float = 0.0,
     ):
         self.input_type = str(input_type).lower()
         allowed_input_types = {"image", "cube", "image_batch"}
@@ -57,6 +58,7 @@ class JEPADataset(Dataset):
         self.random_roll_max = int(random_roll_max)
         self.d4_augment = bool(d4_augment)
         self.cdd_cache = cdd_cache or None
+        self.crop_min_valid_fraction = float(crop_min_valid_fraction) if crop_min_valid_fraction is not None else 0.0
 
         pattern = os.path.join(data_root, npy_pattern)
         self.npy_files = sorted(glob.glob(pattern))
@@ -292,17 +294,42 @@ class JEPADataset(Dataset):
             cdd_np = self._extract_2d_from_cdd(np.asarray(cdd_np), forced_slice_idx=forced_slice_idx)
             # cdd_np is now (S, H, W) float32
             cdd_orig = torch.from_numpy(cdd_np.astype(np.float32))
-            x_clean = cdd_orig.sum(dim=0, keepdim=True)  # 1 x H x W
-            crop = self._crop_slices(int(cdd_orig.shape[-2]), int(cdd_orig.shape[-1]))
-            if crop is not None:
-                crop_y, crop_x = crop
-                cdd_orig = cdd_orig[..., crop_y, crop_x]
-                x_clean = x_clean[..., crop_y, crop_x]
-            cdd_orig, x_clean = self._apply_augmentations(cdd_orig, x_clean)
+            x_clean_full = cdd_orig.sum(dim=0, keepdim=True)  # 1 x H x W
+            max_retries = 100
+            for attempt in range(max_retries):
+                crop = self._crop_slices(int(cdd_orig.shape[-2]), int(cdd_orig.shape[-1]))
+                if crop is not None:
+                    crop_y, crop_x = crop
+                    cdd_cropped = cdd_orig[..., crop_y, crop_x]
+                    x_clean = x_clean_full[..., crop_y, crop_x]
+                else:
+                    cdd_cropped = cdd_orig
+                    x_clean = x_clean_full
+                if self.crop_min_valid_fraction > 0.0 and self.crop_mode == "random" and crop is not None:
+                    arr = x_clean.squeeze(0).numpy()
+                    finite_nonzero = np.isfinite(arr) & (arr > 1e-8)
+                    if finite_nonzero.mean() >= self.crop_min_valid_fraction:
+                        break
+                else:
+                    break
+                if attempt == max_retries - 1:
+                    break
+            cdd_orig, x_clean = self._apply_augmentations(cdd_cropped, x_clean)
             return cdd_orig, x_clean
 
         path, forced_slice_idx = key
-        sample = self._load_sample(path, forced_slice_idx=forced_slice_idx).clone()  # 1 x H x W
-        sample = self._crop_tensor(sample)
+        max_retries = 100
+        for attempt in range(max_retries):
+            sample = self._load_sample(path, forced_slice_idx=forced_slice_idx).clone()  # 1 x H x W
+            sample = self._crop_tensor(sample)
+            if self.crop_min_valid_fraction > 0.0 and self.crop_mode == "random":
+                arr = sample.squeeze(0).numpy()
+                finite_nonzero = np.isfinite(arr) & (arr > 1e-8)
+                if finite_nonzero.mean() >= self.crop_min_valid_fraction:
+                    break
+            else:
+                break
+            if attempt == max_retries - 1:
+                break  # accept anyway after max retries
         (sample,) = self._apply_augmentations(sample)
         return sample

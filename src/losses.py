@@ -15,25 +15,31 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     stale_keys = removed_flat_keys & set(train_cfg)
     assert not stale_keys, f"Use train.spread_regularizer instead of flat keys: {sorted(stale_keys)}"
     cfg = dict(train_cfg.get("spread_regularizer", {}))
-    expected_keys = {"type", "target", "weight", "target_std", "eps"}
+    expected_keys = {"type", "target", "weight", "target_std", "eps", "sketch_dim", "sketch_seed"}
     extra_keys = set(cfg) - expected_keys
     assert not extra_keys, f"Unsupported train.spread_regularizer keys: {sorted(extra_keys)}"
     sigreg_type = str(cfg.get("type", "std_hinge"))
     sigreg_target = str(cfg.get("target", "context"))
     sigreg_weight = float(cfg.get("weight", 0.0))
-    assert sigreg_type == "std_hinge"
+    assert sigreg_type in {"std_hinge", "weak_sigreg"}
     assert sigreg_target == "context"
     assert sigreg_weight >= 0
     target_std = float(cfg.get("target_std", 1.0))
     eps = float(cfg.get("eps", 1e-4))
+    sketch_dim = int(cfg.get("sketch_dim", 64))
+    sketch_seed = int(cfg.get("sketch_seed", 0))
     assert target_std >= 0
     assert eps > 0
+    assert sketch_dim > 0
+    assert sketch_seed >= 0
     return {
         "type": sigreg_type,
         "target": sigreg_target,
         "weight": sigreg_weight,
         "target_std": target_std,
         "eps": eps,
+        "sketch_dim": sketch_dim,
+        "sketch_seed": sketch_seed,
     }
 
 
@@ -101,6 +107,24 @@ def extract_valid_pooled_embeddings(outputs: dict, key: str = "context_patches")
     return z
 
 
+def extract_valid_dense_embeddings(outputs: dict, key: str = "context_patches") -> torch.Tensor:
+    patches = outputs[key]  # B,K,C,... spatial patch tokens
+    valid = outputs["target_valid"]  # B,K
+    if patches.dim() not in (5, 6):
+        raise ValueError(f"Expected {key} rank 5 or 6, got {patches.dim()}")
+    b, k, c = patches.shape[:3]
+    spatial_shape = patches.shape[3:]
+    spatial_n = 1
+    for size in spatial_shape:
+        spatial_n *= int(size)
+    if patches.dim() == 5:
+        z = patches.permute(0, 1, 3, 4, 2).reshape(b, k, spatial_n, c)
+    else:
+        z = patches.permute(0, 1, 3, 4, 5, 2).reshape(b, k, spatial_n, c)
+    vm = valid.unsqueeze(-1).unsqueeze(-1).expand(b, k, spatial_n, 1).reshape(-1)
+    return z.reshape(-1, c)[vm]
+
+
 def spread_regularizer_loss(
     z: torch.Tensor,
     target_std: float = 1.0,
@@ -114,9 +138,81 @@ def spread_regularizer_loss(
     if z.numel() == 0 or z.shape[0] < 2:
         return torch.tensor(0.0, device=z.device, dtype=z.dtype)
 
+    n = z.shape[0]
     z = z - z.mean(dim=0, keepdim=True)
     std = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
-    return torch.relu(float(target_std) - std).mean()
+    loss = torch.relu(float(target_std) - std).mean()
+
+    effective_n = 256.0
+    if n > effective_n:
+        grad_scale = float(n) / effective_n
+        loss = loss * grad_scale - loss.detach() * (grad_scale - 1.0)
+
+    return loss
+
+
+def weak_sigreg_loss(
+    z: torch.Tensor,
+    target_std: float = 1.0,
+    sketch_dim: int = 64,
+    eps: float = 1e-4,
+    sketch_seed: int = 0,
+) -> torch.Tensor:
+    """Sketched isotropic Gaussian regularization on context embeddings.
+
+    Applies the variance hinge on the full embedding dimension for consistent
+    anti-collapse gradients, then uses a rotating sketch only for the cheaper
+    off-diagonal covariance penalty.
+    """
+    del sketch_seed  # Kept as a config key for reproducibility metadata/backward compatibility.
+    z = z.float()
+    if z.numel() == 0 or z.shape[0] < 2:
+        return torch.tensor(0.0, device=z.device, dtype=z.dtype)
+
+    n, c = z.shape
+    z = z - z.mean(dim=0, keepdim=True)
+
+    std_full = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
+    var_loss = torch.relu(float(target_std) - std_full).mean()
+
+    k = min(int(sketch_dim), int(c))
+    if c > k:
+        sketch = torch.randn(c, k, device=z.device, dtype=z.dtype)
+        sketch, _ = torch.linalg.qr(sketch, mode="reduced")
+        z_proj = z @ sketch
+    else:
+        z_proj = z
+
+    cov = (z_proj.t() @ z_proj) / (float(n - 1) + float(eps))
+    cov = cov - torch.diag(cov.diag())
+    cov_loss = cov.pow(2).sum() / float(k)
+    loss = var_loss + cov_loss
+
+    effective_n = 256.0
+    if n > effective_n:
+        grad_scale = float(n) / effective_n
+        loss = loss * grad_scale - loss.detach() * (grad_scale - 1.0)
+
+    return loss
+
+
+def compute_spread_regularizer_loss(z: torch.Tensor, cfg: dict[str, float | str]) -> torch.Tensor:
+    sigreg_type = str(cfg.get("type", "std_hinge"))
+    if sigreg_type == "std_hinge":
+        return spread_regularizer_loss(
+            z,
+            target_std=float(cfg.get("target_std", 1.0)),
+            eps=float(cfg.get("eps", 1e-4)),
+        )
+    if sigreg_type == "weak_sigreg":
+        return weak_sigreg_loss(
+            z,
+            target_std=float(cfg.get("target_std", 1.0)),
+            sketch_dim=int(cfg.get("sketch_dim", 64)),
+            eps=float(cfg.get("eps", 1e-4)),
+            sketch_seed=int(cfg.get("sketch_seed", 0)),
+        )
+    raise ValueError(f"Unsupported spread regularizer type: {sigreg_type}")
 
 
 @torch.no_grad()

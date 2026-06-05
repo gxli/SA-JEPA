@@ -5,13 +5,25 @@ import unittest
 import torch
 
 from src.losses import (
+    compute_spread_regularizer_loss,
     embedding_spread_stats,
+    extract_valid_dense_embeddings,
     parse_spread_regularizer_config,
     spread_regularizer_loss,
+    weak_sigreg_loss,
 )
 
 
 class SpreadRegularizerTests(unittest.TestCase):
+    def test_extract_valid_dense_embeddings_keeps_spatial_tokens(self) -> None:
+        patches = torch.randn(2, 3, 4, 5, 5)
+        valid = torch.tensor([[True, False, True], [False, True, True]])
+        outputs = {"context_patches": patches, "target_valid": valid}
+
+        z = extract_valid_dense_embeddings(outputs, key="context_patches")
+
+        self.assertEqual(tuple(z.shape), (4 * 5 * 5, 4))
+
     def test_near_collapsed_embeddings_produce_nonzero_gradient(self) -> None:
         torch.manual_seed(0)
         z = (torch.randn(32, 8) * 1e-3).requires_grad_()
@@ -29,6 +41,81 @@ class SpreadRegularizerTests(unittest.TestCase):
         loss = spread_regularizer_loss(z, target_std=1.0, eps=1e-4)
 
         self.assertLess(float(loss.item()), 1e-3)
+
+    def test_spread_regularizer_dense_batch_boosts_gradient_not_value(self) -> None:
+        torch.manual_seed(0)
+        z_small = (torch.randn(128, 8) * 1e-3).requires_grad_()
+        z_large = z_small.detach().repeat(4, 1).requires_grad_()
+
+        loss_small = spread_regularizer_loss(z_small, target_std=1.0, eps=1e-4)
+        loss_large = spread_regularizer_loss(z_large, target_std=1.0, eps=1e-4)
+        loss_small.backward()
+        loss_large.backward()
+
+        self.assertAlmostEqual(float(loss_small.item()), float(loss_large.item()), places=5)
+        self.assertGreater(float(z_large.grad.abs().sum().item()), float(z_small.grad.abs().sum().item()))
+
+    def test_weak_sigreg_produces_gradient(self) -> None:
+        torch.manual_seed(0)
+        z = torch.randn(128, 32).requires_grad_()
+
+        loss = weak_sigreg_loss(z, sketch_dim=8, eps=1e-6)
+        loss.backward()
+
+        self.assertGreaterEqual(float(loss.item()), 0.0)
+        self.assertGreater(float(z.grad.abs().sum().item()), 0.0)
+
+    def test_weak_sigreg_near_collapse_keeps_gradient(self) -> None:
+        torch.manual_seed(0)
+        z = (torch.randn(128, 32) * 1e-6).requires_grad_()
+
+        loss = weak_sigreg_loss(z, sketch_dim=8, eps=1e-4)
+        loss.backward()
+
+        self.assertGreater(float(loss.item()), 0.0)
+        self.assertGreater(float(z.grad.abs().sum().item()), 0.0)
+
+    def test_weak_sigreg_collapse_is_variance_hinge_not_covariance_mse(self) -> None:
+        z = torch.zeros(128, 32)
+
+        loss = weak_sigreg_loss(z, sketch_dim=8, eps=1e-4)
+
+        self.assertAlmostEqual(float(loss.item()), 0.99, places=5)
+
+    def test_weak_sigreg_uses_target_std_for_full_variance_hinge(self) -> None:
+        z = torch.zeros(128, 32)
+
+        loss_low_target = weak_sigreg_loss(z, target_std=0.5, sketch_dim=8, eps=1e-4)
+        loss_high_target = weak_sigreg_loss(z, target_std=1.0, sketch_dim=8, eps=1e-4)
+
+        self.assertAlmostEqual(float(loss_low_target.item()), 0.49, places=5)
+        self.assertAlmostEqual(float(loss_high_target.item()), 0.99, places=5)
+
+    def test_weak_sigreg_dense_batch_boosts_gradient_not_value(self) -> None:
+        torch.manual_seed(0)
+        z_small = (torch.randn(128, 32) * 1e-3).requires_grad_()
+        z_large = z_small.detach().repeat(4, 1).requires_grad_()
+
+        torch.manual_seed(123)
+        loss_small = weak_sigreg_loss(z_small, sketch_dim=8, eps=1e-4)
+        torch.manual_seed(123)
+        loss_large = weak_sigreg_loss(z_large, sketch_dim=8, eps=1e-4)
+        loss_small.backward()
+        loss_large.backward()
+
+        self.assertAlmostEqual(float(loss_small.item()), float(loss_large.item()), places=5)
+        self.assertGreater(float(z_large.grad.abs().sum().item()), float(z_small.grad.abs().sum().item()))
+
+    def test_weak_sigreg_dispatch(self) -> None:
+        torch.manual_seed(0)
+        z = torch.randn(128, 32).requires_grad_()
+        cfg = {"type": "weak_sigreg", "target_std": 1.0, "sketch_dim": 8, "eps": 1e-4, "sketch_seed": 123}
+
+        loss = compute_spread_regularizer_loss(z, cfg)
+        loss.backward()
+
+        self.assertGreaterEqual(float(loss.item()), 0.0)
+        self.assertGreater(float(z.grad.abs().sum().item()), 0.0)
 
     def test_perfect_collapse_is_detected_in_diagnostics(self) -> None:
         stats = embedding_spread_stats(torch.zeros(32, 8), target_std=1.0)
@@ -54,6 +141,26 @@ class SpreadRegularizerTests(unittest.TestCase):
         self.assertEqual(cfg["target"], "context")
         self.assertEqual(cfg["weight"], 2.0)
 
+    def test_weak_sigreg_schema_is_explicit(self) -> None:
+        cfg = parse_spread_regularizer_config(
+            {
+                "spread_regularizer": {
+                    "type": "weak_sigreg",
+                    "target": "context",
+                    "weight": 0.5,
+                    "sketch_dim": 64,
+                    "sketch_seed": 123,
+                    "eps": 1e-6,
+                }
+            }
+        )
+
+        self.assertEqual(cfg["type"], "weak_sigreg")
+        self.assertEqual(cfg["target"], "context")
+        self.assertEqual(cfg["weight"], 0.5)
+        self.assertEqual(cfg["sketch_dim"], 64)
+        self.assertEqual(cfg["sketch_seed"], 123)
+
     def test_flat_spread_regularizer_keys_are_rejected(self) -> None:
         with self.assertRaises(AssertionError):
             parse_spread_regularizer_config({"spread_regularizer_weight": 2})
@@ -63,6 +170,8 @@ class SpreadRegularizerTests(unittest.TestCase):
             {"type": "other", "target": "context", "weight": 2},
             {"type": "std_hinge", "target": "predictor", "weight": 2},
             {"type": "std_hinge", "target": "context", "weight": -1},
+            {"type": "weak_sigreg", "target": "context", "weight": 0.5, "sketch_dim": 0},
+            {"type": "weak_sigreg", "target": "context", "weight": 0.5, "sketch_seed": -1},
         )
         for block in invalid_blocks:
             with self.subTest(block=block), self.assertRaises(AssertionError):

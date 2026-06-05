@@ -6,16 +6,13 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(dirname "$SCRIPT_DIR")"
-CONFIG="${ROOT}/configs/movie/movie_default.json"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="${ROOT}/configs_bk/movie_default.json"
 MOVIE_SCRIPT="${ROOT}/scripts/session_to_movie.py"
 
 if [ $# -gt 0 ]; then
-    # Explicit session list
     SESSIONS=("$@")
 else
-    # Auto-discover sessions with movie_frames/
     SESSIONS=()
     for d in "${ROOT}"/sessions/*/; do
         if [ -d "${d}movie_frames" ]; then
@@ -30,15 +27,28 @@ if [ ${#SESSIONS[@]} -eq 0 ]; then
 fi
 
 echo "=== Movie generation for ${#SESSIONS[@]} session(s) ==="
+echo ""
+
+# Detect UMAP backend
+UMAP_BACKEND="CPU (umap-learn)"
+python3 -c "from cuml.manifold import UMAP; print('cuml OK')" 2>/dev/null && UMAP_BACKEND="GPU (cuml)"
+echo "UMAP backend: ${UMAP_BACKEND}"
+echo ""
+
 for name in "${SESSIONS[@]}"; do
-    session_dir="${ROOT}/sessions/${name}"
-    if [ ! -d "$session_dir" ]; then
-        echo "SKIP: session not found: $session_dir"
+    # Support both full paths and bare session names
+    if [ -d "$name" ]; then
+        session_dir="$(cd "$name" && pwd)"
+    elif [ -d "${ROOT}/sessions/${name}" ]; then
+        session_dir="${ROOT}/sessions/${name}"
+    else
+        echo "SKIP: session not found: $name"
         continue
     fi
-    echo ""
-    echo "--- ${name} ---"
-    python3 "$MOVIE_SCRIPT" "$session_dir" --config "$CONFIG" --make-mp4
+    session_name="$(basename "$session_dir")"
+    cp "$CONFIG" "${session_dir}/movie_config.json"
+    echo "--- ${session_name} ---"
+    python3 "$MOVIE_SCRIPT" "$session_dir" --make-mp4 --fps 10 --force
 done
 
 echo ""

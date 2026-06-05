@@ -343,6 +343,7 @@ def _rgb_from_xyz(
     clipped[~fin] = 0.0
     rgb_flat = np.clip(np.round(clipped * 255.0), 0, 255).astype(np.uint8)
     rgb = rgb_flat.reshape(h, w, 3)
+    rgb = rgb[::-1, :, :]  # flip y so image origin matches scatter3d (bottom-left)
     return rgb, rgb_flat
 
 
@@ -705,6 +706,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             _ms = float(_ms_raw[0] if isinstance(_ms_raw, (list, tuple)) else _ms_raw)
             _mb_raw = mc.get("mask_size", 0)
             _mb = int(_mb_raw[0] if isinstance(_mb_raw, (list, tuple)) else _mb_raw)
+            _random_box_per_target = bool(mc.get("random_mask_box_per_target", False))
             _manual_boxes_raw = mc.get("mask_size_manual")
             _manual_boxes = None
             if _manual_boxes_raw is not None:
@@ -723,6 +725,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             _enc = str(mc.get("model_key", mc.get("encoder_type", "unknown")))
             mask_config_summary = [
                 f"encoder={_enc}",
+                f"mask_strategy={'random-box-per-target' if _random_box_per_target else 'standard'}",
                 f"mask_size_scaling={_ms_raw}",
                 f"mask_size={_mb_raw}",
                 f"mask_size_manual={_manual_boxes}" if _manual_boxes else "mask_size_manual=None",
@@ -746,7 +749,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 mask_sigma_names.append(f"σ={s}")
                 mask_sigma_sizes.append(box)
             # Add overall summary
-            _computed = ", ".join(f"σ={s}→{_summary_box(i, s)}px" for i, s in enumerate(_sigmas))
+            if _random_box_per_target and isinstance(_mb_raw, (list, tuple)):
+                _computed = f"per-target random boxes from [{_mb_raw[0]}, {_mb_raw[1]}]px before rejection"
+            else:
+                _computed = ", ".join(f"σ={s}→{_summary_box(i, s)}px" for i, s in enumerate(_sigmas))
             mask_config_summary.append(f"computed: {_computed}")
         except Exception:
             pass
@@ -933,7 +939,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 if rgb.ndim == 2:
                     rgb = rgb[::step]
             rendered_n = int(pts.shape[0])
-            x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+            x, y, z = pts[:, 0], -pts[:, 1], pts[:, 2]
             if rgb.ndim == 2 and rgb.shape[1] >= 3:
                 colors = [f"rgb({int(c[0])},{int(c[1])},{int(c[2])})" for c in rgb]
             else:
@@ -1092,10 +1098,11 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         if len(labels) != s:
             labels = [f"scale_{i}" for i in range(s)]
         finite = arr[np.isfinite(arr)]
+        finite_pos = finite[finite > 0.0] if finite.size > 0 else np.array([], dtype=arr.dtype)
         threshold = 0.0
-        if finite.size > 0:
-            threshold = float(np.percentile(finite, 75.0))
-        zz, yy, xx = np.nonzero(np.isfinite(arr) & (arr >= threshold))
+        if finite_pos.size > 0:
+            threshold = float(np.percentile(finite_pos, 75.0))
+        zz, yy, xx = np.nonzero(np.isfinite(arr) & (arr > threshold))
         if xx.size == 0:
             zz, yy, xx = np.nonzero(np.isfinite(arr))
         if xx.size == 0:
@@ -1117,7 +1124,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             [
                 go.Scatter3d(
                     x=xx.astype(np.float32),
-                    y=yy.astype(np.float32),
+                    y=-yy.astype(np.float32),
                     z=zz.astype(np.float32),
                     mode="markers",
                     marker=dict(

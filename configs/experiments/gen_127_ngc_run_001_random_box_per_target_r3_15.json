@@ -1,7 +1,7 @@
 {
   "base_config": "../base_pyramid_scaleaware_convnext.json",
   "data": {
-    "npy_pattern": "C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy"
+    "npy_pattern": "ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy"
   },
   "model": {
     "mode": "pyramid",
@@ -19,23 +19,27 @@
     "use_grn": true,
     "post_log_transform": true,
     "use_symmetric_feature_loss": true,
-    "target_sampling_mode": "random",
-    "priority_top_percent": 100,
+    "target_sampling_mode": "priority_small_scale",
+    "priority_top_percent": 30,
     "priority_n_target": "auto",
     "priority_min_targets_per_map": 10,
     "priority_dithering_pixels": 6,
     "target_nonoverlap": true,
     "target_allow_partial_overlap": 0.0,
-    "priority_candidate_oversample": 0,
+    "priority_candidate_oversample": 3.0,
     "target_invalid_region_skip": true,
     "mask_size_scaling": 0,
-    "mask_size": 5
+    "mask_size": [
+      3,
+      15
+    ],
+    "random_mask_box_per_target": true
   },
   "train": {
     "epochs": 10,
     "log_interval": 1,
     "diagnostic_interval": 10,
-    "batch_size": 4,
+    "batch_size": 2,
     "num_workers": 8,
     "prefetch_factor": 2,
     "vicreg_spatial_mode": "pooled",
@@ -54,8 +58,6 @@
     },
     "symmetric_feature_loss_weight": 0.003,
     "compute_effective_rank": true,
-    "movie_dump_every_epoch": true,
-    "movie_fixed_targets": false,
     "scale_probe_enabled": true,
     "inference_tta_enabled": true,
     "inference_tta_mode": "flip4"

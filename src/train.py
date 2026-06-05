@@ -26,15 +26,16 @@ from src.diagnostics import (
 )
 from src.inference import run_post_training_inference, run_post_training_inference_3d
 from src.losses import (
+    compute_spread_regularizer_loss,
     compute_jepa_energy,
     compute_raw_mse_and_norm_err,
     compute_sim_var_cov,
     compute_sim_var_cov_torch,
     compute_target_energy_map,
     embedding_spread_stats,
+    extract_valid_dense_embeddings,
     extract_valid_pooled_embeddings,
     parse_spread_regularizer_config,
-    spread_regularizer_loss,
 )
 from src.models.build_jepa import CDD_DEBUG_ENCODER_TYPES, PyramidGridJEPA
 from src.models.build_jepa3d import PyramidGridJEPA3D
@@ -301,6 +302,7 @@ class _MaskingCollator:
         self.mask_scale_range = model.mask_scale_range
         self.mask_box_size = int(model.mask_box_size)
         self.mask_box_size_range = model.mask_box_size_range
+        self.random_mask_box_per_target = bool(getattr(model, "random_mask_box_per_target", False))
         self.manual_mask_box_sizes = model.manual_mask_box_sizes
         self.context_kwargs = {
             "sigmas": model.sigmas,
@@ -309,6 +311,7 @@ class _MaskingCollator:
             "global_shift": model.global_shift,
             "align_scales": model.align_scales,
             "patch_size": model.patch_size,
+            "random_mask_box_per_target": self.random_mask_box_per_target,
             "manual_mask_box_sizes": self.manual_mask_box_sizes,
             "return_debug": self.return_debug,
             "target_invalid_region_skip": model.target_invalid_region_skip,
@@ -331,7 +334,7 @@ class _MaskingCollator:
             mask_scale = lo + (hi - lo) * float(torch.rand(()).item()) if hi > lo else lo
 
         mask_box_size = self.mask_box_size
-        if self.mask_box_size_range is not None:
+        if self.mask_box_size_range is not None and not self.random_mask_box_per_target:
             lo, hi = self.mask_box_size_range
             mask_box_size = int(torch.randint(lo, hi + 1, ()).item()) if hi > lo else lo
         return float(mask_scale), int(mask_box_size)
@@ -351,6 +354,7 @@ class _MaskingCollator:
             x_clean=x_clean,
             mask_scale=mask_scale,
             mask_box_size=mask_box_size,
+            mask_box_size_range=self.mask_box_size_range,
             cdd_orig_in=cdd_orig_in,
             **self.context_kwargs,
         )
@@ -378,6 +382,8 @@ def _prepare_context_from_model(
         global_shift=model.global_shift,
         align_scales=model.align_scales,
         mask_box_size=mask_box_size,
+        mask_box_size_range=model.mask_box_size_range,
+        random_mask_box_per_target=getattr(model, "random_mask_box_per_target", False),
         manual_mask_box_sizes=model.manual_mask_box_sizes,
         cdd_mode=model.cdd_mode,
         cdd_constrained=model.cdd_constrained,
@@ -618,6 +624,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         align_scales=model_cfg.get("align_scales", True),
         mask_box_size=mask_box_cfg,
         mask_box_size_range=None,
+        random_mask_box_per_target=bool(model_cfg.get("random_mask_box_per_target", False)),
         manual_mask_box_sizes=manual_mask_box_sizes_cfg,
         cdd_mode=model_cfg.get("cdd_mode", data_cfg.get("cdd_mode", "log")),
         cdd_constrained=model_cfg.get("cdd_constrained", data_cfg.get("cdd_constrained", True)),
@@ -707,6 +714,57 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
         priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
     ).to(device)
+
+
+def _dump_movie_frame(
+    model,
+    movie_batch,
+    session_dir,
+    epoch,
+    batch_idx,
+    is_3d_mode,
+    device,
+    movie_context_data=None,
+    fixed_targets: bool = False,
+):
+    """Save a single movie frame (pred_map, gt_map, x_clean) for later rendering.
+
+    Returns updated movie_context_data.  When fixed_targets is false, the 2D
+    movie probe keeps the same image batch but resamples target masks per frame.
+    """
+    movie_dir = os.path.join(session_dir, "movie_frames")
+    os.makedirs(movie_dir, exist_ok=True)
+    frame_idx = len([f for f in os.listdir(movie_dir) if f.endswith(".pt")])
+    with torch.no_grad():
+        model.eval()
+        if isinstance(movie_batch, (tuple, list)):
+            mb = movie_batch[1] if movie_batch[1] is not None else movie_batch[0]
+        else:
+            mb = movie_batch
+        x_movie = mb.to(device, non_blocking=True)
+        if is_3d_mode:
+            x_movie = torch.nan_to_num(x_movie, nan=0.0, posinf=0.0, neginf=0.0)
+            out_m = model(x_movie)
+        else:
+            if (not bool(fixed_targets)) or movie_context_data is None:
+                movie_context_data = _prepare_context_from_model(model, x_movie, return_debug=False)
+            out_m = model(x_movie, context_data=movie_context_data)
+        frame = {
+            "pred_map": out_m["pred_map"][:1].detach().cpu(),
+            "gt_map": out_m["gt_map"][:1].detach().cpu(),
+            "x_clean": x_movie[:1].detach().cpu(),
+            "target_locations": out_m["target_locations"][:1].detach().cpu(),
+            "target_valid": out_m["target_valid"][:1].detach().cpu(),
+            "target_scales": out_m["target_scales"][:1].detach().cpu(),
+            "epoch": epoch,
+            "batch": batch_idx,
+            "movie_fixed_targets": bool(fixed_targets),
+        }
+        ctx = out_m.get("context_map")
+        if ctx is not None:
+            frame["context_map"] = ctx[:1].detach().cpu()
+        torch.save(frame, os.path.join(movie_dir, f"frame_{frame_idx:05d}.pt"))
+    return movie_context_data
 
 
 def run_training(config: dict, config_name: str, sessions_root: str = "sessions") -> str:
@@ -1209,6 +1267,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     spread_regularizer_weight = float(spread_regularizer["weight"])
     embed_spread_target = float(spread_regularizer["target_std"])
     spread_regularizer_eps = float(spread_regularizer["eps"])
+    print(f"[{config_name}] spread_regularizer={json.dumps(spread_regularizer, sort_keys=True)}")
     experimental_losses = dict(train_cfg.get("experimental_losses", {}))
     vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", experimental_losses.get("vicreg_var_weight", 0.0)))
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", experimental_losses.get("vicreg_cov_weight", 0.0)))
@@ -1341,7 +1400,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             f.write("\n")
 
     movie_dump_every_epoch = bool(train_cfg.get("movie_dump_every_epoch", False))
-    movie_batch = next(iter(inference_loader)) if movie_dump_every_epoch else None
+    movie_dump_every_n_batches = int(train_cfg.get("movie_dump_every_n_batches", 0))
+    movie_fixed_targets = bool(train_cfg.get("movie_fixed_targets", False))
+    movie_batch = next(iter(inference_loader)) if (movie_dump_every_epoch or movie_dump_every_n_batches > 0) else None
     movie_context_data = None
 
     model.train()
@@ -1405,13 +1466,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     outputs,
                     spatial_mode=vicreg_spatial_mode,
                 )
-                z_ctx_key = "context_patches" if "context_patches" in outputs else "pred_patches"
-                z_ctx = extract_valid_pooled_embeddings(outputs, key=z_ctx_key)
-                loss_spread = spread_regularizer_loss(
-                    z_ctx,
-                    target_std=embed_spread_target,
-                    eps=spread_regularizer_eps,
-                )
+                if "context_patches" not in outputs:
+                    raise KeyError("SIGReg requires outputs['context_patches']; refusing to regularize predictor outputs")
+                z_ctx = extract_valid_dense_embeddings(outputs, key="context_patches")
+                loss_spread = compute_spread_regularizer_loss(z_ctx, spread_regularizer)
                 loss_symmetry = model.compute_symmetric_loss(outputs)
                 total_loss = (
                     (prediction_loss_weight * loss_prediction)
@@ -1458,7 +1516,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             valid_frac = float(outputs["target_valid"].float().mean().item())
             ctx_stats = embedding_spread_stats(z_ctx, target_std=embed_spread_target)
             targets_per_image = float(outputs["target_valid"].float().sum(dim=1).mean().item())
-            footprint_values = outputs.get("cdd_box_sizes")
+            footprint_values = outputs.get("target_box_sizes")
+            if footprint_values is not None and footprint_values.numel() > 0:
+                footprint_valid = outputs.get("target_valid")
+                if footprint_valid is not None and footprint_valid.shape == footprint_values.shape:
+                    footprint_values = footprint_values[footprint_valid]
+                footprint_values = footprint_values[footprint_values > 0]
+            if footprint_values is None or footprint_values.numel() == 0:
+                footprint_values = outputs.get("cdd_box_sizes")
             if footprint_values is None or footprint_values.numel() == 0:
                 footprint_values = torch.as_tensor(
                     [outputs.get("mask_footprint_px", model.mask_box_size)],
@@ -1595,6 +1660,21 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_context_manifold_size += ctx_stats["context_manifold_size"]
             epoch_batches += 1
 
+            # Per-N-batches movie frame dump (captures rapid early learning)
+            if movie_dump_every_n_batches > 0 and (batch_idx + 1) % movie_dump_every_n_batches == 0:
+                movie_context_data = _dump_movie_frame(
+                    model,
+                    movie_batch,
+                    session_dir,
+                    epoch + 1,
+                    batch_idx + 1,
+                    is_3d_mode,
+                    device,
+                    movie_context_data,
+                    fixed_targets=movie_fixed_targets,
+                )
+                model.train()
+
         metrics_bar.close()
         # Only the main process writes files in DDP mode
         if is_main_process:
@@ -1676,27 +1756,17 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
         # Per-epoch embedding snapshot for movie generation.
         if movie_dump_every_epoch:
-            movie_dir = os.path.join(session_dir, "movie_frames")
-            os.makedirs(movie_dir, exist_ok=True)
-            with torch.no_grad():
-                model.eval()
-                if isinstance(movie_batch, (tuple, list)):
-                    movie_batch = movie_batch[1] if movie_batch[1] is not None else movie_batch[0]
-                x_movie = movie_batch.to(device, non_blocking=True)
-                # Let _prepare_context_from_model handle NaN internally.
-                if is_3d_mode:
-                    x_movie = torch.nan_to_num(x_movie, nan=0.0, posinf=0.0, neginf=0.0)
-                    out_m = model(x_movie)
-                else:
-                    if movie_context_data is None:
-                        movie_context_data = _prepare_context_from_model(model, x_movie, return_debug=False)
-                    out_m = model(x_movie, context_data=movie_context_data)
-                frame = {
-                    "pred_map": out_m["pred_map"][:1].detach().cpu(),
-                    "gt_map": out_m["gt_map"][:1].detach().cpu(),
-                    "x_clean": x_movie[:1].detach().cpu(),
-                }
-                torch.save(frame, os.path.join(movie_dir, f"epoch_{epoch + 1:04d}.pt"))
+            movie_context_data = _dump_movie_frame(
+                model,
+                movie_batch,
+                session_dir,
+                epoch + 1,
+                0,
+                is_3d_mode,
+                device,
+                movie_context_data,
+                fixed_targets=movie_fixed_targets,
+            )
             model.train()
 
     if is_main_process:

@@ -1,7 +1,7 @@
 {
   "base_config": "../base_pyramid_scaleaware_convnext.json",
   "data": {
-    "npy_pattern": "C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy"
+    "npy_pattern": "ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy"
   },
   "model": {
     "mode": "pyramid",
@@ -28,14 +28,14 @@
     "target_allow_partial_overlap": 0.0,
     "priority_candidate_oversample": 0,
     "target_invalid_region_skip": true,
-    "mask_size_scaling": 0,
-    "mask_size": 5
+    "mask_size_scaling": 1.2,
+    "mask_size": 0
   },
   "train": {
     "epochs": 10,
     "log_interval": 1,
     "diagnostic_interval": 10,
-    "batch_size": 4,
+    "batch_size": 2,
     "num_workers": 8,
     "prefetch_factor": 2,
     "vicreg_spatial_mode": "pooled",
@@ -54,8 +54,6 @@
     },
     "symmetric_feature_loss_weight": 0.003,
     "compute_effective_rank": true,
-    "movie_dump_every_epoch": true,
-    "movie_fixed_targets": false,
     "scale_probe_enabled": true,
     "inference_tta_enabled": true,
     "inference_tta_mode": "flip4"

@@ -54,6 +54,7 @@ class PyramidGridJEPA(nn.Module):
         align_scales: bool = True,
         mask_box_size: int = 16,
         mask_box_size_range=None,
+        random_mask_box_per_target: bool = False,
         manual_mask_box_sizes=None,
         cdd_mode: str = "log",
         cdd_constrained: bool = True,
@@ -133,6 +134,7 @@ class PyramidGridJEPA(nn.Module):
             mask_box_size_range if mask_box_size_range is not None else inline_mask_box_size_range,
             "mask_box_size_range",
         )
+        self.random_mask_box_per_target = bool(random_mask_box_per_target)
         self.manual_mask_box_sizes = self._coerce_manual_mask_box_sizes(manual_mask_box_sizes)
         if self.manual_mask_box_sizes is not None:
             if len(self.manual_mask_box_sizes) < len(self.sigmas):
@@ -385,7 +387,7 @@ class PyramidGridJEPA(nn.Module):
                 mask_scale = lo
 
         mask_box_size = self.mask_box_size
-        if self.mask_box_size_range is not None:
+        if self.mask_box_size_range is not None and not self.random_mask_box_per_target:
             lo, hi = self.mask_box_size_range
             if hi > lo:
                 mask_box_size = int(torch.randint(lo, hi + 1, (), device=rand_device).item())
@@ -468,6 +470,8 @@ class PyramidGridJEPA(nn.Module):
                     global_shift=self.global_shift,
                     align_scales=self.align_scales,
                     mask_box_size=effective_mask_box_size,
+                    mask_box_size_range=self.mask_box_size_range,
+                    random_mask_box_per_target=self.random_mask_box_per_target,
                     manual_mask_box_sizes=self.manual_mask_box_sizes,
                     cdd_mode=self.cdd_mode,
                     cdd_constrained=self.cdd_constrained,
@@ -502,6 +506,8 @@ class PyramidGridJEPA(nn.Module):
                     global_shift=self.global_shift,
                     align_scales=self.align_scales,
                     mask_box_size=effective_mask_box_size,
+                    mask_box_size_range=self.mask_box_size_range,
+                    random_mask_box_per_target=self.random_mask_box_per_target,
                     manual_mask_box_sizes=self.manual_mask_box_sizes,
                     cdd_mode=self.cdd_mode,
                     cdd_constrained=self.cdd_constrained,
@@ -720,7 +726,7 @@ class PyramidGridJEPA(nn.Module):
         if actual_context_in is not None:
             out["network_context_in"] = actual_context_in
             out["network_target_in"] = actual_target_in
-        for key in ("mask_scale_factor", "mask_footprint_px", "cdd_box_sizes"):
+        for key in ("mask_scale_factor", "mask_footprint_px", "cdd_box_sizes", "target_box_sizes", "random_mask_box_per_target"):
             if key in debug:
                 out[key] = debug[key].to(device=x_clean.device, dtype=x_clean.dtype)
         if return_debug or needs_cdd_cube:
