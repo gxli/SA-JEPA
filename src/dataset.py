@@ -76,9 +76,17 @@ class JEPADataset(Dataset):
             self.num_samples = len(self.sample_index)
     def _preprocess_arr2d(self, arr2d: np.ndarray) -> np.ndarray:
         arr = np.asarray(arr2d, dtype=np.float32)
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-        arr = self._normalize01(arr)
-        return arr.astype(np.float32, copy=False)
+        finite = np.isfinite(arr)
+        out = np.zeros_like(arr, dtype=np.float32)
+        if not bool(finite.any()):
+            return out
+        finite_vals = arr[finite]
+        amin = float(finite_vals.min())
+        amax = float(finite_vals.max())
+        denom = amax - amin
+        if denom > 1e-20:
+            out[finite] = (arr[finite] - amin) / denom
+        return out
 
     @staticmethod
     def _probe_file_shape(path: str) -> tuple[int, ...]:
@@ -257,10 +265,17 @@ class JEPADataset(Dataset):
         if not tensors:
             return tensors
         if self.d4_augment:
-            if bool(np.random.randint(0, 2)):
-                tensors = tuple(torch.flip(t, dims=(-1,)) for t in tensors)
-            if bool(np.random.randint(0, 2)):
+            h, w = tensors[0].shape[-2], tensors[0].shape[-1]
+            if h == w:
+                k = int(np.random.randint(0, 4))
+                if k:
+                    tensors = tuple(torch.rot90(t, k=k, dims=(-2, -1)) for t in tensors)
+                if bool(np.random.randint(0, 2)):
+                    tensors = tuple(torch.flip(t, dims=(-1,)) for t in tensors)
+            elif bool(np.random.randint(0, 2)):
                 tensors = tuple(torch.flip(t, dims=(-2,)) for t in tensors)
+            if h != w and bool(np.random.randint(0, 2)):
+                tensors = tuple(torch.flip(t, dims=(-1,)) for t in tensors)
         if self.random_roll_max > 0:
             h, w = tensors[0].shape[-2], tensors[0].shape[-1]
             pad_val = int(min(self.random_roll_max, max(0, h - 1), max(0, w - 1)))

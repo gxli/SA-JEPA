@@ -14,13 +14,25 @@ def _pad_to_square(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int]]:
     S = max(H, W)
     pad_h = S - H
     pad_w = S - W
-    return torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0.0), (H, W)
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    return torch.nn.functional.pad(
+        x,
+        (pad_left, pad_right, pad_top, pad_bottom),
+        mode="constant",
+        value=0.0,
+    ), (H, W)
 
 
 def _crop_from_square(x: torch.Tensor, orig_shape: tuple[int, int]) -> torch.Tensor:
     """Crop back from square to original (H, W)."""
     H, W = orig_shape
-    return x[..., :H, :W]
+    cur_h, cur_w = x.shape[-2:]
+    top = max(0, (cur_h - H) // 2)
+    left = max(0, (cur_w - W) // 2)
+    return x[..., top:top + H, left:left + W]
 
 
 def symmetric_forward_2d(encoder: nn.Module, x: torch.Tensor, return_var: bool = False, **kwargs):

@@ -253,7 +253,7 @@ class CDDOperatorFeatures2D(nn.Module):
         if self.apply_lognorm and self.lognorm_on_stack:
             # Apply lognorm directly to network input stack with a data-based floor.
             stack_floor = self._compute_stack_floor(stack)
-            stack = torch.sign(stack) * torch.log(torch.abs(stack) + stack_floor)
+            stack = torch.sign(stack) * torch.log1p(torch.abs(stack) / stack_floor)
         if self.normalize_stack:
             stack = self._normalize_per_channel(stack)
 

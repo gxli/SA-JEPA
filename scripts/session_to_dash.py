@@ -1297,12 +1297,25 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             if configured_active or observed_active:
                 active_loss_terms.append((name, raw_arr[:n], weighted, color))
 
+    active_loss_legend = dict(
+        orientation="v",
+        x=0.985,
+        y=0.985,
+        xanchor="right",
+        yanchor="top",
+        bgcolor="rgba(255,255,255,0.72)",
+        bordercolor="rgba(120,120,120,0.35)",
+        borderwidth=1,
+    )
+
     def _add_loss_trace(fig: go.Figure, *, x: np.ndarray, y: np.ndarray, name: str, color: str) -> None:
         values = np.where(np.isfinite(y), y, np.nan).astype(np.float32)
         fig.add_trace(
             go.Scattergl(
-                x=x, y=values, mode="lines", name=name,
-                line=dict(width=1, color=color), opacity=0.12, showlegend=False,
+                x=x, y=values, mode="lines", name=f"{name} raw",
+                line=dict(width=1, color="rgba(120,120,120,0.55)"),
+                opacity=1.0,
+                showlegend=False,
             )
         )
         fig.add_trace(
@@ -1322,7 +1335,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         title={"text": "Active Loss Terms (Unweighted)", "x": 0.02},
         margin=dict(l=42, r=8, t=36, b=36),
         height=330,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
+        legend=active_loss_legend,
     )
     fig_loss_components.update_xaxes(title_text="global_step")
     fig_loss_components.update_yaxes(title_text="loss")
@@ -1337,7 +1350,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         title={"text": "Active Loss Terms (Weighted into loss_total)", "x": 0.02},
         margin=dict(l=42, r=8, t=36, b=36),
         height=330,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0.0),
+        legend=active_loss_legend,
     )
     fig_weighted_components.update_xaxes(title_text="global_step")
     fig_weighted_components.update_yaxes(title_text="weighted contribution")

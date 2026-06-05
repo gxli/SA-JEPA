@@ -859,9 +859,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     model = build_model3d_from_config(model_cfg, train_cfg, device) if is_3d_mode else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
 
     # DDP: wrap model for multi-GPU
+    ddp_find_unused_parameters = bool(train_cfg.get("ddp_find_unused_parameters", True))
     model_without_ddp = model
     if is_ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=ddp_find_unused_parameters,
+        )
         model_without_ddp = model.module
     allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
     resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
@@ -924,7 +930,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 # Re-wrap in DDP if needed
                 model_without_ddp = model
                 if is_ddp:
-                    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+                    model = DDP(
+                        model,
+                        device_ids=[local_rank],
+                        output_device=local_rank,
+                        find_unused_parameters=ddp_find_unused_parameters,
+                    )
                     model_without_ddp = model.module
                 print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
@@ -965,7 +976,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             )
             model_without_ddp = model
             if is_ddp:
-                model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+                model = DDP(
+                    model,
+                    device_ids=[local_rank],
+                    output_device=local_rank,
+                    find_unused_parameters=ddp_find_unused_parameters,
+                )
                 model_without_ddp = model.module
             print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
         else:
