@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from .encoders import (
     CDDScaleAwareConvNeXtEncoder,
     ConvNeXtDenseEncoder,
-    EscnnC4PyramidEncoder,
     LayerNorm2d,
 )
 from .masking import (
@@ -25,8 +24,6 @@ from .symmetry import symmetric_forward_2d
 # Shared encoder-type sets used by both build_jepa.py and train.py.
 CDD_CUBE_ENCODER_TYPES = frozenset({
     "cdd_scaleaware_convnext",
-    "convnext_dense_pyramid",
-    "escnn_c4_pyramid",
 })
 
 CDD_DEBUG_ENCODER_TYPES = frozenset(CDD_CUBE_ENCODER_TYPES | {
@@ -220,21 +217,6 @@ class PyramidGridJEPA(nn.Module):
                 stem_norm=self.scaleaware_stem_norm,
                 dilations=self.convnext_layer_dilations,
             )
-        elif self.encoder_type == "convnext_dense_pyramid":
-            # Pyramid input = per-scale CDD channels + per-scale mask/indicator channels.
-            pyr_in_channels = 2 * max(1, len(self.sigmas))
-            self.context_encoder = ConvNeXtDenseEncoder(
-                in_channels=pyr_in_channels,
-                hidden_channels=self.encoder_width,
-                latent_channels=latent_channels,
-                depth=self.encoder_depth,
-                kernel_size=self.encoder_kernel_size,
-                expansion=4,
-                use_reflect_padding=True,
-                final_norm=True,
-                use_grn=self.use_grn,
-                dilations=self.convnext_layer_dilations,
-            )
         elif self.encoder_type == "escnn_c4_pyramid":
             if self.mode != "pyramid":
                 raise ValueError(f"{self.encoder_type} requires mode='pyramid'.")
@@ -247,19 +229,6 @@ class PyramidGridJEPA(nn.Module):
                 kernel_size=self.encoder_kernel_size,
                 final_norm=self.scaleaware_final_norm,
                 final_norm_type=self.encoder_final_norm_type,
-            )
-        elif self.encoder_type == "convnext_dense":
-            self.context_encoder = ConvNeXtDenseEncoder(
-                in_channels=1,
-                hidden_channels=self.encoder_width,
-                latent_channels=latent_channels,
-                depth=self.encoder_depth,
-                kernel_size=self.encoder_kernel_size,
-                expansion=4,
-                use_reflect_padding=True,
-                final_norm=True,
-                use_grn=self.use_grn,
-                dilations=self.convnext_layer_dilations,
             )
         elif self.encoder_type == "convnext_dense_masktoken":
             # 2D ConvNeXt image mode with explicit hard-mask token channel.
@@ -590,26 +559,6 @@ class PyramidGridJEPA(nn.Module):
                     target_symmetric_var = gt_var if target_symmetric_var is None else target_symmetric_var + gt_var
                 else:
                     gt_map = self.target_encoder(cdd_orig_enc, mask_tokens=zero_mask_tokens)
-        elif self.encoder_type in ("convnext_dense_pyramid", "escnn_c4_pyramid"):
-            if self.mode != "pyramid":
-                raise ValueError(f"{self.encoder_type} requires mode='pyramid'.")
-            mask_tokens = dip_per_ch
-            if bool(mask_inference):
-                enc_context = torch.cat([cdd_masked_enc, mask_tokens], dim=1)
-            else:
-                enc_context = torch.cat([cdd_orig_enc, torch.zeros_like(mask_tokens)], dim=1)
-            enc_target = torch.cat([cdd_orig_enc, torch.zeros_like(mask_tokens)], dim=1)
-            with torch.no_grad():
-                if self.use_symmetric_feature_loss:
-                    gt_map, gt_var = symmetric_forward_2d(self.target_encoder, enc_target, return_var=True)
-                    target_symmetric_var = gt_var if target_symmetric_var is None else target_symmetric_var + gt_var
-                else:
-                    gt_map = self.target_encoder(enc_target)
-            if self.use_symmetric_feature_loss:
-                context_map, ctx_var = symmetric_forward_2d(self.context_encoder, enc_context, return_var=True)
-                symmetric_var = ctx_var if symmetric_var is None else symmetric_var + ctx_var
-            else:
-                context_map = self.context_encoder(enc_context)
         elif self.encoder_type == "convnext_dense_masktoken":
             if self.mode != "image":
                 raise ValueError(f"{self.encoder_type} requires mode='image'.")

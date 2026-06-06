@@ -295,11 +295,12 @@ def embedding_spread_stats(
     cov = (z.T @ z) / max(1, int(z.shape[0]))
     eig = torch.linalg.eigvalsh(cov).clamp_min(0.0)
     eig_sum = eig.sum()
-    if float(eig_sum.item()) <= 1e-20:
-        rank = 0.0
-    else:
+    rank = 0.0
+    if float(eig_sum.item()) > 1e-20:
         p = eig / eig_sum
-        rank = float(torch.exp(-(p * p.clamp_min(1e-20).log()).sum()).item())
+        p = p[p > 1e-20]
+        if p.numel() > 0:
+            rank = float(torch.exp(-(p * p.log()).sum()).item())
     std = torch.sqrt(var + 1e-12)
     return {
         "embed_spread_mean": float(std.mean().item()),

@@ -74,11 +74,13 @@ def _compute_pca_2d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> 
 
 def _compute_pca_3d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
-    fit_x = x
     if x.shape[0] > fit_max_tokens:
         rng = np.random.default_rng(42)
         idx = rng.choice(x.shape[0], size=fit_max_tokens, replace=False)
         fit_x = x[idx]
+    else:
+        fit_x = x
+
     mean = fit_x.mean(axis=0, keepdims=True)
     fit_centered = fit_x - mean
     try:
@@ -124,11 +126,13 @@ def _compute_umap_nd(
     if init_mode not in ("spectral", "random"):
         init_mode = "spectral"
 
-    fit_x = x
     if x.shape[0] > fit_max_tokens:
         rng = np.random.default_rng(random_state)
         idx = rng.choice(x.shape[0], size=fit_max_tokens, replace=False)
         fit_x = x[idx]
+        needs_fit_transform = True
+    else:
+        needs_fit_transform = False
 
     try:
         from cuml.manifold import UMAP as CuMLUMAP
@@ -142,8 +146,10 @@ def _compute_umap_nd(
             random_state=int(random_state),
             init=init_mode,
         )
-        model.fit(fit_x)
-        return model.transform(x)
+        if needs_fit_transform:
+            model.fit(fit_x)
+            return model.transform(x)
+        return model.fit_transform(x)
     except Exception as e:
         print(f"[warning] cuML UMAP failed: {type(e).__name__}: {e}")
 
@@ -156,8 +162,11 @@ def _compute_umap_nd(
                 n_neighbors=int(n_neighbors),
                 min_dist=float(min_dist),
             )
-            model.fit(torch.from_numpy(fit_x.astype(np.float32)))
-            z = model.transform(torch.from_numpy(x.astype(np.float32)))
+            if needs_fit_transform:
+                model.fit(torch.from_numpy(fit_x.astype(np.float32)))
+                z = model.transform(torch.from_numpy(x.astype(np.float32)))
+            else:
+                z = model.fit_transform(torch.from_numpy(x.astype(np.float32)))
             if isinstance(z, torch.Tensor):
                 return z.cpu().numpy()
             return np.asarray(z)
@@ -175,8 +184,10 @@ def _compute_umap_nd(
             random_state=int(random_state),
             init=init_mode,
         )
-        model.fit(fit_x)
-        return model.transform(x)
+        if needs_fit_transform:
+            model.fit(fit_x)
+            return model.transform(x)
+        return model.fit_transform(x)
     except Exception as e:
         print(f"[warning] umap-learn failed: {type(e).__name__}: {e}")
 

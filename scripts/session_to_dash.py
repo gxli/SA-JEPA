@@ -1050,7 +1050,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             [
                 go.Scatter3d(
                     x=xx.astype(np.float32),
-                    y=yy.astype(np.float32),
+                    y=-yy.astype(np.float32),
                     z=zz.astype(np.float32),
                     mode="markers",
                     marker=dict(size=2, opacity=0.7, color=vv, colorscale="Viridis", showscale=True, colorbar=dict(title="mask")),

@@ -566,7 +566,7 @@ def resolve_encoder_type_default(model_cfg: dict) -> str:
         return str(model_cfg["encoder_type"])
     mode = str(model_cfg.get("mode", "image")).lower()
     if mode == "pyramid":
-        return "convnext_dense_pyramid"
+        return "cdd_scaleaware_convnext"
     return "convnext_dense_masktoken"
 
 
@@ -585,12 +585,8 @@ def _resolve_encoder_alias_2d(name: str) -> str:
         # Supported canonical names.
         "convnext_dense_masktoken": "convnext_dense_masktoken",
         "cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
-        "convnext_dense_pyramid": "convnext_dense_pyramid",
-        "escnn_c4_pyramid": "escnn_c4_pyramid",
         # Supported aliases.
         "convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
-        "convnext-pyramid": "convnext_dense_pyramid",
-        "escnn-c4-pyramid": "escnn_c4_pyramid",
     }
     if key not in alias:
         raise ValueError(
@@ -631,7 +627,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         if resolved_encoder_type not in allowed_pyramid:
             raise ValueError(
                 f"Unsupported pyramid-mode encoder_type={resolved_encoder_type}. "
-                "Allowed: cdd_scaleaware_convnext, convnext_dense_pyramid, escnn_c4_pyramid."
+                "Allowed: cdd_scaleaware_convnext, convnext_dense_masktoken."
             )
     else:
         raise ValueError(f"Unsupported mode={resolved_mode}. Allowed: image, pyramid.")
@@ -1769,11 +1765,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
                 _flush_csv_rows(visited_targets_log_path, visited_rows)
             metrics_bar.set_description_str(
-                f"total={log_loss_val:.4f} prediction={loss_prediction.item():.4f} "
-                f"spread={loss_spread.item():.4f} sim={sim_val:.4f} "
-                f"embed_spread={ctx_stats['embed_spread_mean']:.3e} "
-                f"manifold={ctx_stats['context_manifold_size']:.2f} "
-                f"vf={valid_frac:.3f} lr={current_lr:.1e}",
+                f"L={log_loss_val:.4f} "
+                f"MSE(pred,gt)={loss_prediction.item():.4f} "
+                f"sig=relu(1.0-std)={loss_spread.item():.4f} "
+                f"cos(pred,gt)={sim_val:.4f} "
+                f"std(ch)={ctx_stats['embed_spread_mean']:.3f} "
+                f"rank=exp(H(p))={ctx_stats['context_manifold_size']:.2f} "
+                f"v={valid_frac:.3f} lr={current_lr:.1e}",
                 refresh=True,
             )
             if _use_wandb and (batch_idx + 1) % log_flush_interval == 0:
@@ -1847,13 +1845,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             if prev_str:
                 prev_str = f" [{prev_str}]"
             tqdm.write(
-                f"[{config_name}] Epoch {epoch + 1}/{epochs} "
-                f"total={avg_total:.4f} prediction={avg_prediction:.4f} "
-                f"spread={_fmt_metric(epoch_spread/epoch_batches)} "
-                f"sim={_fmt_metric(epoch_sim/epoch_batches)} "
-                f"embed_spread={_fmt_metric(epoch_embed_spread_mean/epoch_batches)} "
-                f"manifold={_fmt_metric(epoch_context_manifold_size/epoch_batches)} "
-                f"vfrac={_fmt_metric(epoch_valid_frac/epoch_batches)}"
+                f"[{config_name}] E {epoch + 1}/{epochs} "
+                f"L={avg_total:.4f} mse={avg_prediction:.4f} sig={_fmt_metric(epoch_spread/epoch_batches)} "
+                f"cos={_fmt_metric(epoch_sim/epoch_batches)} "
+                f"std={_fmt_metric(epoch_embed_spread_mean/epoch_batches)} "
+                f"rank={_fmt_metric(epoch_context_manifold_size/epoch_batches)} "
+                f"v={_fmt_metric(epoch_valid_frac/epoch_batches)}"
                 f"{prev_str}"
             )
         val_loss = 0.0
