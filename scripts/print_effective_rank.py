@@ -52,8 +52,9 @@ def _read_model_inputs(session_dir: str) -> dict:
             "l2": _fmt_bool(m.get("normalize_loss_l2", False)),
             "psn": _fmt_bool(m.get("scaleaware_norm_per_scale", False)),
             "fin": _fmt_bool(m.get("scaleaware_final_norm", False)),
-            "spread_w": str(spread.get("weight", t.get("sigreg_weight", "NA"))),
             "sigtype": str(spread.get("type", "NA")),
+            "spread_w": str(spread.get("weight", t.get("sigreg_weight", "NA"))),
+            "spread_t": str(spread.get("target_std", "NA")),
             "symw": str(t.get("symmetric_feature_loss_weight", "NA")),
             "depth": str(m.get("encoder_depth", "NA")),
         }
@@ -67,7 +68,7 @@ def _fmt_bool(value) -> str:
 
 def _missing_model_inputs() -> dict:
     return {k: "NA" for k in (
-        "mode", "ms", "mbox", "sampling", "l2", "psn", "fin", "spread_w", "sigtype", "symw", "depth",
+        "mode", "ms", "mbox", "sampling", "l2", "psn", "fin", "sigtype", "spread_w", "spread_t", "symw", "depth",
     )}
 
 
@@ -171,6 +172,7 @@ def main() -> int:
             pr_match = f"{float(diag.get('volume_match_ratio', 'nan')):.4f}"
         except Exception:
             pr_match = ""
+        energy = _fmt_float(str(diag.get("energy", "")), 9, 4)
         p_dead = _diag_get(diag, "pred", "dead_channel_fraction")
         p_dead_n = diag.get("pred", {}).get("dead_channel_count",
                     diag.get("pred", {}).get("num_dead_channels", 0))
@@ -182,7 +184,9 @@ def main() -> int:
             (name,
              inputs.get("mode", "NA"), inputs.get("ms", "NA"), inputs.get("mbox", "NA"), inputs.get("sampling", "NA"),
              inputs.get("l2", "NA"), inputs.get("psn", "NA"), inputs.get("fin", "NA"),
-             inputs.get("spread_w", "NA"), inputs.get("symw", "NA"), inputs.get("depth", "NA"),
+             inputs.get("sigtype", "NA"), inputs.get("spread_w", "NA"), inputs.get("spread_t", "NA"),
+             inputs.get("symw", "NA"), inputs.get("depth", "NA"),
+             energy,
              rank, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_str)
         )
 
@@ -195,25 +199,27 @@ def main() -> int:
     session_w = max(len("session"), *(len(row[0]) for row in rows_sorted))
     header = (
         f"{'session':<{session_w}} {'mode':<9} {'sampling':<9} {'mask_scale':>12} {'mask_box':>9} "
-        f"{'l2_norm':>7} {'psnorm':>6} {'final_norm':>10} {'sigreg':>7} {'sym_loss':>9} {'depth':>6} "
+        f"{'l2_norm':>7} {'psnorm':>6} {'final_norm':>10} {'sig_type':>14} {'sig_w':>7} {'sig_t':>6} {'sym_loss':>9} {'depth':>6} "
+        f"{'energy':>9} "
         f"{'erank':>8} {'context':>9} {'predictor':>10} {'target':>9} "
         f"{'top1':>7} {'pred_part':>10} {'target_part':>11} {'part_ratio':>10} {'dead_frac':>10} {'dead_ch':>7}"
     )
     print(header)
     print("-" * len(header))
     for row in rows_sorted:
-        (s, mode, ms, mbox, sampling, l2, psn, fin, sigw, symw, d,
-         rk, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_n) = row
+        (s, mode, ms, mbox, sampling, l2, psn, fin, sigtype, sigw, sigt, symw, d,
+         _energy, rk, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_n) = row
         print(
             f"{s:<{session_w}} {mode:<9} {sampling:<9} {ms:>12} {mbox:>9} "
-            f"{l2:>7} {psn:>6} {fin:>10} {_fmt_float(sigw,7,2)} {_fmt_float(symw,9,4)} {d:>6} "
+            f"{l2:>7} {psn:>6} {fin:>10} {sigtype:>14} {_fmt_float(sigw,7,2)} {_fmt_float(sigt,6,2)} {_fmt_float(symw,9,4)} {d:>6} "
+            f"{energy:>9} "
             f"{_fmt_float(rk,8,4)} {_fmt_float(c_er,9,4)} {_fmt_float(p_er,10,4)} {_fmt_float(g_er,9,4)} "
             f"{_fmt_float(p_t1,7,3)} {_fmt_float(p_pr,10,2)} {_fmt_float(g_pr,11,2)} {_fmt_float(pr_match,10,4)} "
             f"{_fmt_float(p_dead,10,3)} {p_dead_n:>7}"
         )
 
     n_total = len(rows_sorted)
-    n_rank = sum(1 for r in rows_sorted if r[11] != "")
+    n_rank = sum(1 for r in rows_sorted if r[14] != "")
     print("-" * len(header))
     print(f"sessions={n_total} with_rank={n_rank} missing_rank={n_total - n_rank}")
     return 0

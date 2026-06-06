@@ -101,6 +101,16 @@ def probe_scale_response(
     scale_only_sim_maps = []
     pred_sensitivity_maps = []
 
+    def _restore_input_hw(map_bhw: torch.Tensor) -> torch.Tensor:
+        if map_bhw.shape[-2:] == (H, W):
+            return map_bhw
+        return F.interpolate(
+            map_bhw.unsqueeze(1),
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+
     for s in range(S):
         x_drop = x_pyr.clone()
         x_drop[:, s] = 0.0
@@ -108,21 +118,21 @@ def probe_scale_response(
         z_drop_n = _normalize_channel_map(z_drop)
 
         diff = (z_full_n - z_drop_n).pow(2).sum(dim=1).sqrt()
-        sensitivity_maps.append(diff)
+        sensitivity_maps.append(_restore_input_hw(diff))
 
         if pred_full_n is not None:
             z_in_drop = model.projector(z_drop) if hasattr(model, "projector") else z_drop
             pred_drop = model.predictor(z_in_drop)
             pred_drop_n = _normalize_channel_map(pred_drop)
             pred_diff = (pred_full_n - pred_drop_n).pow(2).sum(dim=1).sqrt()
-            pred_sensitivity_maps.append(pred_diff)
+            pred_sensitivity_maps.append(_restore_input_hw(pred_diff))
 
         x_one = torch.zeros_like(x_pyr)
         x_one[:, s] = x_pyr[:, s]
         z_one = _encode_context(model, x_one, mask_tokens=mask_tokens)
         z_one_n = _normalize_channel_map(z_one)
         sim = (z_full_n * z_one_n).sum(dim=1)
-        scale_only_sim_maps.append(sim)
+        scale_only_sim_maps.append(_restore_input_hw(sim))
 
     sensitivity_maps = torch.stack(sensitivity_maps, dim=1)  # B,S,H,W
     scale_only_sim_maps = torch.stack(scale_only_sim_maps, dim=1)
@@ -179,6 +189,7 @@ def probe_scale_response(
         "sensitivity_maps": sensitivity_maps.detach().cpu(),
         "scale_only_sim_maps": scale_only_sim_maps.detach().cpu(),
         "winner_map": winner_map.detach().cpu(),
+        "input_map": x_pyr[0].sum(dim=0).detach().cpu(),
         "z_full": z_full.detach().cpu(),
     }
     if pred_sensitivity_maps is not None:
@@ -219,4 +230,3 @@ def probe_scale_response(
         f.write("\n".join(lines) + "\n")
 
     return report
-

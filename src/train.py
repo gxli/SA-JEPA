@@ -585,8 +585,12 @@ def _resolve_encoder_alias_2d(name: str) -> str:
         # Supported canonical names.
         "convnext_dense_masktoken": "convnext_dense_masktoken",
         "cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
+        "convnext_dense_pyramid": "convnext_dense_pyramid",
+        "escnn_c4_pyramid": "escnn_c4_pyramid",
         # Supported aliases.
         "convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
+        "convnext-pyramid": "convnext_dense_pyramid",
+        "escnn-c4-pyramid": "escnn_c4_pyramid",
     }
     if key not in alias:
         raise ValueError(
@@ -627,7 +631,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         if resolved_encoder_type not in allowed_pyramid:
             raise ValueError(
                 f"Unsupported pyramid-mode encoder_type={resolved_encoder_type}. "
-                "Allowed: cdd_scaleaware_convnext, convnext_dense_masktoken."
+                "Allowed: cdd_scaleaware_convnext, convnext_dense_pyramid, escnn_c4_pyramid."
             )
     else:
         raise ValueError(f"Unsupported mode={resolved_mode}. Allowed: image, pyramid.")
@@ -1659,6 +1663,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 spatial_mode=vicreg_spatial_mode,
             )
             raw_mse_val, norm_err_val = compute_raw_mse_and_norm_err(outputs)
+            energy_val = compute_jepa_energy(outputs)
             valid_frac = float(outputs["target_valid"].float().mean().item())
             ctx_stats = embedding_spread_stats(z_ctx, target_std=embed_spread_target)
             targets_per_image = float(outputs["target_valid"].float().sum(dim=1).mean().item())
@@ -1767,6 +1772,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             metrics_bar.set_description_str(
                 f"L={log_loss_val:.4f} "
                 f"MSE(pred,gt)={loss_prediction.item():.4f} "
+                f"E={energy_val:.4f} "
                 f"sig=relu(1.0-std)={loss_spread.item():.4f} "
                 f"cos(pred,gt)={sim_val:.4f} "
                 f"std(ch)={ctx_stats['embed_spread_mean']:.3f} "
@@ -1965,6 +1971,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             rank_diag = {}
             try:
                 rank_diag = rank_dashboard(outputs)
+                try:
+                    rank_diag["energy"] = float(compute_jepa_energy(outputs))
+                except Exception:
+                    pass
                 with open(os.path.join(session_dir, "rank_diagnostics.json"), "w", encoding="utf-8") as f:
                     json.dump(rank_diag, f, indent=2)
             except Exception as er:

@@ -237,6 +237,13 @@ def _load_scale_probe_dash_data(session_dir: str) -> dict[str, np.ndarray]:
     pred_sensitivity = _to_np(probe.get("pred_sensitivity_maps", np.asarray([]))).astype(np.float32)
     if pred_sensitivity.shape != sensitivity.shape:
         pred_sensitivity = np.asarray([], dtype=np.float32)
+    probe_input = _to_np(probe.get("input_map", np.asarray([]))).astype(np.float32)
+    if probe_input.ndim != 2:
+        x_pyr = _to_np(probe.get("x_pyr", np.asarray([]))).astype(np.float32)
+        if x_pyr.ndim == 4 and x_pyr.shape[0] > 0:
+            probe_input = x_pyr[0].sum(axis=0).astype(np.float32)
+        else:
+            probe_input = np.asarray([], dtype=np.float32)
 
     scale_names: list[str] = []
     report = {}
@@ -249,6 +256,41 @@ def _load_scale_probe_dash_data(session_dir: str) -> dict[str, np.ndarray]:
             report = {}
     if len(scale_names) != int(sensitivity.shape[1]):
         scale_names = [f"scale_{i}" for i in range(int(sensitivity.shape[1]))]
+
+    def _target_hw_from_report() -> tuple[int, int] | None:
+        shape = report.get("input_shape") if isinstance(report, dict) else None
+        if isinstance(shape, (list, tuple)) and len(shape) >= 4:
+            h0, w0 = int(shape[-2]), int(shape[-1])
+            if h0 > 0 and w0 > 0:
+                return h0, w0
+        return None
+
+    target_hw = tuple(int(v) for v in probe_input.shape[-2:]) if probe_input.ndim == 2 else _target_hw_from_report()
+
+    def _coerce_maps_to_hw(arr: np.ndarray, hw: tuple[int, int] | None, *, mode: str = "bilinear") -> np.ndarray:
+        vals = np.asarray(arr, dtype=np.float32)
+        if hw is None or vals.size == 0 or vals.ndim < 2:
+            return vals
+        h0, w0 = int(hw[0]), int(hw[1])
+        if vals.shape[-2:] == (h0, w0):
+            return vals
+        if vals.shape[-2] * vals.shape[-1] == h0 * w0:
+            return vals.reshape(*vals.shape[:-2], h0, w0).astype(np.float32, copy=False)
+        leading = vals.shape[:-2]
+        flat = vals.reshape(-1, 1, vals.shape[-2], vals.shape[-1])
+        kwargs = {"size": (h0, w0), "mode": mode}
+        if mode != "nearest":
+            kwargs["align_corners"] = False
+        resized = torch.nn.functional.interpolate(torch.from_numpy(flat), **kwargs).numpy()
+        return resized.reshape(*leading, h0, w0).astype(np.float32, copy=False)
+
+    sensitivity = _coerce_maps_to_hw(sensitivity, target_hw)
+    scale_only = _coerce_maps_to_hw(scale_only, target_hw)
+    if pred_sensitivity.size > 0:
+        pred_sensitivity = _coerce_maps_to_hw(pred_sensitivity, target_hw)
+    winner = _coerce_maps_to_hw(winner, target_hw, mode="nearest")
+    if winner.ndim != 2:
+        winner = sensitivity[0].argmax(axis=0).astype(np.float32)
 
     sens_global = sensitivity.mean(axis=(0, 2, 3))
     sens_frac = sens_global / max(float(np.sum(sens_global)), 1e-12)
@@ -277,6 +319,7 @@ def _load_scale_probe_dash_data(session_dir: str) -> dict[str, np.ndarray]:
         "scale_probe_names": np.array(scale_names, dtype=str),
         "scale_probe_source": np.array([os.path.basename(pt_path)], dtype=str),
         "scale_probe_report_json": np.array([json.dumps(report, sort_keys=True)], dtype=str),
+        "scale_probe_input_map": probe_input.astype(np.float32) if probe_input.ndim == 2 else np.asarray([], dtype=np.float32),
     }
 
 
@@ -897,6 +940,14 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         h, w = int(shape[0]), int(shape[1])
         return [-0.5, float(w) - 0.5], [float(h) - 0.5, -0.5]
 
+    def _image_xy(shape: tuple[int, int], *, explicit_y_down: bool = False) -> tuple[np.ndarray, np.ndarray]:
+        h, w = int(shape[0]), int(shape[1])
+        x = np.arange(w, dtype=np.float32)
+        y = np.arange(h, dtype=np.float32)
+        if explicit_y_down:
+            y = -y
+        return x, y
+
     def _apply_image_axes(
         fig: go.Figure,
         shape: tuple[int, int],
@@ -904,8 +955,13 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         row: int | None = None,
         col: int | None = None,
         scaleanchor: str | None = "x",
+        explicit_y_down: bool = False,
     ) -> None:
-        xr, yr = _image_axis_range(shape)
+        if explicit_y_down:
+            h, w = int(shape[0]), int(shape[1])
+            xr, yr = [-0.5, float(w) - 0.5], [-(float(h) - 0.5), 0.5]
+        else:
+            xr, yr = _image_axis_range(shape)
         fig.update_xaxes(
             showticklabels=False,
             showgrid=False,
@@ -955,12 +1011,13 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             if zmax <= zmin + 1e-12:
                 zmax = zmin + 1.0
         h_v, w_v = vals.shape[-2:]
+        x_v, y_v = _image_xy((h_v, w_v))
         fig = go.Figure(
             [
                 go.Heatmap(
                     z=vals,
-                    x=np.arange(w_v, dtype=np.float32),
-                    y=np.arange(h_v, dtype=np.float32),
+                    x=x_v,
+                    y=y_v,
                     colorscale=colorscale,
                     zmin=zmin,
                     zmax=zmax,
@@ -1186,7 +1243,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             [
                 go.Scatter3d(
                     x=xx.astype(np.float32),
-                    y=yy.astype(np.float32),
+                    y=(-yy).astype(np.float32),
                     z=zz.astype(np.float32),
                     mode="markers",
                     marker=dict(
@@ -1198,7 +1255,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                         colorbar=dict(title="response"),
                     ),
                     text=[labels[int(i)] for i in zz],
-                    hovertemplate="x=%{x}<br>y=%{y}<br>channel=%{text}<br>response=%{marker.color:.5g}<extra></extra>",
+                    customdata=yy.astype(np.float32),
+                    hovertemplate="x=%{x}<br>row=%{customdata}<br>channel=%{text}<br>response=%{marker.color:.5g}<extra></extra>",
                     showlegend=False,
                 )
             ]
@@ -1210,7 +1268,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             height=430,
             scene=dict(
                 xaxis_title="x",
-                yaxis=dict(title="y", autorange="reversed"),
+                yaxis_title="y",
                 zaxis=dict(title="CDD channel", tickmode="array", tickvals=tickvals, ticktext=labels),
                 aspectmode="manual",
                 aspectratio=dict(x=w0, y=h0, z=max(w0, h0)),
@@ -1243,10 +1301,11 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             r = i // cols + 1
             c = i % cols + 1
             h_i, w_i = arr[i].shape[-2:]
+            x_i, y_i = _image_xy((h_i, w_i), explicit_y_down=True)
             kwargs = dict(
                 z=arr[i],
-                x=np.arange(w_i, dtype=np.float32),
-                y=np.arange(h_i, dtype=np.float32),
+                x=x_i,
+                y=y_i,
                 colorscale=colorscale,
                 zmin=zmin,
                 zmax=zmax,
@@ -1256,7 +1315,14 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 kwargs["zmid"] = zmid
             fig.add_trace(go.Heatmap(**kwargs), row=r, col=c)
             axis_idx = (r - 1) * cols + c
-            _apply_image_axes(fig, arr[i].shape, row=r, col=c, scaleanchor="x" if axis_idx == 1 else f"x{axis_idx}")
+            _apply_image_axes(
+                fig,
+                arr[i].shape,
+                row=r,
+                col=c,
+                scaleanchor="x" if axis_idx == 1 else f"x{axis_idx}",
+                explicit_y_down=True,
+            )
         fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=56, b=8), height=max(330, 260 * rows))
         return fig
 
@@ -1264,12 +1330,13 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         vals = np.asarray(winner, dtype=np.float32)
         labels = [str(v) for v in np.asarray(names).reshape(-1)]
         n_scales = max(1, len(labels))
+        x_v, y_v = _image_xy(vals.shape[-2:], explicit_y_down=True)
         fig = go.Figure(
             [
                 go.Heatmap(
                     z=vals,
-                    x=np.arange(vals.shape[-1], dtype=np.float32),
-                    y=np.arange(vals.shape[-2], dtype=np.float32),
+                    x=x_v,
+                    y=y_v,
                     colorscale="Turbo",
                     zmin=-0.5,
                     zmax=float(n_scales) - 0.5,
@@ -1283,7 +1350,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             ]
         )
         fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=36, b=8), height=330)
-        _apply_image_axes(fig, vals.shape[-2:])
+        _apply_image_axes(fig, vals.shape[-2:], explicit_y_down=True)
         return fig
 
     def _npz_array(name: str, *legacy_names: str) -> np.ndarray:
@@ -1291,6 +1358,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             if key in data.files:
                 return np.asarray(data[key], dtype=np.float32)
         return np.asarray([], dtype=np.float32)
+
+    def _rotate_cdd_probe_180(arr: np.ndarray) -> np.ndarray:
+        vals = np.asarray(arr, dtype=np.float32)
+        if vals.ndim < 2:
+            return vals
+        return np.rot90(vals, k=2, axes=(-2, -1)).astype(np.float32, copy=False)
 
     loss_x = _npz_array("loss_x")
     loss_total = np.asarray(data["loss_total"], dtype=np.float32) if "loss_total" in data.files else np.asarray([], dtype=np.float32)
@@ -1384,15 +1457,19 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         values = np.where(np.isfinite(y), y, np.nan).astype(np.float32)
         fig.add_trace(
             go.Scattergl(
-                x=x, y=values, mode="lines", name=f"{name} raw",
-                line=dict(width=1.35, color=color, dash="dot"),
-                opacity=0.55,
-                showlegend=True,
+                x=x,
+                y=values,
+                mode="lines",
+                name=f"{name} raw",
+                line=dict(width=1.1, color=color, dash="dot"),
+                opacity=0.42,
+                showlegend=False,
+                hoverinfo="skip",
             )
         )
         fig.add_trace(
             go.Scattergl(
-                x=x, y=_smooth(values), mode="lines", name=f"{name} smooth",
+                x=x, y=_smooth(values), mode="lines", name=name,
                 line=dict(width=2, color=color),
             )
         )
@@ -1608,12 +1685,13 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         cards.append({"title": f"{name} UMAP RGB Scatter", "fig": umap_scatter, "group": f"{stem}-umap"})
     if "scale_probe_sensitivity_maps" in data.files and "scale_probe_names" in data.files:
         sp_names = data["scale_probe_names"]
-        sp_sens_maps = np.asarray(data["scale_probe_sensitivity_maps"], dtype=np.float32)
-        sp_sim_maps = np.asarray(data["scale_probe_scale_only_sim_maps"], dtype=np.float32) if "scale_probe_scale_only_sim_maps" in data.files else np.asarray([], dtype=np.float32)
-        sp_winner = np.asarray(data["scale_probe_winner_map"], dtype=np.float32) if "scale_probe_winner_map" in data.files else np.asarray([], dtype=np.float32)
+        sp_sens_maps = _rotate_cdd_probe_180(data["scale_probe_sensitivity_maps"])
+        sp_sim_maps = _rotate_cdd_probe_180(data["scale_probe_scale_only_sim_maps"]) if "scale_probe_scale_only_sim_maps" in data.files else np.asarray([], dtype=np.float32)
+        sp_winner = _rotate_cdd_probe_180(data["scale_probe_winner_map"]) if "scale_probe_winner_map" in data.files else np.asarray([], dtype=np.float32)
         sp_sens_mean = np.asarray(data["scale_probe_sensitivity_mean"], dtype=np.float32) if "scale_probe_sensitivity_mean" in data.files else np.asarray([], dtype=np.float32)
         sp_sens_frac = np.asarray(data["scale_probe_sensitivity_fraction"], dtype=np.float32) if "scale_probe_sensitivity_fraction" in data.files else np.asarray([], dtype=np.float32)
         sp_sim_mean = np.asarray(data["scale_probe_scale_only_similarity"], dtype=np.float32) if "scale_probe_scale_only_similarity" in data.files else np.asarray([], dtype=np.float32)
+        sp_input = _rotate_cdd_probe_180(data["scale_probe_input_map"]) if "scale_probe_input_map" in data.files else np.asarray([], dtype=np.float32)
         cards.extend(
             [
                 {
@@ -1631,6 +1709,17 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                     "fig": scale_probe_spatial_scatter3d("CDD Spatial Response Scatter (top quartile)", sp_sens_maps, sp_names),
                     "group": "scale-probe-spatial-scatter",
                 },
+                *(
+                    [
+                        {
+                            "title": "Scale Probe Input (CDD Sum)",
+                            "fig": heat("Scale Probe Input (CDD Sum)", sp_input, "Viridis"),
+                            "group": "scale-probe-input",
+                        }
+                    ]
+                    if sp_input.ndim == 2 and sp_input.size > 0
+                    else []
+                ),
                 {
                     "title": "CDD Scale Drop Sensitivity",
                     "fig": scale_probe_maps("CDD Scale Drop Sensitivity", sp_sens_maps, sp_names, "Inferno"),
@@ -1655,7 +1744,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 }
             )
         if "scale_probe_pred_sensitivity_maps" in data.files:
-            sp_pred_maps = np.asarray(data["scale_probe_pred_sensitivity_maps"], dtype=np.float32)
+            sp_pred_maps = _rotate_cdd_probe_180(data["scale_probe_pred_sensitivity_maps"])
             if sp_pred_maps.ndim == 3 and sp_pred_maps.size > 0:
                 cards.append(
                     {

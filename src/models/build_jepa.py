@@ -15,6 +15,7 @@ from .encoders import (
 from .masking import (
     extract_location_patches,
     make_pyramid_grid_context,
+    norm_per_sample_channel,
     normalize_target_sampling_mode,
     prepare_context_batch,
 )
@@ -24,6 +25,8 @@ from .symmetry import symmetric_forward_2d
 # Shared encoder-type sets used by both build_jepa.py and train.py.
 CDD_CUBE_ENCODER_TYPES = frozenset({
     "cdd_scaleaware_convnext",
+    "convnext_dense_pyramid",
+    "escnn_c4_pyramid",
 })
 
 CDD_DEBUG_ENCODER_TYPES = frozenset(CDD_CUBE_ENCODER_TYPES | {
@@ -215,6 +218,22 @@ class PyramidGridJEPA(nn.Module):
                 adapter_norm=self.scaleaware_adapter_norm,
                 use_grn=self.use_grn,
                 stem_norm=self.scaleaware_stem_norm,
+                dilations=self.convnext_layer_dilations,
+            )
+        elif self.encoder_type == "convnext_dense_pyramid":
+            if self.mode != "pyramid":
+                raise ValueError("convnext_dense_pyramid requires mode='pyramid'.")
+            pyr_in_channels = 2 * max(1, len(self.sigmas))
+            self.context_encoder = ConvNeXtDenseEncoder(
+                in_channels=pyr_in_channels,
+                hidden_channels=self.encoder_width,
+                latent_channels=latent_channels,
+                depth=self.encoder_depth,
+                kernel_size=self.encoder_kernel_size,
+                expansion=4,
+                use_reflect_padding=True,
+                final_norm=True,
+                use_grn=self.use_grn,
                 dilations=self.convnext_layer_dilations,
             )
         elif self.encoder_type == "escnn_c4_pyramid":
@@ -525,40 +544,65 @@ class PyramidGridJEPA(nn.Module):
             if self.mode != "pyramid":
                 raise ValueError("cdd_scaleaware_convnext requires mode='pyramid'.")
             mask_tokens = dip_per_ch
+            cdd_orig_scaleaware = cdd_orig_enc
+            cdd_masked_scaleaware = cdd_masked_enc
+            if self.scaleaware_norm_per_scale:
+                cdd_orig_scaleaware = norm_per_sample_channel(cdd_orig_scaleaware)
+                cdd_masked_scaleaware = norm_per_sample_channel(cdd_masked_scaleaware)
             zero_mask_tokens = torch.zeros_like(mask_tokens)
             if bool(mask_inference):
                 if self.use_symmetric_feature_loss:
                     context_map, ctx_var = symmetric_forward_2d(
                         self.context_encoder,
-                        cdd_masked_enc,
+                        cdd_masked_scaleaware,
                         mask_tokens=mask_tokens,
                         return_var=True,
                     )
                     symmetric_var = ctx_var if symmetric_var is None else symmetric_var + ctx_var
                 else:
-                    context_map = self.context_encoder(cdd_masked_enc, mask_tokens=mask_tokens)
+                    context_map = self.context_encoder(cdd_masked_scaleaware, mask_tokens=mask_tokens)
             else:
                 if self.use_symmetric_feature_loss:
                     context_map, ctx_var = symmetric_forward_2d(
                         self.context_encoder,
-                        cdd_orig_enc,
+                        cdd_orig_scaleaware,
                         mask_tokens=zero_mask_tokens,
                         return_var=True,
                     )
                     symmetric_var = ctx_var if symmetric_var is None else symmetric_var + ctx_var
                 else:
-                    context_map = self.context_encoder(cdd_orig_enc, mask_tokens=zero_mask_tokens)
+                    context_map = self.context_encoder(cdd_orig_scaleaware, mask_tokens=zero_mask_tokens)
             with torch.no_grad():
                 if self.use_symmetric_feature_loss:
                     gt_map, gt_var = symmetric_forward_2d(
                         self.target_encoder,
-                        cdd_orig_enc,
+                        cdd_orig_scaleaware,
                         mask_tokens=zero_mask_tokens,
                         return_var=True,
                     )
                     target_symmetric_var = gt_var if target_symmetric_var is None else target_symmetric_var + gt_var
                 else:
-                    gt_map = self.target_encoder(cdd_orig_enc, mask_tokens=zero_mask_tokens)
+                    gt_map = self.target_encoder(cdd_orig_scaleaware, mask_tokens=zero_mask_tokens)
+        elif self.encoder_type in ("convnext_dense_pyramid", "escnn_c4_pyramid"):
+            if self.mode != "pyramid":
+                raise ValueError(f"{self.encoder_type} requires mode='pyramid'.")
+            mask_tokens = dip_per_ch
+            if bool(mask_inference):
+                enc_context = torch.cat([cdd_masked_enc, mask_tokens], dim=1)
+            else:
+                enc_context = torch.cat([cdd_orig_enc, torch.zeros_like(mask_tokens)], dim=1)
+            enc_target = torch.cat([cdd_orig_enc, torch.zeros_like(mask_tokens)], dim=1)
+            with torch.no_grad():
+                if self.use_symmetric_feature_loss:
+                    gt_map, gt_var = symmetric_forward_2d(self.target_encoder, enc_target, return_var=True)
+                    target_symmetric_var = gt_var if target_symmetric_var is None else target_symmetric_var + gt_var
+                else:
+                    gt_map = self.target_encoder(enc_target)
+            if self.use_symmetric_feature_loss:
+                context_map, ctx_var = symmetric_forward_2d(self.context_encoder, enc_context, return_var=True)
+                symmetric_var = ctx_var if symmetric_var is None else symmetric_var + ctx_var
+            else:
+                context_map = self.context_encoder(enc_context)
         elif self.encoder_type == "convnext_dense_masktoken":
             if self.mode != "image":
                 raise ValueError(f"{self.encoder_type} requires mode='image'.")

@@ -20,7 +20,8 @@ SUFFIX=""
 
 RSYNC_RSH='ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes'
 RSYNC_COMMON=(
-    -avz
+    -acvz
+    --checksum
     --partial
     --timeout=120
     --contimeout=20
