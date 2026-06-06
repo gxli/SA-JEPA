@@ -6,7 +6,7 @@ from src.train import build_model_from_config
 def _build(model_cfg):
     cfg = {
         "mode": "pyramid",
-        "model_key": "cdd_scaleaware_convnext",
+        "model_key": "convnext_dense_pyramid",
         "sigmas": [2, 4],
         "latent_channels": 8,
         "encoder_width": 8,

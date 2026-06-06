@@ -35,13 +35,58 @@ def _crop_from_square(x: torch.Tensor, orig_shape: tuple[int, int]) -> torch.Ten
     return x[..., top:top + H, left:left + W]
 
 
-def symmetric_forward_2d(encoder: nn.Module, x: torch.Tensor, return_var: bool = False, **kwargs):
+def _stack_spatial_kwargs(kwargs: dict, spatial_shape: tuple[int, ...], view_fns: list, pad_2d: bool = False) -> list[dict]:
+    per_view = [dict() for _ in view_fns]
+    for name, val in kwargs.items():
+        if torch.is_tensor(val) and val.ndim >= len(spatial_shape) and val.shape[-len(spatial_shape):] == spatial_shape:
+            if pad_2d:
+                val, _ = _pad_to_square(val)
+            for i, fn in enumerate(view_fns):
+                per_view[i][name] = fn(val)
+        else:
+            for i in range(len(view_fns)):
+                per_view[i][name] = val
+    return per_view
+
+
+def _encode_view_chunks(
+    encoder: nn.Module,
+    view_inputs: list[torch.Tensor],
+    view_kwargs: list[dict],
+    inverse_fns: list,
+    max_views_per_forward: int,
+) -> torch.Tensor:
+    max_views = max(1, int(max_views_per_forward))
+    aligned = []
+    for start in range(0, len(view_inputs), max_views):
+        xs = view_inputs[start:start + max_views]
+        kws = view_kwargs[start:start + max_views]
+        x_batch = torch.cat(xs, dim=0)
+        kw_batch = {}
+        for name in kws[0].keys():
+            vals = [kw[name] for kw in kws]
+            if torch.is_tensor(vals[0]) and all(torch.is_tensor(v) and v.shape == vals[0].shape for v in vals):
+                kw_batch[name] = torch.cat(vals, dim=0)
+            else:
+                kw_batch[name] = vals[0]
+        feat_batch = encoder(x_batch, **kw_batch)
+        for local_i, feat in enumerate(torch.chunk(feat_batch, chunks=len(xs), dim=0)):
+            aligned.append(inverse_fns[start + local_i](feat))
+    return torch.stack(aligned, dim=0)
+
+
+def symmetric_forward_2d(
+    encoder: nn.Module,
+    x: torch.Tensor,
+    return_var: bool = False,
+    max_views_per_forward: int = 1,
+    **kwargs,
+):
     """
     Four-way rotational group average for dense 2D spatial features.
 
-    Single batched forward pass: pads to square, stacks all 4 rotations into
-    batch dim, runs the encoder once (CuDNN-optimized), then unrotates, crops
-    back, and averages.  Handles non-square (H ≠ W) inputs transparently.
+    Pads to square, evaluates the four rotations in view chunks, unrotates,
+    crops back, and averages. Handles non-square (H != W) inputs transparently.
 
     When return_var=True, also returns the per-pixel variance across the 4 rotation
     views as a regularisation signal (shape matches the averaged output).
@@ -51,32 +96,21 @@ def symmetric_forward_2d(encoder: nn.Module, x: torch.Tensor, return_var: bool =
 
     B, C, H, W = x.shape
 
-    # Pad to square so rot90 doesn't change spatial dims
     x_sq, orig_shape = _pad_to_square(x)
-    _, _, HS, WS = x_sq.shape
-
-    # Stack all 4 rotations in the batch dimension → (B*4, C, S, S)
-    x_rot = torch.cat([torch.rot90(x_sq, k=k, dims=(-2, -1)) for k in range(4)], dim=0)
-
-    # Apply same pad+rotation to spatial tensor kwargs
-    kw_stacked = {}
-    for name, val in kwargs.items():
-        if torch.is_tensor(val) and val.ndim >= 2 and val.shape[-2:] == (H, W):
-            val_sq, _ = _pad_to_square(val)
-            kw_stacked[name] = torch.cat([torch.rot90(val_sq, k=k, dims=(-2, -1)) for k in range(4)], dim=0)
-        else:
-            kw_stacked[name] = val
-
-    # Single forward pass
-    feat_stacked = encoder(x_rot, **kw_stacked)
-
-    # Unstack, inverse-rotate, crop back to original H,W, and stack
-    feats = torch.chunk(feat_stacked, chunks=4, dim=0)
-    feats_inv = []
-    for k in range(4):
-        f = _crop_from_square(torch.rot90(feats[k], k=-k, dims=(-2, -1)), orig_shape)
-        feats_inv.append(f)
-    feats_stacked_inv = torch.stack(feats_inv, dim=0)  # (4, B, C_out, H, W)
+    view_fns = [lambda t, k=k: torch.rot90(t, k=k, dims=(-2, -1)) for k in range(4)]
+    inverse_fns = [
+        lambda t, k=k: _crop_from_square(torch.rot90(t, k=-k, dims=(-2, -1)), orig_shape)
+        for k in range(4)
+    ]
+    view_inputs = [fn(x_sq) for fn in view_fns]
+    view_kwargs = _stack_spatial_kwargs(kwargs, (H, W), view_fns, pad_2d=True)
+    feats_stacked_inv = _encode_view_chunks(
+        encoder,
+        view_inputs,
+        view_kwargs,
+        inverse_fns,
+        max_views_per_forward=max_views_per_forward,
+    )
 
     avg = feats_stacked_inv.mean(dim=0)
     if return_var:
@@ -85,12 +119,17 @@ def symmetric_forward_2d(encoder: nn.Module, x: torch.Tensor, return_var: bool =
     return avg
 
 
-def symmetric_forward_3d(encoder: nn.Module, x: torch.Tensor, return_var: bool = False, **kwargs):
+def symmetric_forward_3d(
+    encoder: nn.Module,
+    x: torch.Tensor,
+    return_var: bool = False,
+    max_views_per_forward: int = 1,
+    **kwargs,
+):
     """
     Eight-way flip group average for dense 3D spatial features.
 
-    Single batched forward pass: stacks all 8 flip configurations into batch dim,
-    runs the encoder once, then unflips and averages.
+    Evaluates the 8 flip configurations in view chunks, then unflips and averages.
     Flips are involutions, so the same flip axes align encoder outputs back to
     the original D/H/W layout.
     """
@@ -106,41 +145,20 @@ def symmetric_forward_3d(encoder: nn.Module, x: torch.Tensor, return_var: bool =
         for dims in itertools.combinations(spatial_dims, r):
             all_dims_list.append(dims)
 
-    # Stack all 8 flips in the batch dimension → (B*8, C, D, H, W)
-    x_flips = []
-    for dims in all_dims_list:
-        if dims:
-            x_flips.append(torch.flip(x, dims=dims))
-        else:
-            x_flips.append(x)
-    x_stacked = torch.cat(x_flips, dim=0)
-
-    # Apply same flips to spatial tensor kwargs
-    kw_stacked = {}
-    for name, val in kwargs.items():
-        if torch.is_tensor(val) and val.ndim >= 3 and val.shape[-3:] == (D, H, W):
-            parts = []
-            for dims in all_dims_list:
-                if dims:
-                    parts.append(torch.flip(val, dims=dims))
-                else:
-                    parts.append(val)
-            kw_stacked[name] = torch.cat(parts, dim=0)
-        else:
-            kw_stacked[name] = val
-
-    # Single forward pass
-    feat_stacked = encoder(x_stacked, **kw_stacked)
-
-    # Unstack, unflip, and average
-    feats = torch.chunk(feat_stacked, chunks=len(all_dims_list), dim=0)
-    feats_inv = []
-    for k, dims in enumerate(all_dims_list):
-        if dims:
-            feats_inv.append(torch.flip(feats[k], dims=dims))
-        else:
-            feats_inv.append(feats[k])
-    feats_stacked_inv = torch.stack(feats_inv, dim=0)  # (8, B, C_out, D_out, H_out, W_out)
+    view_fns = [
+        (lambda t, dims=dims: torch.flip(t, dims=dims) if dims else t)
+        for dims in all_dims_list
+    ]
+    inverse_fns = view_fns
+    view_inputs = [fn(x) for fn in view_fns]
+    view_kwargs = _stack_spatial_kwargs(kwargs, (D, H, W), view_fns, pad_2d=False)
+    feats_stacked_inv = _encode_view_chunks(
+        encoder,
+        view_inputs,
+        view_kwargs,
+        inverse_fns,
+        max_views_per_forward=max_views_per_forward,
+    )
 
     avg = feats_stacked_inv.mean(dim=0)
     if return_var:

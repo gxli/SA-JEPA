@@ -6,16 +6,35 @@ import numpy as np
 import torch
 
 
+MAX_RANK_TOKENS = 10_000
+
+
+def _subsample_rows_np(z: np.ndarray, max_rows: int = MAX_RANK_TOKENS) -> np.ndarray:
+    if z.shape[0] <= int(max_rows):
+        return z
+    idx = np.linspace(0, z.shape[0] - 1, int(max_rows), dtype=np.int64)
+    return z[idx]
+
+
+def _subsample_rows_torch(z: torch.Tensor, max_rows: int = MAX_RANK_TOKENS) -> torch.Tensor:
+    if z.shape[0] <= int(max_rows):
+        return z
+    idx = torch.linspace(0, z.shape[0] - 1, int(max_rows), device=z.device).long()
+    return z.index_select(0, idx)
+
+
 def compute_effective_rank_from_features(z: np.ndarray) -> float:
     z = np.asarray(z, dtype=np.float64)
     if z.ndim != 2 or z.shape[0] < 2 or z.shape[1] < 1:
         return 0.0
+    z = _subsample_rows_np(z)
     z = z - z.mean(axis=0, keepdims=True)
     denom = max(1, z.shape[0] - 1)
     try:
         svals = np.linalg.svd(z, full_matrices=False, compute_uv=False)
     except np.linalg.LinAlgError:
-        z_jitter = z + np.random.normal(0, 1e-5, z.shape)
+        jitter_scale = max(float(np.std(z)), 1e-12) * 1e-5
+        z_jitter = z + np.random.normal(0, jitter_scale, z.shape)
         svals = np.linalg.svd(z_jitter, full_matrices=False, compute_uv=False)
     evals = np.square(svals) / denom
     s = float(evals.sum())
@@ -42,6 +61,7 @@ def spectral_rank_stats(fmap: torch.Tensor, eps: float = 1e-12, dead_thresh: flo
         raise ValueError(f"Expected C,H,W or B,C,H,W, got {tuple(fmap.shape)}")
 
     z = z.float()
+    z = _subsample_rows_torch(z)
     z = z - z.mean(dim=0, keepdim=True)
 
     ch_std = z.std(dim=0, unbiased=False)
@@ -52,7 +72,8 @@ def spectral_rank_stats(fmap: torch.Tensor, eps: float = 1e-12, dead_thresh: flo
     try:
         eig_raw = torch.linalg.svdvals(z)
     except RuntimeError:
-        z_jitter = z + torch.randn_like(z) * 1e-5
+        jitter_scale = z.std(unbiased=False).clamp_min(1e-12) * 1e-5
+        z_jitter = z + torch.randn_like(z) * jitter_scale
         eig_raw = torch.linalg.svdvals(z_jitter)
     eig = eig_raw.pow(2).div(float(denom)).clamp_min(0)
 

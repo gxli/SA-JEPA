@@ -85,6 +85,7 @@ python -m src.inference_from_session \
   "slice_index": null,
   "batch_size": 2,
   "tta": false,
+  "tta_mode": "d4",
   "device": null
 }
 ```
@@ -136,13 +137,14 @@ python -m src.inference_from_session \
 
 ### TTA (Test-Time Augmentation)
 
-Enable 4-way flip augmentation during inference for rotation-invariant embeddings:
+Enable D4 augmentation during inference to average rotations and flips:
 
 ```bash
 python -m src.inference_from_session \
     --session sessions/gen_121_mhd_run_006_ms1p2 \
     --input data/chengdu.npy \
     --tta \
+    --tta-mode d4 \
     --output-session sessions/inference_chengdu_tta
 ```
 
@@ -159,7 +161,8 @@ python -m src.inference_from_session \
 | `--slice-axis` | `0` | Depth axis for 3D slab mode |
 | `--slice-index` | `None` | Specific slice for 3D mode (omitted = all) |
 | `--batch-size` | `2` | Batch size for inference |
-| `--tta` | disabled | Enable test-time flip4 augmentation |
+| `--tta` | disabled | Enable test-time augmentation |
+| `--tta-mode` | `flip4` | TTA view set: `flip4`, `rot4`, or `d4` |
 | `--device` | auto | Override device (`cuda`, `mps`, `cpu`) |
 
 ### Inference session structure
@@ -258,7 +261,7 @@ Outputs in `sessions/<config_name>/`:
 
 How it matches training:
 
-- Loads data through `JEPADataset` with your config values (`data_root`, `npy_pattern`, slice strategy, `image_size`, log settings, etc.).
+- Loads data through `JEPADataset` with your config values (`data_root`, `npy_pattern`, slice strategy, crop settings, etc.).
 - Applies context masking via the same function used in model forward pass: `make_pyramid_grid_context(...)`.
 - Uses `model.sigmas`, `model.cell_sizes`, and `model.sigmas` and `model.cell_sizes` from the active config.
 
@@ -276,7 +279,7 @@ Example: `configs/base_3090.json`
 
 - `model.pretrained` (bool)
 - `data.num_samples` (int)
-- `data.image_size` (int)
+- `data.crop_mode` / `data.crop_size` (optional crop training)
 - `train.epochs` (int)
 - `train.batch_size` (int)
 - `train.num_workers` (int)

@@ -112,8 +112,10 @@ def _build_priority_catalogue_from_cdd_ratio(
     else:
         numerator = cdd_orig[0] + cdd_orig[1]
     total_flux = np.sum(cdd_orig, axis=0)
-    denom = np.maximum(total_flux, 1e-8)
-    ratio = np.nan_to_num(numerator / denom, nan=0.0, posinf=0.0, neginf=0.0)
+    denom = np.maximum(total_flux.astype(np.float64, copy=False), 1e-6)
+    numerator64 = numerator.astype(np.float64, copy=False)
+    ratio = np.divide(numerator64, denom, out=np.zeros_like(numerator64), where=denom > 0.0)
+    ratio = np.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
 
     half_lo = int(patch_size) // 2
     half_hi = int(patch_size) - half_lo
@@ -248,12 +250,12 @@ def _rejection_sample_targets(
         return candidates[:num_targets]
 
     half = exclusion_box // 2
-    occ = torch.zeros((h, w), dtype=torch.bool, device=device)
+    occ = torch.zeros((h, w), dtype=torch.bool, device="cpu")
     accepted: list[tuple[int, int]] = []
     tries = 0
 
     # Shuffle candidates for unbiased selection.
-    perm = torch.randperm(len(candidates), device=device)
+    perm = torch.randperm(len(candidates), device="cpu").tolist()
     idx = 0
     while len(accepted) < num_targets and tries < max_tries and idx < len(candidates):
         tries += 1
@@ -268,7 +270,7 @@ def _rejection_sample_targets(
             continue
 
         footprint = occ[y0:y1, x0:x1]
-        overlap_frac = float(footprint.float().mean().item())
+        overlap_frac = float(footprint.sum().item()) / float(max(1, footprint.numel()))
         if overlap_frac <= float(allow_partial_overlap):
             accepted.append((int(cy), int(cx)))
             occ[y0:y1, x0:x1] = True
@@ -292,12 +294,12 @@ def _rejection_sample_targets_with_boxes(
     if len(candidate_boxes) != len(candidates):
         raise ValueError("candidate_boxes must have the same length as candidates")
 
-    occ = torch.zeros((h, w), dtype=torch.bool, device=device)
+    occ = torch.zeros((h, w), dtype=torch.bool, device="cpu")
     accepted: list[tuple[int, int]] = []
     accepted_boxes: list[int] = []
     tries = 0
 
-    perm = torch.randperm(len(candidates), device=device)
+    perm = torch.randperm(len(candidates), device="cpu").tolist()
     idx = 0
     while len(accepted) < num_targets and tries < max_tries and idx < len(candidates):
         tries += 1
@@ -315,7 +317,7 @@ def _rejection_sample_targets_with_boxes(
             continue
 
         footprint = occ[y0:y1, x0:x1]
-        overlap_frac = float(footprint.float().mean().item())
+        overlap_frac = float(footprint.sum().item()) / float(max(1, footprint.numel()))
         if overlap_frac <= float(allow_partial_overlap):
             accepted.append((int(cy), int(cx)))
             accepted_boxes.append(int(box))

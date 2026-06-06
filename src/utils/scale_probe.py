@@ -220,16 +220,3 @@ def probe_scale_response(
 
     return report
 
-
-def save_scale_response_plots(
-    session_dir: str,
-    scale_names: Optional[Sequence[str]] = None,
-    run_name: str = "probe",
-) -> list[str]:
-    """PNG-free compatibility shim.
-
-    Scale-probe visualizations are rendered by the Plotly dashboard directly
-    from ``<run_name>_scale_response.pt``.
-    """
-    del session_dir, scale_names, run_name
-    return []

@@ -440,10 +440,22 @@ def evaluate_validation(
         n += 1
 
     if n == 0:
-        return {"val_loss": 0.0, "val_sim": 0.0, "val_error_by_scale": {}}
+        val_loss = 0.0
+        val_sim = 0.0
+    else:
+        val_loss = loss_sum / n
+        val_sim = sim_sum / n
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        totals = torch.tensor([loss_sum, sim_sum, float(n)], dtype=torch.float64, device=device)
+        torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+        global_n = max(1.0, float(totals[2].item()))
+        val_loss = float(totals[0].item() / global_n)
+        val_sim = float(totals[1].item() / global_n)
+
     return {
-        "val_loss": loss_sum / n,
-        "val_sim": sim_sum / n,
+        "val_loss": val_loss,
+        "val_sim": val_sim,
         "val_error_by_scale": {float(s): float(np.mean(v)) for s, v in scale_mse.items()},
     }
 
@@ -483,25 +495,21 @@ def load_config(path: str) -> dict:
     cfg.setdefault("data", {})
     cfg.setdefault("model", {})
     cfg.setdefault("train", {})
+    removed = {
+        "data.log_transform": "model.post_log_transform",
+        "data.image_size": "native-resolution data or explicit crop_size",
+        "model.log_transform": "model.post_log_transform",
+    }
+    stale = []
     if "log_transform" in cfg["data"]:
-        legacy_value = cfg["data"].pop("log_transform")
-        print(
-            "[config migration] ignoring removed data.log_transform="
-            f"{legacy_value!r}; dataset preprocessing is always linear normalize01. "
-            "Use model.post_log_transform."
-        )
+        stale.append("data.log_transform")
     if "image_size" in cfg["data"]:
-        legacy_value = cfg["data"].pop("image_size")
-        print(
-            "[config migration] ignoring removed data.image_size="
-            f"{legacy_value!r}; JEPADataset always preserves native input resolution."
-        )
+        stale.append("data.image_size")
     if "log_transform" in cfg["model"]:
-        legacy_value = cfg["model"].pop("log_transform")
-        print(
-            "[config migration] ignoring removed model.log_transform="
-            f"{legacy_value!r}; use model.post_log_transform."
-        )
+        stale.append("model.log_transform")
+    if stale:
+        replacements = ", ".join(f"{key}->{removed[key]}" for key in stale)
+        raise ValueError(f"Removed config keys present: {replacements}. Update the config schema before training.")
     return cfg
 
 
@@ -526,7 +534,7 @@ def resolve_encoder_type_default(model_cfg: dict) -> str:
         return str(model_cfg["encoder_type"])
     mode = str(model_cfg.get("mode", "image")).lower()
     if mode == "pyramid":
-        return "cdd_scaleaware_convnext"
+        return "convnext_dense_pyramid"
     return "convnext_dense_masktoken"
 
 
@@ -540,20 +548,16 @@ def _resolve_encoder_alias_2d(name: str) -> str:
     alias = {
         # Preferred naming convention (image / image_pyramid prefixes).
         "convnext_image_dense_masked": "convnext_dense_masktoken",
-        "cdd_scaleaware_convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
-        "cdd_scaleaware_convnext-pyramid-scaleaware-d4": "cdd_scaleaware_convnext_d4",
-        "rescnn-pyramid-scaleaware": "cdd_scaleaware_rescnn",
-        "image_pyramid_cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
-        "image_pyramid_cdd_scaleaware_convnext_d4": "cdd_scaleaware_convnext_d4",
-        "image_pyramid_cdd_scaleaware_rescnn": "cdd_scaleaware_rescnn",
+        "cdd_scaleaware_convnext-pyramid-scaleaware": "convnext_dense_pyramid",
+        "image_pyramid_cdd_scaleaware_convnext": "convnext_dense_pyramid",
         # Supported canonical names.
         "convnext_dense_masktoken": "convnext_dense_masktoken",
-        "cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
-        "cdd_scaleaware_convnext_d4": "cdd_scaleaware_convnext_d4",
-        "cdd_scaleaware_rescnn": "cdd_scaleaware_rescnn",
+        "cdd_scaleaware_convnext": "convnext_dense_pyramid",
+        "convnext_dense_pyramid": "convnext_dense_pyramid",
         "escnn_c4_pyramid": "escnn_c4_pyramid",
         # Supported aliases.
-        "convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
+        "convnext-pyramid-scaleaware": "convnext_dense_pyramid",
+        "convnext-pyramid": "convnext_dense_pyramid",
         "escnn-c4-pyramid": "escnn_c4_pyramid",
     }
     return alias.get(key, str(name))
@@ -583,27 +587,22 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
             )
     elif resolved_mode == "pyramid":
         allowed_pyramid = {
-            "cdd_scaleaware_convnext",
-            "cdd_scaleaware_convnext_d4",
-            "cdd_scaleaware_rescnn",
             "convnext_dense_pyramid",
             "escnn_c4_pyramid",
         }
         if resolved_encoder_type not in allowed_pyramid:
             raise ValueError(
                 f"Unsupported pyramid-mode encoder_type={resolved_encoder_type}. "
-                "Allowed: cdd_scaleaware_convnext, cdd_scaleaware_convnext_d4, "
-                "cdd_scaleaware_rescnn, convnext_dense_pyramid, escnn_c4_pyramid."
+                "Allowed: convnext_dense_pyramid, escnn_c4_pyramid."
             )
     else:
         raise ValueError(f"Unsupported mode={resolved_mode}. Allowed: image, pyramid.")
 
     patch_size = int(model_cfg.get("patch_size", 3))
     if patch_size <= 0:
-        patch_size = 3
+        raise ValueError(f"model.patch_size must be positive, got {patch_size}.")
     if patch_size % 2 == 0:
-        patch_size = patch_size + 1
-        print(f"[warning] even patch_size requested; using odd patch_size={patch_size}")
+        raise ValueError(f"model.patch_size must be odd, got {patch_size}.")
 
     mask_scale_cfg = model_cfg.get("mask_size_scaling", 1.0)
     mask_box_cfg = model_cfg.get("mask_size", 16)
@@ -778,14 +777,27 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     # ── DDP: detect torchrun-launched multi-GPU ──
     is_ddp = "LOCAL_RANK" in os.environ
     if is_ddp:
+        from datetime import timedelta
         import torch.distributed as dist
         from torch.nn.parallel import DistributedDataParallel as DDP
         from torch.utils.data.distributed import DistributedSampler
 
-        dist.init_process_group(backend="nccl")
+        required_ddp_env = ("RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
+        missing_ddp_env = [name for name in required_ddp_env if name not in os.environ]
+        if missing_ddp_env:
+            raise RuntimeError(
+                "LOCAL_RANK is set but this does not look like a complete torchrun launch. "
+                f"Missing environment variables: {missing_ddp_env}."
+            )
         local_rank = int(os.environ["LOCAL_RANK"])
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
+        if torch.cuda.is_available():
+            ddp_backend = "nccl"
+            device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(device)
+        else:
+            ddp_backend = "gloo"
+            device = torch.device("cpu")
+        dist.init_process_group(backend=ddp_backend, timeout=timedelta(minutes=30))
     else:
         local_rank = 0
         if torch.cuda.is_available():
@@ -808,6 +820,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     train_cfg = config["train"]
     model_cfg = config["model"]
     data_cfg = config["data"]
+    seed = int(train_cfg.get("seed", train_cfg.get("split_seed", 42)))
+    rank_seed = seed + int(local_rank)
+    random.seed(rank_seed)
+    np.random.seed(rank_seed % 2**32)
+    torch.manual_seed(rank_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(rank_seed)
+    if is_main_process:
+        print(f"[{config_name}] global_seed={seed} rank_seed={rank_seed}")
     is_3d_mode = _is_3d_jepa_mode(model_cfg.get("mode", "image"))
 
     # Optional WandB logging (config-controlled, main process only)
@@ -869,12 +890,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     ddp_find_unused_parameters = bool(train_cfg.get("ddp_find_unused_parameters", True))
     model_without_ddp = model
     if is_ddp:
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=ddp_find_unused_parameters,
-        )
+        ddp_kwargs = dict(find_unused_parameters=ddp_find_unused_parameters)
+        if device.type == "cuda":
+            ddp_kwargs.update(device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, **ddp_kwargs)
         model_without_ddp = model.module
     allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
     resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
@@ -896,7 +915,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         resume_state = torch.load(resume_ckpt_path, map_location=device)
         if "model_state_dict" in resume_state:
             try:
-                missing, unexpected = model.load_state_dict(resume_state["model_state_dict"], strict=False)
+                missing, unexpected = model.load_state_dict(
+                    resume_state["model_state_dict"],
+                    strict=not allow_partial_resume,
+                )
             except RuntimeError as e:
                 # Common during architecture evolution (e.g. channel-count changes).
                 log_error("resume_model_load_state_dict", e)
@@ -937,12 +959,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 # Re-wrap in DDP if needed
                 model_without_ddp = model
                 if is_ddp:
-                    model = DDP(
-                        model,
-                        device_ids=[local_rank],
-                        output_device=local_rank,
-                        find_unused_parameters=ddp_find_unused_parameters,
-                    )
+                    ddp_kwargs = dict(find_unused_parameters=ddp_find_unused_parameters)
+                    if device.type == "cuda":
+                        ddp_kwargs.update(device_ids=[local_rank], output_device=local_rank)
+                    model = DDP(model, **ddp_kwargs)
                     model_without_ddp = model.module
                 print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
@@ -950,7 +970,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             print(f"resume_checkpoint={resume_ckpt_path} start_epoch={start_epoch}")
     elif resume_from_existing:
         try:
-            missing, unexpected = model.load_state_dict(torch.load(model_ckpt_path, map_location=device), strict=False)
+            missing, unexpected = model.load_state_dict(
+                torch.load(model_ckpt_path, map_location=device),
+                strict=not allow_partial_resume,
+            )
         except RuntimeError as e:
             # Common during architecture evolution (e.g. channel-count changes).
             log_error("resume_model_load_state_dict", e)
@@ -1211,6 +1234,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     # DDP: distribute data across GPUs
     train_sampler = DistributedSampler(train_dataset) if is_ddp else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False) if (is_ddp and val_dataset is not None) else None
 
     masking_collate = None if is_3d_mode else _MaskingCollator(
         model,
@@ -1234,6 +1258,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             val_dataset,
             batch_size=train_cfg.get("batch_size", 32),
             shuffle=False,
+            sampler=val_sampler,
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
@@ -1278,7 +1303,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     )
     use_amp = device.type == "cuda"
     autocast_device = "cuda" if use_amp else "cpu"
-    scaler = GradScaler("cuda", enabled=use_amp)
+    scaler = GradScaler("cuda" if use_amp else "cpu", enabled=use_amp)
     if resume_state is not None:
         optimizer_state_loaded = False
         if "optimizer_state_dict" in resume_state:

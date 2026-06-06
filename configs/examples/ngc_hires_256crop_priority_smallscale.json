@@ -10,7 +10,7 @@
   },
   "model": {
     "mode": "pyramid",
-    "model_key": "cdd_scaleaware_convnext",
+    "model_key": "convnext_dense_pyramid",
     "encoder_depth": 4,
     "mask_spacing_scaling": 2,
     "normalize_loss_l2": true,
@@ -61,6 +61,6 @@
     "compute_effective_rank": true,
     "scale_probe_enabled": true,
     "inference_tta_enabled": true,
-    "inference_tta_mode": "flip4"
+    "inference_tta_mode": "d4"
   }
 }

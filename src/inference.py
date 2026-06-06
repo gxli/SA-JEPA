@@ -32,6 +32,15 @@ def _tta_views_2d(x: torch.Tensor, mode: str) -> list[tuple[str, torch.Tensor]]:
             ("fy", torch.flip(x, dims=(-2,))),
             ("fxy", torch.flip(x, dims=(-2, -1))),
         ]
+    if m in ("d4", "dihedral8", "8fold", "8-fold", "rotflip8"):
+        views = []
+        for k in range(4):
+            xr = torch.rot90(x, k=k, dims=(-2, -1))
+            views.append((f"r{k}", xr))
+            views.append((f"r{k}fx", torch.flip(xr, dims=(-1,))))
+        return views
+    if m in ("rot4", "rot", "rot90"):
+        return [(f"r{k}", torch.rot90(x, k=k, dims=(-2, -1))) for k in range(4)]
     raise ValueError(f"Unsupported inference TTA mode: {mode}")
 
 
@@ -45,6 +54,13 @@ def _apply_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
         return torch.flip(z, dims=(-2,))
     if name == "fxy":
         return torch.flip(z, dims=(-2, -1))
+    if name.startswith("r") and name[1:2].isdigit():
+        rest = name[1:]
+        if rest.endswith("fx"):
+            k = int(rest[:-2])
+            return torch.rot90(torch.flip(z, dims=(-1,)), k=-k, dims=(-2, -1))
+        k = int(rest)
+        return torch.rot90(z, k=-k, dims=(-2, -1))
     raise ValueError(name)
 
 
@@ -158,6 +174,33 @@ def _apply_nan_boundary_frame(x: torch.Tensor, border_px: int) -> torch.Tensor:
     return out
 
 
+def _first_full_resolution_batch(dataloader):
+    dataset = getattr(dataloader, "dataset", None)
+    if dataset is None or not hasattr(dataset, "__getitem__"):
+        return None
+    old = {}
+    for name, value in (
+        ("crop_mode", "none"),
+        ("crop_size", None),
+        ("d4_augment", False),
+        ("random_roll_max", 0),
+        ("crop_min_valid_fraction", 0.0),
+    ):
+        if hasattr(dataset, name):
+            old[name] = getattr(dataset, name)
+            setattr(dataset, name, value)
+    try:
+        sample = dataset[0]
+    finally:
+        for name, value in old.items():
+            setattr(dataset, name, value)
+    if isinstance(sample, (tuple, list)):
+        return tuple(x.unsqueeze(0) if torch.is_tensor(x) and x.dim() in (3, 4) else x for x in sample)
+    if torch.is_tensor(sample):
+        return sample.unsqueeze(0) if sample.dim() in (3, 4) else sample
+    return None
+
+
 def run_post_training_inference(
     *,
     model,
@@ -181,7 +224,8 @@ def run_post_training_inference(
     if (not force_recompute_inference) and os.path.exists(inference_outputs_path):
         print(
             f"[{config_name}] inference_outputs.pt already exists; "
-            "skipping post-training inference (set train.force_recompute_inference=true to recompute)"
+            "skipping post-training dashboard-sample inference "
+            "(set train.force_recompute_inference=true to recompute)"
         )
         return session_dir
 
@@ -197,15 +241,31 @@ def run_post_training_inference(
     if (not force_recompute_inference) and all(os.path.exists(p) for p in inference_required):
         print(
             f"[{config_name}] inference artifacts already exist; "
-            "skipping post-training inference (set train.force_recompute_inference=true to recompute)"
+            "skipping post-training dashboard-sample inference "
+            "(set train.force_recompute_inference=true to recompute)"
         )
         return session_dir
 
-    print(f"[{config_name}] post_training_inference begin")
+    try:
+        dataloader_len = len(dataloader)
+    except TypeError:
+        dataloader_len = None
+    if dataloader_len is not None and dataloader_len > 1:
+        print(
+            f"[{config_name}] post_training_inference scope=dashboard_sample_batch "
+            f"using first batch only out of {dataloader_len}; use src.inference_from_session "
+            "for explicit dataset inference"
+        )
+    else:
+        print(f"[{config_name}] post_training_inference scope=dashboard_sample_batch")
     model.eval()
     with torch.no_grad():
         print(f"[{config_name}] post_training_inference loading sample batch")
-        raw_batch = next(iter(dataloader))
+        raw_batch = _first_full_resolution_batch(dataloader)
+        if raw_batch is None:
+            raw_batch = next(iter(dataloader))
+        else:
+            print(f"[{config_name}] post_training_inference using uncropped first image for dashboard")
         if isinstance(raw_batch, (tuple, list)) and len(raw_batch) == 2 and raw_batch[1] is not None:
             cdd_raw, x_raw = raw_batch
             cdd_raw = cdd_raw.to(next(model.parameters()).device)
@@ -304,6 +364,9 @@ def run_post_training_inference(
             outputs.update(_average_maps(first_out_by_shift))
 
     inference_outputs = {
+        "inference_scope": "dashboard_sample_batch",
+        "inference_num_dataloader_batches_seen": 1,
+        "inference_num_dataloader_batches_available": dataloader_len if dataloader_len is not None else -1,
         "x_clean_raw": outputs.get("x_clean_raw", outputs["x_clean"])[:8].detach().cpu(),
         "x_context_raw": outputs.get("x_context_raw", outputs["x_context"])[:8].detach().cpu(),
         "x_clean": outputs["x_clean"][:8].detach().cpu(),

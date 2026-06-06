@@ -7,25 +7,12 @@ import numpy as np
 import torch
 
 from src.dataset import JEPADataset
-from src.models.cdd_inspect import CDDOperatorFeatures2D
+from src.inference import _apply_tta_2d, _tta_views_2d
+from src.inference_from_session import TileLayout2D, _stitch_tile_tensor
 from src.models.symmetry import _crop_from_square, _pad_to_square
 
 
 class ReviewFixesTests(unittest.TestCase):
-    def test_cdd_stack_lognorm_preserves_positive_sign_below_one(self) -> None:
-        op = CDDOperatorFeatures2D(
-            features=("x",),
-            expect_3d_pyramid=False,
-            apply_lognorm=True,
-            lognorm_on_stack=True,
-            lognorm_mode="signed",
-        )
-        x = torch.full((1, 1, 4, 4), 1e-4)
-
-        stack = op(x)["stack"]
-
-        self.assertGreaterEqual(float(stack.min().item()), 0.0)
-
     def test_square_padding_is_symmetric_and_crops_back(self) -> None:
         x = torch.arange(8, dtype=torch.float32).reshape(1, 1, 2, 4)
 
@@ -57,6 +44,37 @@ class ReviewFixesTests(unittest.TestCase):
             (out,) = dataset._apply_augmentations(x)
 
         torch.testing.assert_close(out, torch.rot90(x, k=1, dims=(-2, -1)))
+
+    def test_tile_stitching_restores_full_image_canvas(self) -> None:
+        tiles = torch.zeros((4, 1, 4, 4), dtype=torch.float32)
+        tiles[0, 0, :4, :4] = 1.0
+        tiles[1, 0, :4, :2] = 2.0
+        tiles[2, 0, :2, :4] = 3.0
+        tiles[3, 0, :2, :2] = 4.0
+        layout = TileLayout2D(
+            original_shape=(6, 6),
+            crop_size=4,
+            origins=((0, 0), (0, 4), (4, 0), (4, 4)),
+            valid_shapes=((4, 4), (4, 2), (2, 4), (2, 2)),
+        )
+
+        stitched = _stitch_tile_tensor(tiles, layout)
+
+        self.assertEqual(tuple(stitched.shape), (1, 1, 6, 6))
+        self.assertEqual(float(stitched[0, 0, 0, 0]), 1.0)
+        self.assertEqual(float(stitched[0, 0, 0, 5]), 2.0)
+        self.assertEqual(float(stitched[0, 0, 5, 0]), 3.0)
+        self.assertEqual(float(stitched[0, 0, 5, 5]), 4.0)
+
+    def test_d4_tta_views_align_back_to_original_shape(self) -> None:
+        x = torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 4)
+
+        restored = [_apply_tta_2d(name, view) for name, view in _tta_views_2d(x, "d4")]
+
+        self.assertEqual(len(restored), 8)
+        for item in restored:
+            self.assertEqual(tuple(item.shape), tuple(x.shape))
+            torch.testing.assert_close(item, x)
 
 
 if __name__ == "__main__":

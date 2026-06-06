@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -43,6 +44,7 @@ from src.inference import (
     _save_npz,
     _tta_views_2d,
     _apply_tta_2d,
+    _average_maps,
 )
 from src.utils.viz import save_inference_dashboard
 
@@ -51,7 +53,7 @@ from src.utils.viz import save_inference_dashboard
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model_from_session(session_dir: str, device: torch.device):
+def load_model_from_session(session_dir: str, device: torch.device, *, strict_load: bool = True):
     """Reconstruct a PyramidGridJEPA model from a session directory.
 
     Returns (model, config, session_dir).
@@ -87,7 +89,7 @@ def load_model_from_session(session_dir: str, device: torch.device):
         raise FileNotFoundError(f"model_last.pt not found in {session_dir}")
 
     state = torch.load(model_ckpt, map_location=device)
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing, unexpected = model.load_state_dict(state, strict=strict_load)
     if missing:
         print(f"[inference] load_model missing_keys={missing}")
     if unexpected:
@@ -125,7 +127,7 @@ def _tile_crops_2d(
             padded = np.zeros((cs, cs), dtype=arr2d.dtype)
             padded[:h, :w] = arr2d
             return [padded]
-        return [arr2d.copy()]
+        return [np.asarray(arr2d, dtype=np.float32).copy()]
 
     tiles = []
     stride = max(1, cs // 2)  # 50% overlap
@@ -136,7 +138,7 @@ def _tile_crops_2d(
             tile = np.zeros((cs, cs), dtype=arr2d.dtype)
             th = y1 - y0
             tw = x1 - x0
-            tile[:th, :tw] = arr2d[y0:y1, x0:x1]
+            tile[:th, :tw] = np.asarray(arr2d[y0:y1, x0:x1], dtype=np.float32)
             tiles.append(tile)
 
     # If only one tile requested (center mode)
@@ -146,10 +148,90 @@ def _tile_crops_2d(
         tile = np.zeros((cs, cs), dtype=arr2d.dtype)
         th = min(cs, h - y0)
         tw = min(cs, w - x0)
-        tile[:th, :tw] = arr2d[y0 : y0 + th, x0 : x0 + tw]
+        tile[:th, :tw] = np.asarray(arr2d[y0 : y0 + th, x0 : x0 + tw], dtype=np.float32)
         return [tile]
 
     return tiles
+
+
+@dataclass(frozen=True)
+class TileLayout2D:
+    original_shape: tuple[int, int]
+    crop_size: int
+    origins: tuple[tuple[int, int], ...]
+    valid_shapes: tuple[tuple[int, int], ...]
+
+
+def _tile_crops_2d_with_layout(
+    arr2d: np.ndarray,
+    crop_size: int,
+    crop_mode: str = "center",
+) -> tuple[list[np.ndarray], TileLayout2D | None]:
+    h, w = arr2d.shape
+    cs = int(crop_size)
+    if h <= cs and w <= cs:
+        if h < cs or w < cs:
+            padded = np.zeros((cs, cs), dtype=arr2d.dtype)
+            padded[:h, :w] = arr2d
+            return [padded], TileLayout2D((h, w), cs, ((0, 0),), ((h, w),))
+        return [np.asarray(arr2d, dtype=np.float32).copy()], None
+
+    if crop_mode == "center":
+        y0 = max(0, (h - cs) // 2)
+        x0 = max(0, (w - cs) // 2)
+        tile = np.zeros((cs, cs), dtype=arr2d.dtype)
+        th = min(cs, h - y0)
+        tw = min(cs, w - x0)
+        tile[:th, :tw] = np.asarray(arr2d[y0 : y0 + th, x0 : x0 + tw], dtype=np.float32)
+        return [tile], None
+
+    tiles = []
+    origins = []
+    valid_shapes = []
+    stride = max(1, cs // 2)
+    for y0 in range(0, h, stride):
+        y1 = min(y0 + cs, h)
+        for x0 in range(0, w, stride):
+            x1 = min(x0 + cs, w)
+            tile = np.zeros((cs, cs), dtype=arr2d.dtype)
+            th = y1 - y0
+            tw = x1 - x0
+            tile[:th, :tw] = np.asarray(arr2d[y0:y1, x0:x1], dtype=np.float32)
+            tiles.append(tile)
+            origins.append((y0, x0))
+            valid_shapes.append((th, tw))
+    return tiles, TileLayout2D((h, w), cs, tuple(origins), tuple(valid_shapes))
+
+
+def _stitch_tile_tensor(value, layout: TileLayout2D | None):
+    if value is None or layout is None:
+        return value
+    tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
+    if tensor.dim() < 4 or int(tensor.shape[0]) != len(layout.origins):
+        return value
+    h, w = layout.original_shape
+    out_shape = (1, *tensor.shape[1:-2], h, w)
+    out = torch.zeros(out_shape, dtype=tensor.dtype, device=tensor.device)
+    counts = torch.zeros((1, *([1] * (tensor.dim() - 3)), h, w), dtype=tensor.dtype, device=tensor.device)
+    for idx, ((y0, x0), (th, tw)) in enumerate(zip(layout.origins, layout.valid_shapes)):
+        tile = tensor[idx : idx + 1, ..., :th, :tw]
+        out[..., y0 : y0 + th, x0 : x0 + tw] += tile
+        counts[..., y0 : y0 + th, x0 : x0 + tw] += 1
+    return out / counts.clamp_min(1)
+
+
+def _stitch_tiled_outputs(outputs: dict, layout: TileLayout2D | None) -> dict:
+    if layout is None:
+        return outputs
+    stitched = dict(outputs)
+    for key in ("pred_map", "gt_map", "context_map", "x_clean_raw", "x_context_raw"):
+        stitched[key] = _stitch_tile_tensor(stitched.get(key), layout)
+    stitched["tile_layout"] = {
+        "original_shape": list(layout.original_shape),
+        "crop_size": int(layout.crop_size),
+        "num_tiles": len(layout.origins),
+    }
+    return stitched
 
 
 def load_raw_data(
@@ -159,7 +241,8 @@ def load_raw_data(
     mode: str = "image",
     slice_axis: int = 0,
     slice_index: int | None = None,
-) -> torch.Tensor:
+    return_layout: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, TileLayout2D | None]:
     """Load an arbitrary .npy and return a B×1×H×W tensor (or B×1×D×H×W for 3D).
 
     Args:
@@ -174,7 +257,6 @@ def load_raw_data(
         Tensor B×1×H×W for image mode, B×1×D×H×W for 3D slab mode.
     """
     arr = np.load(input_path, mmap_mode="r")
-    arr = np.asarray(arr, dtype=np.float32)
     print(f"[inference] loaded {input_path} shape={arr.shape} dtype={arr.dtype}")
 
     mode_norm = str(mode).strip().lower()
@@ -191,7 +273,7 @@ def load_raw_data(
 
         slabs = []
         for idx in slices:
-            slab = np.take(arr, idx, axis=axis)
+            slab = np.asarray(np.take(arr, idx, axis=axis), dtype=np.float32)
             if crop_size and max(slab.shape) > crop_size:
                 tiles = _tile_crops_2d(slab, crop_size, crop_mode)
                 for tile in tiles:
@@ -199,7 +281,8 @@ def load_raw_data(
             else:
                 slabs.append(_normalize01(slab))
         tensor = np.stack(slabs, axis=0)  # B×H×W
-        return torch.from_numpy(tensor).unsqueeze(1)  # B×1×H×W
+        out = torch.from_numpy(tensor).unsqueeze(1)  # B×1×H×W
+        return (out, None) if return_layout else out
 
     # 2D image mode
     if arr.ndim == 3:
@@ -214,15 +297,15 @@ def load_raw_data(
                 "Use --mode 3d_slab for 3D volumes."
             )
 
-    arr = _normalize01(arr)
-
     if crop_size and max(arr.shape) > crop_size:
-        tiles = _tile_crops_2d(arr, crop_size, crop_mode)
+        tiles, layout = _tile_crops_2d_with_layout(arr, crop_size, crop_mode)
         tensor = np.stack([_normalize01(t) for t in tiles], axis=0)
     else:
-        tensor = arr[np.newaxis, ...]  # 1×H×W
+        layout = None
+        tensor = _normalize01(np.asarray(arr, dtype=np.float32))[np.newaxis, ...]  # 1×H×W
 
-    return torch.from_numpy(tensor).unsqueeze(1)  # B×1×H×W
+    out = torch.from_numpy(tensor).unsqueeze(1)  # B×1×H×W
+    return (out, layout) if return_layout else out
 
 
 # ---------------------------------------------------------------------------
@@ -312,49 +395,29 @@ def run_inference_on_data(
         if x_batch is not None:
             x_batch = x_batch.to(device, non_blocking=True)
 
-        # For scale-aware encoder, we need to prepare CDD fields + mask tokens
-        # Run with mask_inference=False → encoder sees the full CDD context
-        if x_batch is not None and x_batch.dim() == 4 and model.mode == "pyramid":
-            # Pyramid mode: construct CDD pyramid from x_batch
-            cdd_fields = cdd_batch  # Already precomputed
-            out = model(
-                x_batch,
-                mask_inference=False,
-                context_data=None,
-                cdd_orig=cdd_fields,
-            )
-        elif model.mode == "image":
-            out = model(
-                x_batch if x_batch is not None else cdd_batch,
-                mask_inference=False,
-            )
-        else:
-            # Generic fallback
-            out = model(
-                cdd_batch,
-                mask_inference=False,
-            )
+        x_in = x_batch if x_batch is not None else cdd_batch
+        cdd_fields = cdd_batch if (x_batch is not None and x_batch.dim() == 4 and model.mode == "pyramid") else None
+
+        def _forward_one(xv: torch.Tensor, cdv: torch.Tensor | None):
+            if cdv is not None and model.mode == "pyramid":
+                return model(xv, mask_inference=False, context_data=None, cdd_orig=cdv)
+            return model(xv, mask_inference=False)
 
         if inference_tta_enabled:
-            tta_results = []
-            for tta_name, tta_view in _tta_views_2d(
-                x_batch if x_batch is not None else cdd_batch, inference_tta_mode
-            ):
-                if tta_name == "id":
-                    _out = out
-                else:
-                    if model.mode == "pyramid" and x_batch is not None:
-                        _out = model(tta_view, mask_inference=False, context_data=None, cdd_orig=cdd_fields)
-                    else:
-                        _out = model(tta_view, mask_inference=False)
-                pm = _out.get("pred_map")
-                if pm is not None:
-                    pm = _apply_tta_2d(tta_name, pm)
-                tta_results.append(pm)
-            pred_map = torch.stack([p for p in tta_results if p is not None], dim=0).mean(dim=0)
+            per_view = []
+            for tta_name, tta_view in _tta_views_2d(x_in, inference_tta_mode):
+                cdv = _apply_tta_2d(tta_name, cdd_fields) if cdd_fields is not None else None
+                _out = _forward_one(tta_view, cdv)
+                for key in ("pred_map", "gt_map", "context_map"):
+                    if _out.get(key) is not None:
+                        _out[key] = _apply_tta_2d(tta_name, _out[key])
+                per_view.append(_out)
+            out = per_view[0]
+            out.update(_average_maps(per_view))
         else:
-            pred_map = out.get("pred_map")
+            out = _forward_one(x_in, cdd_fields)
 
+        pred_map = out.get("pred_map")
         gt_map = out.get("gt_map")
         context_map = out.get("context_map")
 
@@ -442,6 +505,8 @@ def save_inference_session(
         "pred_map_shape": list(outputs["pred_map"].shape) if outputs.get("pred_map") is not None else None,
         "gt_map_shape": list(outputs["gt_map"].shape) if outputs.get("gt_map") is not None else None,
     }
+    if outputs.get("tile_layout") is not None:
+        energy_summary["tile_layout"] = outputs["tile_layout"]
     with open(os.path.join(output_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
         json.dump(energy_summary, f, indent=2)
 
@@ -477,7 +542,9 @@ def _resolve_args(args, config_dict: dict | None) -> argparse.Namespace:
         "output_session": "output_session",
         "batch_size": "batch_size",
         "tta": "tta",
+        "tta_mode": "tta_mode",
         "device": "device",
+        "allow_partial_load": "allow_partial_load",
     }
 
     cli_defaults = {
@@ -491,7 +558,9 @@ def _resolve_args(args, config_dict: dict | None) -> argparse.Namespace:
         "output_session": None,
         "batch_size": 2,
         "tta": False,
+        "tta_mode": "flip4",
         "device": None,
+        "allow_partial_load": False,
     }
 
     for config_key, attr_name in key_map.items():
@@ -554,8 +623,14 @@ Examples:
     parser.add_argument("--slice-index", type=int, default=None, help="Specific slice index for 3D mode")
     parser.add_argument("--output-session", default=None, help="Output session directory")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size for inference")
-    parser.add_argument("--tta", action="store_true", help="Enable test-time augmentation (flip4)")
+    parser.add_argument("--tta", action="store_true", help="Enable test-time augmentation")
+    parser.add_argument("--tta-mode", default="flip4", choices=["flip4", "rot4", "d4"], help="TTA view set")
     parser.add_argument("--device", default=None, help="Override device (cuda, mps, cpu)")
+    parser.add_argument(
+        "--allow-partial-load",
+        action="store_true",
+        help="Allow missing/unexpected checkpoint keys instead of failing strict model loading.",
+    )
     args = parser.parse_args()
 
     # Load config file if provided, merge CLI overrides
@@ -586,20 +661,30 @@ Examples:
     print(f"[inference] device={device}")
 
     # Load model
-    model, config, source_session = load_model_from_session(args.session, device)
+    model, config, source_session = load_model_from_session(
+        args.session,
+        device,
+        strict_load=not bool(args.allow_partial_load),
+    )
     config["_source_session"] = source_session
     print(f"[inference] model loaded from {source_session}")
 
     # Load data
-    data_tensor = load_raw_data(
+    data_tensor, tile_layout = load_raw_data(
         args.input,
         crop_size=args.crop_size,
         crop_mode=args.crop_mode,
         mode=args.mode,
         slice_axis=args.slice_axis,
         slice_index=args.slice_index,
+        return_layout=True,
     )
     print(f"[inference] data shape={tuple(data_tensor.shape)}")
+    if tile_layout is not None:
+        print(
+            f"[inference] tiled input will be stitched: original_shape={tile_layout.original_shape} "
+            f"tiles={len(tile_layout.origins)} crop_size={tile_layout.crop_size}"
+        )
 
     # Build a simple DataLoader
     class _TensorDataset(torch.utils.data.Dataset):
@@ -628,8 +713,9 @@ Examples:
         loader,
         device,
         inference_tta_enabled=args.tta,
-        inference_tta_mode="flip4",
+        inference_tta_mode=args.tta_mode,
     )
+    outputs = _stitch_tiled_outputs(outputs, tile_layout)
     print(f"[inference] pred_map shape={tuple(outputs['pred_map'].shape) if outputs.get('pred_map') is not None else None}")
 
     # Save

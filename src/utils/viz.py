@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MAX_PCA_FIT_TOKENS = 10_000
 
 
 def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
@@ -40,7 +42,7 @@ def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
         out_html,
     ]
     env = os.environ.copy()
-    env.setdefault("MPLCONFIGDIR", "/private/tmp/mpl-cache")
+    env.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "mpl-cache"))
     try:
         subprocess.run(cmd, cwd=ROOT_DIR, env=env, check=True, text=True, capture_output=True)
     except Exception as e:
@@ -50,34 +52,48 @@ def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
 
 
 def _compute_pca_2d(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    fit_x = x
+    if x.shape[0] > MAX_PCA_FIT_TOKENS:
+        idx = np.linspace(0, x.shape[0] - 1, MAX_PCA_FIT_TOKENS, dtype=np.int64)
+        fit_x = x[idx]
     try:
         from sklearn.decomposition import PCA
 
-        return PCA(n_components=2).fit_transform(x)
+        pca = PCA(n_components=2).fit(fit_x)
+        return pca.transform(x).astype(np.float32)
     except Exception as e:
         print(f"[warning] sklearn PCA(2D) failed: {type(e).__name__}: {e}; falling back to torch.pca_lowrank")
-        x_t = torch.from_numpy(x.astype(np.float32))
-        x_t = x_t - x_t.mean(dim=0, keepdim=True)
-        u, s, _ = torch.pca_lowrank(x_t, q=2)
-        return (u[:, :2] * s[:2]).cpu().numpy()
+        fit_t = torch.from_numpy(fit_x.astype(np.float32))
+        mean = fit_t.mean(dim=0, keepdim=True)
+        fit_t = fit_t - mean
+        _u, _s, v = torch.pca_lowrank(fit_t, q=2)
+        x_t = torch.from_numpy(x.astype(np.float32)) - mean
+        return (x_t @ v[:, :2]).cpu().numpy().astype(np.float32)
 
 
 def _compute_pca_3d(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
-    x = x - x.mean(axis=0, keepdims=True)
+    fit_x = x
+    if x.shape[0] > MAX_PCA_FIT_TOKENS:
+        idx = np.linspace(0, x.shape[0] - 1, MAX_PCA_FIT_TOKENS, dtype=np.int64)
+        fit_x = x[idx]
+    mean = fit_x.mean(axis=0, keepdims=True)
+    fit_centered = fit_x - mean
     try:
         from sklearn.decomposition import PCA
 
-        return PCA(n_components=3).fit_transform(x)
+        pca = PCA(n_components=3).fit(fit_x)
+        return pca.transform(x).astype(np.float32)
     except Exception as e:
         print(f"[warning] sklearn PCA(3D) failed: {type(e).__name__}: {e}; falling back to numpy SVD")
         try:
-            u, s, _ = np.linalg.svd(x.astype(np.float64), full_matrices=False)
+            _, _, vt = np.linalg.svd(fit_centered.astype(np.float64), full_matrices=False)
         except np.linalg.LinAlgError:
-            x_jitter = x.astype(np.float64) + np.eye(x.shape[0], x.shape[1]) * 1e-5
-            u, s, _ = np.linalg.svd(x_jitter, full_matrices=False)
-        z = (u[:, :3] * s[:3]).astype(np.float32)
-        return z
+            fit_jitter = fit_centered.astype(np.float64) + np.eye(fit_centered.shape[0], fit_centered.shape[1]) * 1e-5
+            _, _, vt = np.linalg.svd(fit_jitter, full_matrices=False)
+        comps = vt[:3].T.astype(np.float32)
+        return ((x - mean) @ comps).astype(np.float32)
 
 
 def _preprocess_latents_for_umap(x: np.ndarray, l2_normalize: bool = False, standardize: bool = False) -> np.ndarray:

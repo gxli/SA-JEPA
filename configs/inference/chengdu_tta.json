@@ -7,5 +7,6 @@
   "mode": "image",
   "batch_size": 2,
   "tta": true,
+  "tta_mode": "d4",
   "device": null
 }

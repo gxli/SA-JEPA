@@ -65,6 +65,8 @@ def _reshape_patch_pairs(
     for s in spatial_shape:
         spatial_n *= int(s)
     mode = str(spatial_mode).lower()
+    if mode not in ("dense", "pooled"):
+        raise ValueError(f"Unsupported spatial_mode={spatial_mode}. Use 'dense' or 'pooled'.")
     if mode == "pooled":
         reduce_dims = tuple(range(3, pred.dim()))
         pred_v = pred.mean(dim=reduce_dims)
@@ -84,17 +86,6 @@ def _reshape_patch_pairs(
     z1 = pred_v.reshape(-1, c)[vm]
     z2 = gt_v.reshape(-1, c)[vm]
     return z1, z2
-
-
-def _flatten_vicreg_samples(
-    pred: torch.Tensor,
-    gt: torch.Tensor,
-    valid: torch.Tensor,
-    spatial_mode: str = "dense",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if spatial_mode not in ("dense", "pooled"):
-        raise ValueError(f"Unsupported spatial_mode={spatial_mode}. Use 'dense' or 'pooled'.")
-    return _reshape_patch_pairs(pred, gt, valid, spatial_mode=spatial_mode)
 
 
 def extract_valid_pooled_embeddings(outputs: dict, key: str = "context_patches") -> torch.Tensor:
@@ -260,8 +251,8 @@ def _compute_sim_var_cov_tensors(
     gt = outputs["gt_patches"].float()  # keep graph (target branch already no-grad in forward)
     valid = outputs["target_valid"]
 
-    z_pred, z_gt = _flatten_vicreg_samples(pred, gt, valid, spatial_mode=spatial_mode)
-    z_ctx, _ = _flatten_vicreg_samples(ctx, gt, valid, spatial_mode=spatial_mode)
+    z_pred, z_gt = _reshape_patch_pairs(pred, gt, valid, spatial_mode=spatial_mode)
+    z_ctx, _ = _reshape_patch_pairs(ctx, gt, valid, spatial_mode=spatial_mode)
     if z_pred.numel() == 0 or z_gt.numel() == 0:
         z = pred.sum() * 0.0
         return z, z, z

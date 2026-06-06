@@ -16,7 +16,7 @@
   },
   "model": {
     "mode": "pyramid",
-    "model_key": "cdd_scaleaware_convnext",
+    "model_key": "convnext_dense_pyramid",
     "sigmas": [
       2,
       4,
