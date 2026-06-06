@@ -457,7 +457,12 @@ def run_post_training_inference(
                 cy = int(tloc[bi, ki, 0].item())
                 cx = int(tloc[bi, ki, 1].item())
                 if 0 <= cy < h and 0 <= cx < w:
-                    tmap[bi, 0, cy, cx] = 1.0
+                    # 3×3 cross so targets are visible when downscaled
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            yy, xx = cy + dy, cx + dx
+                            if 0 <= yy < h and 0 <= xx < w:
+                                tmap[bi, 0, yy, xx] = 1.0
     inference_outputs["target_map"] = tmap
     torch.save(inference_outputs, inference_outputs_path)
     print(f"[{config_name}] saved inference_outputs.pt")

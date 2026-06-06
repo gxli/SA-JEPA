@@ -134,16 +134,18 @@ class PyramidGridJEPA3D(nn.Module):
 
         y0 = torch.randint(0, y_lim, (batch_size, n_box), device=device)
         x0 = torch.randint(0, x_lim, (batch_size, n_box), device=device)
-        # Move once to host to avoid repeated GPU->CPU scalar sync in Python loops.
+        # Build mask on CPU to avoid per-slice CUDA kernel launches
         z0_cpu = z0.detach().to("cpu").numpy()
         y0_cpu = y0.detach().to("cpu").numpy()
         x0_cpu = x0.detach().to("cpu").numpy()
+        mask_cpu = mask.detach().to("cpu").numpy()
         for b in range(batch_size):
             for j in range(n_box):
                 zz = int(z0_cpu[b, j])
                 yy = int(y0_cpu[b, j])
                 xx = int(x0_cpu[b, j])
-                mask[b, 0, zz : zz + box, yy : yy + box, xx : xx + box] = 1.0
+                mask_cpu[b, 0, zz : zz + box, yy : yy + box, xx : xx + box] = 1.0
+        mask.copy_(torch.from_numpy(mask_cpu).to(device=mask.device))
         return mask
 
     def _center_slab_start_index(self, batch_size: int, depth: int, device) -> tuple[torch.Tensor, int]:

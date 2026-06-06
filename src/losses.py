@@ -324,7 +324,7 @@ def representation_dense_energy(pred_map: torch.Tensor, gt_map: torch.Tensor, ep
     rel_gt = diff2.sum(dim=1, keepdim=True) / gt_norm2.clamp_min(eps)
     rel_sym = diff2.sum(dim=1, keepdim=True) / (0.5 * (gt_norm2 + pred_norm2)).clamp_min(eps)
 
-    cos = 1.0 - F.cosine_similarity(pred_map, gt_map, dim=1, eps=eps).unsqueeze(1)
+    cos = (1.0 - F.cosine_similarity(pred_map, gt_map, dim=1, eps=eps).unsqueeze(1)).clamp_min(0.0)
 
     return {
         "energy_raw": raw,

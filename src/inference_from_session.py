@@ -124,8 +124,8 @@ def _tile_crops_2d(
     if h <= cs and w <= cs:
         # No tiling needed — return the whole thing (possibly padded)
         if h < cs or w < cs:
-            padded = np.zeros((cs, cs), dtype=arr2d.dtype)
-            padded[:h, :w] = arr2d
+            padded = np.zeros((cs, cs), dtype=np.float32)
+            padded[:h, :w] = np.asarray(arr2d, dtype=np.float32)
             return [padded]
         return [np.asarray(arr2d, dtype=np.float32).copy()]
 
@@ -135,7 +135,7 @@ def _tile_crops_2d(
         y1 = min(y0 + cs, h)
         for x0 in range(0, w, stride):
             x1 = min(x0 + cs, w)
-            tile = np.zeros((cs, cs), dtype=arr2d.dtype)
+            tile = np.zeros((cs, cs), dtype=np.float32)
             th = y1 - y0
             tw = x1 - x0
             tile[:th, :tw] = np.asarray(arr2d[y0:y1, x0:x1], dtype=np.float32)
@@ -145,7 +145,7 @@ def _tile_crops_2d(
     if crop_mode == "center" and len(tiles) > 1:
         y0 = max(0, (h - cs) // 2)
         x0 = max(0, (w - cs) // 2)
-        tile = np.zeros((cs, cs), dtype=arr2d.dtype)
+        tile = np.zeros((cs, cs), dtype=np.float32)
         th = min(cs, h - y0)
         tw = min(cs, w - x0)
         tile[:th, :tw] = np.asarray(arr2d[y0 : y0 + th, x0 : x0 + tw], dtype=np.float32)
@@ -171,15 +171,15 @@ def _tile_crops_2d_with_layout(
     cs = int(crop_size)
     if h <= cs and w <= cs:
         if h < cs or w < cs:
-            padded = np.zeros((cs, cs), dtype=arr2d.dtype)
-            padded[:h, :w] = arr2d
+            padded = np.zeros((cs, cs), dtype=np.float32)
+            padded[:h, :w] = np.asarray(arr2d, dtype=np.float32)
             return [padded], TileLayout2D((h, w), cs, ((0, 0),), ((h, w),))
         return [np.asarray(arr2d, dtype=np.float32).copy()], None
 
     if crop_mode == "center":
         y0 = max(0, (h - cs) // 2)
         x0 = max(0, (w - cs) // 2)
-        tile = np.zeros((cs, cs), dtype=arr2d.dtype)
+        tile = np.zeros((cs, cs), dtype=np.float32)
         th = min(cs, h - y0)
         tw = min(cs, w - x0)
         tile[:th, :tw] = np.asarray(arr2d[y0 : y0 + th, x0 : x0 + tw], dtype=np.float32)
@@ -193,7 +193,7 @@ def _tile_crops_2d_with_layout(
         y1 = min(y0 + cs, h)
         for x0 in range(0, w, stride):
             x1 = min(x0 + cs, w)
-            tile = np.zeros((cs, cs), dtype=arr2d.dtype)
+            tile = np.zeros((cs, cs), dtype=np.float32)
             th = y1 - y0
             tw = x1 - x0
             tile[:th, :tw] = np.asarray(arr2d[y0:y1, x0:x1], dtype=np.float32)
@@ -211,10 +211,11 @@ def _stitch_tile_tensor(value, layout: TileLayout2D | None):
         return value
     h, w = layout.original_shape
     out_shape = (1, *tensor.shape[1:-2], h, w)
-    out = torch.zeros(out_shape, dtype=tensor.dtype, device=tensor.device)
-    counts = torch.zeros((1, *([1] * (tensor.dim() - 3)), h, w), dtype=tensor.dtype, device=tensor.device)
+    # Accumulate on CPU to avoid GPU OOM on large images (e.g. 10k×10k)
+    out = torch.zeros(out_shape, dtype=tensor.dtype, device="cpu")
+    counts = torch.zeros((1, *([1] * (tensor.dim() - 3)), h, w), dtype=tensor.dtype, device="cpu")
     for idx, ((y0, x0), (th, tw)) in enumerate(zip(layout.origins, layout.valid_shapes)):
-        tile = tensor[idx : idx + 1, ..., :th, :tw]
+        tile = tensor[idx : idx + 1, ..., :th, :tw].cpu()
         out[..., y0 : y0 + th, x0 : x0 + tw] += tile
         counts[..., y0 : y0 + th, x0 : x0 + tw] += 1
     return out / counts.clamp_min(1)

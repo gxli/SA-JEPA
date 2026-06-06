@@ -485,6 +485,7 @@ def _target_patch_has_valid_input(
     cy: int,
     cx: int,
     inner_target_size: int,
+    nan_mask: np.ndarray | None = None,
 ) -> bool:
     patch_half_lo = int(inner_target_size) // 2
     patch_half_hi = int(inner_target_size) - patch_half_lo
@@ -501,9 +502,13 @@ def _target_patch_has_valid_input(
     invalid_mask = np.zeros_like(patch, dtype=bool)
     if sample_invalid_mask is not None:
         invalid_mask |= sample_invalid_mask[py0:py1, px0:px1]
+    # Precomputed NaN mask avoids per-patch isnan() calls
+    if nan_mask is not None and "nan" in (str(s).lower() for s in invalid_value_specs if isinstance(s, str)):
+        invalid_mask |= nan_mask[py0:py1, px0:px1]
     for spec in invalid_value_specs:
         if isinstance(spec, str) and spec.lower() == "nan":
-            invalid_mask |= np.isnan(patch)
+            if nan_mask is None:
+                invalid_mask |= np.isnan(patch)
         else:
             try:
                 invalid_mask |= np.isclose(patch, float(spec), equal_nan=False)
@@ -612,6 +617,7 @@ def make_pyramid_grid_context(
     for bi in range(b):
         arr = x_clean[bi, 0].cpu().numpy().copy()
         sample_invalid_mask = invalid_pixel_mask[bi, 0].cpu().numpy() if invalid_pixel_mask is not None else None
+        nan_mask = np.isnan(arr)
         priority_good_candidates_bi = 0.0
         priority_nonzero_mean_bi = 1.0
         priority_prescreen_candidates_bi = 0.0
@@ -777,9 +783,9 @@ def make_pyramid_grid_context(
                             arr=arr,
                             sample_invalid_mask=sample_invalid_mask,
                             invalid_value_specs=invalid_value_specs,
-                            cy=int(cy),
-                            cx=int(cx),
+                            cy=int(cy), cx=int(cx),
                             inner_target_size=inner_target_size,
+                            nan_mask=nan_mask,
                         ):
                             continue
                         good_candidates.append((int(cy), int(cx)))
@@ -1022,9 +1028,9 @@ def make_pyramid_grid_context(
                         arr=arr,
                         sample_invalid_mask=sample_invalid_mask,
                         invalid_value_specs=invalid_value_specs,
-                        cy=iy,
-                        cx=ix,
+                        cy=iy, cx=ix,
                         inner_target_size=inner_target_size,
+                        nan_mask=nan_mask,
                     ):
                         continue
                 sample_locations.append((iy, ix))
@@ -1139,7 +1145,7 @@ def prepare_context_batch(
     cdd_constrained: bool = True,
     cdd_sm_mode: str = "reflect",
     cdd_append_last_residual: bool = True,
-    patch_size: int = 2,
+    patch_size: int = 3,
     return_debug: bool = False,
     enable_grid_jitter: bool = True,
     enable_target_dithering: bool = True,

@@ -888,13 +888,21 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     # DDP: wrap model for multi-GPU
     ddp_find_unused_parameters = bool(train_cfg.get("ddp_find_unused_parameters", True))
-    model_without_ddp = model
-    if is_ddp:
-        ddp_kwargs = dict(find_unused_parameters=ddp_find_unused_parameters)
-        if device.type == "cuda":
-            ddp_kwargs.update(device_ids=[local_rank], output_device=local_rank)
-        model = DDP(model, **ddp_kwargs)
-        model_without_ddp = model.module
+    ddp_kwargs = dict(find_unused_parameters=ddp_find_unused_parameters)
+    if device.type == "cuda":
+        ddp_kwargs.update(device_ids=[local_rank], output_device=local_rank)
+
+    def _ddp_wrap(m):
+        nonlocal model_without_ddp
+        model_without_ddp = m
+        if is_ddp:
+            wrapped = DDP(m, **ddp_kwargs)
+            model_without_ddp = wrapped.module
+            return wrapped
+        return m
+
+    model = _ddp_wrap(model)
+    model_without_ddp = model.module if is_ddp else model
     allow_partial_resume = bool(train_cfg.get("allow_partial_resume", False))
     resume_mismatch_action = str(train_cfg.get("resume_mismatch_action", "skip")).lower()
     if resume_mismatch_action not in ("skip", "error"):
@@ -922,7 +930,25 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             except RuntimeError as e:
                 # Common during architecture evolution (e.g. channel-count changes).
                 log_error("resume_model_load_state_dict", e)
-                missing, unexpected = ["__load_state_dict_failed__"], []
+                if not allow_partial_resume:
+                    raise RuntimeError(
+                        "Checkpoint model-state load failed. "
+                        "Set train.allow_partial_resume=true only if this architecture change is intentional."
+                    ) from e
+                print(
+                    f"[{config_name}] warning: resume checkpoint model-state load failed; "
+                    "skipping checkpoint and starting fresh model/optimizer/scaler."
+                )
+                resume_state = None
+                start_epoch = 0
+                model = (
+                    build_model3d_from_config(model_cfg, train_cfg, device)
+                    if is_3d_mode
+                    else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
+                )
+                model_without_ddp = model
+                model = _ddp_wrap(model)
+                missing, unexpected = [], []
             print(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
             if missing:
                 print(f"[{config_name}] resume_model missing_keys_list={missing}")
@@ -956,19 +982,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     if is_3d_mode
                     else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
                 )
-                # Re-wrap in DDP if needed
-                model_without_ddp = model
-                if is_ddp:
-                    ddp_kwargs = dict(find_unused_parameters=ddp_find_unused_parameters)
-                    if device.type == "cuda":
-                        ddp_kwargs.update(device_ids=[local_rank], output_device=local_rank)
-                    model = DDP(model, **ddp_kwargs)
-                    model_without_ddp = model.module
+                model = _ddp_wrap(model)
                 print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
             start_epoch = int(resume_state.get("epoch", 0))
             print(f"resume_checkpoint={resume_ckpt_path} start_epoch={start_epoch}")
     elif resume_from_existing:
+        resume_model_ignored = False
         try:
             missing, unexpected = model.load_state_dict(
                 torch.load(model_ckpt_path, map_location=device),
@@ -977,7 +997,23 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         except RuntimeError as e:
             # Common during architecture evolution (e.g. channel-count changes).
             log_error("resume_model_load_state_dict", e)
-            missing, unexpected = ["__load_state_dict_failed__"], []
+            if not allow_partial_resume:
+                raise RuntimeError(
+                    "Model checkpoint load failed. "
+                    "Set train.allow_partial_resume=true only if this architecture change is intentional."
+                ) from e
+            print(
+                f"[{config_name}] warning: model checkpoint load failed; "
+                "ignoring model_last and starting fresh model/optimizer/scaler."
+            )
+            model = (
+                build_model3d_from_config(model_cfg, train_cfg, device)
+                if is_3d_mode
+                else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
+            )
+            model = _ddp_wrap(model)
+            missing, unexpected = [], []
+            resume_model_ignored = True
         print(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
         if missing:
             print(f"[{config_name}] resume_model missing_keys_list={missing}")
@@ -1004,18 +1040,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 if is_3d_mode
                 else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
             )
-            model_without_ddp = model
-            if is_ddp:
-                model = DDP(
-                    model,
-                    device_ids=[local_rank],
-                    output_device=local_rank,
-                    find_unused_parameters=ddp_find_unused_parameters,
-                )
-                model_without_ddp = model.module
+            model = _ddp_wrap(model)
             print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
         else:
-            print(f"resume_model={model_ckpt_path}")
+            if not resume_model_ignored:
+                print(f"resume_model={model_ckpt_path}")
 
     scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
     def _param_max(value_key: str, default: float) -> float:
@@ -1077,14 +1106,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
 
     # --- Pre-compute CDD once on GPU, store in CPU RAM ---
-    # Only pyramid encoders consume CDD fields. Image-mode mask-token runs use
-    # the raw image plus a binary mask channel and should not allocate a CDD cache.
+    # All 2D modes require CDD: pyramid encoders need it for scale-aware features,
+    # image-mode mask-token runs need it for priority sampling and context masking.
     cdd_cache = _precompute_cdd_cache(
         data_cfg=data_cfg,
         model_cfg=model_cfg,
         device=device,
         config_name=config_name,
-    ) if (not is_3d_mode and str(model_cfg.get("mode", "image")).lower() == "pyramid") else None
+    ) if not is_3d_mode else None
     _write_cdd_cache_profile(cdd_cache=cdd_cache, session_dir=session_dir, config_name=config_name)
 
     if is_3d_mode:
