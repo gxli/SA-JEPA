@@ -33,6 +33,11 @@ def main():
         cfg["train"]["compute_effective_rank"] = True
         cfg["train"]["force_recompute_inference"] = bool(args.recompute_inference)
         config = cfg
+    elif args.recompute_inference:
+        cfg = copy.deepcopy(config)
+        cfg.setdefault("train", {})
+        cfg["train"]["force_recompute_inference"] = True
+        config = cfg
     session_dir = run_training(config, config_name=config_name, sessions_root=args.sessions_dir)
     print(f"session_saved={session_dir}")
 

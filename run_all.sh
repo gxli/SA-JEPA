@@ -7,14 +7,12 @@ SESSIONS_DIR="${SESSIONS_DIR:-${ROOT_DIR}/sessions}"
 FORCE_REINFERENCE="${FORCE_REINFERENCE:-0}"
 CONFIG_GLOB="${CONFIG_GLOB:-experiments/*.json}"
 CONFIG_SEARCH_ROOT="${CONFIG_SEARCH_ROOT:-${CONFIG_DIR}}"
-OVERRIDE_DIR="${ROOT_DIR}/.run_all_overrides"
+FAIL_LOG="${SESSIONS_DIR}/.run_all_failures.log"
 
 mkdir -p "${SESSIONS_DIR}"
-mkdir -p "${OVERRIDE_DIR}"
 
 mapfile -t configs < <(find "${CONFIG_SEARCH_ROOT}" -type f -path "${CONFIG_SEARCH_ROOT}/${CONFIG_GLOB}" | sort)
 if [[ ${#configs[@]} -eq 0 && "${CONFIG_GLOB}" == "experiments/*.json" ]]; then
-  # Backward-compat for legacy misspelled folder name.
   mapfile -t configs < <(find "${CONFIG_SEARCH_ROOT}" -type f -path "${CONFIG_SEARCH_ROOT}/exeriments/*.json" | sort)
 fi
 if [[ ${#configs[@]} -eq 0 ]]; then
@@ -24,25 +22,19 @@ if [[ ${#configs[@]} -eq 0 ]]; then
   exit 1
 fi
 
-for cfg in "${configs[@]}"; do
-  printf "\nRunning config: %s\n" "${cfg}"
-  config_name="$(basename "${cfg}")"
-  config_name="${config_name%.json}"
-  session_dir="${SESSIONS_DIR}/${config_name}"
-  model_ckpt="${session_dir}/model_last.pt"
-  inference_pt="${session_dir}/inference_outputs.pt"
-  epoch_summary_csv="${session_dir}/epoch_summary.csv"
+echo "Found ${#configs[@]} config(s).  Sessions dir: ${SESSIONS_DIR}"
+> "${FAIL_LOG}"
 
-  # Skip as early as possible, but only when training actually completed.
-  # Require:
-  #  1) model checkpoint exists
-  #  2) inference outputs exist
-  #  3) epoch_summary indicates max(epoch) >= configured train.epochs
-  if [[ "${FORCE_REINFERENCE}" != "1" && -f "${model_ckpt}" && -f "${inference_pt}" && -f "${epoch_summary_csv}" ]]; then
-    skip_ok="$(
-      python3 - "${cfg}" "${epoch_summary_csv}" <<'PY'
-import csv, json, sys
-import os
+total=${#configs[@]}
+skipped=0
+failed=0
+ok=0
+
+# ── helper: check if a config's training is already complete ───────────
+_check_complete() {
+  local cfg_path="$1" epoch_csv="$2"
+  python3 - "$cfg_path" "$epoch_csv" 2>/dev/null <<'PY'
+import csv, json, sys, os
 
 cfg_path, epoch_csv = os.path.abspath(sys.argv[1]), sys.argv[2]
 
@@ -95,42 +87,64 @@ except Exception:
     raise SystemExit(0)
 print("1" if max_epoch >= target_epochs else "0")
 PY
-    )"
-    if [[ "${skip_ok}" == "1" ]]; then
-      echo "skip_complete_session config=${config_name} reason=epochs_and_inference_complete"
-      continue
-    else
-      echo "resume_session config=${config_name} reason=incomplete_epochs_or_missing_summary"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+for cfg in "${configs[@]}"; do
+  config_name="$(basename "${cfg}")"
+  config_name="${config_name%.json}"
+  printf '\n━━━ [%s] ━━━\n' "${config_name}"
+
+  session_dir="${SESSIONS_DIR}/${config_name}"
+
+  # ── skip if already complete ────────────────────────────────────
+  skip_ok="0"
+  if [[ "${FORCE_REINFERENCE}" != "1" ]]; then
+    model_ckpt="${session_dir}/model_last.pt"
+    inference_pt="${session_dir}/inference_outputs.pt"
+    epoch_summary_csv="${session_dir}/epoch_summary.csv"
+    if [[ -f "${model_ckpt}" && -f "${inference_pt}" && -f "${epoch_summary_csv}" ]]; then
+      skip_ok="$(_check_complete "${cfg}" "${epoch_summary_csv}" || echo "0")"
     fi
   fi
 
-  # Use a stable override path so config_name (derived from basename) stays
-  # identical to the original config and sessions resume correctly.
-  tmp_cfg="${OVERRIDE_DIR}/$(basename "${cfg}")"
-  python3 - "${cfg}" "${tmp_cfg}" "${FORCE_REINFERENCE}" <<'PY'
-import json
-import os
-import sys
+  if [[ "${skip_ok}" == "1" ]]; then
+    echo "  SKIP  (epochs complete + inference exists)"
+    ((skipped++)) || true
+    continue
+  fi
 
-src, dst, force_flag = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(src, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-# Preserve base-config inheritance when writing to override dir by
-# converting relative base_config paths to absolute paths.
-base_ref = cfg.get("base_config")
-if isinstance(base_ref, str) and base_ref:
-    if not os.path.isabs(base_ref):
-        cfg["base_config"] = os.path.abspath(os.path.join(os.path.dirname(src), base_ref))
-train = cfg.setdefault("train", {})
-train["force_recompute_inference"] = bool(int(force_flag))
-os.makedirs(os.path.dirname(dst), exist_ok=True)
-with open(dst, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2)
-    f.write("\n")
-PY
-  python3 "${ROOT_DIR}/main.py" --config "${tmp_cfg}" --sessions-dir "${SESSIONS_DIR}"
+  # ── run main.py (isolated — failure does NOT kill the loop) ─────
+  run_args=(python3 "${ROOT_DIR}/main.py" --config "${cfg}" --sessions-dir "${SESSIONS_DIR}")
+  if [[ "${FORCE_REINFERENCE}" == "1" ]]; then
+    run_args+=(--recompute-inference)
+  fi
+  echo "  RUN   ${run_args[*]}"
+  if "${run_args[@]}"; then
+    echo "  OK    ${config_name}"
+    ((ok++)) || true
+  else
+    rc=$?
+    echo "  FAIL  ${config_name}  (exit code ${rc})" >&2
+    echo "[$(date -Iseconds)] ${config_name}: main.py exit ${rc}" >> "${FAIL_LOG}"
+    ((failed++)) || true
+  fi
 done
 
-echo "All sessions complete."
+# ── summary ────────────────────────────────────────────────────────────
+echo
+echo "═══════════════════════════════════════════════════════════════"
+echo "  total:   ${total}"
+echo "  ok:      ${ok}"
+echo "  skipped: ${skipped}"
+echo "  failed:  ${failed}"
+if [[ "${failed}" -gt 0 ]]; then
+  echo "  failures logged → ${FAIL_LOG}"
+fi
+echo "═══════════════════════════════════════════════════════════════"
 echo "Post-training inference artifacts are saved in each session directory."
 echo "Use ./session_to_dash.sh to build dashboards into results/dashboard."
+
+if [[ "${failed}" -gt 0 ]]; then
+  exit 1
+fi

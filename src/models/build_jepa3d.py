@@ -14,6 +14,15 @@ from .predictor3d import FullResPredictor3D
 from .symmetry import symmetric_forward_3d
 
 
+def compute_3d_encoder_receptive_field_depth(encoder_depth: int = 3, encoder_kernel_size: int = 5) -> int:
+    """Depth receptive field for the same-padded 3D encoder path.
+
+    The 3D encoders use two 3x3x3 stem convolutions, then `encoder_depth`
+    ConvNeXt depthwise convolutions with `encoder_kernel_size`.
+    """
+    return 1 + 2 * (3 - 1) + max(0, int(encoder_depth)) * (int(encoder_kernel_size) - 1)
+
+
 class PyramidGridJEPA3D(nn.Module):
     def __init__(
         self,
@@ -36,6 +45,7 @@ class PyramidGridJEPA3D(nn.Module):
         use_film: bool = True,
         use_per_scale_adapters: bool = False,
         priority_candidate_oversample: float = 3.0,
+        encoder_receptive_field_depth: int | None = None,
     ):
         super().__init__()
         self.patch_size = int(patch_size)
@@ -48,6 +58,12 @@ class PyramidGridJEPA3D(nn.Module):
         self.num_mask_boxes = int(num_mask_boxes)
         self.mode = "3d_slab"
         self.slab_depth = max(self.patch_size, int(slab_depth))
+        self.encoder_receptive_field_depth = int(
+            encoder_receptive_field_depth
+            if encoder_receptive_field_depth is not None
+            else compute_3d_encoder_receptive_field_depth(encoder_depth, encoder_kernel_size)
+        )
+        self.required_input_depth = int(self.encoder_receptive_field_depth + self.slab_depth - 1)
         self.use_symmetric_feature_loss = bool(use_symmetric_feature_loss)
         self.use_film = bool(use_film)
         self.use_per_scale_adapters = bool(use_per_scale_adapters)
@@ -151,6 +167,12 @@ class PyramidGridJEPA3D(nn.Module):
         b, _, _, _, _ = x_clean.shape
         fields = self.make_fields(x_clean)
         _, _, d, h, w = fields.shape
+        if d < int(self.required_input_depth):
+            raise ValueError(
+                "3d_slab input depth is too small for the configured encoder/target geometry: "
+                f"got {d}, required at least {self.required_input_depth} "
+                f"(encoder_rf={self.encoder_receptive_field_depth}, target_slab_depth={self.slab_depth})"
+            )
 
         slab_starts, slab_depth = self._center_slab_start_index(batch_size=b, depth=d, device=x_clean.device)
 
@@ -232,11 +254,17 @@ class PyramidGridJEPA3D(nn.Module):
             "pred_map": pred_map,
             "gt_map": gt_map,
             "gt_map_3d": gt_map_3d,
-            "x_clean": x_clean,
-            "x_context": fields_context,
+            "x_clean": self._gather_slabs(x_clean, slab_starts, slab_depth),
+            "x_clean_full": x_clean,
+            "x_context": self._gather_slabs(fields_context, slab_starts, slab_depth),
+            "x_context_full": fields_context,
             "mask_cube": box_mask,
             "selected_slab_start_index": slab_starts,
             "selected_slab_depth": torch.full((b,), int(slab_depth), device=x_clean.device, dtype=torch.long),
+            "encoder_receptive_field_depth": torch.full((b,), int(self.encoder_receptive_field_depth), device=x_clean.device, dtype=torch.long),
+            "required_input_depth": torch.full((b,), int(self.required_input_depth), device=x_clean.device, dtype=torch.long),
+            "mask_footprint_px": torch.tensor(float(self.mask_box_size), device=x_clean.device, dtype=x_clean.dtype),
+            "mask_scale_factor": torch.tensor(1.0, device=x_clean.device, dtype=x_clean.dtype),
         }
         if symmetric_var is not None:
             out["symmetric_var"] = symmetric_var

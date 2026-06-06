@@ -10,6 +10,11 @@ try:
 except ImportError:
     h5py = None
 
+try:
+    from astropy.io import fits  # optional — FITS file support
+except ImportError:
+    fits = None
+
 
 class JEPADataset(Dataset):
     def __init__(
@@ -61,6 +66,7 @@ class JEPADataset(Dataset):
         self.crop_min_valid_fraction = float(crop_min_valid_fraction) if crop_min_valid_fraction is not None else 0.0
 
         pattern = os.path.join(data_root, npy_pattern)
+        self.pattern = pattern
         self.npy_files = sorted(glob.glob(pattern))
 
         # Also scan for .h5 files (preferred for fast random-access slicing)
@@ -69,8 +75,9 @@ class JEPADataset(Dataset):
         if self.h5_files:
             print(f"[dataset] Found {len(self.h5_files)} .h5 file(s); using chunked HDF5 for fast I/O")
 
+        self.fits_files = []
         if not self.npy_files and not self.h5_files:
-            raise FileNotFoundError(f"No .npy or .h5 files found with pattern: {pattern}")
+            raise FileNotFoundError(f"No .npy, .h5, or .fits files found with pattern: {pattern}")
         self.sample_index = self._build_sample_index()
         if self.num_samples is None:
             self.num_samples = len(self.sample_index)
@@ -96,6 +103,10 @@ class JEPADataset(Dataset):
                 raise ImportError("h5py is required to read .h5 files; pip install h5py")
             with h5py.File(path, "r") as f:
                 return tuple(f["data"].shape)
+        if path.endswith(".fits"):
+            if fits is None:
+                raise ImportError("astropy is required to read .fits files; pip install astropy")
+            return fits.getdata(path, memmap=True).shape
         arr = np.load(path, mmap_mode="r")
         return arr.shape
 
@@ -103,8 +114,18 @@ class JEPADataset(Dataset):
     def _is_h5(path: str) -> bool:
         return path.endswith(".h5")
 
+    @staticmethod
+    def _is_fits(path: str) -> bool:
+        return path.endswith(".fits")
+
     def _build_sample_index(self):
-        all_files = list(self.npy_files) + list(self.h5_files)
+        # Also scan for .fits files
+        fits_pattern = self.pattern.replace(".npy", ".fits") if self.pattern.endswith(".npy") else os.path.join(os.path.dirname(self.pattern), "*.fits")
+        self.fits_files = sorted(glob.glob(fits_pattern)) if fits is not None else []
+        if self.fits_files:
+            print(f"[dataset] Found {len(self.fits_files)} .fits file(s)")
+
+        all_files = list(self.npy_files) + list(self.h5_files) + list(self.fits_files)
         index = []
         for path in all_files:
             shape = self._probe_file_shape(path)
@@ -204,6 +225,11 @@ class JEPADataset(Dataset):
                 ds = h5_file["data"]
                 arr2d, _ = self._extract_2d_from_array(ds, forced_slice_idx=forced_slice_idx)
                 arr2d = np.asarray(arr2d, dtype=np.float32)
+        elif self._is_fits(path):
+            if fits is None:
+                raise ImportError("astropy is required to read .fits files; pip install astropy")
+            arr_mm = fits.getdata(path, memmap=True)
+            arr2d, _ = self._extract_2d_from_array(arr_mm, forced_slice_idx=forced_slice_idx)
         else:
             arr_mm = np.load(path, mmap_mode="r")
             arr2d, _ = self._extract_2d_from_array(arr_mm, forced_slice_idx=forced_slice_idx)

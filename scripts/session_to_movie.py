@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 
 import matplotlib
 matplotlib.use("Agg")  # headless — no display required
@@ -515,7 +516,7 @@ def main():
         np.savez_compressed(umap_cache, pred_umap=np.stack(all_pred_umap, axis=0), gt_umap=np.stack(all_gt_umap, axis=0))
         print(f"[session_to_movie] PCA/UMAP cache saved to {cache_dir}")
 
-    # Step 2: render PNGs
+    # Step 2: render transient PNGs for ffmpeg only; do not leave PNGs in outputs.
     cached_pca = np.load(pca_cache)
     cached_umap = np.load(umap_cache)
     pred_pca_stack = cached_pca["pred_pca"]
@@ -524,31 +525,35 @@ def main():
     gt_umap_stack = cached_umap["gt_umap"]
     H0, W0 = int(cached_pca["spatial_shape"][0]), int(cached_pca["spatial_shape"][1])
 
-    for i, (ep, fp) in enumerate(zip(epochs, frame_paths)):
-        pred_pca = pred_pca_stack[i]  # [H*W, 2]
-        gt_pca = gt_pca_stack[i]
-        pred_umap = pred_umap_stack[i]
-        gt_umap = gt_umap_stack[i]
+    frame_tmp = None if args.dump_only else tempfile.TemporaryDirectory(prefix="jepa_movie_frames_")
+    frame_dir = frame_tmp.name if frame_tmp is not None else None
+    try:
+        for i, (ep, fp) in enumerate(zip(epochs, frame_paths)):
+            pred_pca = pred_pca_stack[i]  # [H*W, 3]
+            gt_pca = gt_pca_stack[i]
+            pred_umap = pred_umap_stack[i]
+            gt_umap = gt_umap_stack[i]
+            if args.dump_only:
+                dumpp = os.path.join(dump_dir, f"epoch_{ep:04d}.npz")
+                np.savez_compressed(dumpp, epoch=np.asarray(ep, dtype=np.int64), spatial_shape=np.asarray([H0, W0], dtype=np.int64), pred_pca=pred_pca, gt_pca=gt_pca, pred_umap=pred_umap, gt_umap=gt_umap)
+                continue
+            out_path = os.path.join(frame_dir, f"frame_{i:04d}.png")
+            _render_frame_8panel(pred_pca, gt_pca, pred_umap, gt_umap, H0, W0, ep, out_path, dpi=args.dpi, figsize=tuple(args.figsize))
+            if (i + 1) % 20 == 0 or i == 0:
+                print(f"[session_to_movie] rendered {i + 1}/{len(epochs)} transient frames")
+
+        print(f"[session_to_movie] whole-map embedding dumps saved to {dump_dir}")
         if args.dump_only:
-            dumpp = os.path.join(dump_dir, f"epoch_{ep:04d}.npz")
-            np.savez_compressed(dumpp, epoch=np.asarray(ep, dtype=np.int64), spatial_shape=np.asarray([H0, W0], dtype=np.int64), pred_pca=pred_pca, gt_pca=gt_pca, pred_umap=pred_umap, gt_umap=gt_umap)
-            continue
-        out_path = os.path.join(out_dir, f"frame_{i:04d}.png")
-        _render_frame_8panel(pred_pca, gt_pca, pred_umap, gt_umap, H0, W0, ep, out_path, dpi=args.dpi, figsize=tuple(args.figsize))
-        if (i + 1) % 20 == 0 or i == 0:
-            print(f"[session_to_movie] rendered {i + 1}/{len(epochs)} frames")
+            return
+        if not args.make_mp4:
+            print("[session_to_movie] rendered transient frames only; no PNG files retained")
+            return
 
-    print(f"[session_to_movie] whole-map embedding dumps saved to {dump_dir}")
-    if args.dump_only:
-        return
-    print(f"[session_to_movie] all {len(epochs)} frames saved to {out_dir}")
-
-    if args.make_mp4:
         mp4_path = os.path.join(out_dir, f"{session_name}.mp4")
         cmd = [
             "ffmpeg", "-y",
             "-framerate", str(args.fps),
-            "-i", os.path.join(out_dir, "frame_%04d.png"),
+            "-i", os.path.join(frame_dir, "frame_%04d.png"),
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
@@ -557,6 +562,9 @@ def main():
         import subprocess
         subprocess.run(cmd, check=True)
         print(f"[session_to_movie] mp4 saved to {mp4_path}")
+    finally:
+        if frame_tmp is not None:
+            frame_tmp.cleanup()
 
 
 if __name__ == "__main__":

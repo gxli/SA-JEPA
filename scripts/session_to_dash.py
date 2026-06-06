@@ -55,10 +55,11 @@ SCALE_PROBE_KEYS = {
 }
 
 
-def _find_session_config(session_dir: str) -> str | None:
+def _session_config_candidates(session_dir: str) -> list[str]:
     name = os.path.basename(os.path.abspath(session_dir))
     env_cfg_dir = os.environ.get("SESSION_DASH_CONFIG_DIR", "").strip()
     candidates = [
+        os.path.join(session_dir, "resolved_config.json"),
         os.path.join(session_dir, "config_used.json"),
     ]
     if env_cfg_dir:
@@ -67,14 +68,43 @@ def _find_session_config(session_dir: str) -> str | None:
         os.path.join(ROOT_DIR, "configs", "experiments", f"{name}.json"),
         os.path.join(ROOT_DIR, "configs", f"{name}.json"),
     ])
-    for path in candidates:
+    return [os.path.abspath(path) for path in candidates]
+
+
+def _find_session_config(session_dir: str) -> str | None:
+    for path in _session_config_candidates(session_dir):
         if os.path.exists(path):
-            return os.path.abspath(path)
+            return path
     return None
 
 
+def _find_readable_session_config(session_dir: str) -> tuple[dict[str, Any], str | None]:
+    for path in _session_config_candidates(session_dir):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict):
+                return cfg, path
+            print(f"dashboard_config_read_failed={path} reason=not_object")
+        except Exception as e:
+            print(f"dashboard_config_read_failed={path} reason={type(e).__name__}: {e}")
+            continue
+    return {}, None
+
+
+def _find_readable_session_config_path(session_dir: str) -> str | None:
+    _cfg, cfg_path = _find_readable_session_config(session_dir)
+    return cfg_path
+
+
+def _load_session_config(session_dir: str) -> tuple[dict[str, Any], str | None]:
+    return _find_readable_session_config(session_dir)
+
+
 def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
-    cfg_path = _find_session_config(session_dir)
+    cfg_path = _find_readable_session_config_path(session_dir)
     if cfg_path is None:
         print(f"dashboard_masking_demo_skip={session_dir} reason=no_config")
         return None
@@ -130,32 +160,14 @@ def _verbose_artifact_report(session_dir: str) -> list[str]:
         return missing
     # Core branch artifacts expected from src/train.py save_inference_dashboard().
     for branch in ("predict", "target"):
-        for fn in (
-            f"{branch}_pca_xyz.npy",
-            f"{branch}_umap_x.npy",
-            f"{branch}_umap_y.npy",
-            f"{branch}_umap_z.npy",
-            f"{branch}_spatial_shape.npy",
-        ):
-            p = os.path.join(results_dir, fn)
-            if not os.path.exists(p):
-                missing.append(f"missing_file[{branch}]: {p}")
+        if not _has_required_branch_artifacts(results_dir, branch):
+            missing.append(f"missing_branch_artifacts[{branch}]: map or legacy coordinate files absent")
     # Context branch is optional: if absent, we fallback to predict branch.
-    ctx_files = [
-        os.path.join(results_dir, "context_pca_xyz.npy"),
-        os.path.join(results_dir, "context_umap_x.npy"),
-        os.path.join(results_dir, "context_umap_y.npy"),
-        os.path.join(results_dir, "context_umap_z.npy"),
-        os.path.join(results_dir, "context_spatial_shape.npy"),
-    ]
-    if any(not os.path.exists(p) for p in ctx_files):
+    if not _has_required_branch_artifacts(results_dir, "context"):
         missing.append(
             "optional_context_missing: one or more context_* artifacts missing; "
             "dashboard will fallback to predict_* for context panels"
         )
-        for p in ctx_files:
-            if not os.path.exists(p):
-                missing.append(f"missing_file[context_optional]: {p}")
     return missing
 
 
@@ -269,14 +281,14 @@ def _load_scale_probe_dash_data(session_dir: str) -> dict[str, np.ndarray]:
 
 
 def _has_required_branch_artifacts(results_dir: str, branch: str) -> bool:
-    required = (
-        f"{branch}_pca_xyz.npy",
-        f"{branch}_umap_x.npy",
-        f"{branch}_umap_y.npy",
-        f"{branch}_umap_z.npy",
-        f"{branch}_spatial_shape.npy",
+    has_shape = os.path.exists(os.path.join(results_dir, f"{branch}_spatial_shape.npy"))
+    has_pca = os.path.exists(os.path.join(results_dir, f"{branch}_pca_xyz.npy"))
+    has_umap_map = os.path.exists(os.path.join(results_dir, f"{branch}_umap_xyz.npy"))
+    has_umap_legacy = all(
+        os.path.exists(os.path.join(results_dir, f"{branch}_umap_{axis}.npy"))
+        for axis in ("x", "y", "z")
     )
-    return all(os.path.exists(os.path.join(results_dir, fn)) for fn in required)
+    return has_shape and has_pca and (has_umap_map or has_umap_legacy)
 
 
 def _has_min_dashboard_artifacts(session_dir: str) -> bool:
@@ -293,16 +305,8 @@ def _missing_dashboard_artifacts(session_dir: str) -> list[str]:
         missing.append(f"missing_dir:{results_dir}")
         return missing
     for branch in ("predict", "target"):
-        for fn in (
-            f"{branch}_pca_xyz.npy",
-            f"{branch}_umap_x.npy",
-            f"{branch}_umap_y.npy",
-            f"{branch}_umap_z.npy",
-            f"{branch}_spatial_shape.npy",
-        ):
-            p = os.path.join(results_dir, fn)
-            if not os.path.exists(p):
-                missing.append(f"missing_file:{p}")
+        if not _has_required_branch_artifacts(results_dir, branch):
+            missing.append(f"missing_branch_artifacts:{branch}")
     return missing
 
 
@@ -343,7 +347,6 @@ def _rgb_from_xyz(
     clipped[~fin] = 0.0
     rgb_flat = np.clip(np.round(clipped * 255.0), 0, 255).astype(np.uint8)
     rgb = rgb_flat.reshape(h, w, 3)
-    rgb = rgb[::-1, :, :]  # flip y so image origin matches scatter3d (bottom-left)
     return rgb, rgb_flat
 
 
@@ -508,7 +511,23 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         raise RuntimeError(f"{session_dir}: inference outputs missing pred_map")
     h_lat, w_lat = int(pred_map.shape[-2]), int(pred_map.shape[-1])
 
-    def _load_xyz_triplet(prefix: str, kind: str) -> np.ndarray:
+    def _chw_or_n3_to_xyz(arr: np.ndarray, hh: int, ww: int, path: str) -> np.ndarray:
+        xyz = np.asarray(arr, dtype=np.float32)
+        if xyz.ndim == 3:
+            if xyz.shape[0] != 3 or xyz.shape[1:] != (hh, ww):
+                raise RuntimeError(
+                    f"{session_dir}: malformed map artifact {path} shape={xyz.shape}, "
+                    f"expected (3,{hh},{ww})"
+                )
+            return np.transpose(xyz, (1, 2, 0)).reshape(hh * ww, 3).astype(np.float32)
+        if xyz.ndim == 2 and xyz.shape == (hh * ww, 3):
+            return xyz.astype(np.float32)
+        raise RuntimeError(
+            f"{session_dir}: malformed embedding artifact {path} shape={xyz.shape}, "
+            f"expected (3,{hh},{ww}) or ({hh * ww},3)"
+        )
+
+    def _load_xyz_triplet(prefix: str, kind: str, hh: int, ww: int) -> np.ndarray:
         if kind == "pca":
             path = os.path.join(results_dir, f"{prefix}_pca_xyz.npy")
             if not os.path.exists(path):
@@ -516,10 +535,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     f"{session_dir}: missing required artifact {path}\n"
                     f"hint: run training/inference export that writes results/{prefix}_pca_xyz.npy"
                 )
-            xyz = np.asarray(np.load(path), dtype=np.float32)
-            if xyz.ndim != 2 or xyz.shape[1] != 3:
-                raise RuntimeError(f"{session_dir}: malformed PCA artifact {path} shape={xyz.shape}")
-            return xyz
+            return _chw_or_n3_to_xyz(np.load(path), hh, ww, path)
+        xyz_path = os.path.join(results_dir, f"{prefix}_umap_xyz.npy")
+        if os.path.exists(xyz_path):
+            return _chw_or_n3_to_xyz(np.load(xyz_path), hh, ww, xyz_path)
         ux = os.path.join(results_dir, f"{prefix}_umap_x.npy")
         uy = os.path.join(results_dir, f"{prefix}_umap_y.npy")
         uz = os.path.join(results_dir, f"{prefix}_umap_z.npy")
@@ -533,6 +552,11 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         y = np.asarray(np.load(uy), dtype=np.float32).reshape(-1)
         z = np.asarray(np.load(uz), dtype=np.float32).reshape(-1)
         n = min(x.size, y.size, z.size)
+        if n != hh * ww:
+            raise RuntimeError(
+                f"{session_dir}: malformed legacy UMAP artifacts for {prefix}, "
+                f"expected {hh * ww} points, got {n}"
+            )
         return np.stack([x[:n], y[:n], z[:n]], axis=1).astype(np.float32)
 
     def _load_hw(prefix: str) -> tuple[int, int]:
@@ -575,14 +599,14 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         src_prefix = prefix_saved
         try:
             hh, ww = _load_hw(src_prefix)
-            pca = _load_xyz_triplet(src_prefix, "pca")
-            um = _load_xyz_triplet(src_prefix, "umap")
+            pca = _load_xyz_triplet(src_prefix, "pca", hh, ww)
+            um = _load_xyz_triplet(src_prefix, "umap", hh, ww)
         except Exception:
             if prefix_saved == "context":
                 src_prefix = "predict"
                 hh, ww = _load_hw(src_prefix)
-                pca = _load_xyz_triplet(src_prefix, "pca")
-                um = _load_xyz_triplet(src_prefix, "umap")
+                pca = _load_xyz_triplet(src_prefix, "pca", hh, ww)
+                um = _load_xyz_triplet(src_prefix, "umap", hh, ww)
                 print(
                     f"dashboard_note={session_dir}: missing context embeddings; "
                     "using predict embeddings for context panels"
@@ -692,14 +716,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     rd_volume_match_ratio = float(rank_diag.get("volume_match_ratio", rank_diag.get("pred_gt_participation_ratio", np.nan))) if isinstance(rank_diag, dict) else np.nan
 
     # Compute mask sizes per sigma from config
-    cfg_used_path = os.path.join(session_dir, "config_used.json")
     mask_sigma_names: list[str] = []
     mask_sigma_sizes: list[int] = []
     mask_config_summary: list[str] = []
-    if os.path.exists(cfg_used_path):
+    cfg, cfg_source = _load_session_config(session_dir)
+    if cfg:
         try:
-            with open(cfg_used_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
             mc = cfg.get("model", {})
             _sigmas = mc.get("sigmas", [2, 4, 8, 16])
             _ms_raw = mc.get("mask_size_scaling", 1.0)
@@ -724,6 +746,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             _sampling = str(mc.get("target_sampling_mode", "random"))
             _enc = str(mc.get("model_key", mc.get("encoder_type", "unknown")))
             mask_config_summary = [
+                f"config={os.path.basename(cfg_source) if cfg_source else 'unknown'}",
                 f"encoder={_enc}",
                 f"mask_strategy={'random-box-per-target' if _random_box_per_target else 'standard'}",
                 f"mask_size_scaling={_ms_raw}",
@@ -866,16 +889,36 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         compute_dash_data(session_dir, overwrite=True)
         data = np.load(npz_path)
     model_mode = "unknown"
-    cfg_used_path = os.path.join(session_dir, "config_used.json")
-    if os.path.exists(cfg_used_path):
-        try:
-            import json
+    cfg_used, _cfg_source = _load_session_config(session_dir)
+    if cfg_used:
+        model_mode = str(cfg_used.get("model", {}).get("mode", "unknown")).lower()
 
-            with open(cfg_used_path, "r", encoding="utf-8") as f:
-                cfg_used = json.load(f)
-            model_mode = str(cfg_used.get("model", {}).get("mode", "unknown")).lower()
-        except Exception:
-            model_mode = "unknown"
+    def _image_axis_range(shape: tuple[int, int]) -> tuple[list[float], list[float]]:
+        h, w = int(shape[0]), int(shape[1])
+        return [-0.5, float(w) - 0.5], [float(h) - 0.5, -0.5]
+
+    def _apply_image_axes(fig: go.Figure, shape: tuple[int, int], *, row: int | None = None, col: int | None = None) -> None:
+        xr, yr = _image_axis_range(shape)
+        fig.update_xaxes(
+            showticklabels=False,
+            showgrid=False,
+            zeroline=False,
+            constrain="domain",
+            range=xr,
+            row=row,
+            col=col,
+        )
+        fig.update_yaxes(
+            showticklabels=False,
+            showgrid=False,
+            zeroline=False,
+            scaleanchor="x" if row is None else None,
+            scaleratio=1,
+            constrain="domain",
+            range=yr,
+            row=row,
+            col=col,
+        )
 
     def heat(
         title: str,
@@ -906,15 +949,14 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 zmax = zmin + 1.0
         fig = go.Figure([go.Heatmap(z=vals, colorscale=colorscale, zmin=zmin, zmax=zmax, showscale=False)])
         fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=36, b=8), height=330)
-        fig.update_xaxes(showticklabels=False, constrain="domain")
-        fig.update_yaxes(showticklabels=False, scaleanchor="x", scaleratio=1, constrain="domain", autorange="reversed")
+        _apply_image_axes(fig, vals.shape[-2:])
         return fig
 
     def img(title: str, rgb: np.ndarray) -> go.Figure:
-        fig = go.Figure([go.Image(z=np.asarray(rgb))])
+        vals = np.asarray(rgb)
+        fig = go.Figure([go.Image(z=vals)])
         fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=36, b=8), height=330)
-        fig.update_xaxes(showticklabels=False, constrain="domain")
-        fig.update_yaxes(showticklabels=False, scaleanchor="x", scaleratio=1, constrain="domain")
+        _apply_image_axes(fig, vals.shape[:2])
         return fig
 
     def scatter3d(title: str, xyz: np.ndarray, rgb_flat: np.ndarray) -> tuple[go.Figure, int, int]:
@@ -1097,14 +1139,14 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         labels = [str(v) for v in np.asarray(names).reshape(-1)]
         if len(labels) != s:
             labels = [f"scale_{i}" for i in range(s)]
-        finite = arr[np.isfinite(arr)]
-        finite_pos = finite[finite > 0.0] if finite.size > 0 else np.array([], dtype=arr.dtype)
+        valid = np.isfinite(arr) & (arr > 0.0)
+        finite_pos = arr[valid]
         threshold = 0.0
         if finite_pos.size > 0:
             threshold = float(np.percentile(finite_pos, 75.0))
-        zz, yy, xx = np.nonzero(np.isfinite(arr) & (arr > threshold))
+        zz, yy, xx = np.nonzero(valid & (arr >= threshold))
         if xx.size == 0:
-            zz, yy, xx = np.nonzero(np.isfinite(arr))
+            zz, yy, xx = np.nonzero(valid)
         if xx.size == 0:
             xx = np.asarray([0], dtype=np.int32)
             yy = np.asarray([0], dtype=np.int32)
@@ -1124,7 +1166,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             [
                 go.Scatter3d(
                     x=xx.astype(np.float32),
-                    y=-yy.astype(np.float32),
+                    y=yy.astype(np.float32),
                     z=zz.astype(np.float32),
                     mode="markers",
                     marker=dict(
@@ -1148,7 +1190,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             height=430,
             scene=dict(
                 xaxis_title="x",
-                yaxis_title="y",
+                yaxis=dict(title="y", autorange="reversed"),
                 zaxis=dict(title="CDD channel", tickmode="array", tickvals=tickvals, ticktext=labels),
                 aspectmode="manual",
                 aspectratio=dict(x=w0, y=h0, z=max(w0, h0)),
@@ -1184,8 +1226,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             if zmid is not None:
                 kwargs["zmid"] = zmid
             fig.add_trace(go.Heatmap(**kwargs), row=r, col=c)
-            fig.update_xaxes(showticklabels=False, row=r, col=c)
-            fig.update_yaxes(showticklabels=False, scaleanchor=f"x{i + 1}" if i > 0 else "x", scaleratio=1, autorange="reversed", row=r, col=c)
+            _apply_image_axes(fig, arr[i].shape, row=r, col=c)
         fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=56, b=8), height=max(330, 260 * rows))
         return fig
 
@@ -1210,8 +1251,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             ]
         )
         fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=36, b=8), height=330)
-        fig.update_xaxes(showticklabels=False, constrain="domain")
-        fig.update_yaxes(showticklabels=False, scaleanchor="x", scaleratio=1, constrain="domain", autorange="reversed")
+        _apply_image_axes(fig, vals.shape[-2:])
         return fig
 
     def _npz_array(name: str, *legacy_names: str) -> np.ndarray:
@@ -1313,14 +1353,14 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         fig.add_trace(
             go.Scattergl(
                 x=x, y=values, mode="lines", name=f"{name} raw",
-                line=dict(width=1, color="rgba(120,120,120,0.55)"),
-                opacity=1.0,
-                showlegend=False,
+                line=dict(width=1.35, color=color, dash="dot"),
+                opacity=0.55,
+                showlegend=True,
             )
         )
         fig.add_trace(
             go.Scattergl(
-                x=x, y=_smooth(values), mode="lines", name=name,
+                x=x, y=_smooth(values), mode="lines", name=f"{name} smooth",
                 line=dict(width=2, color=color),
             )
         )

@@ -40,7 +40,7 @@ for session_dir in "$SESSIONS_DIR"/*; do
 
   # If reusable artifacts already exist, export them even without inference_outputs.pt.
   has_existing_artifacts=0
-  if [[ -f "$session_dir/dashboard.html" || -f "$session_dir/latent_overview_4panel.html" || -f "$session_dir/dashboard.png" || -f "$session_dir/loss_curve.png" ]]; then
+  if [[ -f "$session_dir/dashboard.html" || -f "$session_dir/latent_overview_4panel.html" ]]; then
     has_existing_artifacts=1
   fi
 
@@ -48,9 +48,9 @@ for session_dir in "$SESSIONS_DIR"/*; do
   # Recompute only when inference outputs exist and outputs are missing/stale.
   regen=0
   if [[ -f "$session_dir/inference_outputs.pt" ]]; then
-    if [[ ! -f "$session_dir/dash_data.npz" || ! -f "$session_dir/dashboard.png" ]]; then
+    if [[ ! -f "$session_dir/dash_data.npz" || ! -f "$session_dir/dashboard.html" ]]; then
       regen=1
-    elif [[ "$DASH_SCRIPT" -nt "$session_dir/dash_data.npz" || "$DASH_SCRIPT" -nt "$session_dir/dashboard.png" ]]; then
+    elif [[ "$DASH_SCRIPT" -nt "$session_dir/dash_data.npz" || "$DASH_SCRIPT" -nt "$session_dir/dashboard.html" ]]; then
       regen=1
     fi
   elif [[ "$has_existing_artifacts" -eq 0 ]]; then
@@ -89,17 +89,6 @@ PY
     copied=$((copied + 1))
     found_any=1
   fi
-  if [[ -f "$session_dir/dashboard.png" ]]; then
-    cp -f "$session_dir/dashboard.png" "$session_out/dashboard.png"
-    copied=$((copied + 1))
-    found_any=1
-  fi
-  if [[ -f "$session_dir/loss_curve.png" ]]; then
-    cp -f "$session_dir/loss_curve.png" "$session_out/loss_curve.png"
-    copied=$((copied + 1))
-    found_any=1
-  fi
-
   # Optional richer plotly session overview pages produced by session_overview_4panel.
   overview_artifacts=(
     "$session_dir/results/plots/session_overview_4panel.html"
@@ -110,20 +99,6 @@ PY
   for of in "${overview_artifacts[@]}"; do
     if [[ -f "$of" ]]; then
       cp -f "$of" "$session_out/$(basename "$of")"
-      copied=$((copied + 1))
-      found_any=1
-    fi
-  done
-
-  # Reference images used by dashboard.html:
-  ref_artifacts=(
-    "$session_dir/results/reference_000_clean.png"
-    "$session_dir/results/reference_000_context_blurred.png"
-    "$session_dir/results/reference_000_clean_minus_context.png"
-  )
-  for rf in "${ref_artifacts[@]}"; do
-    if [[ -f "$rf" ]]; then
-      cp -f "$rf" "$session_out/results/$(basename "$rf")"
       copied=$((copied + 1))
       found_any=1
     fi
@@ -142,8 +117,6 @@ PY
     index_items+=("<li><a href=\"./$session_name/dashboard.html\">$session_name</a></li>")
   elif [[ -f "$session_out/latent_overview_4panel.html" ]]; then
     index_items+=("<li><a href=\"./$session_name/latent_overview_4panel.html\">$session_name (latent overview)</a></li>")
-  elif [[ -f "$session_out/dashboard.png" ]]; then
-    index_items+=("<li><a href=\"./$session_name/dashboard.png\">$session_name (png)</a></li>")
   fi
 
   # One session, one canonical dashboard.

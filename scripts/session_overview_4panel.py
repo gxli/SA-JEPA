@@ -43,7 +43,15 @@ def pca_3d(latents: np.ndarray) -> np.ndarray:
     return x @ comps
 
 
-def load_or_compute_pca_3d(results_dir: Path, latents: np.ndarray) -> np.ndarray:
+def _points_to_chw(points: np.ndarray, image_shape: tuple[int, int]) -> np.ndarray:
+    h, w = int(image_shape[0]), int(image_shape[1])
+    arr = np.asarray(points, dtype=np.float32)
+    if arr.shape != (h * w, 3):
+        raise ValueError(f"Expected points shape ({h * w},3), got {arr.shape}")
+    return np.transpose(arr.reshape(h, w, 3), (2, 0, 1)).astype(np.float32)
+
+
+def load_or_compute_pca_3d(results_dir: Path, latents: np.ndarray, image_shape: tuple[int, int] | None = None) -> np.ndarray:
     pca_x_path = results_dir / "pca_x.npy"
     pca_y_path = results_dir / "pca_y.npy"
     pca_z_path = results_dir / "pca_z.npy"
@@ -53,7 +61,9 @@ def load_or_compute_pca_3d(results_dir: Path, latents: np.ndarray) -> np.ndarray
     if pca_xyz_path.exists():
         try:
             arr = to_native(np.load(pca_xyz_path))
-            if arr.ndim == 2 and arr.shape[1] >= 3:
+            if arr.ndim == 3 and arr.shape[0] == 3:
+                pca_points = np.transpose(arr, (1, 2, 0)).reshape(-1, 3).astype(np.float32)
+            elif arr.ndim == 2 and arr.shape[1] >= 3:
                 pca_points = arr[:, :3].astype(np.float32)
         except Exception:
             pca_points = None
@@ -69,10 +79,13 @@ def load_or_compute_pca_3d(results_dir: Path, latents: np.ndarray) -> np.ndarray
 
     if pca_points is None or pca_points.shape[0] != latents.shape[0]:
         pca_points = pca_3d(latents).astype(np.float32)
-        np.save(pca_xyz_path, pca_points)
-        np.save(pca_x_path, pca_points[:, 0])
-        np.save(pca_y_path, pca_points[:, 1])
-        np.save(pca_z_path, pca_points[:, 2])
+        if image_shape is None:
+            raise ValueError("Refusing to save flat PCA cache without an exact image_shape")
+        pca_map = _points_to_chw(pca_points, image_shape)
+        np.save(pca_xyz_path, pca_map)
+        for legacy_path in (pca_x_path, pca_y_path, pca_z_path):
+            if legacy_path.exists():
+                legacy_path.unlink()
     return pca_points
 
 
@@ -83,6 +96,36 @@ def l2_normalize_rows(x: np.ndarray, enable: bool) -> np.ndarray:
     norms = np.linalg.norm(x, axis=1, keepdims=True)
     norms = np.maximum(norms, 1e-12)
     return x / norms
+
+
+def latent_map_to_rows(latents: np.ndarray) -> np.ndarray:
+    arr = to_native(np.asarray(latents)).astype(np.float32, copy=False)
+    if arr.ndim == 3:
+        c, h, w = arr.shape
+        return np.transpose(arr, (1, 2, 0)).reshape(h * w, c)
+    return arr.reshape(arr.shape[0], -1) if arr.ndim > 2 else arr
+
+
+def load_xyz_map_or_legacy(results_dir: Path, prefix: str, kind: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    xyz_path = results_dir / f"{prefix}{kind}_xyz.npy"
+    if xyz_path.exists():
+        xyz = to_native(np.load(xyz_path)).astype(np.float32)
+        if xyz.ndim == 3 and xyz.shape[0] == 3:
+            points = np.transpose(xyz, (1, 2, 0)).reshape(-1, 3)
+            return points, xyz[0], xyz[1], xyz[2]
+        if xyz.ndim == 2 and xyz.shape[1] >= 3:
+            points = xyz[:, :3].astype(np.float32)
+            return points, points[:, 0], points[:, 1], points[:, 2]
+    x_path = results_dir / f"{prefix}{kind}_x.npy"
+    y_path = results_dir / f"{prefix}{kind}_y.npy"
+    z_path = results_dir / f"{prefix}{kind}_z.npy"
+    if not (x_path.exists() and y_path.exists() and z_path.exists()):
+        raise FileNotFoundError(f"Missing {kind} embedding map/triplet for prefix={prefix!r}")
+    x = to_native(np.load(x_path)).astype(np.float32)
+    y = to_native(np.load(y_path)).astype(np.float32)
+    z = to_native(np.load(z_path)).astype(np.float32)
+    points = np.stack([x.reshape(-1), y.reshape(-1), z.reshape(-1)], axis=1).astype(np.float32)
+    return points, x, y, z
 
 
 def tile_maps_batch(maps: np.ndarray) -> np.ndarray:
@@ -383,54 +426,32 @@ def main() -> None:
     for mode in modes:
         prefix = "" if mode == "default" else f"{mode}_"
         latent_full_path = results_dir / f"{prefix}latent_vectors_full.npy"
+        umap_xyz_path = results_dir / f"{prefix}umap_xyz.npy"
         umap_x_path = results_dir / f"{prefix}umap_x.npy"
         umap_y_path = results_dir / f"{prefix}umap_y.npy"
         umap_z_path = results_dir / f"{prefix}umap_z.npy"
-        req = [latent_full_path, umap_x_path, umap_y_path, umap_z_path]
+        req = [latent_full_path]
         if any(not p.exists() for p in req):
             if args.inference == "all":
                 continue
             missing = [str(p) for p in req if not p.exists()]
             raise FileNotFoundError(f"Missing required files: {missing}")
+        has_umap = umap_xyz_path.exists() or (umap_x_path.exists() and umap_y_path.exists() and umap_z_path.exists())
+        if not has_umap:
+            if args.inference == "all":
+                continue
+            raise FileNotFoundError(f"Missing required UMAP files for prefix={prefix!r}")
 
-        latents = to_native(np.load(latent_full_path))
+        latents = latent_map_to_rows(np.load(latent_full_path))
         latents = l2_normalize_rows(latents, enable=plot_l2)
-        umap_x = to_native(np.load(umap_x_path))
-        umap_y = to_native(np.load(umap_y_path))
-        umap_z = to_native(np.load(umap_z_path))
-
-        umap_points = np.stack([umap_x.reshape(-1), umap_y.reshape(-1), umap_z.reshape(-1)], axis=1)
+        umap_points, umap_x, umap_y, umap_z = load_xyz_map_or_legacy(results_dir, prefix, "umap")
         if umap_points.shape[0] != latents.shape[0]:
             if args.inference == "all":
                 continue
             raise ValueError(f"Shape mismatch: latents={latents.shape}, umap_points={umap_points.shape}")
 
-        pca_points = load_or_compute_pca_3d(results_dir, latents) if prefix == "" else None
-        if prefix != "":
-        # Branch-specific PCA caches.
-            pca_xyz = results_dir / f"{prefix}pca_xyz.npy"
-            pca_x = results_dir / f"{prefix}pca_x.npy"
-            pca_y = results_dir / f"{prefix}pca_y.npy"
-            pca_z = results_dir / f"{prefix}pca_z.npy"
-            if pca_xyz.exists():
-                pca_points = to_native(np.load(pca_xyz)).astype(np.float32)
-            elif pca_x.exists() and pca_y.exists() and pca_z.exists():
-                pca_points = np.stack(
-                    [
-                        to_native(np.load(pca_x)).reshape(-1),
-                        to_native(np.load(pca_y)).reshape(-1),
-                        to_native(np.load(pca_z)).reshape(-1),
-                    ],
-                    axis=1,
-                ).astype(np.float32)
-            else:
-                pca_points = pca_3d(latents).astype(np.float32)
-                np.save(pca_xyz, pca_points)
-                np.save(pca_x, pca_points[:, 0])
-                np.save(pca_y, pca_points[:, 1])
-                np.save(pca_z, pca_points[:, 2])
-
-        # Resolve image shape/subset for the 2D color-map panels.
+        # Resolve image shape/subset for the 2D color-map panels before any
+        # embedding recompute, so cache writes can round-trip exactly.
         image_shape = None
         image_umap_points = None
         image_pca_points = None
@@ -441,20 +462,42 @@ def main() -> None:
                 if shp.size >= 2 and int(shp[0]) > 0 and int(shp[1]) > 0:
                     h_img, w_img = int(shp[0]), int(shp[1])
                     n_img = h_img * w_img
-                    if n_img <= umap_points.shape[0] and n_img <= pca_points.shape[0]:
+                    if n_img <= umap_points.shape[0]:
                         image_shape = (h_img, w_img)
                         image_umap_points = umap_points[:n_img]
-                        image_pca_points = pca_points[:n_img]
             except Exception:
                 pass
         if image_shape is None and umap_x.ndim == 1:
-            # Legacy/default fallback: use original HxW if compatible.
+            # Legacy/default fallback: use original HxW only when it matches exactly.
             h0, w0 = original.shape[-2], original.shape[-1]
             n0 = int(h0 * w0)
-            if n0 <= umap_points.shape[0] and n0 <= pca_points.shape[0]:
+            if n0 == umap_points.shape[0]:
                 image_shape = (int(h0), int(w0))
                 image_umap_points = umap_points[:n0]
-                image_pca_points = pca_points[:n0]
+
+        pca_points = None
+        if prefix != "":
+        # Branch-specific PCA caches.
+            try:
+                pca_points, _, _, _ = load_xyz_map_or_legacy(results_dir, prefix, "pca")
+            except FileNotFoundError:
+                pca_xyz = results_dir / f"{prefix}pca_xyz.npy"
+                pca_points = pca_3d(latents).astype(np.float32)
+                if image_shape is None:
+                    raise ValueError(f"Refusing to save flat PCA cache for prefix={prefix!r} without exact image_shape")
+                np.save(pca_xyz, _points_to_chw(pca_points, image_shape))
+            if pca_points.shape[0] != latents.shape[0]:
+                pca_points = pca_3d(latents).astype(np.float32)
+                if image_shape is None:
+                    raise ValueError(f"Refusing to save flat PCA cache for prefix={prefix!r} without exact image_shape")
+                np.save(results_dir / f"{prefix}pca_xyz.npy", _points_to_chw(pca_points, image_shape))
+        else:
+            pca_points = load_or_compute_pca_3d(results_dir, latents, image_shape=image_shape)
+
+        if image_shape is not None:
+            n_img = int(image_shape[0] * image_shape[1])
+            if n_img <= pca_points.shape[0]:
+                image_pca_points = pca_points[:n_img]
 
         out_name = "session_overview_4panel.html" if prefix == "" else f"session_overview_4panel_{mode}.html"
         out_path = out_dir / out_name

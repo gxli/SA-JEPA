@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -411,67 +411,33 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         if 0 <= cy < target_vis.shape[0] and 0 <= cx < target_vis.shape[1]:
             target_vis[cy, cx] = 1.0
 
-    pred_vec = pred_map.detach().cpu().permute(0, 2, 3, 1).reshape(-1, pred_map.shape[1]).numpy()
-    gt_vec = gt_map.detach().cpu().permute(0, 2, 3, 1).reshape(-1, gt_map.shape[1]).numpy()
-    x = np.concatenate([pred_vec, gt_vec], axis=0)
-
-    pca_cache = os.path.join(session_dir, "pca_embeddings.npy")
-    umap_cache_key = hashlib.md5(json.dumps(umap_cfg, sort_keys=True).encode("utf-8")).hexdigest()[:10]
-    umap_cache = os.path.join(session_dir, f"umap_embeddings_{umap_cache_key}.npy")
-    x_umap = _preprocess_latents_for_umap(
-        x,
-        l2_normalize=umap_l2_normalize,
-        standardize=umap_standardize,
-    )
-    if os.path.exists(pca_cache):
-        try:
-            pca_2d = np.load(pca_cache)
-        except Exception as e:
-            print(f"[warning] failed to load PCA cache {pca_cache}: {type(e).__name__}: {e}; recomputing")
-            pca_2d = _compute_pca_2d(x)
-            np.save(pca_cache, pca_2d)
-    else:
-        pca_2d = _compute_pca_2d(x)
-        np.save(pca_cache, pca_2d)
-    if os.path.exists(umap_cache):
-        try:
-            umap_3d = np.load(umap_cache)
-        except Exception as e:
-            print(f"[warning] failed to load UMAP cache {umap_cache}: {type(e).__name__}: {e}; recomputing")
-            umap_3d = _compute_umap_nd(
-                x_umap,
-                n_components=3,
-                n_neighbors=umap_n_neighbors,
-                min_dist=umap_min_dist,
-                metric=umap_metric,
-                random_state=umap_random_state,
-                init=umap_init,
-            )
-            np.save(umap_cache, umap_3d)
-    else:
-        umap_3d = _compute_umap_nd(
-            x_umap,
-            n_components=3,
-            n_neighbors=umap_n_neighbors,
-            min_dist=umap_min_dist,
-            metric=umap_metric,
-            random_state=umap_random_state,
-            init=umap_init,
-        )
-        np.save(umap_cache, umap_3d)
     # Session plot compatibility artifacts.
     results_dir = os.path.join(session_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
-    np.save(os.path.join(results_dir, "latent_vectors_full.npy"), x.astype(np.float32))
-    np.save(os.path.join(results_dir, "umap_x.npy"), umap_3d[:, 0].astype(np.float32))
-    np.save(os.path.join(results_dir, "umap_y.npy"), umap_3d[:, 1].astype(np.float32))
-    np.save(os.path.join(results_dir, "umap_z.npy"), umap_3d[:, 2].astype(np.float32))
+    for legacy_name in (
+        "pca_embeddings.npy",
+        "umap_x.npy",
+        "umap_y.npy",
+        "umap_z.npy",
+        "pca_x.npy",
+        "pca_y.npy",
+        "pca_z.npy",
+    ):
+        legacy_path = os.path.join(results_dir, legacy_name)
+        if os.path.exists(legacy_path):
+            os.remove(legacy_path)
+    for legacy_name in os.listdir(session_dir):
+        if legacy_name == "pca_embeddings.npy" or re.match(r"umap_embeddings_[0-9a-f]+\.npy$", legacy_name):
+            legacy_path = os.path.join(session_dir, legacy_name)
+            if os.path.exists(legacy_path):
+                os.remove(legacy_path)
 
     def _save_branch_embeddings(branch_name: str, fmap: torch.Tensor):
         # Use sample-0 dense latent map (H*W tokens) for branch-specific plotly 2D color + 3D scatter.
         h_map = int(fmap.shape[-2])
         w_map = int(fmap.shape[-1])
-        z = fmap[0].detach().cpu().permute(1, 2, 0).reshape(-1, fmap.shape[1]).numpy().astype(np.float32)
+        latent_map = fmap[0].detach().cpu().numpy().astype(np.float32)
+        z = np.transpose(latent_map, (1, 2, 0)).reshape(-1, fmap.shape[1]).astype(np.float32)
 
         # Filter invalid-region latents from PCA/UMAP, keep NaN sentinels.
         pca3 = _filtered_embedding(z, valid_mask_flat, _compute_pca_3d).astype(np.float32)
@@ -513,17 +479,34 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
                 umap3 = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
                 umap3[valid_mask_flat] = umap3_valid
 
+        expected_n = h_map * w_map
+        if pca3.shape != (expected_n, 3):
+            raise RuntimeError(f"PCA embedding shape {pca3.shape} cannot reshape exactly to (3,{h_map},{w_map})")
+        if umap3.shape != (expected_n, 3):
+            raise RuntimeError(f"UMAP embedding shape {umap3.shape} cannot reshape exactly to (3,{h_map},{w_map})")
+        pca_map = np.transpose(pca3.reshape(h_map, w_map, 3), (2, 0, 1)).astype(np.float32)
+        umap_map = np.transpose(umap3.reshape(h_map, w_map, 3), (2, 0, 1)).astype(np.float32)
         np.save(os.path.join(results_dir, f"{branch_name}_spatial_shape.npy"), np.asarray([h_map, w_map], dtype=np.int64))
-        np.save(os.path.join(results_dir, f"{branch_name}_latent_vectors_full.npy"), z)
-        np.save(os.path.join(results_dir, f"{branch_name}_pca_xyz.npy"), pca3)
-        np.save(os.path.join(results_dir, f"{branch_name}_pca_x.npy"), pca3[:, 0])
-        np.save(os.path.join(results_dir, f"{branch_name}_pca_y.npy"), pca3[:, 1])
-        np.save(os.path.join(results_dir, f"{branch_name}_pca_z.npy"), pca3[:, 2])
-        np.save(os.path.join(results_dir, f"{branch_name}_umap_x.npy"), umap3[:, 0])
-        np.save(os.path.join(results_dir, f"{branch_name}_umap_y.npy"), umap3[:, 1])
-        np.save(os.path.join(results_dir, f"{branch_name}_umap_z.npy"), umap3[:, 2])
+        np.save(os.path.join(results_dir, f"{branch_name}_latent_vectors_full.npy"), latent_map)
+        np.save(os.path.join(results_dir, f"{branch_name}_pca_xyz.npy"), pca_map)
+        np.save(os.path.join(results_dir, f"{branch_name}_umap_xyz.npy"), umap_map)
+        for legacy_name in (
+            f"{branch_name}_pca_x.npy",
+            f"{branch_name}_pca_y.npy",
+            f"{branch_name}_pca_z.npy",
+            f"{branch_name}_umap_x.npy",
+            f"{branch_name}_umap_y.npy",
+            f"{branch_name}_umap_z.npy",
+        ):
+            legacy_path = os.path.join(results_dir, legacy_name)
+            if os.path.exists(legacy_path):
+                os.remove(legacy_path)
+        return latent_map, pca_map, umap_map
 
-    _save_branch_embeddings("predict", pred_map)
+    default_latent_map, default_pca_map, default_umap_map = _save_branch_embeddings("predict", pred_map)
+    np.save(os.path.join(results_dir, "latent_vectors_full.npy"), default_latent_map)
+    np.save(os.path.join(results_dir, "pca_xyz.npy"), default_pca_map)
+    np.save(os.path.join(results_dir, "umap_xyz.npy"), default_umap_map)
     _save_branch_embeddings("target", gt_map)
     if context_map is not None:
         _save_branch_embeddings("context", context_map)

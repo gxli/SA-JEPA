@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 try:
     import torch
 except Exception:  # pragma: no cover
@@ -14,16 +16,12 @@ except Exception:  # pragma: no cover
 
 REQUIRED_BRANCH_FILES = (
     "{b}_pca_xyz.npy",
-    "{b}_umap_x.npy",
-    "{b}_umap_y.npy",
-    "{b}_umap_z.npy",
+    "{b}_umap_xyz.npy",
     "{b}_spatial_shape.npy",
 )
 OPTIONAL_CONTEXT_FILES = (
     "context_pca_xyz.npy",
-    "context_umap_x.npy",
-    "context_umap_y.npy",
-    "context_umap_z.npy",
+    "context_umap_xyz.npy",
     "context_spatial_shape.npy",
 )
 REQUIRED_INFERENCE_KEYS = ("x_clean", "pred_map")
@@ -45,6 +43,25 @@ def _check_branch_artifacts(results_dir: str, branch: str) -> list[str]:
         p = os.path.join(results_dir, fn)
         if not os.path.exists(p):
             missing.append(f"missing_file:{fn}")
+    if f"missing_file:{branch}_umap_xyz.npy" in missing:
+        legacy = [os.path.join(results_dir, f"{branch}_umap_{axis}.npy") for axis in ("x", "y", "z")]
+        if all(os.path.exists(p) for p in legacy):
+            missing.remove(f"missing_file:{branch}_umap_xyz.npy")
+    if missing:
+        return missing
+    try:
+        shp = np.asarray(np.load(os.path.join(results_dir, f"{branch}_spatial_shape.npy")), dtype=np.int64).reshape(-1)
+        if shp.size < 2 or int(shp[0]) <= 0 or int(shp[1]) <= 0:
+            return [f"invalid_shape:{branch}_spatial_shape.npy"]
+        h, w = int(shp[0]), int(shp[1])
+        for kind in ("pca", "umap"):
+            path = os.path.join(results_dir, f"{branch}_{kind}_xyz.npy")
+            if os.path.exists(path):
+                arr = np.asarray(np.load(path))
+                if arr.shape != (3, h, w):
+                    missing.append(f"invalid_shape:{branch}_{kind}_xyz.npy expected=(3,{h},{w}) got={tuple(arr.shape)}")
+    except Exception as e:
+        missing.append(f"invalid_embedding_artifacts:{branch}:{type(e).__name__}")
     return missing
 
 

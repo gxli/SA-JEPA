@@ -38,7 +38,7 @@ from src.losses import (
     parse_spread_regularizer_config,
 )
 from src.models.build_jepa import CDD_DEBUG_ENCODER_TYPES, PyramidGridJEPA
-from src.models.build_jepa3d import PyramidGridJEPA3D
+from src.models.build_jepa3d import PyramidGridJEPA3D, compute_3d_encoder_receptive_field_depth
 from src.models.masking import prepare_context_batch
 from src.utils import log_error, set_error_log_path
 from src.utils.viz import save_inference_dashboard, save_volumetric_umap_embeddings
@@ -693,13 +693,19 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
     if "dense" in enc_type:
         fusion = "concat"
     normalize_loss_l2 = bool(model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", False)))
+    encoder_depth = int(model_cfg.get("encoder_depth", 3))
+    encoder_kernel_size = int(model_cfg.get("encoder_kernel_size", 5))
+    encoder_rf_depth = compute_3d_encoder_receptive_field_depth(
+        encoder_depth=encoder_depth,
+        encoder_kernel_size=encoder_kernel_size,
+    )
     return PyramidGridJEPA3D(
         latent_channels=int(model_cfg.get("latent_channels", 16)),
         scale_channels=int(model_cfg.get("scale_channels", model_cfg.get("encoder_width", 8))),
         patch_size=int(model_cfg.get("patch_size", 2)),
         num_targets=int(model_cfg.get("num_targets", 32)),
-        encoder_depth=int(model_cfg.get("encoder_depth", 3)),
-        encoder_kernel_size=int(model_cfg.get("encoder_kernel_size", 5)),
+        encoder_depth=encoder_depth,
+        encoder_kernel_size=encoder_kernel_size,
         encoder_stride=int(model_cfg.get("encoder_stride", 1)),
         ema_momentum=float(model_cfg.get("ema_momentum", train_cfg.get("momentum", 0.996))),
         normalize_loss_l2=normalize_loss_l2,
@@ -713,6 +719,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         use_film=bool(model_cfg.get("use_film", True)),
         use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
         priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
+        encoder_receptive_field_depth=encoder_rf_depth,
     ).to(device)
 
 
@@ -1047,20 +1054,48 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
 
     # --- Pre-compute CDD once on GPU, store in CPU RAM ---
+    # Only pyramid encoders consume CDD fields. Image-mode mask-token runs use
+    # the raw image plus a binary mask channel and should not allocate a CDD cache.
     cdd_cache = _precompute_cdd_cache(
         data_cfg=data_cfg,
         model_cfg=model_cfg,
         device=device,
         config_name=config_name,
-    ) if not is_3d_mode else None
+    ) if (not is_3d_mode and str(model_cfg.get("mode", "image")).lower() == "pyramid") else None
     _write_cdd_cache_profile(cdd_cache=cdd_cache, session_dir=session_dir, config_name=config_name)
 
     if is_3d_mode:
+        encoder_rf_depth_3d = compute_3d_encoder_receptive_field_depth(
+            encoder_depth=int(model_cfg.get("encoder_depth", 3)),
+            encoder_kernel_size=int(model_cfg.get("encoder_kernel_size", 5)),
+        )
+        target_slab_depth_3d = max(
+            int(model_cfg.get("patch_size", 2)),
+            int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
+        )
+        auto_crop_depth_3d = int(encoder_rf_depth_3d + target_slab_depth_3d - 1)
+        crop_depth_3d = int(data_cfg.get("volume_crop_depth", data_cfg.get("crop_depth_3d", auto_crop_depth_3d)))
+        if crop_depth_3d < auto_crop_depth_3d:
+            raise ValueError(
+                "3D slab crop depth is too small: "
+                f"got {crop_depth_3d}, required at least {auto_crop_depth_3d} "
+                f"(encoder_rf={encoder_rf_depth_3d}, target_slab_depth={target_slab_depth_3d})"
+            )
+        if is_main_process:
+            print(
+                f"[{config_name}] 3d_slab geometry: spatial_crop="
+                f"{int(data_cfg.get('volume_crop_size', data_cfg.get('crop_size_3d', 64)))} "
+                f"crop_depth={crop_depth_3d} encoder_rf_depth={encoder_rf_depth_3d} "
+                f"target_slab_depth={target_slab_depth_3d}"
+            )
         dataset = JEPA3DCropDataset(
             data_root=data_cfg.get("data_root", "data"),
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
             num_samples=int(data_cfg.get("num_samples", 2000)),
             crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
+            crop_depth=crop_depth_3d,
+            depth_axis=int(data_cfg.get("volume_depth_axis", data_cfg.get("cube_slice_axis", 0))),
+            random_axis=bool(data_cfg.get("volume_random_axis", False)),
             normalize=bool(data_cfg.get("normalize", True)),
             crop_strategy=str(data_cfg.get("crop_strategy", "random")),
         )
@@ -1071,6 +1106,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
             num_samples=max(1, int(train_cfg.get("inference_num_samples", 8))),
             crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
+            crop_depth=crop_depth_3d,
+            depth_axis=int(data_cfg.get("volume_depth_axis", data_cfg.get("cube_slice_axis", 0))),
+            random_axis=False,
             normalize=bool(data_cfg.get("normalize", True)),
             crop_strategy="center",
         )
@@ -1549,7 +1587,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             mask_footprint_mean_px = float(footprint_values.float().mean().item())
             mask_footprint_min_px = float(footprint_values.float().min().item())
             mask_footprint_max_px = float(footprint_values.float().max().item())
-            mask_scale_factor = float(outputs.get("mask_scale_factor", model.mask_scale))
+            mask_scale_factor = float(outputs.get("mask_scale_factor", getattr(model, "mask_scale", 1.0)))
 
             elapsed = time.time() - start
             global_step = epoch * max(1, len(dataloader)) + batch_idx

@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+from scripts.check_session_integrity import check_session
+from scripts.migrate_embedding_artifacts import migrate_results
 from scripts.session_to_dash import compute_dash_data
 from src.models.masking import (
     ALLOWED_TARGET_SAMPLING_MODES,
@@ -9,6 +11,7 @@ from src.models.masking import (
     make_pyramid_grid_context,
     normalize_target_sampling_mode,
 )
+from src.utils.viz import save_inference_dashboard
 
 
 def test_fractional_spatial_target_budget_matches_area_ratio_for_integer_case():
@@ -313,3 +316,96 @@ def test_dashboard_reconstructs_pyramid_mask_cube_from_cdd_diff(tmp_path):
 
     assert cube.shape == (3, 8, 8)
     assert int(np.count_nonzero(cube)) == 8
+
+
+def test_dashboard_accepts_chw_embedding_artifacts(tmp_path):
+    session_dir = tmp_path / "session_chw_embeddings"
+    results_dir = session_dir / "results"
+    results_dir.mkdir(parents=True)
+    outputs = {
+        "x_clean": torch.ones((1, 1, 8, 8), dtype=torch.float32),
+        "x_context": torch.ones((1, 1, 8, 8), dtype=torch.float32),
+        "target_locations": torch.zeros((1, 1, 2), dtype=torch.long),
+        "target_valid": torch.ones((1, 1), dtype=torch.bool),
+        "pred_map": torch.zeros((1, 4, 4, 4), dtype=torch.float32),
+        "gt_map": torch.zeros((1, 4, 4, 4), dtype=torch.float32),
+        "context_map": torch.zeros((1, 4, 4, 4), dtype=torch.float32),
+        "pred_patches": torch.zeros((1, 1, 4, 1, 1), dtype=torch.float32),
+        "gt_patches": torch.zeros((1, 1, 4, 1, 1), dtype=torch.float32),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+    base = np.arange(3 * 4 * 4, dtype=np.float32).reshape(3, 4, 4)
+    for branch in ("predict", "target", "context"):
+        np.save(results_dir / f"{branch}_spatial_shape.npy", np.asarray([4, 4], dtype=np.int64))
+        np.save(results_dir / f"{branch}_pca_xyz.npy", base + 10.0)
+        np.save(results_dir / f"{branch}_umap_xyz.npy", base + 20.0)
+
+    dash_path = compute_dash_data(str(session_dir), overwrite=True)
+    with np.load(dash_path) as data:
+        pred_pca = data["pred_pca3d"]
+        pred_umap = data["pred_umap3d"]
+
+    assert pred_pca.shape == (16, 3)
+    assert pred_umap.shape == (16, 3)
+    np.testing.assert_allclose(pred_pca[0], np.array([10.0, 26.0, 42.0], dtype=np.float32))
+    np.testing.assert_allclose(pred_umap[0], np.array([20.0, 36.0, 52.0], dtype=np.float32))
+
+
+def test_inference_dashboard_exports_embedding_maps_not_flat_triplets(tmp_path):
+    session_dir = tmp_path / "export_session"
+    outputs = {
+        "x_clean": torch.ones((1, 1, 8, 8), dtype=torch.float32),
+        "x_clean_raw": torch.ones((1, 1, 8, 8), dtype=torch.float32),
+        "x_context": torch.ones((1, 1, 8, 8), dtype=torch.float32),
+        "target_locations": torch.zeros((1, 1, 2), dtype=torch.long),
+        "target_valid": torch.ones((1, 1), dtype=torch.bool),
+        "pred_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
+        "gt_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
+        "context_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
+    }
+
+    save_inference_dashboard(str(session_dir), outputs, umap_cfg={"n_neighbors": 4})
+    results_dir = session_dir / "results"
+
+    assert np.load(results_dir / "latent_vectors_full.npy").shape == (4, 4, 4)
+    assert np.load(results_dir / "pca_xyz.npy").shape == (3, 4, 4)
+    assert np.load(results_dir / "umap_xyz.npy").shape == (3, 4, 4)
+    assert np.load(results_dir / "predict_latent_vectors_full.npy").shape == (4, 4, 4)
+    assert np.load(results_dir / "predict_pca_xyz.npy").shape == (3, 4, 4)
+    assert np.load(results_dir / "predict_umap_xyz.npy").shape == (3, 4, 4)
+    assert not (results_dir / "predict_umap_x.npy").exists()
+    assert not (results_dir / "predict_umap_y.npy").exists()
+    assert not (results_dir / "predict_umap_z.npy").exists()
+
+
+def test_embedding_migration_refuses_guessed_square_reshape(tmp_path):
+    results_dir = tmp_path / "session" / "results"
+    results_dir.mkdir(parents=True)
+    np.save(results_dir / "predict_latent_vectors_full.npy", np.zeros((16, 4), dtype=np.float32))
+
+    try:
+        migrate_results(results_dir, dry_run=True)
+    except ValueError as e:
+        assert "refusing guessed reshape" in str(e)
+    else:
+        raise AssertionError("migration should refuse reshaping without spatial_shape")
+
+
+def test_session_integrity_rejects_flat_embedding_maps(tmp_path):
+    session_dir = tmp_path / "session"
+    results_dir = session_dir / "results"
+    results_dir.mkdir(parents=True)
+    outputs = {
+        "x_clean": torch.ones((1, 1, 8, 8), dtype=torch.float32),
+        "pred_map": torch.zeros((1, 4, 4, 4), dtype=torch.float32),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+    for branch in ("predict", "target"):
+        np.save(results_dir / f"{branch}_spatial_shape.npy", np.asarray([4, 4], dtype=np.int64))
+        np.save(results_dir / f"{branch}_pca_xyz.npy", np.zeros((16, 3), dtype=np.float32))
+        np.save(results_dir / f"{branch}_umap_xyz.npy", np.zeros((3, 4, 4), dtype=np.float32))
+
+    report = check_session(str(session_dir))
+
+    assert not report.ok
+    assert any(f"invalid_shape:predict_pca_xyz.npy expected=(3,4,4) got=(16, 3)" in issue for issue in report.issues)
