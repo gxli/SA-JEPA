@@ -6,20 +6,21 @@ import numpy as np
 import torch
 
 
-MAX_RANK_TOKENS = 10_000
+MAX_RANK_TOKENS = 65536
 
 
 def _subsample_rows_np(z: np.ndarray, max_rows: int = MAX_RANK_TOKENS) -> np.ndarray:
     if z.shape[0] <= int(max_rows):
         return z
-    idx = np.linspace(0, z.shape[0] - 1, int(max_rows), dtype=np.int64)
+    rng = np.random.default_rng(42)
+    idx = rng.choice(z.shape[0], size=int(max_rows), replace=False)
     return z[idx]
 
 
 def _subsample_rows_torch(z: torch.Tensor, max_rows: int = MAX_RANK_TOKENS) -> torch.Tensor:
     if z.shape[0] <= int(max_rows):
         return z
-    idx = torch.linspace(0, z.shape[0] - 1, int(max_rows), device=z.device).long()
+    idx = torch.randperm(z.shape[0], device=z.device)[:int(max_rows)]
     return z.index_select(0, idx)
 
 

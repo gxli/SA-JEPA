@@ -21,7 +21,7 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     sigreg_type = str(cfg.get("type", "std_hinge"))
     sigreg_target = str(cfg.get("target", "context"))
     sigreg_weight = float(cfg.get("weight", 0.0))
-    assert sigreg_type in {"std_hinge", "weak_sigreg"}
+    assert sigreg_type in {"std_hinge", "weak_sigreg", "sketched_sigreg"}
     assert sigreg_target == "context"
     assert sigreg_weight >= 0
     target_std = float(cfg.get("target_std", 1.0))
@@ -187,6 +187,50 @@ def weak_sigreg_loss(
     return loss
 
 
+def sketched_sigreg_loss(
+    z: torch.Tensor,
+    target_std: float = 1.0,
+    sketch_dim: int = 64,
+    eps: float = 1e-6,
+    sketch_seed: int = 0,
+) -> torch.Tensor:
+    del sketch_seed  # Preserve config shape; projection is intentionally stochastic.
+    z = z.float()
+    if z.numel() == 0 or z.shape[0] < 2:
+        return z.sum() * 0.0
+
+    z = z - z.mean(dim=0, keepdim=True)
+    c = z.shape[1]
+    sketch_dim = int(max(1, sketch_dim))
+    a = torch.randn((c, sketch_dim), device=z.device, dtype=z.dtype)
+    a = a / a.norm(dim=0, keepdim=True).clamp_min(1e-6)
+    y = z @ a
+    projected_var_loss = (y.var(dim=0, unbiased=False) - float(target_std) ** 2).pow(2).mean()
+
+    # The historical projected variance loss has zero gradient at exact
+    # collapse because d(var(z @ A))/dz is proportional to z. Keep the old
+    # isotropic pressure, but add a direct std hinge so near-zero embeddings
+    # have an escape gradient instead of sitting at loss ~= 1 forever.
+    # If all target embeddings are exactly identical, std(z) is high-loss but
+    # zero-gradient. Add tiny loss-local jitter so collapsed dimensions get a
+    # deterministic escape direction through the std hinge; the jitter is not
+    # applied to the model outputs or diagnostics.
+    escape_jitter = max(float(eps) ** 0.5, 1e-3)
+    z_escape = z + escape_jitter * torch.randn_like(z)
+    std_full = torch.sqrt(z_escape.var(dim=0, unbiased=False) + float(eps))
+    escape_loss = torch.relu(float(target_std) - std_full).mean()
+
+    std_corr = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
+    z_corr = z / std_corr.clamp_min(float(eps)).unsqueeze(0)
+    corr = (z_corr.t() @ z_corr) / float(max(1, z.shape[0] - 1))
+    corr = corr - torch.diag(corr.diag())
+    if c > 1:
+        decorrelation_loss = corr.pow(2).sum() / float(c * (c - 1))
+    else:
+        decorrelation_loss = corr.sum() * 0.0
+    return projected_var_loss + escape_loss + decorrelation_loss
+
+
 def compute_spread_regularizer_loss(z: torch.Tensor, cfg: dict[str, float | str]) -> torch.Tensor:
     sigreg_type = str(cfg.get("type", "std_hinge"))
     if sigreg_type == "std_hinge":
@@ -203,7 +247,31 @@ def compute_spread_regularizer_loss(z: torch.Tensor, cfg: dict[str, float | str]
             eps=float(cfg.get("eps", 1e-4)),
             sketch_seed=int(cfg.get("sketch_seed", 0)),
         )
+    if sigreg_type == "sketched_sigreg":
+        return sketched_sigreg_loss(
+            z,
+            target_std=float(cfg.get("target_std", 1.0)),
+            sketch_dim=int(cfg.get("sketch_dim", 64)),
+            eps=float(cfg.get("eps", 1e-6)),
+            sketch_seed=int(cfg.get("sketch_seed", 0)),
+        )
     raise ValueError(f"Unsupported spread regularizer type: {sigreg_type}")
+
+
+def compute_output_spread_regularizer_loss(
+    outputs: dict,
+    cfg: dict[str, float | str],
+    *,
+    include_predictor: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if "context_patches" not in outputs:
+        raise KeyError("SIGReg requires outputs['context_patches']; refusing to regularize predictor-only outputs")
+    z_ctx = extract_valid_pooled_embeddings(outputs, key="context_patches")
+    loss = compute_spread_regularizer_loss(z_ctx, cfg)
+    if include_predictor:
+        z_pred = extract_valid_pooled_embeddings(outputs, key="pred_patches")
+        loss = loss + compute_spread_regularizer_loss(z_pred, cfg)
+    return loss, z_ctx
 
 
 @torch.no_grad()

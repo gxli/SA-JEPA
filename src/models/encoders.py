@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 
@@ -268,3 +269,170 @@ class EscnnC4PyramidEncoder(nn.Module):
         gx = self.head(gx)
         gx = self.gpool(gx)
         return self.final_norm(gx.tensor)
+
+
+class CDDScaleAwareConvNeXtEncoder(nn.Module):
+    """
+    Scale-aware CDD pyramid encoder.
+
+    Input:
+      fields:      B x S x H x W
+      mask_tokens: B x S x H x W
+
+    Per scale:
+      [field_s, mask_s, normalized_log_sigma_s] -> shared adapter.
+    Then concatenate scale features and feed a dense ConvNeXt encoder.
+    """
+
+    def __init__(
+        self,
+        scales,
+        hidden_channels: int,
+        latent_channels: int,
+        depth: int = 4,
+        kernel_size: int = 7,
+        expansion: int = 4,
+        scale_feat_channels: int = 8,
+        adapter_kernel_size: int = 3,
+        fusion_type: str = "concat",
+        use_reflect_padding: bool = True,
+        final_norm: bool = True,
+        final_norm_type: str = "layernorm",
+        head_bias: bool = True,
+        cdd_append_last_residual: bool = True,
+        adapter_norm: bool = True,
+        use_grn: bool = True,
+        stem_norm: bool = True,
+        dilations=None,
+    ):
+        super().__init__()
+        self.scales = tuple(float(s) for s in scales)
+        self.num_scales = len(self.scales)
+        self.scale_feat_channels = int(scale_feat_channels)
+        self.fusion_type = str(fusion_type).lower()
+        self.cdd_append_last_residual = bool(cdd_append_last_residual)
+        if self.fusion_type not in ("concat", "topdown"):
+            raise ValueError(f"Unsupported fusion_type={fusion_type}. Use 'concat' or 'topdown'.")
+
+        logs = torch.log(torch.tensor(self.scales, dtype=torch.float32))
+        if logs.numel() > 1:
+            logs = (logs - logs.mean()) / logs.std(unbiased=False).clamp_min(1e-6)
+        else:
+            logs = logs * 0.0
+        self.register_buffer("scale_codes", logs.view(1, self.num_scales, 1, 1), persistent=False)
+
+        pad = int(adapter_kernel_size) // 2
+        if use_reflect_padding and pad > 0:
+            adapter_layers = [
+                nn.ReflectionPad2d(pad),
+                nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=0),
+            ]
+        else:
+            adapter_layers = [
+                nn.Conv2d(3, self.scale_feat_channels, kernel_size=int(adapter_kernel_size), padding=pad),
+            ]
+        if adapter_norm:
+            adapter_layers.append(LayerNorm2d(self.scale_feat_channels))
+        adapter_layers += [
+            nn.GELU(),
+            nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1),
+        ]
+        if adapter_norm:
+            adapter_layers.append(LayerNorm2d(self.scale_feat_channels))
+        adapter_layers.append(nn.GELU())
+        self.adapter = nn.Sequential(*adapter_layers)
+
+        print(
+            f"[CDDScaleAwareConvNeXt] depth={depth}, dilations={dilations}, "
+            f"stem_norm={stem_norm}, adapter_norm={adapter_norm}, "
+            f"final_norm={final_norm}({final_norm_type}), grn={use_grn}"
+        )
+        self.convnext = ConvNeXtDenseEncoder(
+            in_channels=self.num_scales * self.scale_feat_channels,
+            hidden_channels=hidden_channels,
+            latent_channels=latent_channels,
+            depth=depth,
+            kernel_size=kernel_size,
+            expansion=expansion,
+            use_reflect_padding=use_reflect_padding,
+            final_norm=final_norm,
+            final_norm_type=final_norm_type,
+            head_bias=head_bias,
+            use_grn=use_grn,
+            stem_norm=stem_norm,
+            dilations=dilations,
+        )
+        if self.fusion_type == "topdown":
+            self.fusion_proj = nn.ModuleList(
+                [
+                    nn.Conv2d(self.scale_feat_channels, self.scale_feat_channels, kernel_size=1)
+                    for _ in range(self.num_scales)
+                ]
+            )
+
+    def forward(self, fields: torch.Tensor, mask_tokens=None) -> torch.Tensor:
+        if fields.ndim != 4:
+            raise ValueError(f"Expected fields B,S,H,W, got {tuple(fields.shape)}")
+        b, s, h, w = fields.shape
+        if mask_tokens is None:
+            mask_tokens = torch.zeros_like(fields)
+
+        if s != self.num_scales:
+            if s > self.num_scales:
+                n_extra = s - self.num_scales
+                if self.cdd_append_last_residual:
+                    base = fields[:, : self.num_scales, :, :]
+                    extra = fields[:, self.num_scales :, :, :]
+                    last = base[:, self.num_scales - 1 : self.num_scales, :, :] + extra.sum(dim=1, keepdim=True)
+                    fields = torch.cat([base[:, : self.num_scales - 1, :, :], last], dim=1)
+                else:
+                    fields = fields[:, : self.num_scales, :, :]
+                print(
+                    f"[{self.__class__.__name__}] WARNING: Truncated {n_extra} extra channel(s) "
+                    f"(append_last_residual={self.cdd_append_last_residual}). Check model.sigmas and encoder scale count."
+                )
+            else:
+                n_missing = self.num_scales - s
+                if self.cdd_append_last_residual:
+                    residual = fields[:, -1:, :, :]
+                    res_mask = mask_tokens[:, -1:, :, :]
+                    n_split = n_missing + 1
+                    split = residual / float(n_split)
+                    fields = torch.cat([fields[:, :-1, :, :], split.expand(-1, n_split, -1, -1)], dim=1)
+                    mask_tokens = torch.cat([mask_tokens[:, :-1, :, :], res_mask.expand(-1, n_split, -1, -1)], dim=1)
+                else:
+                    zeros = torch.zeros(b, n_missing, h, w, dtype=fields.dtype, device=fields.device)
+                    fields = torch.cat([fields, zeros], dim=1)
+                    mask_tokens = torch.cat([mask_tokens, zeros], dim=1)
+                print(
+                    f"[{self.__class__.__name__}] WARNING: Padded {n_missing} missing channel(s) "
+                    f"(append_last_residual={self.cdd_append_last_residual}). Check model.sigmas and encoder scale count."
+                )
+            s = self.num_scales
+
+        mask_tokens = mask_tokens[:, :s, :, :]
+        if mask_tokens.shape != fields.shape:
+            raise ValueError(
+                f"mask_tokens shape must match fields shape. fields={tuple(fields.shape)} mask={tuple(mask_tokens.shape)}"
+            )
+
+        scale_maps = self.scale_codes.to(dtype=fields.dtype, device=fields.device).expand(b, s, h, w)
+        feats = []
+        for i in range(s):
+            xi = torch.stack([fields[:, i], mask_tokens[:, i], scale_maps[:, i]], dim=1)
+            feats.append(self.adapter(xi))
+        if self.fusion_type == "topdown":
+            fused = [None] * s
+            running = None
+            for rev_i, feat in enumerate(reversed(feats)):
+                idx = s - 1 - rev_i
+                if running is None:
+                    running = feat
+                else:
+                    if running.shape[-2:] != feat.shape[-2:]:
+                        running = F.interpolate(running, size=feat.shape[-2:], mode="bilinear", align_corners=False)
+                    running = feat + running
+                fused[idx] = self.fusion_proj[idx](running)
+            feats = fused
+        x = torch.cat(feats, dim=1)
+        return self.convnext(x)

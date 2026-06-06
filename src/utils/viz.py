@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MAX_PCA_FIT_TOKENS = 10_000
+MAX_PCA_FIT_TOKENS = 65536
 
 
 def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
@@ -51,16 +51,16 @@ def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
     return os.path.basename(out_html)
 
 
-def _compute_pca_2d(x: np.ndarray) -> np.ndarray:
+def _compute_pca_2d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     fit_x = x
-    if x.shape[0] > MAX_PCA_FIT_TOKENS:
-        idx = np.linspace(0, x.shape[0] - 1, MAX_PCA_FIT_TOKENS, dtype=np.int64)
-        fit_x = x[idx]
+    if x.shape[0] > fit_max_tokens:
+        rng = np.random.default_rng(42)
+        fit_x = x[rng.choice(x.shape[0], size=fit_max_tokens, replace=False)]
     try:
         from sklearn.decomposition import PCA
 
-        pca = PCA(n_components=2).fit(fit_x)
+        pca = PCA(n_components=2, random_state=42).fit(fit_x)
         return pca.transform(x).astype(np.float32)
     except Exception as e:
         print(f"[warning] sklearn PCA(2D) failed: {type(e).__name__}: {e}; falling back to torch.pca_lowrank")
@@ -72,18 +72,19 @@ def _compute_pca_2d(x: np.ndarray) -> np.ndarray:
         return (x_t @ v[:, :2]).cpu().numpy().astype(np.float32)
 
 
-def _compute_pca_3d(x: np.ndarray) -> np.ndarray:
+def _compute_pca_3d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     fit_x = x
-    if x.shape[0] > MAX_PCA_FIT_TOKENS:
-        idx = np.linspace(0, x.shape[0] - 1, MAX_PCA_FIT_TOKENS, dtype=np.int64)
+    if x.shape[0] > fit_max_tokens:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(x.shape[0], size=fit_max_tokens, replace=False)
         fit_x = x[idx]
     mean = fit_x.mean(axis=0, keepdims=True)
     fit_centered = fit_x - mean
     try:
         from sklearn.decomposition import PCA
 
-        pca = PCA(n_components=3).fit(fit_x)
+        pca = PCA(n_components=3, random_state=42).fit(fit_x)
         return pca.transform(x).astype(np.float32)
     except Exception as e:
         print(f"[warning] sklearn PCA(3D) failed: {type(e).__name__}: {e}; falling back to numpy SVD")
@@ -116,23 +117,33 @@ def _compute_umap_nd(
     metric: str = "cosine",
     random_state: int = 42,
     init: str = "spectral",
+    fit_max_tokens: int = 65536,
 ) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     init_mode = str(init).lower()
     if init_mode not in ("spectral", "random"):
         init_mode = "spectral"
+
+    fit_x = x
+    if x.shape[0] > fit_max_tokens:
+        rng = np.random.default_rng(random_state)
+        idx = rng.choice(x.shape[0], size=fit_max_tokens, replace=False)
+        fit_x = x[idx]
+
     try:
         from cuml.manifold import UMAP as CuMLUMAP
 
         print("[inference] UMAP backend: cuML (GPU)")
-        return CuMLUMAP(
+        model = CuMLUMAP(
             n_components=n_components,
             n_neighbors=int(n_neighbors),
             min_dist=float(min_dist),
             metric=str(metric),
             random_state=int(random_state),
             init=init_mode,
-        ).fit_transform(x)
+        )
+        model.fit(fit_x)
+        return model.transform(x)
     except Exception as e:
         print(f"[warning] cuML UMAP failed: {type(e).__name__}: {e}")
 
@@ -145,7 +156,8 @@ def _compute_umap_nd(
                 n_neighbors=int(n_neighbors),
                 min_dist=float(min_dist),
             )
-            z = model.fit_transform(torch.from_numpy(x.astype(np.float32)))
+            model.fit(torch.from_numpy(fit_x.astype(np.float32)))
+            z = model.transform(torch.from_numpy(x.astype(np.float32)))
             if isinstance(z, torch.Tensor):
                 return z.cpu().numpy()
             return np.asarray(z)
@@ -155,20 +167,22 @@ def _compute_umap_nd(
     try:
         import umap
 
-        return umap.UMAP(
+        model = umap.UMAP(
             n_components=n_components,
             n_neighbors=int(n_neighbors),
             min_dist=float(min_dist),
             metric=str(metric),
             random_state=int(random_state),
             init=init_mode,
-        ).fit_transform(x)
+        )
+        model.fit(fit_x)
+        return model.transform(x)
     except Exception as e:
         print(f"[warning] umap-learn failed: {type(e).__name__}: {e}")
 
     if n_components == 3:
-        return _compute_pca_3d(x)
-    return _compute_pca_2d(x)
+        return _compute_pca_3d(x, fit_max_tokens=fit_max_tokens)
+    return _compute_pca_2d(x, fit_max_tokens=fit_max_tokens)
 
 
 def _save_latent_overview_html(session_dir: str, pca_points: np.ndarray, umap_points: np.ndarray, h: int, w: int) -> str:
@@ -389,6 +403,7 @@ def _filtered_embedding(
 
 def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | None = None) -> str:
     umap_cfg = dict(umap_cfg or {})
+    fit_max_tokens = int(umap_cfg.get("fit_max_tokens", 65536))
     umap_n_neighbors = int(umap_cfg.get("n_neighbors", 15))
     umap_min_dist = float(umap_cfg.get("min_dist", 0.05))
     umap_metric = str(umap_cfg.get("metric", "cosine"))
@@ -456,7 +471,10 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         z = np.transpose(latent_map, (1, 2, 0)).reshape(-1, fmap.shape[1]).astype(np.float32)
 
         # Filter invalid-region latents from PCA/UMAP, keep NaN sentinels.
-        pca3 = _filtered_embedding(z, valid_mask_flat, _compute_pca_3d).astype(np.float32)
+        pca3 = _filtered_embedding(
+            z, valid_mask_flat,
+            lambda arr: _compute_pca_3d(arr, fit_max_tokens=fit_max_tokens),
+        ).astype(np.float32)
 
         if valid_mask_flat.all():
             z_umap = _preprocess_latents_for_umap(
@@ -472,6 +490,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
                 metric=umap_metric,
                 random_state=umap_random_state,
                 init=umap_init,
+                fit_max_tokens=fit_max_tokens,
             ).astype(np.float32)
         else:
             z_valid = z[valid_mask_flat]
@@ -491,6 +510,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
                     metric=umap_metric,
                     random_state=umap_random_state,
                     init=umap_init,
+                    fit_max_tokens=fit_max_tokens,
                 ).astype(np.float32)
                 umap3 = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
                 umap3[valid_mask_flat] = umap3_valid

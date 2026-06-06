@@ -174,14 +174,33 @@ def _apply_nan_boundary_frame(x: torch.Tensor, border_px: int) -> torch.Tensor:
     return out
 
 
-def _first_full_resolution_batch(dataloader):
+def _first_full_resolution_batch(dataloader, max_diagnostic_size: int = 768):
+    """Fetch a single batch for diagnostic visualization.
+
+    Enforces a max size to prevent GPU OOM and 100MB+ HTML crashes
+    on very large images (e.g. 2000×2000+).
+    """
     dataset = getattr(dataloader, "dataset", None)
     if dataset is None or not hasattr(dataset, "__getitem__"):
         return None
     old = {}
+
+    # Check original image size to see if we need to enforce a crop
+    needs_safety_crop = False
+    try:
+        sample_path = dataset.sample_index[0][0]
+        shape = dataset._probe_file_shape(sample_path)
+        if shape[-2] > max_diagnostic_size or shape[-1] > max_diagnostic_size:
+            needs_safety_crop = True
+    except Exception:
+        pass
+
+    target_crop_mode = "center" if needs_safety_crop else "none"
+    target_crop_size = max_diagnostic_size if needs_safety_crop else None
+
     for name, value in (
-        ("crop_mode", "none"),
-        ("crop_size", None),
+        ("crop_mode", target_crop_mode),
+        ("crop_size", target_crop_size),
         ("d4_augment", False),
         ("random_roll_max", 0),
         ("crop_min_valid_fraction", 0.0),
@@ -219,6 +238,7 @@ def run_post_training_inference(
     training_d4_augment: bool = False,
     inference_tta_enabled: bool = False,
     inference_tta_mode: str = "flip4",
+    max_diagnostic_size: int = 768,
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
     if (not force_recompute_inference) and os.path.exists(inference_outputs_path):
@@ -261,7 +281,7 @@ def run_post_training_inference(
     model.eval()
     with torch.no_grad():
         print(f"[{config_name}] post_training_inference loading sample batch")
-        raw_batch = _first_full_resolution_batch(dataloader)
+        raw_batch = _first_full_resolution_batch(dataloader, max_diagnostic_size=max_diagnostic_size)
         if raw_batch is None:
             raw_batch = next(iter(dataloader))
         else:

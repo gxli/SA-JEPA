@@ -290,6 +290,77 @@ Example: `configs/base_3090.json`
 - `loss.weight_jepa` (float)
 - `loss.weight_pixel` (float)
 
+## Inference Mode
+
+Run a trained model on arbitrary `.npy` or `.fits` data without a config file:
+
+```bash
+python -m src.inference_from_session \
+    --session sessions/gen_127_mhd_run_001_ms1p2 \
+    --input data/chengdu.npy \
+    --output-session sessions/inference_chengdu
+```
+
+Or via config:
+
+```bash
+python -m src.inference_from_session --config configs/inference/chengdu.json
+```
+
+### Large images — tiled inference
+
+For images that exceed GPU memory, use `--crop-mode tile` with `--crop-size`:
+
+```bash
+python -m src.inference_from_session \
+    --session sessions/gen_127_mhd_run_001_ms1p2 \
+    --input data/huge_mosaic.npy \
+    --crop-size 256 --crop-mode tile \
+    --output-session sessions/inference_mosaic
+```
+
+Tiles are stitched on CPU to avoid GPU OOM. 50% overlap, simple averaging.
+
+### Test-time augmentation
+
+```bash
+python -m src.inference_from_session \
+    --session ... --input ... \
+    --tta --tta-mode flip4
+```
+
+### 3D slab mode
+
+```bash
+python -m src.inference_from_session \
+    --session ... --input data/volume.npy \
+    --mode 3d_slab --slice-axis 0
+```
+
+### Output
+
+Creates `sessions/<name>/` with:
+- `inference_outputs.pt` — full tensors
+- `pred_map.npz`, `gt_map.npz`, `context_map.npz`
+- `config_used.json` — marked `inference_only: true`
+- Dashboard artifacts (PCA/UMAP arrays for `session_to_dash.py`)
+
+### CLI reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--session` | required | Path to trained session |
+| `--input` | required | Path to `.npy` or `.fits` file |
+| `--crop-size` | None | Crop size for large inputs |
+| `--crop-mode` | center | `center` or `tile` |
+| `--mode` | image | `image` or `3d_slab` |
+| `--output-session` | auto | Output directory |
+| `--batch-size` | 2 | Per-GPU batch size |
+| `--tta` | off | Enable test-time augmentation |
+| `--tta-mode` | flip4 | `flip4`, `rot4`, or `d4` |
+| `--device` | auto | `cuda`, `mps`, or `cpu` |
+| `--allow-partial-load` | off | Skip strict checkpoint matching |
+
 ## Notes
 
 - Mixed precision (`torch.amp`) is enabled automatically when CUDA is available.

@@ -26,21 +26,20 @@ from src.diagnostics import (
 )
 from src.inference import run_post_training_inference, run_post_training_inference_3d
 from src.losses import (
-    compute_spread_regularizer_loss,
     compute_jepa_energy,
+    compute_output_spread_regularizer_loss,
     compute_raw_mse_and_norm_err,
     compute_sim_var_cov,
     compute_sim_var_cov_torch,
     compute_target_energy_map,
     embedding_spread_stats,
-    extract_valid_dense_embeddings,
-    extract_valid_pooled_embeddings,
     parse_spread_regularizer_config,
 )
 from src.models.build_jepa import CDD_DEBUG_ENCODER_TYPES, PyramidGridJEPA
 from src.models.build_jepa3d import PyramidGridJEPA3D, compute_3d_encoder_receptive_field_depth
 from src.models.masking import prepare_context_batch
 from src.utils import log_error, set_error_log_path
+from src.utils.npy import _safe_load_npy
 from src.utils.viz import save_inference_dashboard, save_volumetric_umap_embeddings
 
 def _fmt_metric(v: float) -> str:
@@ -143,12 +142,29 @@ def _write_data_profile(*, data_cfg: dict, session_dir: str, config_name: str) -
     }
     for path in files:
         item = {"path": path}
-        item.update(_summarize_data_array(np.load(path, mmap_mode="r")))
+        if path.endswith(".fits"):
+            try:
+                from astropy.io import fits
+                arr = fits.getdata(path, memmap=True)
+                item.update(_summarize_data_array(np.asarray(arr, dtype=np.float32)))
+            except ImportError:
+                item.update({"shape": "unknown (astropy not installed)", "nan_count": -1, "normalized_zero_fraction": -1, "aspect_ratio_h_over_w": -1})
+        elif path.endswith(".h5"):
+            try:
+                import h5py
+                with h5py.File(path, "r") as h5:
+                    arr = h5["data"][:]
+                item.update(_summarize_data_array(np.asarray(arr, dtype=np.float32)))
+            except ImportError:
+                item.update({"shape": "unknown (h5py not installed)", "nan_count": -1, "normalized_zero_fraction": -1, "aspect_ratio_h_over_w": -1})
+        else:
+            item.update(_summarize_data_array(_safe_load_npy(path, mmap_mode="r")))
         profile["files"].append(item)
+        shape_str = f"shape={tuple(item.get('shape', '?'))}" if 'shape' in item else ""
         print(
-            f"[{config_name}] Data profile: path={path} shape={tuple(item['shape'])} "
-            f"nan={item['nan_count']} normalized_zero_fraction={item['normalized_zero_fraction']:.4f} "
-            f"aspect_h_over_w={item['aspect_ratio_h_over_w']}"
+            f"[{config_name}] Data profile: path={path} {shape_str} "
+            f"nan={item.get('nan_count', '?')} normalized_zero_fraction={item.get('normalized_zero_fraction', -1):.4f} "
+            f"aspect_h_over_w={item.get('aspect_ratio_h_over_w', -1)}"
         )
     with open(os.path.join(session_dir, "data_profile.json"), "w", encoding="utf-8") as f:
         json.dump(profile, f, indent=2)
@@ -188,6 +204,7 @@ def _precompute_cdd_cache(
     model_cfg: dict,
     device: torch.device,
     config_name: str,
+    cache_replicas: int = 1,
 ) -> dict:
     """Pre-compute a bounded CDD decomposition cache on GPU, store in CPU RAM."""
     import glob as _glob
@@ -201,11 +218,16 @@ def _precompute_cdd_cache(
     cdd_append_last_residual = bool(model_cfg.get("cdd_append_last_residual", True))
     sigmas = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
     if device.type != "cuda":
-        print(f"[{config_name}] CDD precompute: no CUDA, skipping")
-        return {}
+        raise RuntimeError(f"[{config_name}] CDD precompute requires CUDA. Got device={device.type}.")
     npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
+    # Also scan for .fits if pattern was .npy
+    if npy_pattern.endswith(".fits"):
+        pass  # already globbed
+    elif npy_pattern.endswith(".npy"):
+        fits_pattern = npy_pattern.replace(".npy", ".fits")
+        npy_files = sorted(_glob.glob(os.path.join(data_root, fits_pattern)) or npy_files)
     if not npy_files:
-        print(f"[{config_name}] CDD precompute: no files found, skipping")
+        print(f"[{config_name}] CDD precompute: no files found for pattern, skipping")
         return {}
     enabled = bool(data_cfg.get("cdd_precompute", True))
     if not enabled:
@@ -213,27 +235,37 @@ def _precompute_cdd_cache(
         return {}
     max_files = int(data_cfg.get("cdd_precompute_max_files", 4096))
     if max_files > 0 and len(npy_files) > max_files:
-        print(
+        raise RuntimeError(
             f"[{config_name}] CDD precompute: {len(npy_files)} files exceeds "
-            f"data.cdd_precompute_max_files={max_files}; using on-the-fly loading"
+            f"data.cdd_precompute_max_files={max_files}. Bump the limit."
         )
-        return {}
     max_gb = float(data_cfg.get("cdd_precompute_max_gb", 8.0))
     if max_gb > 0:
-        sample_shape = np.load(npy_files[0], mmap_mode="r").shape
+        sample_path = npy_files[0]
+        if sample_path.endswith(".fits"):
+            from astropy.io import fits as _fits
+            sample_shape = _fits.getdata(sample_path, memmap=True).shape
+        else:
+            sample_shape = _safe_load_npy(sample_path, mmap_mode="r").shape
         n_channels = len(sigmas) + (1 if cdd_append_last_residual else 0)
         est_bytes_per = int(n_channels) * int(np.prod(sample_shape)) * np.dtype(np.float32).itemsize
-        est_total_gb = (est_bytes_per * len(npy_files)) / float(1024 ** 3)
-        if est_total_gb > max_gb:
-            print(
-                f"[{config_name}] CDD precompute: estimated cache {est_total_gb:.2f} GiB exceeds "
-                f"data.cdd_precompute_max_gb={max_gb:.2f}; using on-the-fly loading"
+        est_process_gb = (est_bytes_per * len(npy_files)) / float(1024 ** 3)
+        est_node_gb = est_process_gb * max(1, int(cache_replicas))
+        if est_node_gb > max_gb:
+            raise RuntimeError(
+                f"[{config_name}] CDD precompute: estimated cache {est_process_gb:.2f} GiB per process "
+                f"x {max(1, int(cache_replicas))} local replica(s) = {est_node_gb:.2f} GiB exceeds "
+                f"data.cdd_precompute_max_gb={max_gb:.2f}. Bump the limit, reduce dataset size, "
+                "or disable RAM precompute for DDP."
             )
-            return {}
     print(f"[{config_name}] CDD precompute: {len(npy_files)} file(s) on GPU...")
     cache = {}
     for path in npy_files:
-        arr = np.load(path, mmap_mode="r").astype(np.float32)
+        if path.endswith(".fits"):
+            from astropy.io import fits as _fits
+            arr = np.asarray(_fits.getdata(path, memmap=True), dtype=np.float32)
+        else:
+            arr = _safe_load_npy(path, mmap_mode="r").astype(np.float32)
         # Normalize01 (same order as JEPADataset._preprocess_arr2d).
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         amin, amax = float(arr.min()), float(arr.max())
@@ -548,19 +580,24 @@ def _resolve_encoder_alias_2d(name: str) -> str:
     alias = {
         # Preferred naming convention (image / image_pyramid prefixes).
         "convnext_image_dense_masked": "convnext_dense_masktoken",
-        "cdd_scaleaware_convnext-pyramid-scaleaware": "convnext_dense_pyramid",
-        "image_pyramid_cdd_scaleaware_convnext": "convnext_dense_pyramid",
+        "cdd_scaleaware_convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
+        "image_pyramid_cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
         # Supported canonical names.
         "convnext_dense_masktoken": "convnext_dense_masktoken",
-        "cdd_scaleaware_convnext": "convnext_dense_pyramid",
+        "cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
         "convnext_dense_pyramid": "convnext_dense_pyramid",
         "escnn_c4_pyramid": "escnn_c4_pyramid",
         # Supported aliases.
-        "convnext-pyramid-scaleaware": "convnext_dense_pyramid",
+        "convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
         "convnext-pyramid": "convnext_dense_pyramid",
         "escnn-c4-pyramid": "escnn_c4_pyramid",
     }
-    return alias.get(key, str(name))
+    if key not in alias:
+        raise ValueError(
+            f"Unsupported 2D model_key/encoder_type={name!r}. "
+            f"Allowed aliases: {sorted(alias)}"
+        )
+    return alias[key]
 
 
 def _resolve_encoder_alias_3d(name: str) -> str:
@@ -587,13 +624,14 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
             )
     elif resolved_mode == "pyramid":
         allowed_pyramid = {
+            "cdd_scaleaware_convnext",
             "convnext_dense_pyramid",
             "escnn_c4_pyramid",
         }
         if resolved_encoder_type not in allowed_pyramid:
             raise ValueError(
                 f"Unsupported pyramid-mode encoder_type={resolved_encoder_type}. "
-                "Allowed: convnext_dense_pyramid, escnn_c4_pyramid."
+                "Allowed: cdd_scaleaware_convnext, convnext_dense_pyramid, escnn_c4_pyramid."
             )
     else:
         raise ValueError(f"Unsupported mode={resolved_mode}. Allowed: image, pyramid.")
@@ -807,6 +845,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         else:
             device = torch.device("cpu")
     is_main_process = (local_rank == 0)
+    cdd_cache_replicas = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1"))) if is_ddp else 1
 
     if is_main_process:
         print(
@@ -1084,7 +1123,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         sel_path = os.path.join(session_dir, "selected_slices.json")
         rng = random.Random(int(train_cfg.get("split_seed", 42)))
         for fpath in npy_files:
-            arr_mm = np.load(fpath, mmap_mode="r")
+            arr_mm = _safe_load_npy(fpath, mmap_mode="r")
             if arr_mm.ndim != 3:
                 continue
             n_total = int(arr_mm.shape[0])
@@ -1113,6 +1152,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         model_cfg=model_cfg,
         device=device,
         config_name=config_name,
+        cache_replicas=cdd_cache_replicas,
     ) if not is_3d_mode else None
     _write_cdd_cache_profile(cdd_cache=cdd_cache, session_dir=session_dir, config_name=config_name)
 
@@ -1370,7 +1410,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     inference_tta_enabled = bool(train_cfg.get("inference_tta_enabled", False))
     inference_tta_mode = str(train_cfg.get("inference_tta_mode", "flip4"))
     print(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
-    prediction_loss_weight = float(train_cfg.get("prediction_loss_weight", 100.0))
+    prediction_loss_weight = float(train_cfg.get("prediction_loss_weight", train_cfg.get("mse_loss_weight", 100.0)))
+    normalize_loss_l2_active = bool(model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", False)))
     spread_regularizer = parse_spread_regularizer_config(train_cfg)
     spread_regularizer_weight = float(spread_regularizer["weight"])
     embed_spread_target = float(spread_regularizer["target_std"])
@@ -1379,7 +1420,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     experimental_losses = dict(train_cfg.get("experimental_losses", {}))
     vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", experimental_losses.get("vicreg_var_weight", 0.0)))
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", experimental_losses.get("vicreg_cov_weight", 0.0)))
-    symmetry_loss_weight = float(train_cfg.get("symmetry_loss_weight", 0.0))
+    symmetry_loss_weight = float(train_cfg.get("symmetry_loss_weight", train_cfg.get("symmetric_feature_loss_weight", 0.0)))
     vicreg_spatial_mode = str(train_cfg.get("vicreg_spatial_mode", "dense")).lower()
     if vicreg_spatial_mode not in ("dense", "pooled"):
         raise ValueError(
@@ -1569,15 +1610,16 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
             with autocast(device_type=autocast_device, enabled=use_amp):
                 outputs = model(x_clean, context_data=context_data) if not is_3d_mode else model(x_clean)
-                loss_prediction = model.compute_loss(outputs)
                 _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
                     outputs,
                     spatial_mode=vicreg_spatial_mode,
                 )
-                if "context_patches" not in outputs:
-                    raise KeyError("SIGReg requires outputs['context_patches']; refusing to regularize predictor outputs")
-                z_ctx = extract_valid_dense_embeddings(outputs, key="context_patches")
-                loss_spread = compute_spread_regularizer_loss(z_ctx, spread_regularizer)
+                loss_spread, z_ctx = compute_output_spread_regularizer_loss(
+                    outputs,
+                    spread_regularizer,
+                    include_predictor=False,
+                )
+                loss_prediction = model.compute_loss(outputs)
                 loss_symmetry = model.compute_symmetric_loss(outputs)
                 total_loss = (
                     (prediction_loss_weight * loss_prediction)
@@ -1846,7 +1888,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             )
         model.train()
         # Save resumable checkpoint at the end of every epoch (main process only).
+        # Atomic write: tmp → rename prevents corruption on crash/OOM.
         if is_main_process:
+            tmp_ckpt = resume_ckpt_path + ".tmp"
             torch.save(
                 {
                     "epoch": int(epoch + 1),
@@ -1856,10 +1900,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     "scheduler_state_dict": scheduler.state_dict(),
                     "config_name": config_name,
                 },
-                resume_ckpt_path,
+                tmp_ckpt,
             )
-            # Keep model_last in sync for inference-only resume paths.
-            torch.save(model_without_ddp.state_dict(), model_ckpt_path)
+            os.replace(tmp_ckpt, resume_ckpt_path)
+            tmp_model = model_ckpt_path + ".tmp"
+            torch.save(model_without_ddp.state_dict(), tmp_model)
+            os.replace(tmp_model, model_ckpt_path)
             tqdm.write(f"[{config_name}] ckpt_saved epoch={epoch + 1}")
 
         # Per-epoch embedding snapshot for movie generation.
@@ -1878,7 +1924,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             model.train()
 
     if is_main_process:
-        torch.save(model_without_ddp.state_dict(), os.path.join(session_dir, "model_last.pt"))
+        tmp_final = os.path.join(session_dir, "model_last.pt.tmp")
+        torch.save(model_without_ddp.state_dict(), tmp_final)
+        os.replace(tmp_final, os.path.join(session_dir, "model_last.pt"))
 
     if is_3d_mode:
         session_dir = run_post_training_inference_3d(
@@ -1906,6 +1954,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             training_d4_augment=bool(data_cfg.get("d4_augment", False)),
             inference_tta_enabled=inference_tta_enabled,
             inference_tta_mode=inference_tta_mode,
+            max_diagnostic_size=int(train_cfg.get("max_diagnostic_size", 768)),
         )
     # Save NPY artifacts (PCA/UMAP/latent embeddings) required by session_to_dash.py.
     # No PNG, HTML, or dashboard rendering is performed here.

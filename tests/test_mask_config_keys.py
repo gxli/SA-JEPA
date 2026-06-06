@@ -1,6 +1,8 @@
+import pytest
 import torch
 
-from src.train import build_model_from_config
+from src.models.encoders import CDDScaleAwareConvNeXtEncoder
+from src.train import _resolve_encoder_alias_2d, build_model_from_config
 
 
 def _build(model_cfg):
@@ -88,3 +90,19 @@ def test_legacy_mask_keys_are_ignored_by_config_parser():
     assert model.mask_scale == 1.0
     assert model.mask_scale_range is None
     assert model.mask_box_size == 16
+
+
+def test_cdd_scaleaware_model_key_builds_scaleaware_encoder():
+    model = _build({"model_key": "cdd_scaleaware_convnext"})
+
+    assert model.encoder_type == "cdd_scaleaware_convnext"
+    assert isinstance(model.context_encoder, CDDScaleAwareConvNeXtEncoder)
+
+
+def test_scaleaware_alias_does_not_fallback_to_dense_pyramid():
+    assert _resolve_encoder_alias_2d("convnext-pyramid-scaleaware") == "cdd_scaleaware_convnext"
+
+
+def test_unknown_encoder_alias_raises():
+    with pytest.raises(ValueError, match="Unsupported 2D model_key"):
+        _resolve_encoder_alias_2d("cdd_scaleaware_convnext_typo")

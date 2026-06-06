@@ -46,6 +46,7 @@ from src.inference import (
     _apply_tta_2d,
     _average_maps,
 )
+from src.utils.npy import _safe_load_npy
 from src.utils.viz import save_inference_dashboard
 
 
@@ -257,7 +258,7 @@ def load_raw_data(
     Returns:
         Tensor B×1×H×W for image mode, B×1×D×H×W for 3D slab mode.
     """
-    arr = np.load(input_path, mmap_mode="r")
+    arr = _safe_load_npy(input_path, mmap_mode="r")
     print(f"[inference] loaded {input_path} shape={arr.shape} dtype={arr.dtype}")
 
     mode_norm = str(mode).strip().lower()

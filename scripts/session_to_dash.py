@@ -897,7 +897,14 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         h, w = int(shape[0]), int(shape[1])
         return [-0.5, float(w) - 0.5], [float(h) - 0.5, -0.5]
 
-    def _apply_image_axes(fig: go.Figure, shape: tuple[int, int], *, row: int | None = None, col: int | None = None) -> None:
+    def _apply_image_axes(
+        fig: go.Figure,
+        shape: tuple[int, int],
+        *,
+        row: int | None = None,
+        col: int | None = None,
+        scaleanchor: str | None = "x",
+    ) -> None:
         xr, yr = _image_axis_range(shape)
         fig.update_xaxes(
             showticklabels=False,
@@ -912,7 +919,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             showticklabels=False,
             showgrid=False,
             zeroline=False,
-            scaleanchor="x" if row is None else None,
+            scaleanchor=scaleanchor,
             scaleratio=1,
             constrain="domain",
             range=yr,
@@ -947,7 +954,20 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 zmin, zmax = float(np.min(finite)), float(np.max(finite))
             if zmax <= zmin + 1e-12:
                 zmax = zmin + 1.0
-        fig = go.Figure([go.Heatmap(z=vals, colorscale=colorscale, zmin=zmin, zmax=zmax, showscale=False)])
+        h_v, w_v = vals.shape[-2:]
+        fig = go.Figure(
+            [
+                go.Heatmap(
+                    z=vals,
+                    x=np.arange(w_v, dtype=np.float32),
+                    y=np.arange(h_v, dtype=np.float32),
+                    colorscale=colorscale,
+                    zmin=zmin,
+                    zmax=zmax,
+                    showscale=False,
+                )
+            ]
+        )
         fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=36, b=8), height=330)
         _apply_image_axes(fig, vals.shape[-2:])
         return fig
@@ -1222,11 +1242,21 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         for i in range(arr.shape[0]):
             r = i // cols + 1
             c = i % cols + 1
-            kwargs = dict(z=arr[i], colorscale=colorscale, zmin=zmin, zmax=zmax, showscale=(i == arr.shape[0] - 1))
+            h_i, w_i = arr[i].shape[-2:]
+            kwargs = dict(
+                z=arr[i],
+                x=np.arange(w_i, dtype=np.float32),
+                y=np.arange(h_i, dtype=np.float32),
+                colorscale=colorscale,
+                zmin=zmin,
+                zmax=zmax,
+                showscale=(i == arr.shape[0] - 1),
+            )
             if zmid is not None:
                 kwargs["zmid"] = zmid
             fig.add_trace(go.Heatmap(**kwargs), row=r, col=c)
-            _apply_image_axes(fig, arr[i].shape, row=r, col=c)
+            axis_idx = (r - 1) * cols + c
+            _apply_image_axes(fig, arr[i].shape, row=r, col=c, scaleanchor="x" if axis_idx == 1 else f"x{axis_idx}")
         fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=56, b=8), height=max(330, 260 * rows))
         return fig
 
@@ -1238,6 +1268,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             [
                 go.Heatmap(
                     z=vals,
+                    x=np.arange(vals.shape[-1], dtype=np.float32),
+                    y=np.arange(vals.shape[-2], dtype=np.float32),
                     colorscale="Turbo",
                     zmin=-0.5,
                     zmax=float(n_scales) - 0.5,

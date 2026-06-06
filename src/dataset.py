@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.utils.npy import _safe_load_npy
+
 try:
     import h5py  # optional — enables chunked HDF5 reading for large 3D arrays
 except ImportError:
@@ -107,7 +109,7 @@ class JEPADataset(Dataset):
             if fits is None:
                 raise ImportError("astropy is required to read .fits files; pip install astropy")
             return fits.getdata(path, memmap=True).shape
-        arr = np.load(path, mmap_mode="r")
+        arr = _safe_load_npy(path, mmap_mode="r")
         return arr.shape
 
     @staticmethod
@@ -156,12 +158,23 @@ class JEPADataset(Dataset):
             raise ValueError("No usable samples found from npy files.")
         return index
 
+    @property
+    def rng(self):
+        """Lazily initialize an isolated generator per DataLoader worker."""
+        if not hasattr(self, "_rng") or self._rng is None:
+            import torch.utils.data
+
+            worker_info = torch.utils.data.get_worker_info()
+            seed = worker_info.seed % (2**32) if worker_info is not None else np.random.randint(2**32)
+            self._rng = np.random.default_rng(seed)
+        return self._rng
+
     def _pick_slice_index(self, depth: int) -> int:
         strategy = self.cube_slice_strategy
         if strategy == "auto":
             strategy = "random"
         if strategy == "random":
-            return int(np.random.randint(0, depth))
+            return int(self.rng.integers(0, depth))
         if strategy == "center":
             return depth // 2
         if strategy == "fixed":
@@ -181,7 +194,7 @@ class JEPADataset(Dataset):
             elif forced_slice_idx is not None:
                 sidx = forced_slice_idx
             else:
-                sidx = int(np.random.randint(0, depth))
+                sidx = int(self.rng.integers(0, depth))
             sidx = int(np.clip(sidx, 0, depth - 1))
             return arr[sidx], int(sidx)
         axis = self.cube_slice_axis % 3
@@ -206,7 +219,7 @@ class JEPADataset(Dataset):
             elif forced_slice_idx is not None:
                 sidx = forced_slice_idx
             else:
-                sidx = int(np.random.randint(0, depth))
+                sidx = int(self.rng.integers(0, depth))
         else:
             axis = self.cube_slice_axis % 3
             depth = cdd.shape[axis + 1]
@@ -231,7 +244,7 @@ class JEPADataset(Dataset):
             arr_mm = fits.getdata(path, memmap=True)
             arr2d, _ = self._extract_2d_from_array(arr_mm, forced_slice_idx=forced_slice_idx)
         else:
-            arr_mm = np.load(path, mmap_mode="r")
+            arr_mm = _safe_load_npy(path, mmap_mode="r")
             arr2d, _ = self._extract_2d_from_array(arr_mm, forced_slice_idx=forced_slice_idx)
         arr = self._preprocess_arr2d(arr2d)
 
@@ -266,8 +279,8 @@ class JEPADataset(Dataset):
             x0 = (w - crop_w) // 2
         else:
             # Crop origin stays inside the margin implied by the crop size.
-            y0 = int(np.random.randint(0, h - crop_h + 1))
-            x0 = int(np.random.randint(0, w - crop_w + 1))
+            y0 = int(self.rng.integers(0, h - crop_h + 1))
+            x0 = int(self.rng.integers(0, w - crop_w + 1))
         return slice(y0, y0 + crop_h), slice(x0, x0 + crop_w)
 
     def _crop_tensor(self, x: torch.Tensor) -> torch.Tensor:
@@ -293,22 +306,22 @@ class JEPADataset(Dataset):
         if self.d4_augment:
             h, w = tensors[0].shape[-2], tensors[0].shape[-1]
             if h == w:
-                k = int(np.random.randint(0, 4))
+                k = int(self.rng.integers(0, 4))
                 if k:
                     tensors = tuple(torch.rot90(t, k=k, dims=(-2, -1)) for t in tensors)
-                if bool(np.random.randint(0, 2)):
+                if bool(self.rng.integers(0, 2)):
                     tensors = tuple(torch.flip(t, dims=(-1,)) for t in tensors)
-            elif bool(np.random.randint(0, 2)):
+            elif bool(self.rng.integers(0, 2)):
                 tensors = tuple(torch.flip(t, dims=(-2,)) for t in tensors)
-            if h != w and bool(np.random.randint(0, 2)):
+            if h != w and bool(self.rng.integers(0, 2)):
                 tensors = tuple(torch.flip(t, dims=(-1,)) for t in tensors)
         if self.random_roll_max > 0:
             h, w = tensors[0].shape[-2], tensors[0].shape[-1]
             pad_val = int(min(self.random_roll_max, max(0, h - 1), max(0, w - 1)))
             if pad_val <= 0:
                 return tensors
-            dy = int(np.random.randint(-pad_val, pad_val + 1))
-            dx = int(np.random.randint(-pad_val, pad_val + 1))
+            dy = int(self.rng.integers(-pad_val, pad_val + 1))
+            dx = int(self.rng.integers(-pad_val, pad_val + 1))
             padded = tuple(
                 torch.nn.functional.pad(t, (pad_val, pad_val, pad_val, pad_val), mode='reflect')
                 for t in tensors

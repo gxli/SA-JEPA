@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.utils.npy import _safe_load_npy
+
 
 class JEPA3DCropDataset(Dataset):
     def __init__(
@@ -100,7 +102,7 @@ class JEPA3DCropDataset(Dataset):
 
     def __getitem__(self, idx):
         path = self.npy_files[idx % len(self.npy_files)]
-        arr = np.load(path, mmap_mode="r")
+        arr = _safe_load_npy(path, mmap_mode="r")
 
         if arr.ndim != 3:
             raise ValueError(f"Expected 3D array D,H,W, got shape={arr.shape} in {path}")
