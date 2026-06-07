@@ -21,31 +21,32 @@ def _save_npz(path: str, arr: np.ndarray) -> None:
     np.savez_compressed(path, arr=arr)
 
 
-def _tta_views_2d(x: torch.Tensor, mode: str) -> list[tuple[str, torch.Tensor]]:
+def _iter_tta_views_2d(x: torch.Tensor, mode: str):
     m = str(mode).lower().strip()
     if m in ("none", "", "off"):
-        return [("id", x)]
+        yield "id", x
+        return
     if m in ("flip4", "4fold", "4-fold"):
-        return [
-            ("id", x),
-            ("fx", torch.flip(x, dims=(-1,))),
-            ("fy", torch.flip(x, dims=(-2,))),
-            ("fxy", torch.flip(x, dims=(-2, -1))),
-        ]
+        yield "id", x
+        yield "fx", torch.flip(x, dims=(-1,))
+        yield "fy", torch.flip(x, dims=(-2,))
+        yield "fxy", torch.flip(x, dims=(-2, -1))
+        return
     if m in ("d4", "dihedral8", "8fold", "8-fold", "rotflip8"):
-        views = []
         for k in range(4):
             xr = torch.rot90(x, k=k, dims=(-2, -1))
-            views.append((f"r{k}", xr))
-            views.append((f"r{k}fx", torch.flip(xr, dims=(-1,))))
-        return views
+            yield f"r{k}", xr
+            yield f"r{k}fx", torch.flip(xr, dims=(-1,))
+        return
     if m in ("rot4", "rot", "rot90"):
-        return [(f"r{k}", torch.rot90(x, k=k, dims=(-2, -1))) for k in range(4)]
+        for k in range(4):
+            yield f"r{k}", torch.rot90(x, k=k, dims=(-2, -1))
+        return
     raise ValueError(f"Unsupported inference TTA mode: {mode}")
 
 
 def _apply_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
-    """Apply the same TTA view transform, matching _tta_views_2d output."""
+    """Invert a TTA view transform produced by _iter_tta_views_2d."""
     if name == "id":
         return z
     if name == "fx":
@@ -64,14 +65,58 @@ def _apply_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
     raise ValueError(name)
 
 
-def _average_maps(out_list: list[dict], keys=("pred_map", "gt_map", "context_map")) -> dict:
-    """Stack and mean the given keys across a list of output dicts. Skips missing keys."""
-    result = {}
-    for key in keys:
-        tensors = [o.get(key) for o in out_list if o.get(key) is not None]
-        if tensors:
-            result[key] = torch.stack(tensors, dim=0).mean(dim=0)
-    return result
+def _forward_tta_streaming_2d(
+    *,
+    x: torch.Tensor,
+    mode: str,
+    forward_one: Callable[[torch.Tensor, torch.Tensor | None], dict],
+    cdd: torch.Tensor | None = None,
+    keys=("pred_map", "gt_map", "context_map"),
+) -> tuple[dict, int]:
+    """Run TTA one view at a time and average aligned maps without stacking views."""
+    first_out = None
+    sums: dict[str, torch.Tensor] = {}
+    counts: dict[str, int] = {}
+    n_views = 0
+    align_keys = set(keys) | {
+        "x_clean_raw",
+        "x_context_raw",
+        "x_clean",
+        "x_context",
+        "network_context_in",
+        "network_target_in",
+        "target_mask_map",
+        "cdd_channels_orig",
+        "cdd_channels_masked",
+        "dip_field_per_channel",
+        "pyramid_mask_token",
+    }
+    for name, xv in _iter_tta_views_2d(x, mode):
+        cdv = _apply_tta_2d(name, cdd) if cdd is not None else None
+        out_v = forward_one(xv, cdv)
+        n_views += 1
+        for key in align_keys:
+            if out_v.get(key) is not None:
+                out_v[key] = _apply_tta_2d(name, out_v[key])
+        if first_out is None:
+            first_out = out_v
+        for key in keys:
+            value = out_v.get(key)
+            if value is None:
+                continue
+            if key not in sums:
+                sums[key] = value
+                counts[key] = 1
+            else:
+                sums[key].add_(value)
+                counts[key] += 1
+        if out_v is not first_out:
+            del out_v
+    if first_out is None:
+        raise ValueError("TTA produced no views")
+    for key, value in sums.items():
+        first_out[key] = value.div(float(max(1, counts[key])))
+    return first_out, n_views
 
 
 def _mask_invalid_targets_from_input(
@@ -333,30 +378,45 @@ def run_post_training_inference(
         invalid_region_skip = bool(getattr(model, "target_invalid_region_skip", False))
         invalid_region_values = tuple(getattr(model, "target_invalid_region_values", (0.0, "nan")))
         patch_size = int(getattr(model, "patch_size", 2))
-        tta_views = _tta_views_2d(x_raw, inference_tta_mode) if bool(inference_tta_enabled) else [("id", x_raw)]
-        first_out_by_shift: list[dict] = []
+        tta_view_count = 1
+        shift_sums: dict[str, torch.Tensor] = {}
+        shift_counts: dict[str, int] = {}
         for pi, shift in enumerate(shifts):
-            per_view = []
-            for vi, (vname, xv) in enumerate(tta_views):
-                cdv = _apply_tta_2d(vname, cdd_raw) if cdd_raw is not None else None
-                out_v = model(
+            return_debug_next = pi == 0
+
+            def _forward_one_tta(xv: torch.Tensor, cdv: torch.Tensor | None) -> dict:
+                nonlocal return_debug_next
+                return_debug = return_debug_next
+                return_debug_next = False
+                return model(
                     xv,
-                    return_debug=(pi == 0 and vi == 0),
+                    return_debug=return_debug,
                     enable_grid_jitter=False,
                     enable_target_dithering=False,
                     lattice_shift_override=shift,
                     mask_inference=bool(mask_inference),
                     cdd_orig=cdv,
                 )
-                out_v["pred_map"] = _apply_tta_2d(vname, out_v["pred_map"])
-                out_v["gt_map"] = _apply_tta_2d(vname, out_v["gt_map"])
-                if "context_map" in out_v:
-                    out_v["context_map"] = _apply_tta_2d(vname, out_v["context_map"])
-                per_view.append(out_v)
-            out_i = per_view[0]
-            if len(per_view) > 1:
-                out_i.update(_average_maps(per_view))
-            first_out_by_shift.append(out_i)
+
+            if bool(inference_tta_enabled):
+                out_i, tta_view_count = _forward_tta_streaming_2d(
+                    x=x_raw,
+                    mode=inference_tta_mode,
+                    forward_one=_forward_one_tta,
+                    cdd=cdd_raw,
+                )
+            else:
+                out_i = _forward_one_tta(x_raw, cdd_raw)
+            for key in ("pred_map", "gt_map", "context_map"):
+                value = out_i.get(key)
+                if value is None:
+                    continue
+                if key not in shift_sums:
+                    shift_sums[key] = value
+                    shift_counts[key] = 1
+                else:
+                    shift_sums[key].add_(value)
+                    shift_counts[key] += 1
             if invalid_region_skip:
                 _mask_invalid_targets_from_input(
                     outputs=out_i,
@@ -380,8 +440,9 @@ def run_post_training_inference(
             total_valid += int(n_val_i)
         assert outputs is not None and energy_sum is not None and count_map is not None
         # Average aligned maps across deterministic shifts to stabilize dashboard embeddings.
-        if len(first_out_by_shift) > 1:
-            outputs.update(_average_maps(first_out_by_shift))
+        if len(shifts) > 1:
+            for key, value in shift_sums.items():
+                outputs[key] = value.div(float(max(1, shift_counts[key])))
 
     inference_outputs = {
         "inference_scope": "dashboard_sample_batch",
@@ -543,7 +604,7 @@ def run_post_training_inference(
                 "mask_inference": bool(mask_inference),
                 "inference_tta_enabled": bool(inference_tta_enabled),
                 "inference_tta_mode": str(inference_tta_mode),
-                "inference_tta_views": int(len(tta_views)),
+                "inference_tta_views": int(tta_view_count),
             },
             f,
             indent=2,

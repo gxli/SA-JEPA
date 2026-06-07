@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from src.dataset import JEPADataset
-from src.inference import _apply_tta_2d, _tta_views_2d
+from src.inference import _apply_tta_2d, _forward_tta_streaming_2d, _iter_tta_views_2d
 from src.inference_from_session import TileLayout2D, _stitch_tile_tensor
 from src.models.symmetry import _crop_from_square, _pad_to_square
 
@@ -69,12 +69,47 @@ class ReviewFixesTests(unittest.TestCase):
     def test_d4_tta_views_align_back_to_original_shape(self) -> None:
         x = torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 4)
 
-        restored = [_apply_tta_2d(name, view) for name, view in _tta_views_2d(x, "d4")]
+        restored = [_apply_tta_2d(name, view) for name, view in _iter_tta_views_2d(x, "d4")]
 
         self.assertEqual(len(restored), 8)
         for item in restored:
             self.assertEqual(tuple(item.shape), tuple(x.shape))
             torch.testing.assert_close(item, x)
+
+    def test_streaming_tta_matches_stack_average(self) -> None:
+        x = torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 4)
+
+        def forward_one(xv: torch.Tensor, _cdv: torch.Tensor | None) -> dict:
+            return {
+                "pred_map": xv + 1.0,
+                "gt_map": xv * 2.0,
+                "cdd_channels_orig": xv + 3.0,
+                "target_locations": torch.zeros((1, 1, 2), dtype=torch.long),
+            }
+
+        expected_pred = None
+        expected_gt = None
+        expected_count = 0
+        for name, view in _iter_tta_views_2d(x, "d4"):
+            out = forward_one(view, None)
+            pred = _apply_tta_2d(name, out["pred_map"])
+            gt = _apply_tta_2d(name, out["gt_map"])
+            expected_pred = pred if expected_pred is None else expected_pred + pred
+            expected_gt = gt if expected_gt is None else expected_gt + gt
+            expected_count += 1
+        expected_pred = expected_pred / float(expected_count)
+        expected_gt = expected_gt / float(expected_count)
+
+        streamed, n_views = _forward_tta_streaming_2d(
+            x=x,
+            mode="d4",
+            forward_one=forward_one,
+        )
+
+        self.assertEqual(n_views, 8)
+        torch.testing.assert_close(streamed["pred_map"], expected_pred)
+        torch.testing.assert_close(streamed["gt_map"], expected_gt)
+        torch.testing.assert_close(streamed["cdd_channels_orig"], x + 3.0)
 
 
 if __name__ == "__main__":

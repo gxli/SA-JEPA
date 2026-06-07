@@ -220,12 +220,6 @@ def _precompute_cdd_cache(
     if device.type != "cuda":
         raise RuntimeError(f"[{config_name}] CDD precompute requires CUDA. Got device={device.type}.")
     npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
-    # Also scan for .fits if pattern was .npy
-    if npy_pattern.endswith(".fits"):
-        pass  # already globbed
-    elif npy_pattern.endswith(".npy"):
-        fits_pattern = npy_pattern.replace(".npy", ".fits")
-        npy_files = sorted(_glob.glob(os.path.join(data_root, fits_pattern)) or npy_files)
     if not npy_files:
         print(f"[{config_name}] CDD precompute: no files found for pattern, skipping")
         return {}
@@ -2043,26 +2037,33 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         try:
             from src.utils.scale_probe import probe_scale_response
 
-            probe_batch, _ = next(iter(dataloader))
-            probe_batch = probe_batch.to(device, non_blocking=True)
-            # Let _prepare_context_from_model handle NaN internally.
             model.eval()
             with torch.no_grad():
-                ctx_result = _prepare_context_from_model(model, probe_batch, return_debug=True)
-                if len(ctx_result) >= 5:
-                    debug = ctx_result[4]
-                    cdd_channels = debug.get("cdd_channels_orig")
-                    if cdd_channels is not None and cdd_channels.ndim == 4:
-                        report = probe_scale_response(
-                            model,
-                            x_pyr=cdd_channels.to(device),
-                            scale_names=train_cfg.get("scale_probe_names"),
-                            out_dir=session_dir,
-                            run_name=config_name,
-                        )
-                        print(f"[{config_name}] scale_probe_report={json.dumps(report['scale_drop_sensitivity_fraction'])}")
-                    else:
-                        print(f"[{config_name}] scale_probe: cdd_channels not in debug, skipping")
+                cdd_channels = None
+                if os.path.exists(inf_path):
+                    inf_outputs = torch.load(inf_path, map_location="cpu")
+                    cdd_channels = inf_outputs.get("cdd_channels_orig")
+                    if cdd_channels is not None:
+                        cdd_channels = cdd_channels[:1]
+                if cdd_channels is None or cdd_channels.ndim != 4:
+                    probe_batch, _ = next(iter(dataloader))
+                    probe_batch = probe_batch.to(device, non_blocking=True)
+                    # Let _prepare_context_from_model handle NaN internally.
+                    ctx_result = _prepare_context_from_model(model, probe_batch, return_debug=True)
+                    if len(ctx_result) >= 5:
+                        debug = ctx_result[4]
+                        cdd_channels = debug.get("cdd_channels_orig")
+                if cdd_channels is not None and cdd_channels.ndim == 4:
+                    report = probe_scale_response(
+                        model,
+                        x_pyr=cdd_channels.to(device),
+                        scale_names=train_cfg.get("scale_probe_names"),
+                        out_dir=session_dir,
+                        run_name=config_name,
+                    )
+                    print(f"[{config_name}] scale_probe_report={json.dumps(report['scale_drop_sensitivity_fraction'])}")
+                else:
+                    print(f"[{config_name}] scale_probe: cdd_channels not available, skipping")
             model.train()
         except Exception as e:
             log_error("scale_probe", e)

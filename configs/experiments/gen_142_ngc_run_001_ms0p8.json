@@ -1,7 +1,7 @@
 {
   "base_config": "../base_pyramid_scaleaware_convnext.json",
   "data": {
-    "npy_pattern": "ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy",
+    "npy_pattern": "ngc3627_12m+7m+tp_co21_strict_mom0.npy_scale.npy_stack.npy",
     "cdd_precompute": true
   },
   "model": {
@@ -62,7 +62,7 @@
       "target_std": 1.0,
       "eps": 0.0001
     },
-    "symmetric_feature_loss_weight": 0.003,
+    "symmetric_feature_loss_weight": 0.0,
     "compute_effective_rank": true,
     "scale_probe_enabled": true,
     "inference_tta_enabled": true,

@@ -38,11 +38,11 @@ def _read_model_inputs(session_dir: str) -> dict:
             spread = {}
         mask_scale = _first_present(
             m,
-            ("mask_size_scaling",),
+            ("mask_size_scaling", "mask_scale_factor", "mask_scale"),
         )
         mask_box = _first_present(
             m,
-            ("mask_size_manual", "mask_size"),
+            ("mask_size_manual", "mask_size", "mask_footprint_px", "mask_box_size"),
         )
         return {
             "mode": str(m.get("mode", "NA")),
@@ -93,6 +93,46 @@ def _read_effective_rank(session_dir: str) -> str:
         except Exception:
             return ""
     return ""
+
+
+def _read_loss_ratios(session_dir: str) -> dict[str, str]:
+    """Read first/last epoch averages for key loss terms, return final/initial ratios."""
+    path = os.path.join(session_dir, "metrics.csv")
+    if not os.path.exists(path):
+        return {}
+    try:
+        epoch_sums: dict[str, dict[int, float]] = {}
+        epoch_counts: dict[str, dict[int, int]] = {}
+        keys = ["sim", "loss_spread", "weighted_spread"]
+        with open(path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    ep = int(row.get("epoch", -1))
+                except Exception:
+                    continue
+                for k in keys:
+                    v = row.get(k, row.get({"loss_spread": "loss_sigreg", "weighted_spread": "weighted_sigreg"}.get(k, k), ""))
+                    if v and v.strip():
+                        try:
+                            fv = float(v)
+                        except Exception:
+                            continue
+                        if k not in epoch_sums:
+                            epoch_sums[k] = {}
+                            epoch_counts[k] = {}
+                        epoch_sums[k][ep] = epoch_sums[k].get(ep, 0.0) + fv
+                        epoch_counts[k][ep] = epoch_counts[k].get(ep, 0) + 1
+        result = {}
+        for k in keys:
+            if k in epoch_sums and len(epoch_sums[k]) >= 2:
+                eps = sorted(epoch_sums[k].keys())
+                first_avg = epoch_sums[k][eps[0]] / max(1, epoch_counts[k][eps[0]])
+                last_avg = epoch_sums[k][eps[-1]] / max(1, epoch_counts[k][eps[-1]])
+                if first_avg > 1e-20:
+                    result[k] = str(last_avg / first_avg)
+        return result
+    except Exception:
+        return {}
 
 
 def _read_rank_diag(session_dir: str) -> dict:
@@ -173,6 +213,10 @@ def main() -> int:
         except Exception:
             pr_match = ""
         energy = _fmt_float(str(diag.get("energy", "")), 9, 4)
+        ratios = _read_loss_ratios(path)
+        sim_r = _fmt_float(ratios.get("sim", ""), 7, 4)
+        hinge_r = _fmt_float(ratios.get("loss_spread", ""), 7, 4)
+        sig_r = _fmt_float(ratios.get("weighted_spread", ""), 7, 4)
         p_dead = _diag_get(diag, "pred", "dead_channel_fraction")
         p_dead_n = diag.get("pred", {}).get("dead_channel_count",
                     diag.get("pred", {}).get("num_dead_channels", 0))
@@ -187,6 +231,7 @@ def main() -> int:
              inputs.get("sigtype", "NA"), inputs.get("spread_w", "NA"), inputs.get("spread_t", "NA"),
              inputs.get("symw", "NA"), inputs.get("depth", "NA"),
              energy,
+             sim_r, hinge_r, sig_r,
              rank, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_str)
         )
 
@@ -200,7 +245,7 @@ def main() -> int:
     header = (
         f"{'session':<{session_w}} {'mode':<9} {'sampling':<9} {'mask_scale':>12} {'mask_box':>9} "
         f"{'l2_norm':>7} {'psnorm':>6} {'final_norm':>10} {'sig_type':>14} {'sig_w':>7} {'sig_t':>6} {'sym_loss':>9} {'depth':>6} "
-        f"{'energy':>9} "
+        f"{'energy':>9} {'sim_r':>7} {'hinge_r':>7} {'sig_r':>7} "
         f"{'erank':>8} {'context':>9} {'predictor':>10} {'target':>9} "
         f"{'top1':>7} {'pred_part':>10} {'target_part':>11} {'part_ratio':>10} {'dead_frac':>10} {'dead_ch':>7}"
     )
@@ -208,18 +253,18 @@ def main() -> int:
     print("-" * len(header))
     for row in rows_sorted:
         (s, mode, ms, mbox, sampling, l2, psn, fin, sigtype, sigw, sigt, symw, d,
-         _energy, rk, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_n) = row
+         _energy, _sim_r, _hinge_r, _sig_r, rk, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_n) = row
         print(
             f"{s:<{session_w}} {mode:<9} {sampling:<9} {ms:>12} {mbox:>9} "
             f"{l2:>7} {psn:>6} {fin:>10} {sigtype:>14} {_fmt_float(sigw,7,2)} {_fmt_float(sigt,6,2)} {_fmt_float(symw,9,4)} {d:>6} "
-            f"{energy:>9} "
+            f"{_energy:>9} {_sim_r:>7} {_hinge_r:>7} {_sig_r:>7} "
             f"{_fmt_float(rk,8,4)} {_fmt_float(c_er,9,4)} {_fmt_float(p_er,10,4)} {_fmt_float(g_er,9,4)} "
             f"{_fmt_float(p_t1,7,3)} {_fmt_float(p_pr,10,2)} {_fmt_float(g_pr,11,2)} {_fmt_float(pr_match,10,4)} "
             f"{_fmt_float(p_dead,10,3)} {p_dead_n:>7}"
         )
 
     n_total = len(rows_sorted)
-    n_rank = sum(1 for r in rows_sorted if r[14] != "")
+    n_rank = sum(1 for r in rows_sorted if r[17] != "")
     print("-" * len(header))
     print(f"sessions={n_total} with_rank={n_rank} missing_rank={n_total - n_rank}")
     return 0

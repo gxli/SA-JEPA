@@ -364,7 +364,26 @@ def _extract_hw_map(src: dict, keys: tuple[str, ...], shape: tuple[int, int]) ->
             arr = arr[0]
         if arr.ndim == 2 and arr.shape == shape:
             return np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
+        if arr.ndim == 2 and arr.shape == (shape[1], shape[0]):
+            arr = arr.T
+            return np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
     return None
+
+
+def _canonicalize_cube_hw(arr: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Return an S,H,W cube aligned to the dashboard image shape when possible."""
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim != 3:
+        return np.zeros((1, shape[0], shape[1]), dtype=np.float32)
+    if arr.shape[-2:] == shape:
+        out = arr
+    elif arr.shape[-2:] == (shape[1], shape[0]):
+        out = arr.transpose(0, 2, 1)
+    else:
+        out = np.zeros((arr.shape[0], shape[0], shape[1]), dtype=np.float32)
+    return np.where(np.isfinite(out), out, 0.0).astype(np.float32, copy=False)
 
 
 def _rgb_from_xyz(
@@ -530,7 +549,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     if mask_cube is None:
         mask_cube = np.zeros((1, h, w), dtype=np.float32)
     else:
-        mask_cube = np.where(np.isfinite(mask_cube), mask_cube, 0.0).astype(np.float32)
+        mask_cube = _canonicalize_cube_hw(mask_cube, (h, w))
     np.save(os.path.join(session_dir, "example_pyramid_mask_cube.npy"), mask_cube.astype(np.float32, copy=False))
 
     # Load precomputed PCA/UMAP artifacts saved by training-time pipeline.

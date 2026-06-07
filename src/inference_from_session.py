@@ -42,9 +42,7 @@ from src.inference import (
     run_post_training_inference,
     run_post_training_inference_3d,
     _save_npz,
-    _tta_views_2d,
-    _apply_tta_2d,
-    _average_maps,
+    _forward_tta_streaming_2d,
 )
 from src.utils.npy import _safe_load_npy
 from src.utils.viz import save_inference_dashboard
@@ -406,16 +404,12 @@ def run_inference_on_data(
             return model(xv, mask_inference=False)
 
         if inference_tta_enabled:
-            per_view = []
-            for tta_name, tta_view in _tta_views_2d(x_in, inference_tta_mode):
-                cdv = _apply_tta_2d(tta_name, cdd_fields) if cdd_fields is not None else None
-                _out = _forward_one(tta_view, cdv)
-                for key in ("pred_map", "gt_map", "context_map"):
-                    if _out.get(key) is not None:
-                        _out[key] = _apply_tta_2d(tta_name, _out[key])
-                per_view.append(_out)
-            out = per_view[0]
-            out.update(_average_maps(per_view))
+            out, _ = _forward_tta_streaming_2d(
+                x=x_in,
+                mode=inference_tta_mode,
+                forward_one=_forward_one,
+                cdd=cdd_fields,
+            )
         else:
             out = _forward_one(x_in, cdd_fields)
 
