@@ -35,7 +35,7 @@ from src.losses import (
     embedding_spread_stats,
     parse_spread_regularizer_config,
 )
-from src.models.build_jepa import CDD_DEBUG_ENCODER_TYPES, PyramidGridJEPA
+from src.models.build_jepa import CDD_CUBE_ENCODER_TYPES, CDD_DEBUG_ENCODER_TYPES, MASK_MAP_ENCODER_TYPES, PyramidGridJEPA
 from src.models.build_jepa3d import PyramidGridJEPA3D, compute_3d_encoder_receptive_field_depth
 from src.models.masking import prepare_context_batch
 from src.utils import log_error, set_error_log_path
@@ -216,6 +216,7 @@ def _precompute_cdd_cache(
     cdd_constrained = bool(model_cfg.get("cdd_constrained", data_cfg.get("cdd_constrained", True)))
     cdd_sm_mode = str(model_cfg.get("cdd_sm_mode", data_cfg.get("cdd_sm_mode", "reflect")))
     cdd_append_last_residual = bool(model_cfg.get("cdd_append_last_residual", True))
+    cdd_pre_log_transform = bool(model_cfg.get("cdd_pre_log_transform", False))
     sigmas = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
     if device.type != "cuda":
         raise RuntimeError(f"[{config_name}] CDD precompute requires CUDA. Got device={device.type}.")
@@ -320,9 +321,11 @@ def _move_to_device(value, device: torch.device):
 class _MaskingCollator:
     def __init__(self, model: PyramidGridJEPA, return_debug: bool = False):
         enc_type = str(getattr(model, "encoder_type", "")).lower()
+        self.use_cdd = bool(enc_type in CDD_CUBE_ENCODER_TYPES)
         self.return_debug = bool(
             return_debug
             or enc_type in CDD_DEBUG_ENCODER_TYPES
+            or enc_type in MASK_MAP_ENCODER_TYPES
         )
         self.mask_scale = float(model.mask_scale)
         self.mask_scale_range = model.mask_scale_range
@@ -351,6 +354,7 @@ class _MaskingCollator:
             "target_nonoverlap": getattr(model, "target_nonoverlap", False),
             "target_allow_partial_overlap": getattr(model, "target_allow_partial_overlap", 0.0),
             "mask_box_hardcap": getattr(model, "mask_box_hardcap", None),
+            "use_cdd": self.use_cdd,
         }
 
     def _sample_mask_params(self) -> tuple[float, int]:
@@ -397,6 +401,7 @@ def _prepare_context_from_model(
     need_debug = bool(
         return_debug
         or enc_type in CDD_DEBUG_ENCODER_TYPES
+        or enc_type in MASK_MAP_ENCODER_TYPES
     )
     mask_scale, mask_box_size = model.sample_mask_params(device=x_clean.device)
     return prepare_context_batch(
@@ -415,6 +420,7 @@ def _prepare_context_from_model(
         cdd_constrained=model.cdd_constrained,
         cdd_sm_mode=model.cdd_sm_mode,
         cdd_append_last_residual=model.cdd_append_last_residual,
+        cdd_pre_log_transform=model.cdd_pre_log_transform,
         patch_size=model.patch_size,
         return_debug=need_debug,
         target_invalid_region_skip=model.target_invalid_region_skip,
@@ -429,6 +435,7 @@ def _prepare_context_from_model(
         target_allow_partial_overlap=getattr(model, "target_allow_partial_overlap", 0.0),
         mask_box_hardcap=getattr(model, "mask_box_hardcap", None),
         cdd_use_gpu=(x_clean.device.type == "cuda"),
+        use_cdd=bool(enc_type in CDD_CUBE_ENCODER_TYPES),
     )
 
 
@@ -661,6 +668,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         cdd_constrained=model_cfg.get("cdd_constrained", data_cfg.get("cdd_constrained", True)),
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", data_cfg.get("cdd_sm_mode", "reflect")),
         cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
+        cdd_pre_log_transform=bool(model_cfg.get("cdd_pre_log_transform", False)),
         post_log_transform=model_cfg.get("post_log_transform", model_post_log),
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
@@ -696,7 +704,8 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         priority_min_targets_per_map=int(model_cfg.get("priority_min_targets_per_map", 0)),
         priority_dithering_pixels=int(model_cfg.get("priority_dithering_pixels", model_cfg.get("target_dithering_pixels", 6))),
         priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
-        use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
+        use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False))
+        and float(train_cfg.get("symmetry_loss_weight", train_cfg.get("symmetric_feature_loss_weight", 0.0))) > 0.0,
         target_nonoverlap=bool(model_cfg.get("target_nonoverlap", True)),
         target_allow_partial_overlap=float(model_cfg.get("target_allow_partial_overlap", 0.0)),
         mask_box_hardcap=model_cfg.get("mask_box_hardcap"),
@@ -746,7 +755,8 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         mask_box_size=int(model_cfg.get("mask_size", 8)),
         num_mask_boxes=int(model_cfg.get("num_mask_boxes", 8)),
         slab_depth=int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
-        use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False)),
+        use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False))
+        and float(train_cfg.get("symmetry_loss_weight", train_cfg.get("symmetric_feature_loss_weight", 0.0))) > 0.0,
         use_film=bool(model_cfg.get("use_film", True)),
         use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
         priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
@@ -830,15 +840,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             ddp_backend = "gloo"
             device = torch.device("cpu")
         dist.init_process_group(backend=ddp_backend, timeout=timedelta(minutes=30))
+        global_rank = dist.get_rank()
+        world_size = dist.get_world_size()
     else:
         local_rank = 0
+        global_rank = 0
+        world_size = 1
         if torch.cuda.is_available():
             device = torch.device("cuda")
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             device = torch.device("mps")
         else:
             device = torch.device("cpu")
-    is_main_process = (local_rank == 0)
+    is_main_process = (global_rank == 0)
     cdd_cache_replicas = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1"))) if is_ddp else 1
 
     if is_main_process:
@@ -847,14 +861,20 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             f"cuda_available={torch.cuda.is_available()}, "
             f"mps_available={device.type == 'mps'}, "
             f"ddp={'on' if is_ddp else 'off'}, "
-            f"local_rank={local_rank}"
+            f"local_rank={local_rank}, "
+            f"global_rank={global_rank}, "
+            f"world_size={world_size}"
         )
 
     train_cfg = config["train"]
     model_cfg = config["model"]
     data_cfg = config["data"]
+    if is_ddp and bool(data_cfg.get("cdd_precompute", True)):
+        data_cfg["cdd_precompute"] = False
+        if is_main_process:
+            print(f"[{config_name}] DDP detected: disabling in-process CDD RAM precompute")
     seed = int(train_cfg.get("seed", train_cfg.get("split_seed", 42)))
-    rank_seed = seed + int(local_rank)
+    rank_seed = seed + int(global_rank)
     random.seed(rank_seed)
     np.random.seed(rank_seed % 2**32)
     torch.manual_seed(rank_seed)
@@ -888,8 +908,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     resume_ckpt_path = os.path.join(session_dir, "checkpoint_last.pt")
     resume_from_existing = os.path.exists(model_ckpt_path)
 
-    with open(os.path.join(session_dir, "config_used.json"), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    if is_main_process:
+        with open(os.path.join(session_dir, "config_used.json"), "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+    if is_ddp:
+        dist.barrier()
 
     input_type = str(data_cfg.get("input_type", "image")).lower()
     allowed_input_types = {"image", "cube", "image_batch"}
@@ -907,7 +930,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     image_batch_inference = (input_type == "image_batch")
 
     resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
-    _write_data_profile(data_cfg=data_cfg, session_dir=session_dir, config_name=config_name)
+    if is_main_process:
+        _write_data_profile(data_cfg=data_cfg, session_dir=session_dir, config_name=config_name)
 
     if is_main_process:
         print(
@@ -953,7 +977,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     start_epoch = 0
     resume_state = None
     if os.path.exists(resume_ckpt_path):
-        resume_state = torch.load(resume_ckpt_path, map_location=device)
+        resume_state = torch.load(resume_ckpt_path, map_location=device, weights_only=False)
         if "model_state_dict" in resume_state:
             try:
                 missing, unexpected = model.load_state_dict(
@@ -1024,7 +1048,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         resume_model_ignored = False
         try:
             missing, unexpected = model.load_state_dict(
-                torch.load(model_ckpt_path, map_location=device),
+                torch.load(model_ckpt_path, map_location=device, weights_only=True),
                 strict=not allow_partial_resume,
             )
         except RuntimeError as e:
@@ -1129,26 +1153,30 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 sel_idx = sorted(rng.sample(range(n_total), n_sel))
             selected[fpath] = sel_idx
         image_batch_selected_indices = selected
-        with open(sel_path, "w", encoding="utf-8") as f:
-            json.dump({k: list(v) for k, v in selected.items()}, f, indent=2)
+        if is_main_process:
+            with open(sel_path, "w", encoding="utf-8") as f:
+                json.dump({k: list(v) for k, v in selected.items()}, f, indent=2)
         total_selected = sum(len(v) for v in selected.values())
-        print(
-            f"[{config_name}] image_batch_n_sample={image_batch_n_sample} "
-            f"files={len(selected)} total_selected={total_selected} "
-            f"saved_to={sel_path}"
-        )
+        if is_main_process:
+            print(
+                f"[{config_name}] image_batch_n_sample={image_batch_n_sample} "
+                f"files={len(selected)} total_selected={total_selected} "
+                f"saved_to={sel_path}"
+            )
 
     # --- Pre-compute CDD once on GPU, store in CPU RAM ---
-    # All 2D modes require CDD: pyramid encoders need it for scale-aware features,
-    # image-mode mask-token runs need it for priority sampling and context masking.
+    # Only CDD/pyramid encoders require CDD channels. Plain image ConvNeXt
+    # mask-token runs build masks directly on the raw image.
+    uses_cdd_channels = (not is_3d_mode) and str(getattr(model_without_ddp, "encoder_type", "")).lower() in CDD_CUBE_ENCODER_TYPES
     cdd_cache = _precompute_cdd_cache(
         data_cfg=data_cfg,
         model_cfg=model_cfg,
         device=device,
         config_name=config_name,
         cache_replicas=cdd_cache_replicas,
-    ) if not is_3d_mode else None
-    _write_cdd_cache_profile(cdd_cache=cdd_cache, session_dir=session_dir, config_name=config_name)
+    ) if uses_cdd_channels else None
+    if is_main_process:
+        _write_cdd_cache_profile(cdd_cache=cdd_cache, session_dir=session_dir, config_name=config_name)
 
     if is_3d_mode:
         encoder_rf_depth_3d = compute_3d_encoder_receptive_field_depth(
@@ -1297,7 +1325,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
     # DDP: distribute data across GPUs
     train_sampler = DistributedSampler(train_dataset) if is_ddp else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False) if (is_ddp and val_dataset is not None) else None
+    val_sampler = None
 
     masking_collate = None if is_3d_mode else _MaskingCollator(
         model,
@@ -1481,54 +1509,55 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         "mask_scale_factor",
         "time_sec",
     ]
-    if os.path.exists(metrics_path):
-        with open(metrics_path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            existing_rows = list(reader)
-            existing_header = list(reader.fieldnames or [])
-        if existing_header != metrics_header:
-            legacy_names = {
-                "loss_total": "total_loss",
-                "loss_prediction": "loss_mse",
-                "loss_spread": "loss_sigreg",
-                "loss_symmetry": "loss_symmetric",
-                "weighted_prediction": "weighted_mse",
-                "weighted_spread": "weighted_sigreg",
-                "weighted_symmetry": "weighted_symmetric",
-                "embed_spread_mean": "ctx_std_mean",
-                "embed_spread_min": "ctx_std_min",
-                "context_manifold_size": "ctx_rank",
-            }
+    if is_main_process:
+        if os.path.exists(metrics_path):
+            with open(metrics_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                existing_rows = list(reader)
+                existing_header = list(reader.fieldnames or [])
+            if existing_header != metrics_header:
+                legacy_names = {
+                    "loss_total": "total_loss",
+                    "loss_prediction": "loss_mse",
+                    "loss_spread": "loss_sigreg",
+                    "loss_symmetry": "loss_symmetric",
+                    "weighted_prediction": "weighted_mse",
+                    "weighted_spread": "weighted_sigreg",
+                    "weighted_symmetry": "weighted_symmetric",
+                    "embed_spread_mean": "ctx_std_mean",
+                    "embed_spread_min": "ctx_std_min",
+                    "context_manifold_size": "ctx_rank",
+                }
+                with open(metrics_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=metrics_header)
+                    writer.writeheader()
+                    for row in existing_rows:
+                        writer.writerow({
+                            key: row.get(key, row.get(legacy_names.get(key, ""), ""))
+                            for key in metrics_header
+                        })
+        else:
             with open(metrics_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=metrics_header)
-                writer.writeheader()
-                for row in existing_rows:
-                    writer.writerow({
-                        key: row.get(key, row.get(legacy_names.get(key, ""), ""))
-                        for key in metrics_header
-                    })
-    else:
-        with open(metrics_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(metrics_header)
+                writer = csv.writer(f)
+                writer.writerow(metrics_header)
     masked_scales_log_path = os.path.join(session_dir, "masked_scales_log.csv")
-    if not os.path.exists(masked_scales_log_path):
+    if is_main_process and not os.path.exists(masked_scales_log_path):
         with open(masked_scales_log_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["epoch", "batch", "scale", "count"])
     epoch_summary_path = os.path.join(session_dir, "epoch_summary.csv")
-    if not os.path.exists(epoch_summary_path):
+    if is_main_process and not os.path.exists(epoch_summary_path):
         with open(epoch_summary_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["epoch", "train_loss", "val_loss", "val_sim", "val_error_by_scale_json"])
     visited_targets_log_path = os.path.join(session_dir, "visited_target_locations.csv")
-    if not os.path.exists(visited_targets_log_path):
+    if is_main_process and not os.path.exists(visited_targets_log_path):
         with open(visited_targets_log_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["epoch", "batch", "sample_idx", "target_idx", "y", "x", "scale"])
 
     loss_weights_path = os.path.join(session_dir, "loss_weights.json")
-    if not os.path.exists(loss_weights_path):
+    if is_main_process and not os.path.exists(loss_weights_path):
         with open(loss_weights_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
@@ -1541,6 +1570,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 indent=2,
             )
             f.write("\n")
+    if is_ddp:
+        dist.barrier()
 
     movie_dump_every_epoch = bool(train_cfg.get("movie_dump_every_epoch", False))
     movie_dump_every_n_batches = int(train_cfg.get("movie_dump_every_n_batches", 0))
@@ -1555,6 +1586,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         print(f"[{config_name}] checkpoint epoch {start_epoch} already >= configured epochs {epochs}, skipping training loop")
     prev_epochs = []
     for epoch in range(start_epoch, epochs):
+        if is_ddp:
+            train_sampler.set_epoch(epoch)
         epoch_total = 0.0
         epoch_prediction = 0.0
         epoch_sim = 0.0
@@ -1594,9 +1627,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 debug = context_result[4] if len(context_result) == 5 else {}
                 context_data = (x_context, tloc, tscale, tvalid, debug)
 
-            # DDP: advance distributed sampler epoch
-            if is_ddp:
-                train_sampler.set_epoch(epoch)
             # PyTorch scheduler handles warmup + cosine automatically
             current_step = epoch * max(1, len(dataloader)) + batch_idx
 
@@ -1631,9 +1661,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 log_loss_val = float(total_loss.item())
 
             scaler.scale(total_loss).backward()
+            scaler_scale_before_step = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            if (not use_amp) or scaler.get_scale() >= scaler_scale_before_step:
+                scheduler.step()
             current_lr = scheduler.get_last_lr()[0]
 
             total_steps_sched = max(1, int(epochs) * max(1, len(dataloader)))
@@ -1719,7 +1751,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 ((batch_idx + 1) % diagnostic_interval == 0)
                 or ((batch_idx + 1) == len(dataloader))
             )
-            if "cdd_channels_masked" in outputs:
+            if is_main_process and "cdd_channels_masked" in outputs:
                 cube_path = os.path.join(session_dir, "example_masked_channel_cube.npy")
                 if not os.path.exists(cube_path):
                     np.save(
@@ -1809,9 +1841,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_batches += 1
 
             # Per-N-batches movie frame dump (captures rapid early learning)
-            if movie_dump_every_n_batches > 0 and (batch_idx + 1) % movie_dump_every_n_batches == 0:
+            if is_main_process and movie_dump_every_n_batches > 0 and (batch_idx + 1) % movie_dump_every_n_batches == 0:
                 movie_context_data = _dump_movie_frame(
-                    model,
+                    model_without_ddp,
                     movie_batch,
                     session_dir,
                     epoch + 1,
@@ -1856,9 +1888,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         val_loss = 0.0
         val_sim = 0.0
         val_error_by_scale = {}
-        if val_loader is not None:
+        if is_main_process and val_loader is not None:
             v = evaluate_validation(
-                model=model,
+                model=model_without_ddp,
                 val_loader=val_loader,
                 device=device,
                 max_batches=train_cfg.get("val_max_batches"),
@@ -1872,17 +1904,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"loss={_fmt_metric(val_loss)} sim={_fmt_metric(val_sim)} "
                 f"err_by_scale={json.dumps(val_error_by_scale, sort_keys=True)}"
             )
-        with open(epoch_summary_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    epoch + 1,
-                    round(epoch_total / max(1, epoch_batches), 8),
-                    round(val_loss, 8),
-                    round(val_sim, 8),
-                    json.dumps(val_error_by_scale, sort_keys=True),
-                ]
-            )
+        if is_main_process:
+            with open(epoch_summary_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        epoch + 1,
+                        round(epoch_total / max(1, epoch_batches), 8),
+                        round(val_loss, 8),
+                        round(val_sim, 8),
+                        json.dumps(val_error_by_scale, sort_keys=True),
+                    ]
+                )
         model.train()
         # Save resumable checkpoint at the end of every epoch (main process only).
         # Atomic write: tmp → rename prevents corruption on crash/OOM.
@@ -1906,9 +1939,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             tqdm.write(f"[{config_name}] ckpt_saved epoch={epoch + 1}")
 
         # Per-epoch embedding snapshot for movie generation.
-        if movie_dump_every_epoch:
+        if is_main_process and movie_dump_every_epoch:
             movie_context_data = _dump_movie_frame(
-                model,
+                model_without_ddp,
                 movie_batch,
                 session_dir,
                 epoch + 1,
@@ -1925,40 +1958,41 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         torch.save(model_without_ddp.state_dict(), tmp_final)
         os.replace(tmp_final, os.path.join(session_dir, "model_last.pt"))
 
-    if is_3d_mode:
-        session_dir = run_post_training_inference_3d(
-            model=model,
-            dataloader=inference_loader,
-            session_dir=session_dir,
-            config_name=config_name,
-            force_recompute_inference=force_recompute_inference,
-        )
-    else:
-        session_dir = run_post_training_inference(
-            model=model,
-            dataloader=inference_loader,
-            session_dir=session_dir,
-            config_name=config_name,
-            visit_counts=visit_counts,
-            force_recompute_inference=force_recompute_inference,
-            inference_mask_passes=inference_mask_passes,
-            mask_inference=mask_inference,
-            viz_crop_border=viz_crop_border,
-            viz_crop_border_px=viz_crop_border_px,
-            compute_jepa_energy_fn=compute_jepa_energy,
-            compute_target_energy_map_fn=compute_target_energy_map,
-            inference_visit_batches=inference_visit_batches,
-            training_d4_augment=bool(data_cfg.get("d4_augment", False)),
-            inference_tta_enabled=inference_tta_enabled,
-            inference_tta_mode=inference_tta_mode,
-            max_diagnostic_size=int(train_cfg.get("max_diagnostic_size", 768)),
-        )
+    if is_main_process:
+        if is_3d_mode:
+            session_dir = run_post_training_inference_3d(
+                model=model_without_ddp,
+                dataloader=inference_loader,
+                session_dir=session_dir,
+                config_name=config_name,
+                force_recompute_inference=force_recompute_inference,
+            )
+        else:
+            session_dir = run_post_training_inference(
+                model=model_without_ddp,
+                dataloader=inference_loader,
+                session_dir=session_dir,
+                config_name=config_name,
+                visit_counts=visit_counts,
+                force_recompute_inference=force_recompute_inference,
+                inference_mask_passes=inference_mask_passes,
+                mask_inference=mask_inference,
+                viz_crop_border=viz_crop_border,
+                viz_crop_border_px=viz_crop_border_px,
+                compute_jepa_energy_fn=compute_jepa_energy,
+                compute_target_energy_map_fn=compute_target_energy_map,
+                inference_visit_batches=inference_visit_batches,
+                training_d4_augment=bool(data_cfg.get("d4_augment", False)),
+                inference_tta_enabled=inference_tta_enabled,
+                inference_tta_mode=inference_tta_mode,
+                max_diagnostic_size=int(train_cfg.get("max_diagnostic_size", 768)),
+            )
     # Save NPY artifacts (PCA/UMAP/latent embeddings) required by session_to_dash.py.
     # No PNG, HTML, or dashboard rendering is performed here.
     inf_path = os.path.join(session_dir, "inference_outputs.pt")
-    if (not is_3d_mode) and os.path.exists(inf_path):
+    if is_main_process and (not is_3d_mode) and os.path.exists(inf_path):
         try:
-            outputs = torch.load(inf_path, map_location="cpu")
+            outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
             artifacts_dir = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)
             print(f"[{config_name}] artifacts_saved={artifacts_dir}")
             effective_rank = ""
@@ -2023,25 +2057,25 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         except Exception as e:
             log_error("artifact_generation", e)
     else:
-        if is_3d_mode and os.path.exists(inf_path):
+        if is_main_process and is_3d_mode and os.path.exists(inf_path):
             try:
-                outputs = torch.load(inf_path, map_location="cpu")
+                outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
                 umap_meta_path = save_volumetric_umap_embeddings(session_dir, outputs, umap_cfg=umap_cfg)
                 print(f"[{config_name}] volumetric_umap_saved={umap_meta_path}")
             except Exception as e:
                 log_error("volumetric_umap", e)
-        else:
+        elif is_main_process:
             print(f"[{config_name}] warning: inference_outputs.pt missing; skip artifact generation")
 
-    if not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)) and model.mode == "pyramid":
+    if is_main_process and not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)) and model_without_ddp.mode == "pyramid":
         try:
             from src.utils.scale_probe import probe_scale_response
 
-            model.eval()
+            model_without_ddp.eval()
             with torch.no_grad():
                 cdd_channels = None
                 if os.path.exists(inf_path):
-                    inf_outputs = torch.load(inf_path, map_location="cpu")
+                    inf_outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
                     cdd_channels = inf_outputs.get("cdd_channels_orig")
                     if cdd_channels is not None:
                         cdd_channels = cdd_channels[:1]
@@ -2049,13 +2083,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     probe_batch, _ = next(iter(dataloader))
                     probe_batch = probe_batch.to(device, non_blocking=True)
                     # Let _prepare_context_from_model handle NaN internally.
-                    ctx_result = _prepare_context_from_model(model, probe_batch, return_debug=True)
+                    ctx_result = _prepare_context_from_model(model_without_ddp, probe_batch, return_debug=True)
                     if len(ctx_result) >= 5:
                         debug = ctx_result[4]
                         cdd_channels = debug.get("cdd_channels_orig")
                 if cdd_channels is not None and cdd_channels.ndim == 4:
                     report = probe_scale_response(
-                        model,
+                        model_without_ddp,
                         x_pyr=cdd_channels.to(device),
                         scale_names=train_cfg.get("scale_probe_names"),
                         out_dir=session_dir,
@@ -2064,8 +2098,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     print(f"[{config_name}] scale_probe_report={json.dumps(report['scale_drop_sensitivity_fraction'])}")
                 else:
                     print(f"[{config_name}] scale_probe: cdd_channels not available, skipping")
-            model.train()
+            model_without_ddp.train()
         except Exception as e:
             log_error("scale_probe", e)
+
+    if is_ddp:
+        dist.barrier()
 
     return session_dir

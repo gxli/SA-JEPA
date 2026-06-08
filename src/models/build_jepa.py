@@ -29,9 +29,8 @@ CDD_CUBE_ENCODER_TYPES = frozenset({
     "escnn_c4_pyramid",
 })
 
-CDD_DEBUG_ENCODER_TYPES = frozenset(CDD_CUBE_ENCODER_TYPES | {
-    "convnext_dense_masktoken",
-})
+CDD_DEBUG_ENCODER_TYPES = frozenset(CDD_CUBE_ENCODER_TYPES)
+MASK_MAP_ENCODER_TYPES = frozenset({"convnext_dense_masktoken"})
 
 
 class PyramidGridJEPA(nn.Module):
@@ -55,6 +54,7 @@ class PyramidGridJEPA(nn.Module):
         cdd_constrained: bool = True,
         cdd_sm_mode: str = "reflect",
         cdd_append_last_residual: bool = True,
+        cdd_pre_log_transform: bool = False,
         post_log_transform: bool = True,
         log_eps: float = 1.0,
         cdd_log_std_floor_mult: float = 0.05,
@@ -146,6 +146,7 @@ class PyramidGridJEPA(nn.Module):
         self.cdd_constrained = bool(cdd_constrained)
         self.cdd_sm_mode = str(cdd_sm_mode)
         self.cdd_append_last_residual = bool(cdd_append_last_residual)
+        self.cdd_pre_log_transform = bool(cdd_pre_log_transform)
         self.post_log_transform = bool(post_log_transform)
         self.log_eps = float(log_eps)
         self.cdd_log_std_floor_mult = float(cdd_log_std_floor_mult)
@@ -413,7 +414,7 @@ class PyramidGridJEPA(nn.Module):
             if invalid_pixel_mask.any():
                 x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
 
-            debug_encoder_types = CDD_DEBUG_ENCODER_TYPES
+            debug_encoder_types = CDD_DEBUG_ENCODER_TYPES | MASK_MAP_ENCODER_TYPES
             need_debug_tensors = bool(
                 return_debug
                 or self.encoder_type in debug_encoder_types
@@ -436,6 +437,7 @@ class PyramidGridJEPA(nn.Module):
                     cdd_constrained=self.cdd_constrained,
                     cdd_sm_mode=self.cdd_sm_mode,
                     cdd_append_last_residual=self.cdd_append_last_residual,
+                    cdd_pre_log_transform=self.cdd_pre_log_transform,
                     inner_target_size=self.patch_size,
                     return_debug=True,
                     enable_grid_jitter=enable_grid_jitter,
@@ -454,6 +456,7 @@ class PyramidGridJEPA(nn.Module):
                     target_allow_partial_overlap=self.target_allow_partial_overlap,
                     mask_box_hardcap=self.mask_box_hardcap,
                     cdd_orig_in=cdd_orig,
+                    use_cdd=self.encoder_type in CDD_CUBE_ENCODER_TYPES,
                 )
             else:
                 x_context, target_locations, target_scales, target_valid = make_pyramid_grid_context(
@@ -472,6 +475,7 @@ class PyramidGridJEPA(nn.Module):
                     cdd_constrained=self.cdd_constrained,
                     cdd_sm_mode=self.cdd_sm_mode,
                     cdd_append_last_residual=self.cdd_append_last_residual,
+                    cdd_pre_log_transform=self.cdd_pre_log_transform,
                     inner_target_size=self.patch_size,
                     enable_grid_jitter=enable_grid_jitter,
                     enable_target_dithering=enable_target_dithering,
@@ -688,19 +692,19 @@ class PyramidGridJEPA(nn.Module):
         for key in ("mask_scale_factor", "mask_footprint_px", "cdd_box_sizes", "target_box_sizes", "random_mask_box_per_target"):
             if key in debug:
                 out[key] = debug[key].to(device=x_clean.device, dtype=x_clean.dtype)
-        if return_debug or needs_cdd_cube:
+        if return_debug:
             # Exact applied hard mask footprint from make_pyramid_grid_context.
-            if return_debug:
-                out["target_mask_map"] = debug["mask_map"].unsqueeze(1).to(device=x_clean.device, dtype=x_clean.dtype)
-                for k in (
-                    "priority_good_candidates",
-                    "priority_nonzero_mean",
-                    "priority_prescreen_candidates",
-                    "priority_auto_base_targets",
-                    "priority_effective_targets",
-                ):
-                    if k in debug:
-                        out[k] = debug[k].to(device=x_clean.device, dtype=x_clean.dtype)
+            out["target_mask_map"] = debug["mask_map"].unsqueeze(1).to(device=x_clean.device, dtype=x_clean.dtype)
+            for k in (
+                "priority_good_candidates",
+                "priority_nonzero_mean",
+                "priority_prescreen_candidates",
+                "priority_auto_base_targets",
+                "priority_effective_targets",
+            ):
+                if k in debug:
+                    out[k] = debug[k].to(device=x_clean.device, dtype=x_clean.dtype)
+        if needs_cdd_cube:
             out["cdd_channels_orig"] = debug["cdd_channels_orig"].to(device=x_clean.device, dtype=x_clean.dtype)
             out["cdd_channels_masked"] = debug["cdd_channels_masked"].to(device=x_clean.device, dtype=x_clean.dtype)
             out["dip_field_per_channel"] = debug["dip_field_per_channel"].to(device=x_clean.device, dtype=x_clean.dtype)

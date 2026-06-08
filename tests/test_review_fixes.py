@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
 from unittest.mock import patch
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 from src.dataset import JEPADataset
 from src.inference import _apply_tta_2d, _forward_tta_streaming_2d, _iter_tta_views_2d
-from src.inference_from_session import TileLayout2D, _stitch_tile_tensor
+from src.inference_from_session import TileLayout2D, _stitch_tile_tensor, load_raw_data, run_inference_on_data
 from src.models.symmetry import _crop_from_square, _pad_to_square
 
 
@@ -65,6 +67,86 @@ class ReviewFixesTests(unittest.TestCase):
         self.assertEqual(float(stitched[0, 0, 0, 5]), 2.0)
         self.assertEqual(float(stitched[0, 0, 5, 0]), 3.0)
         self.assertEqual(float(stitched[0, 0, 5, 5]), 4.0)
+
+    def test_tile_stitching_scales_origins_for_downsampled_maps(self) -> None:
+        tiles = torch.zeros((4, 1, 2, 2), dtype=torch.float32)
+        tiles[0, 0, :2, :2] = 1.0
+        tiles[1, 0, :2, :1] = 2.0
+        tiles[2, 0, :1, :2] = 3.0
+        tiles[3, 0, :1, :1] = 4.0
+        layout = TileLayout2D(
+            original_shape=(6, 6),
+            crop_size=4,
+            origins=((0, 0), (0, 4), (4, 0), (4, 4)),
+            valid_shapes=((4, 4), (4, 2), (2, 4), (2, 2)),
+        )
+
+        stitched = _stitch_tile_tensor(tiles, layout)
+
+        self.assertEqual(tuple(stitched.shape), (1, 1, 3, 3))
+        self.assertEqual(float(stitched[0, 0, 0, 0]), 1.0)
+        self.assertEqual(float(stitched[0, 0, 0, 2]), 2.0)
+        self.assertEqual(float(stitched[0, 0, 2, 0]), 3.0)
+        self.assertEqual(float(stitched[0, 0, 2, 2]), 4.0)
+
+    def test_tiled_raw_data_uses_global_normalization(self) -> None:
+        arr = np.arange(24, dtype=np.float32).reshape(4, 6)
+        with tempfile.NamedTemporaryFile(suffix=".npy") as f:
+            np.save(f.name, arr)
+            data, layout = load_raw_data(
+                f.name,
+                crop_size=4,
+                crop_mode="tile",
+                mode="image",
+                return_layout=True,
+            )
+
+        self.assertIsNotNone(layout)
+        self.assertEqual(tuple(data.shape), (6, 1, 4, 4))
+        # arr[0, 2] appears in the first tile at [0, 2] and the second at [0, 0].
+        self.assertEqual(float(data[0, 0, 0, 2]), float(data[1, 0, 0, 0]))
+
+    def test_3d_slab_raw_data_returns_5d_sliding_slabs(self) -> None:
+        volume = np.arange(5 * 3 * 4, dtype=np.float32).reshape(5, 3, 4)
+        with tempfile.NamedTemporaryFile(suffix=".npy") as f:
+            np.save(f.name, volume)
+            data, layout = load_raw_data(
+                f.name,
+                mode="3d_slab",
+                slice_axis=0,
+                slab_depth=3,
+                return_layout=True,
+            )
+
+        self.assertIsNone(layout)
+        self.assertEqual(tuple(data.shape), (5, 1, 3, 3, 4))
+
+    def test_run_inference_returns_target_metadata(self) -> None:
+        class FakeModel:
+            mode = "image"
+
+            def eval(self) -> None:
+                return None
+
+            def __call__(self, x: torch.Tensor, mask_inference: bool) -> dict:
+                b = x.shape[0]
+                return {
+                    "pred_map": x + 1.0,
+                    "gt_map": x + 2.0,
+                    "context_map": x + 3.0,
+                    "target_locations": torch.zeros((b, 2, 2), dtype=torch.long, device=x.device),
+                    "target_scales": torch.ones((b, 2), dtype=x.dtype, device=x.device),
+                    "target_valid": torch.ones((b, 2), dtype=torch.bool, device=x.device),
+                }
+
+        data = torch.zeros((3, 1, 4, 4), dtype=torch.float32)
+        loader = DataLoader(data, batch_size=2)
+
+        outputs = run_inference_on_data(FakeModel(), loader, torch.device("cpu"))
+
+        self.assertEqual(tuple(outputs["target_locations"].shape), (3, 2, 2))
+        self.assertEqual(tuple(outputs["target_scales"].shape), (3, 2))
+        self.assertEqual(tuple(outputs["target_valid"].shape), (3, 2))
 
     def test_d4_tta_views_align_back_to_original_shape(self) -> None:
         x = torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 4)

@@ -8,6 +8,13 @@
     "mode": "pyramid",
     "model_key": "cdd_scaleaware_convnext",
     "encoder_depth": 5,
+    "convnext_layer_dilations": [
+      1,
+      1,
+      2,
+      2,
+      2
+    ],
     "mask_spacing_scaling": 2,
     "normalize_loss_l2": false,
     "predictor_spatial_conv": true,

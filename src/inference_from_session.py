@@ -105,8 +105,11 @@ def load_model_from_session(session_dir: str, device: torch.device, *, strict_lo
 
 def _normalize01(arr: np.ndarray) -> np.ndarray:
     a = np.asarray(arr, dtype=np.float32)
-    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
-    amin, amax = float(a.min()), float(a.max())
+    finite = np.isfinite(a)
+    if not bool(finite.any()):
+        return np.zeros_like(a, dtype=np.float32)
+    amin, amax = float(a[finite].min()), float(a[finite].max())
+    a = np.nan_to_num(a, nan=amin, posinf=amax, neginf=amin)
     if amax - amin > 1e-20:
         return ((a - amin) / (amax - amin)).astype(np.float32)
     return np.zeros_like(a, dtype=np.float32)
@@ -208,16 +211,60 @@ def _stitch_tile_tensor(value, layout: TileLayout2D | None):
     tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
     if tensor.dim() < 4 or int(tensor.shape[0]) != len(layout.origins):
         return value
-    h, w = layout.original_shape
-    out_shape = (1, *tensor.shape[1:-2], h, w)
+
+    tile_h = int(tensor.shape[-2])
+    tile_w = int(tensor.shape[-1])
+    scale_y = float(tile_h) / float(layout.crop_size)
+    scale_x = float(tile_w) / float(layout.crop_size)
+    out_h = max(1, int(np.ceil(float(layout.original_shape[0]) * scale_y)))
+    out_w = max(1, int(np.ceil(float(layout.original_shape[1]) * scale_x)))
+    out_shape = (1, *tensor.shape[1:-2], out_h, out_w)
     # Accumulate on CPU to avoid GPU OOM on large images (e.g. 10k×10k)
     out = torch.zeros(out_shape, dtype=tensor.dtype, device="cpu")
-    counts = torch.zeros((1, *([1] * (tensor.dim() - 3)), h, w), dtype=tensor.dtype, device="cpu")
+    counts = torch.zeros((1, *([1] * (tensor.dim() - 3)), out_h, out_w), dtype=tensor.dtype, device="cpu")
     for idx, ((y0, x0), (th, tw)) in enumerate(zip(layout.origins, layout.valid_shapes)):
-        tile = tensor[idx : idx + 1, ..., :th, :tw].cpu()
-        out[..., y0 : y0 + th, x0 : x0 + tw] += tile
-        counts[..., y0 : y0 + th, x0 : x0 + tw] += 1
+        oy0 = int(np.floor(float(y0) * scale_y))
+        ox0 = int(np.floor(float(x0) * scale_x))
+        oy1 = min(out_h, int(np.ceil(float(y0 + th) * scale_y)))
+        ox1 = min(out_w, int(np.ceil(float(x0 + tw) * scale_x)))
+        vh = max(0, oy1 - oy0)
+        vw = max(0, ox1 - ox0)
+        if vh <= 0 or vw <= 0:
+            continue
+        tile = tensor[idx : idx + 1, ..., :vh, :vw].cpu()
+        out[..., oy0:oy1, ox0:ox1] += tile
+        counts[..., oy0:oy1, ox0:ox1] += 1
     return out / counts.clamp_min(1)
+
+
+def _make_depth_slabs(
+    volume: np.ndarray,
+    depth_size: int | None,
+    slice_index: int | None = None,
+) -> list[np.ndarray]:
+    """Return D×H×W slabs from an already depth-first normalized volume."""
+    if volume.ndim != 3:
+        raise ValueError(f"Expected depth-first 3D volume, got shape {volume.shape}")
+    depth = int(volume.shape[0])
+    if depth_size is None:
+        if slice_index is not None:
+            idx = int(slice_index) % depth
+            return [volume[idx : idx + 1]]
+        return [volume]
+
+    slab_depth = max(1, int(depth_size))
+    centers = [int(slice_index) % depth] if slice_index is not None else list(range(depth))
+    slabs: list[np.ndarray] = []
+    for center in centers:
+        start = center - slab_depth // 2
+        end = start + slab_depth
+        src0 = max(0, start)
+        src1 = min(depth, end)
+        dst0 = max(0, -start)
+        slab = np.zeros((slab_depth, volume.shape[1], volume.shape[2]), dtype=np.float32)
+        slab[dst0 : dst0 + (src1 - src0)] = volume[src0:src1]
+        slabs.append(slab)
+    return slabs
 
 
 def _stitch_tiled_outputs(outputs: dict, layout: TileLayout2D | None) -> dict:
@@ -242,6 +289,7 @@ def load_raw_data(
     slice_axis: int = 0,
     slice_index: int | None = None,
     return_layout: bool = False,
+    slab_depth: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, TileLayout2D | None]:
     """Load an arbitrary .npy and return a B×1×H×W tensor (or B×1×D×H×W for 3D).
 
@@ -251,7 +299,9 @@ def load_raw_data(
         crop_mode: 'center' (single crop) or 'tile' (tiled crops across image).
         mode: 'image' (2D) or '3d_slab' (3D volume).
         slice_axis: for 3D mode, which axis to treat as depth (default 0).
-        slice_index: for 3D mode, specific slice index, or None for all slices.
+        slice_index: for 3D mode, specific center slice index, or None for all slices.
+        slab_depth: for 3D mode, depth window per sample. If None, use the full
+            input volume as one sample.
 
     Returns:
         Tensor B×1×H×W for image mode, B×1×D×H×W for 3D slab mode.
@@ -264,24 +314,26 @@ def load_raw_data(
         if arr.ndim != 3:
             raise ValueError(f"3D slab mode requires 3D input, got shape {arr.shape}")
         axis = int(slice_axis) % 3
-        depth = arr.shape[axis]
-
-        if slice_index is not None:
-            slices = [int(slice_index) % depth]
-        else:
-            slices = list(range(depth))
-
-        slabs = []
-        for idx in slices:
-            slab = np.asarray(np.take(arr, idx, axis=axis), dtype=np.float32)
-            if crop_size and max(slab.shape) > crop_size:
-                tiles = _tile_crops_2d(slab, crop_size, crop_mode)
-                for tile in tiles:
-                    slabs.append(_normalize01(tile))
-            else:
-                slabs.append(_normalize01(slab))
-        tensor = np.stack(slabs, axis=0)  # B×H×W
-        out = torch.from_numpy(tensor).unsqueeze(1)  # B×1×H×W
+        volume = np.moveaxis(np.asarray(arr, dtype=np.float32), axis, 0)
+        volume = _normalize01(volume)
+        slabs = _make_depth_slabs(volume, slab_depth, slice_index=slice_index)
+        processed = []
+        for slab in slabs:
+            if crop_size and max(slab.shape[-2:]) > crop_size:
+                if crop_mode == "tile":
+                    raise ValueError("Tiled 3D slab inference is not supported yet; use center crop or smaller inputs.")
+                h, w = slab.shape[-2:]
+                cs = int(crop_size)
+                y0 = max(0, (h - cs) // 2)
+                x0 = max(0, (w - cs) // 2)
+                cropped = np.zeros((slab.shape[0], cs, cs), dtype=np.float32)
+                th = min(cs, h - y0)
+                tw = min(cs, w - x0)
+                cropped[:, :th, :tw] = slab[:, y0 : y0 + th, x0 : x0 + tw]
+                slab = cropped
+            processed.append(np.asarray(slab, dtype=np.float32))
+        tensor = np.stack(processed, axis=0)  # B×D×H×W
+        out = torch.from_numpy(tensor).unsqueeze(1)  # B×1×D×H×W
         return (out, None) if return_layout else out
 
     # 2D image mode
@@ -298,8 +350,9 @@ def load_raw_data(
             )
 
     if crop_size and max(arr.shape) > crop_size:
-        tiles, layout = _tile_crops_2d_with_layout(arr, crop_size, crop_mode)
-        tensor = np.stack([_normalize01(t) for t in tiles], axis=0)
+        arr_norm = _normalize01(np.asarray(arr, dtype=np.float32))
+        tiles, layout = _tile_crops_2d_with_layout(arr_norm, crop_size, crop_mode)
+        tensor = np.stack([np.asarray(t, dtype=np.float32) for t in tiles], axis=0)
     else:
         layout = None
         tensor = _normalize01(np.asarray(arr, dtype=np.float32))[np.newaxis, ...]  # 1×H×W
@@ -366,6 +419,7 @@ def run_inference_on_data(
     model,
     data_loader: DataLoader,
     device: torch.device,
+    mask_inference: bool = True,
     inference_tta_enabled: bool = False,
     inference_tta_mode: str = "flip4",
 ) -> dict:
@@ -400,8 +454,8 @@ def run_inference_on_data(
 
         def _forward_one(xv: torch.Tensor, cdv: torch.Tensor | None):
             if cdv is not None and model.mode == "pyramid":
-                return model(xv, mask_inference=False, context_data=None, cdd_orig=cdv)
-            return model(xv, mask_inference=False)
+                return model(xv, mask_inference=bool(mask_inference), context_data=None, cdd_orig=cdv)
+            return model(xv, mask_inference=bool(mask_inference))
 
         if inference_tta_enabled:
             out, _ = _forward_tta_streaming_2d(
@@ -423,9 +477,20 @@ def run_inference_on_data(
             gt_maps.append(gt_map.cpu())
         if context_map is not None:
             context_maps.append(context_map.cpu())
-        if x_batch is not None:
+        if out.get("x_clean_raw") is not None:
+            x_clean_list.append(out["x_clean_raw"].cpu())
+        elif x_batch is not None:
             x_clean_list.append(x_batch.cpu())
-        x_context_list.append(cdd_batch.cpu())
+        if out.get("x_context_raw") is not None:
+            x_context_list.append(out["x_context_raw"].cpu())
+        else:
+            x_context_list.append(cdd_batch.cpu())
+        if out.get("target_locations") is not None:
+            all_target_locs.append(out["target_locations"].cpu())
+        if out.get("target_scales") is not None:
+            all_target_scales.append(out["target_scales"].cpu())
+        if out.get("target_valid") is not None:
+            all_target_valid.append(out["target_valid"].cpu())
 
     # Stack and mean across batches
     def _stack_or_none(lst):
@@ -439,6 +504,9 @@ def run_inference_on_data(
         "context_map": _stack_or_none(context_maps),
         "x_clean_raw": _stack_or_none(x_clean_list) if x_clean_list else None,
         "x_context_raw": _stack_or_none(x_context_list) if x_context_list else None,
+        "target_locations": _stack_or_none(all_target_locs),
+        "target_scales": _stack_or_none(all_target_scales),
+        "target_valid": _stack_or_none(all_target_valid),
     }
     return outputs
 
@@ -454,6 +522,7 @@ def save_inference_session(
     input_path: str,
     crop_size: int | None = None,
     mode: str = "image",
+    mask_inference: bool = True,
 ) -> str:
     """Save inference outputs as a new inference-only session.
 
@@ -469,6 +538,7 @@ def save_inference_session(
         "input_file": os.path.abspath(input_path),
         "crop_size": crop_size,
         "mode": mode,
+        "mask_inference": bool(mask_inference),
     }
 
     with open(os.path.join(output_dir, "config_used.json"), "w", encoding="utf-8") as f:
@@ -477,8 +547,8 @@ def save_inference_session(
     # Save raw tensors
     torch.save(outputs, os.path.join(output_dir, "inference_outputs.pt"))
 
-    # Save compressed NPZ maps
-    for key in ("pred_map", "gt_map", "context_map"):
+    # Save compressed NPZ maps and target metadata.
+    for key in ("pred_map", "gt_map", "context_map", "target_locations", "target_scales", "target_valid"):
         val = outputs.get(key)
         if val is not None:
             _save_npz(os.path.join(output_dir, f"{key}.npz"), val.cpu().numpy() if hasattr(val, "cpu") else val)
@@ -498,8 +568,10 @@ def save_inference_session(
         "input_file": os.path.abspath(input_path),
         "crop_size": crop_size,
         "mode": mode,
+        "mask_inference": bool(mask_inference),
         "pred_map_shape": list(outputs["pred_map"].shape) if outputs.get("pred_map") is not None else None,
         "gt_map_shape": list(outputs["gt_map"].shape) if outputs.get("gt_map") is not None else None,
+        "target_locations_shape": list(outputs["target_locations"].shape) if outputs.get("target_locations") is not None else None,
     }
     if outputs.get("tile_layout") is not None:
         energy_summary["tile_layout"] = outputs["tile_layout"]
@@ -533,6 +605,7 @@ def _resolve_args(args, config_dict: dict | None) -> argparse.Namespace:
         "crop_size": "crop_size",
         "crop_mode": "crop_mode",
         "mode": "mode",
+        "mask_inference": "mask_inference",
         "slice_axis": "slice_axis",
         "slice_index": "slice_index",
         "output_session": "output_session",
@@ -549,6 +622,7 @@ def _resolve_args(args, config_dict: dict | None) -> argparse.Namespace:
         "crop_size": None,
         "crop_mode": "center",
         "mode": "image",
+        "mask_inference": True,
         "slice_axis": 0,
         "slice_index": None,
         "output_session": None,
@@ -615,6 +689,13 @@ Examples:
     parser.add_argument("--crop-size", type=int, default=None, help="Crop/tile size for large inputs")
     parser.add_argument("--crop-mode", default="center", choices=["center", "tile"], help="Crop mode")
     parser.add_argument("--mode", default="image", choices=["image", "3d_slab"], help="Inference mode")
+    parser.add_argument(
+        "--no-mask-inference",
+        dest="mask_inference",
+        action="store_false",
+        help="Use clean context features for representation export instead of masked prediction evaluation.",
+    )
+    parser.set_defaults(mask_inference=True)
     parser.add_argument("--slice-axis", type=int, default=0, help="Depth axis for 3D slab mode")
     parser.add_argument("--slice-index", type=int, default=None, help="Specific slice index for 3D mode")
     parser.add_argument("--output-session", default=None, help="Output session directory")
@@ -674,6 +755,11 @@ Examples:
         slice_axis=args.slice_axis,
         slice_index=args.slice_index,
         return_layout=True,
+        slab_depth=(
+            getattr(model, "required_input_depth", None)
+            if str(args.mode).strip().lower() in ("3d_slab", "3d-slab")
+            else None
+        ),
     )
     print(f"[inference] data shape={tuple(data_tensor.shape)}")
     if tile_layout is not None:
@@ -708,6 +794,7 @@ Examples:
         model,
         loader,
         device,
+        mask_inference=args.mask_inference,
         inference_tta_enabled=args.tta,
         inference_tta_mode=args.tta_mode,
     )
@@ -723,6 +810,7 @@ Examples:
         args.input,
         crop_size=args.crop_size,
         mode=args.mode,
+        mask_inference=args.mask_inference,
     )
 
     print(f"[inference] done → {output_dir}")

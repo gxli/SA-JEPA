@@ -15,7 +15,7 @@
     "predictor_hidden": 96,
     "use_grn": true,
     "post_log_transform": true,
-    "use_symmetric_feature_loss": true,
+    "use_symmetric_feature_loss": false,
     "target_sampling_mode": "random",
     "priority_top_percent": 100,
     "priority_n_target": "auto",

@@ -172,6 +172,33 @@ def _build_random_catalogue_from_cdd(
     return [(int(y), int(x)) for y, x in zip(ys, xs)]
 
 
+def _build_random_catalogue_from_array(
+    arr: np.ndarray,
+    patch_size: int,
+    h: int,
+    w: int,
+) -> list[tuple[int, int]]:
+    """All valid nonzero image pixels, shuffled later by torch."""
+    arr2d = np.asarray(arr)
+    if arr2d.ndim != 2:
+        return []
+    half_lo = int(patch_size) // 2
+    half_hi = int(patch_size) - half_lo
+    valid = np.isfinite(arr2d) & (arr2d > 1e-8)
+    if half_lo > 0:
+        valid[:half_lo, :] = False
+        valid[:, :half_lo] = False
+    if half_hi > 0:
+        valid[h - half_hi :, :] = False
+        valid[:, w - half_hi :] = False
+    valid_idx = np.flatnonzero(valid.reshape(-1))
+    if valid_idx.size == 0:
+        return []
+    ys = (valid_idx // w).astype(np.int64)
+    xs = (valid_idx % w).astype(np.int64)
+    return [(int(y), int(x)) for y, x in zip(ys, xs)]
+
+
 def _fractional_spatial_target_budget(
     height: int,
     width: int,
@@ -533,6 +560,9 @@ def make_pyramid_grid_context(
     cdd_constrained: bool = True,
     cdd_sm_mode: str = "reflect",
     cdd_append_last_residual: bool = True,
+    cdd_pre_log_transform: bool = False,
+    cdd_log_eps: float = 1.0,
+    cdd_log_std_floor_mult: float = 0.05,
     inner_target_size: int = 2,
     return_debug: bool = False,
     enable_grid_jitter: bool = True,
@@ -552,6 +582,7 @@ def make_pyramid_grid_context(
     mask_box_hardcap: int | None = None,
     cdd_use_gpu: bool = False,
     cdd_orig_in: Optional[torch.Tensor] = None,
+    use_cdd: bool = True,
 ):
     """
     x_clean: B x 1 x H x W
@@ -695,13 +726,14 @@ def make_pyramid_grid_context(
                 if shared_centers_dithered is not None:
                     shared_centers_dithered = [shared_centers_dithered[int(i)] for i in idx]
 
-        # Masking is applied only after CDD decomposition.
+        use_cdd_for_sample = bool(use_cdd)
         if active_sigmas:
             if cdd_orig_in is not None:
                 # Keep everything on GPU — no CPU transfer for CDD data.
                 cdd_orig_t = cdd_orig_in[bi].to(device=x_clean.device, dtype=x_clean.dtype)
                 cdd_residual_t = None
-            else:
+                use_cdd_for_sample = True
+            elif use_cdd_for_sample:
                 import constrained_diffusion as cdd
 
                 cdd_kwargs = dict(
@@ -712,8 +744,16 @@ def make_pyramid_grid_context(
                     verbose=False,
                     use_gpu=bool(cdd_use_gpu),
                 )
+                if cdd_pre_log_transform:
+                    eps = max(1e-6, float(cdd_log_eps))
+                    arr_clamp = np.clip(arr, 0.0, None)
+                    arr_std = float(np.std(arr_clamp))
+                    log_floor = max(eps, arr_std * float(cdd_log_std_floor_mult))
+                    arr_log = np.log(arr_clamp + log_floor).astype(np.float32)
+                else:
+                    arr_log = arr.astype(np.float32)
                 cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(
-                    arr.astype(np.float32),
+                    arr_log,
                     num_channels=len(active_sigmas),
                     max_scale=max(active_sigmas),
                     **cdd_kwargs,
@@ -725,16 +765,20 @@ def make_pyramid_grid_context(
 
                 if cdd_append_last_residual and cdd_residual_t is not None:
                     cdd_orig_t[-1] = cdd_orig_t[-1] + cdd_residual_t
+            else:
+                cdd_orig_t = x_clean[bi].to(device=x_clean.device, dtype=x_clean.dtype).clone()
+                cdd_residual_t = None
 
             # Mutable mask target stays on GPU
             cdd_mod_t = cdd_orig_t.clone()
             cdd_orig = cdd_orig_t.cpu().numpy()  # CPU copy strictly for catalogue sorting
 
-            all_cdd_orig.append(cdd_orig_t.clone().detach())
+            if use_cdd_for_sample:
+                all_cdd_orig.append(cdd_orig_t.clone().detach())
 
             priority_catalogue = []
             if sampled_mode:
-                if priority_sampling_mode:
+                if priority_sampling_mode and use_cdd_for_sample:
                     _cdd_for_catalogue = np.expm1(cdd_orig) if _use_linear_catalogue else cdd_orig
                     priority_catalogue = _build_priority_catalogue_from_cdd_ratio(
                         cdd_orig=_cdd_for_catalogue,
@@ -743,9 +787,16 @@ def make_pyramid_grid_context(
                         h=h,
                         w=w,
                     )
-                else:
+                elif use_cdd_for_sample:
                     priority_catalogue = _build_random_catalogue_from_cdd(
                         cdd_orig=cdd_orig,
+                        patch_size=int(inner_target_size),
+                        h=h,
+                        w=w,
+                    )
+                else:
+                    priority_catalogue = _build_random_catalogue_from_array(
+                        arr=arr,
                         patch_size=int(inner_target_size),
                         h=h,
                         w=w,
@@ -1145,6 +1196,9 @@ def prepare_context_batch(
     cdd_constrained: bool = True,
     cdd_sm_mode: str = "reflect",
     cdd_append_last_residual: bool = True,
+    cdd_pre_log_transform: bool = False,
+    cdd_log_eps: float = 1.0,
+    cdd_log_std_floor_mult: float = 0.05,
     patch_size: int = 3,
     return_debug: bool = False,
     enable_grid_jitter: bool = True,
@@ -1163,6 +1217,7 @@ def prepare_context_batch(
     mask_box_hardcap: int | None = None,
     cdd_use_gpu: bool = False,
     cdd_orig_in: Optional[torch.Tensor] = None,
+    use_cdd: bool = True,
 ):
     """Prepare context tensors from a clean batch.
 
@@ -1190,6 +1245,9 @@ def prepare_context_batch(
         cdd_constrained=cdd_constrained,
         cdd_sm_mode=cdd_sm_mode,
         cdd_append_last_residual=cdd_append_last_residual,
+        cdd_pre_log_transform=cdd_pre_log_transform,
+        cdd_log_eps=cdd_log_eps,
+        cdd_log_std_floor_mult=cdd_log_std_floor_mult,
         inner_target_size=patch_size,
         return_debug=return_debug,
         enable_grid_jitter=enable_grid_jitter,
@@ -1209,6 +1267,7 @@ def prepare_context_batch(
         mask_box_hardcap=mask_box_hardcap,
         cdd_use_gpu=cdd_use_gpu,
         cdd_orig_in=cdd_orig_in,
+        use_cdd=use_cdd,
     )
 
 

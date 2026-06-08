@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import html as html_lib
+import io
 import json
 import os
 import re
@@ -955,6 +957,41 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     if cfg_used:
         model_mode = str(cfg_used.get("model", {}).get("mode", "unknown")).lower()
 
+    def _safe_download_name(name: str) -> str:
+        safe = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+        return safe or "panel"
+
+    def _raw_png_data_url(arr: np.ndarray) -> str:
+        vals = np.asarray(arr)
+        if vals.ndim == 3 and vals.shape[-1] in (3, 4):
+            out = vals
+            if not np.issubdtype(out.dtype, np.integer):
+                max_v = float(np.nanmax(out)) if out.size else 1.0
+                scale = 255.0 if max_v <= 1.0 + 1e-6 else 1.0
+                out = out.astype(np.float32) * scale
+            out = np.clip(np.nan_to_num(out, nan=0.0, posinf=255.0, neginf=0.0), 0, 255).astype(np.uint8)
+        elif vals.ndim == 2:
+            raw = vals.astype(np.float32, copy=False)
+            finite = raw[np.isfinite(raw)]
+            if finite.size == 0:
+                gray = np.zeros(raw.shape, dtype=np.uint8)
+                alpha = np.zeros(raw.shape, dtype=np.uint8)
+            else:
+                lo = float(np.min(finite))
+                hi = float(np.max(finite))
+                if hi <= lo + 1e-12:
+                    hi = lo + 1.0
+                gray = np.clip(np.round((np.nan_to_num(raw, nan=lo) - lo) / (hi - lo) * 255.0), 0, 255).astype(np.uint8)
+                alpha = np.where(np.isfinite(raw), 255, 0).astype(np.uint8)
+            out = np.dstack([gray, gray, gray, alpha])
+        else:
+            out = np.zeros((1, 1, 4), dtype=np.uint8)
+        from PIL import Image
+
+        bio = io.BytesIO()
+        Image.fromarray(out).save(bio, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(bio.getvalue()).decode("ascii")
+
     def _image_axis_range(shape: tuple[int, int]) -> tuple[list[float], list[float]]:
         h, w = int(shape[0]), int(shape[1])
         return [-0.5, float(w) - 0.5], [float(h) - 0.5, -0.5]
@@ -1070,12 +1107,6 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             pts = pts[:n]
             if rgb.ndim == 2:
                 rgb = rgb[:n]
-            # Keep HTML size sane while still showing dense point clouds.
-            if n > 65536:
-                step = int(np.ceil(n / 65536.0))
-                pts = pts[::step]
-                if rgb.ndim == 2:
-                    rgb = rgb[::step]
             rendered_n = int(pts.shape[0])
             x, y, z = pts[:, 0], -pts[:, 1], pts[:, 2]
             if rgb.ndim == 2 and rgb.shape[1] >= 3:
@@ -1378,11 +1409,9 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 return np.asarray(data[key], dtype=np.float32)
         return np.asarray([], dtype=np.float32)
 
-    def _rotate_cdd_probe_180(arr: np.ndarray) -> np.ndarray:
+    def _orient_cdd_probe_for_display(arr: np.ndarray) -> np.ndarray:
         vals = np.asarray(arr, dtype=np.float32)
-        if vals.ndim < 2:
-            return vals
-        return np.rot90(vals, k=2, axes=(-2, -1)).astype(np.float32, copy=False)
+        return vals.astype(np.float32, copy=False)
 
     loss_x = _npz_array("loss_x")
     loss_total = np.asarray(data["loss_total"], dtype=np.float32) if "loss_total" in data.files else np.asarray([], dtype=np.float32)
@@ -1480,8 +1509,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 y=values,
                 mode="lines",
                 name=f"{name} raw",
-                line=dict(width=1.1, color=color, dash="dot"),
-                opacity=0.42,
+                line=dict(width=1.8, color="#aaaaaa", dash="dot"),
+                opacity=0.55,
                 showlegend=False,
                 hoverinfo="skip",
             )
@@ -1691,6 +1720,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 "title": f"{name} PCA RGB",
                 "fig": img(f"{name} PCA RGB", data[f"{stem}_pca_rgb"]),
                 "group": f"{stem}-pca",
+                "raw_png": _raw_png_data_url(data[f"{stem}_pca_rgb"]),
             }
         )
         cards.append({"title": f"{name} PCA RGB Scatter", "fig": pca_scatter, "group": f"{stem}-pca"})
@@ -1699,18 +1729,19 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 "title": f"{name} UMAP RGB",
                 "fig": img(f"{name} UMAP RGB", data[f"{stem}_umap_rgb"]),
                 "group": f"{stem}-umap",
+                "raw_png": _raw_png_data_url(data[f"{stem}_umap_rgb"]),
             }
         )
         cards.append({"title": f"{name} UMAP RGB Scatter", "fig": umap_scatter, "group": f"{stem}-umap"})
     if "scale_probe_sensitivity_maps" in data.files and "scale_probe_names" in data.files:
         sp_names = data["scale_probe_names"]
-        sp_sens_maps = _rotate_cdd_probe_180(data["scale_probe_sensitivity_maps"])
-        sp_sim_maps = _rotate_cdd_probe_180(data["scale_probe_scale_only_sim_maps"]) if "scale_probe_scale_only_sim_maps" in data.files else np.asarray([], dtype=np.float32)
-        sp_winner = _rotate_cdd_probe_180(data["scale_probe_winner_map"]) if "scale_probe_winner_map" in data.files else np.asarray([], dtype=np.float32)
+        sp_sens_maps = _orient_cdd_probe_for_display(data["scale_probe_sensitivity_maps"])
+        sp_sim_maps = _orient_cdd_probe_for_display(data["scale_probe_scale_only_sim_maps"]) if "scale_probe_scale_only_sim_maps" in data.files else np.asarray([], dtype=np.float32)
+        sp_winner = _orient_cdd_probe_for_display(data["scale_probe_winner_map"]) if "scale_probe_winner_map" in data.files else np.asarray([], dtype=np.float32)
         sp_sens_mean = np.asarray(data["scale_probe_sensitivity_mean"], dtype=np.float32) if "scale_probe_sensitivity_mean" in data.files else np.asarray([], dtype=np.float32)
         sp_sens_frac = np.asarray(data["scale_probe_sensitivity_fraction"], dtype=np.float32) if "scale_probe_sensitivity_fraction" in data.files else np.asarray([], dtype=np.float32)
         sp_sim_mean = np.asarray(data["scale_probe_scale_only_similarity"], dtype=np.float32) if "scale_probe_scale_only_similarity" in data.files else np.asarray([], dtype=np.float32)
-        sp_input = _rotate_cdd_probe_180(data["scale_probe_input_map"]) if "scale_probe_input_map" in data.files else np.asarray([], dtype=np.float32)
+        sp_input = _orient_cdd_probe_for_display(data["scale_probe_input_map"]) if "scale_probe_input_map" in data.files else np.asarray([], dtype=np.float32)
         cards.extend(
             [
                 {
@@ -1763,7 +1794,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 }
             )
         if "scale_probe_pred_sensitivity_maps" in data.files:
-            sp_pred_maps = _rotate_cdd_probe_180(data["scale_probe_pred_sensitivity_maps"])
+            sp_pred_maps = _orient_cdd_probe_for_display(data["scale_probe_pred_sensitivity_maps"])
             if sp_pred_maps.ndim == 3 and sp_pred_maps.size > 0:
                 cards.append(
                     {
@@ -1775,7 +1806,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     # Non-pair panels afterwards.
     cards.extend(
         [
-            {"title": "Input (Log-Norm)", "fig": heat("Input (Log-Norm)", data["orig"], "Viridis"), "group": "input"},
+            {"title": "Input (Log-Norm)", "fig": heat("Input (Log-Norm)", data["orig"], "Viridis"), "group": "input", "raw_png": _raw_png_data_url(data["orig"])},
             {"title": "Effective Rank", "fig": fig_eff_rank, "group": "eff-rank"},
             {"title": "Active Loss Terms (Unweighted)", "fig": fig_loss_components, "group": "loss-components"},
             {"title": "Active Loss Terms (Weighted)", "fig": fig_weighted_components, "group": "weighted-loss-components"},
@@ -1784,9 +1815,9 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             {"title": "Manifold Diagnostics", "fig": fig_rank_diag, "group": "rank-diag"},
             {"title": "Rank Energy Top-k", "fig": fig_rank_energy, "group": "rank-energy"},
             {"title": "Energy Distribution", "fig": fig_energy_dist, "group": "energy-dist"},
-            {"title": "Target Locations", "fig": heat("Target Locations", data["target"], "Magma"), "group": "target-loc"},
-            {"title": "Target Location Heatmap", "fig": heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma"), "group": "target-heat"},
-            {"title": "Energy Map", "fig": heat("Energy Map", data["energy_map"], "Inferno"), "group": "energy"},
+            {"title": "Target Locations", "fig": heat("Target Locations", data["target"], "Magma"), "group": "target-loc", "raw_png": _raw_png_data_url(data["target"])},
+            {"title": "Target Location Heatmap", "fig": heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma"), "group": "target-heat", "raw_png": _raw_png_data_url(data["target_loc_heatmap"])},
+            {"title": "Energy Map", "fig": heat("Energy Map", data["energy_map"], "Inferno"), "group": "energy", "raw_png": _raw_png_data_url(data["energy_map"])},
             {
                 "title": "Visit Frequency Heatmap",
                 "fig": heat(
@@ -1797,6 +1828,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                     log1p_nonzero_nan=True,
                 ),
                 "group": "visit",
+                "raw_png": _raw_png_data_url(data["visit_heatmap"]),
             },
         ]
     )
@@ -1816,6 +1848,13 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         group = card["group"]
         panel_title = str(card.get("title", f"panel_{i+1}"))
         panel_title_html = html_lib.escape(panel_title, quote=True)
+        raw_png = card.get("raw_png")
+        if raw_png:
+            href = html_lib.escape(str(raw_png), quote=True)
+            file_name = html_lib.escape(f"{_safe_download_name(panel_title)}.png", quote=True)
+            save_control = f'<a class="save-panel" download="{file_name}" href="{href}">Save raw PNG</a>'
+        else:
+            save_control = f'<button class="save-panel" type="button" data-panel-title="{panel_title_html}">Save plot PNG</button>'
         controls = ""
         if group not in seen_groups and ("-pca" in group or "-umap" in group):
             controls = (
@@ -1838,9 +1877,9 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             seen_groups.add(group)
         rendered.append(
             f'<section class="card" data-group="{group}">'
-            f'<div class="card-tools"><button class="save-panel" type="button" data-panel-title="{panel_title_html}">Save PNG</button></div>'
+            f'<div class="card-tools">{save_control}</div>'
             f'{controls}'
-            f'{fig.to_html(full_html=False, include_plotlyjs=(True if i == 0 else False), config={"responsive": True, "displaylogo": False})}'
+            f'{fig.to_html(full_html=False, include_plotlyjs=(True if i == 0 else False), config={"responsive": True, "displaylogo": False, "modeBarButtonsToRemove": ["toImage"]})}'
             f'</section>'
         )
     # Keep grid alignment stable: if odd number of cards, append a dummy placeholder.
@@ -2074,6 +2113,157 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
 	      .replace(/[^a-z0-9]+/g, "_")
 	      .replace(/^_+|_+$/g, "") || "panel";
 	  }}
+	  function _axisLayoutKey(axisRef) {{
+	    const ref = String(axisRef || "x");
+	    const prefix = ref.charAt(0) === "y" ? "yaxis" : "xaxis";
+	    const suffix = ref.length > 1 ? ref.slice(1) : "";
+	    return prefix + suffix;
+	  }}
+	  function _traceRasterShape(trace) {{
+	    if (!trace || (trace.type !== "image" && trace.type !== "heatmap")) return null;
+	    const z = trace.z || [];
+	    const h = Array.isArray(z) || ArrayBuffer.isView(z) ? z.length : 0;
+	    const row0 = h > 0 ? z[0] : [];
+	    const w = Array.isArray(row0) || ArrayBuffer.isView(row0) ? row0.length : 0;
+	    return h > 0 && w > 0 ? {{ h, w }} : null;
+	  }}
+	  function _axisDomain(layout, key) {{
+	    const axis = (layout || {{}})[key] || {{}};
+	    const domain = axis.domain || [0, 1];
+	    const lo = Number(domain[0]);
+	    const hi = Number(domain[1]);
+	    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return 1.0;
+	    return Math.max(1e-6, hi - lo);
+	  }}
+	  function _dominantRasterShape(gd) {{
+	    let best = null;
+	    (gd.data || []).forEach((trace) => {{
+	      const shape = _traceRasterShape(trace);
+	      if (!shape) return;
+	      const area = shape.w * shape.h;
+	      if (!best || area > best.area) best = {{ ...shape, area }};
+	    }});
+	    return best;
+	  }}
+	  function _dominantRasterTrace(gd) {{
+	    let best = null;
+	    (gd.data || []).forEach((trace) => {{
+	      const shape = _traceRasterShape(trace);
+	      if (!shape) return;
+	      const area = shape.w * shape.h;
+	      if (!best || area > best.area) best = {{ trace, shape, area }};
+	    }});
+	    return best;
+	  }}
+	  function _finiteRange2d(z, fallbackLo, fallbackHi) {{
+	    let lo = Number(fallbackLo);
+	    let hi = Number(fallbackHi);
+	    if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) return [lo, hi];
+	    lo = Infinity;
+	    hi = -Infinity;
+	    (z || []).forEach((row) => {{
+	      Array.from(row || []).forEach((v) => {{
+	        const x = Number(v);
+	        if (!Number.isFinite(x)) return;
+	        lo = Math.min(lo, x);
+	        hi = Math.max(hi, x);
+	      }});
+	    }});
+	    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return [0, 1];
+	    return [lo, hi];
+	  }}
+	  function _toByte(v, lo = 0, hi = 255) {{
+	    const x = Number(v);
+	    if (!Number.isFinite(x)) return 0;
+	    const y = (x - lo) / Math.max(1e-12, hi - lo);
+	    return Math.max(0, Math.min(255, Math.round(y * 255)));
+	  }}
+	  function _downloadRawRasterPng(gd, title) {{
+	    const item = _dominantRasterTrace(gd);
+	    if (!item) return false;
+	    const trace = item.trace;
+	    const z = trace.z || [];
+	    const width = item.shape.w;
+	    const height = item.shape.h;
+	    const canvas = document.createElement("canvas");
+	    canvas.width = width;
+	    canvas.height = height;
+	    const ctx = canvas.getContext("2d");
+	    if (!ctx) return false;
+	    const image = ctx.createImageData(width, height);
+	    const data = image.data;
+	    const scalarRange = trace.type === "heatmap" ? _finiteRange2d(z, trace.zmin, trace.zmax) : [0, 255];
+	    for (let y = 0; y < height; y++) {{
+	      const row = z[y] || [];
+	      for (let x = 0; x < width; x++) {{
+	        const pixel = row[x];
+	        const idx = 4 * (y * width + x);
+	        if (Array.isArray(pixel) || ArrayBuffer.isView(pixel)) {{
+	          data[idx] = _toByte(pixel[0]);
+	          data[idx + 1] = _toByte(pixel[1]);
+	          data[idx + 2] = _toByte(pixel[2]);
+	          data[idx + 3] = pixel.length > 3 ? _toByte(pixel[3]) : 255;
+	        }} else {{
+	          const g = _toByte(pixel, scalarRange[0], scalarRange[1]);
+	          data[idx] = g;
+	          data[idx + 1] = g;
+	          data[idx + 2] = g;
+	          data[idx + 3] = Number.isFinite(Number(pixel)) ? 255 : 0;
+	        }}
+	      }}
+	    }}
+	    ctx.putImageData(image, 0, 0);
+	    const a = document.createElement("a");
+	    a.href = canvas.toDataURL("image/png");
+	    a.download = _safeFileName(title) + ".png";
+	    document.body.appendChild(a);
+	    a.click();
+	    a.remove();
+	    return true;
+	  }}
+	  function _panelExportSize(gd) {{
+	    const layout = gd.layout || {{}};
+	    const margin = layout.margin || {{}};
+	    const ml = Number.isFinite(Number(margin.l)) ? Number(margin.l) : 80;
+	    const mr = Number.isFinite(Number(margin.r)) ? Number(margin.r) : 40;
+	    const mt = Number.isFinite(Number(margin.t)) ? Number(margin.t) : 80;
+	    const mb = Number.isFinite(Number(margin.b)) ? Number(margin.b) : 50;
+	    let width = Math.max(1200, gd.clientWidth || 1200);
+	    let height = Math.max(900, gd.clientHeight || 900);
+	    let plotW = 0;
+	    let plotH = 0;
+	    (gd.data || []).forEach((trace) => {{
+	      const shape = _traceRasterShape(trace);
+	      if (!shape) return;
+	      const xDomain = _axisDomain(layout, _axisLayoutKey(trace.xaxis || "x"));
+	      const yDomain = _axisDomain(layout, _axisLayoutKey(trace.yaxis || "y"));
+	      plotW = Math.max(plotW, shape.w / xDomain);
+	      plotH = Math.max(plotH, shape.h / yDomain);
+	    }});
+	    const nativeWidth = plotW > 0 ? Math.ceil(plotW + ml + mr) : 0;
+	    const nativeHeight = plotH > 0 ? Math.ceil(plotH + mt + mb) : 0;
+	    const rasterShape = _dominantRasterShape(gd);
+	    if (rasterShape) {{
+	      const contentW = Math.max(nativeWidth > 0 ? nativeWidth - ml - mr : 0, gd.clientWidth || 0, 1200);
+	      const contentH = Math.max(1, Math.ceil(contentW * rasterShape.h / Math.max(1, rasterShape.w)));
+	      width = Math.max(width, Math.ceil(contentW + ml + mr));
+	      height = Math.max(gd.clientHeight || 0, Math.ceil(contentH + mt + mb));
+	    }}
+	    let scale = Math.max(
+	      4,
+	      nativeWidth > 0 ? nativeWidth / width : 0,
+	      nativeHeight > 0 ? nativeHeight / height : 0,
+	    );
+	    const maxDim = 16384;
+	    const maxPixels = 120000000;
+	    scale = Math.min(scale, maxDim / width, maxDim / height);
+	    scale = Math.min(scale, Math.sqrt(maxPixels / Math.max(1, width * height)));
+	    scale = Math.max(1, scale);
+	    if (plotW <= 0 || plotH <= 0) {{
+	      return {{ width, height, scale: Math.max(2, scale) }};
+	    }}
+	    return {{ width, height, scale }};
+	  }}
 	  async function savePanelPng(btn) {{
 	    const card = btn.closest(".card");
 	    const gd = card ? card.querySelector(".js-plotly-plot") : null;
@@ -2082,10 +2272,13 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
 	      return;
 	    }}
 	    const title = btn.getAttribute("data-panel-title") || "panel";
-	    const width = Math.max(1200, gd.clientWidth || 1200);
-	    const height = Math.max(900, gd.clientHeight || 900);
+	    const exportSize = _panelExportSize(gd);
 	    try {{
-	      const dataUrl = await window.Plotly.toImage(gd, {{ format: "png", width, height, scale: 2 }});
+	      if (_downloadRawRasterPng(gd, title)) return;
+	      const dataUrl = await window.Plotly.toImage(
+	        gd,
+	        {{ format: "png", width: exportSize.width, height: exportSize.height, scale: exportSize.scale }}
+	      );
 	      const a = document.createElement("a");
 	      a.href = dataUrl;
 	      a.download = _safeFileName(title) + ".png";
@@ -2097,7 +2290,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
 	      alert("Failed to save panel PNG.");
 	    }}
 	  }}
-	  document.querySelectorAll(".save-panel").forEach((btn) => {{
+	  document.querySelectorAll("button.save-panel").forEach((btn) => {{
 	    btn.addEventListener("click", () => savePanelPng(btn));
 	  }});
 	  </script>

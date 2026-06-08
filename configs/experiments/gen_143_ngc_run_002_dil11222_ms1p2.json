@@ -8,6 +8,13 @@
     "mode": "pyramid",
     "model_key": "cdd_scaleaware_convnext",
     "encoder_depth": 5,
+    "convnext_layer_dilations": [
+      1,
+      1,
+      2,
+      2,
+      2
+    ],
     "mask_spacing_scaling": 2,
     "normalize_loss_l2": false,
     "predictor_spatial_conv": true,
@@ -25,7 +32,7 @@
     "target_allow_partial_overlap": 0.0,
     "priority_candidate_oversample": 0,
     "target_invalid_region_skip": true,
-    "mask_size_scaling": 1.6,
+    "mask_size_scaling": 1.2,
     "mask_size": 0,
     "mask_box_hardcap": 27,
     "scaleaware_norm_per_scale": true,
