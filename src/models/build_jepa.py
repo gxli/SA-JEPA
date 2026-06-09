@@ -25,6 +25,7 @@ from .symmetry import symmetric_forward_2d
 # Shared encoder-type sets used by both build_jepa.py and train.py.
 CDD_CUBE_ENCODER_TYPES = frozenset({
     "cdd_scaleaware_convnext",
+    "cdd_scaleaware_convnext3d",
     "convnext_dense_pyramid",
     "escnn_c4_pyramid",
 })

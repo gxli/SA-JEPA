@@ -770,3 +770,78 @@ def run_post_training_inference_3d(
     _save_npz(os.path.join(session_dir, "target_energy_cosine_map_slab.npz"), slab_energy["energy_cosine"].numpy())
     print(f"[{config_name}] saved 3D inference artifacts")
     return session_dir
+
+
+def run_full_volume_inference_3d(
+    *,
+    model,
+    cdd_cache: dict,
+    session_dir: str,
+    config_name: str,
+    device: torch.device,
+    slab_depth: int = 8,
+    overlap: int = 4,
+    post_log_transform: bool = True,
+    log_eps: float = 1.0,
+    cdd_log_std_floor_mult: float = 0.05,
+) -> str:
+    """Run encoder on the full precomputed CDD volume and save context map.
+
+    Slides the encoder over the depth axis in overlapping slabs, stitches
+    results by averaging in the overlap region. Saves the full (C, D, H, W)
+    context_map_3d as .npz.
+    """
+    if not cdd_cache:
+        print(f"[{config_name}] full-volume inference: no CDD cache, skipping")
+        return session_dir
+
+    model.eval()
+    with torch.no_grad():
+        for (path, _), cdd_vol in cdd_cache.items():
+            # cdd_vol: (S, D, H, W) numpy float32
+            s, d, h, w = cdd_vol.shape
+            vol_t = torch.from_numpy(cdd_vol).unsqueeze(0).to(device)  # (1, S, D, H, W)
+
+            # Apply post_log_transform to match training input distribution
+            if post_log_transform:
+                eps_f = max(1e-6, float(log_eps))
+                vol_clamp = vol_t.clamp(min=0.0)
+                base_std = torch.std(vol_clamp, dim=(-3, -2, -1), keepdim=True)
+                log_floor = torch.clamp(base_std * float(cdd_log_std_floor_mult), min=eps_f)
+                vol_t = torch.log(vol_clamp + log_floor)
+
+            step = max(1, slab_depth - overlap)
+            starts = list(range(0, max(1, d - slab_depth + 1), step))
+            tail_start = max(0, d - slab_depth)
+            if not starts or starts[-1] != tail_start:
+                starts.append(tail_start)
+
+            ctx_sum = None
+            ctx_weight = torch.zeros((1, 1, d, 1, 1), device=device)
+
+            for z0 in starts:
+                ze = min(z0 + slab_depth, d)
+                slab = vol_t[:, :, z0:ze]  # (1, S, slab, H, W)
+                valid_depth = int(ze - z0)
+                if slab.shape[2] < slab_depth:
+                    pad_needed = slab_depth - slab.shape[2]
+                    pad_mode = "reflect" if slab.shape[2] > 1 else "replicate"
+                    slab = F.pad(slab, (0, 0, 0, 0, 0, pad_needed), mode=pad_mode)
+
+                mask_tokens = torch.zeros_like(slab)
+                ctx = model.context_encoder(slab, mask_tokens=mask_tokens)[:, :, :valid_depth]
+                if ctx_sum is None:
+                    ctx_sum = torch.zeros((1, int(ctx.shape[1]), d, int(ctx.shape[3]), int(ctx.shape[4])), device=device)
+                ctx_sum[:, :, z0:ze] += ctx
+                ctx_weight[:, :, z0:ze] += 1.0
+
+            if ctx_sum is None:
+                raise RuntimeError(f"[{config_name}] full-volume inference produced no slabs for {path}")
+            ctx_avg = ctx_sum / ctx_weight.clamp_min(1.0)
+
+            name = os.path.basename(path).replace('.npy', '')
+            out_path = os.path.join(session_dir, f"{name}_context_map_3d.npz")
+            _save_npz(out_path, ctx_avg.squeeze(0).cpu().numpy())
+            print(f"[{config_name}] full-volume context map saved: {out_path}")
+
+    return session_dir

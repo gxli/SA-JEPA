@@ -28,6 +28,8 @@ class PyramidGridJEPA3D(nn.Module):
         self,
         latent_channels=16,
         scale_channels=8,
+        num_scales: int = 1,
+        encoder_type: str = "cdd_scaleaware_convnext3d",
         patch_size=2,
         num_targets=32,
         encoder_depth=3,
@@ -37,6 +39,7 @@ class PyramidGridJEPA3D(nn.Module):
         normalize_loss_l2=False,
         post_log_transform: bool = True,
         log_eps: float = 1e-6,
+        cdd_log_std_floor_mult: float = 0.05,
         fusion="gate",
         mask_box_size: int = 8,
         num_mask_boxes: int = 8,
@@ -46,14 +49,22 @@ class PyramidGridJEPA3D(nn.Module):
         use_per_scale_adapters: bool = False,
         priority_candidate_oversample: float = 3.0,
         encoder_receptive_field_depth: int | None = None,
+        use_grn: bool = True,
+        stem_norm: bool = True,
+        norm_per_scale: bool = True,
+        adapter_norm: bool = True,
+        final_norm: bool = True,
     ):
         super().__init__()
+        self.num_scales = int(num_scales)
+        self.encoder_type = str(encoder_type).lower()
         self.patch_size = int(patch_size)
         self.num_targets = int(num_targets)
         self.ema_momentum = float(ema_momentum)
         self.normalize_loss_l2 = bool(normalize_loss_l2)
         self.post_log_transform = bool(post_log_transform)
         self.log_eps = float(log_eps)
+        self.cdd_log_std_floor_mult = float(cdd_log_std_floor_mult)
         self.mask_box_size = int(mask_box_size)
         self.num_mask_boxes = int(num_mask_boxes)
         self.mode = "3d_slab"
@@ -71,7 +82,7 @@ class PyramidGridJEPA3D(nn.Module):
 
         if self.use_film or self.use_per_scale_adapters:
             self.context_encoder = ScaleFiLMConvNeXt3DEncoder(
-                num_scales=1,
+                num_scales=self.num_scales,
                 out_channels=int(latent_channels),
                 scale_channels=int(scale_channels),
                 depth=int(encoder_depth),
@@ -80,16 +91,26 @@ class PyramidGridJEPA3D(nn.Module):
                 fusion=str(fusion),
                 use_film=self.use_film,
                 use_per_scale_adapters=self.use_per_scale_adapters,
+                use_grn=bool(use_grn),
+                stem_norm=bool(stem_norm),
+                norm_per_scale=bool(norm_per_scale),
+                adapter_norm=bool(adapter_norm),
+                final_norm=bool(final_norm),
             )
         else:
             self.context_encoder = ScaleAwareConvNeXt3DEncoder(
-                num_scales=1,
+                num_scales=self.num_scales,
                 out_channels=int(latent_channels),
                 scale_channels=int(scale_channels),
                 depth=int(encoder_depth),
                 kernel_size=int(encoder_kernel_size),
                 stride=int(encoder_stride),
                 fusion=str(fusion),
+                use_grn=bool(use_grn),
+                stem_norm=bool(stem_norm),
+                norm_per_scale=bool(norm_per_scale),
+                adapter_norm=bool(adapter_norm),
+                final_norm=bool(final_norm),
             )
         self.target_encoder = copy.deepcopy(self.context_encoder)
         for p in self.target_encoder.parameters():
@@ -164,9 +185,36 @@ class PyramidGridJEPA3D(nn.Module):
 
     def forward(self, x_clean, **kwargs):
         if x_clean.dim() != 5:
-            raise ValueError(f"Expected Bx1xDxHxW, got {tuple(x_clean.shape)}")
+            raise ValueError(f"Expected BxSxDxHxW, got {tuple(x_clean.shape)}")
 
-        b, _, _, _, _ = x_clean.shape
+        b, s, _, _, _ = x_clean.shape
+        if s == 1 and s != self.num_scales:
+            # On-the-fly 3D CDD decomposition (DDP fallback — no precomputed cache).
+            import constrained_diffusion as cdd
+            import numpy as np
+            x_np = x_clean[:, 0].cpu().numpy()  # (B, D, H, W)
+            decomposed = []
+            for bi in range(b):
+                arr = x_np[bi].astype(np.float32)
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                arr = (arr - arr.min()) / max(arr.max() - arr.min(), 1e-20)
+                channels_arr, _residual = cdd.constrained_diffusion_decomposition(
+                    arr,
+                    num_channels=self.num_scales,
+                    max_scale=16.0,
+                    mode="log",
+                    constrained=True,
+                    sm_mode="reflect",
+                    return_scales=False,
+                    verbose=False,
+                    use_gpu=False,
+                )
+                ch = np.clip(np.stack(channels_arr, axis=0), 0.0, None).astype(np.float32)
+                decomposed.append(torch.from_numpy(ch).to(x_clean.device))
+            x_clean = torch.stack(decomposed, dim=0)  # (B, S, D, H, W)
+            s = self.num_scales
+        elif s != self.num_scales:
+            raise ValueError(f"Expected Bx{self.num_scales}xDxHxW, got {tuple(x_clean.shape)}")
         fields = self.make_fields(x_clean)
         _, _, d, h, w = fields.shape
         if d < int(self.required_input_depth):
@@ -189,9 +237,13 @@ class PyramidGridJEPA3D(nn.Module):
         fields_context = fields * (1.0 - box_mask)
         mask_tokens = box_mask.expand(-1, fields.shape[1], -1, -1, -1)
         if self.post_log_transform:
-            eps = max(1e-30, float(self.log_eps))
-            fields = torch.log(torch.clamp(fields, min=0.0) + eps)
-            fields_context = torch.log(torch.clamp(fields_context, min=0.0) + eps)
+            eps = max(1e-6, float(self.log_eps))
+            base = torch.clamp(fields, min=0.0)
+            base_std = torch.std(base, dim=(-3, -2, -1), keepdim=True)
+            log_floor = torch.clamp(base_std * float(self.cdd_log_std_floor_mult), min=eps)
+            fields = torch.log(base + log_floor)
+            base_ctx = torch.clamp(fields_context, min=0.0)
+            fields_context = torch.log(base_ctx + log_floor)
 
         if self.use_symmetric_feature_loss:
             context_map_3d, symmetric_var = symmetric_forward_3d(

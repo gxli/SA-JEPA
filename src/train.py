@@ -24,7 +24,7 @@ from src.diagnostics import (
     compute_error_by_scale,
     rank_dashboard,
 )
-from src.inference import run_post_training_inference, run_post_training_inference_3d
+from src.inference import run_post_training_inference, run_post_training_inference_3d, run_full_volume_inference_3d
 from src.losses import (
     compute_jepa_energy,
     compute_output_spread_regularizer_loss,
@@ -272,6 +272,14 @@ def _precompute_cdd_cache(
             raise ValueError(f"Unexpected ndim={arr.ndim} for {path}")
         # Preserve volumetric context: decompose a cube once, then let the
         # dataset choose a 2D slice from every cached CDD channel together.
+        if cdd_pre_log_transform:
+            log_eps_val = float(model_cfg.get("log_eps", 1.0))
+            log_floor_mult = float(model_cfg.get("cdd_log_std_floor_mult", 0.05))
+            eps_f = max(1e-6, log_eps_val)
+            arr_clamp = np.clip(arr, 0.0, None)
+            arr_std = float(np.std(arr_clamp))
+            log_floor = max(eps_f, arr_std * log_floor_mult)
+            arr = np.log(arr_clamp + log_floor).astype(np.float32)
         cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(
             arr,
             num_channels=len(sigmas),
@@ -735,6 +743,9 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
     normalize_loss_l2 = bool(model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", False)))
     encoder_depth = int(model_cfg.get("encoder_depth", 3))
     encoder_kernel_size = int(model_cfg.get("encoder_kernel_size", 5))
+    sigmas = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
+    cdd_append_last_residual = bool(model_cfg.get("cdd_append_last_residual", True))
+    num_scales = 1 if enc_type == "convnext_dense3d" else len(sigmas) + (1 if cdd_append_last_residual else 0)
     encoder_rf_depth = compute_3d_encoder_receptive_field_depth(
         encoder_depth=encoder_depth,
         encoder_kernel_size=encoder_kernel_size,
@@ -742,6 +753,8 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
     return PyramidGridJEPA3D(
         latent_channels=int(model_cfg.get("latent_channels", 16)),
         scale_channels=int(model_cfg.get("scale_channels", model_cfg.get("encoder_width", 8))),
+        num_scales=int(num_scales),
+        encoder_type=enc_type,
         patch_size=int(model_cfg.get("patch_size", 2)),
         num_targets=int(model_cfg.get("num_targets", 32)),
         encoder_depth=encoder_depth,
@@ -751,6 +764,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         normalize_loss_l2=normalize_loss_l2,
         post_log_transform=bool(model_cfg.get("post_log_transform", True)),
         log_eps=float(model_cfg.get("log_eps", 1e-6)),
+        cdd_log_std_floor_mult=float(model_cfg.get("cdd_log_std_floor_mult", 0.05)),
         fusion=fusion,
         mask_box_size=int(model_cfg.get("mask_size", 8)),
         num_mask_boxes=int(model_cfg.get("num_mask_boxes", 8)),
@@ -761,6 +775,11 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
         priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
         encoder_receptive_field_depth=encoder_rf_depth,
+        use_grn=bool(model_cfg.get("use_grn", True)),
+        stem_norm=bool(model_cfg.get("scaleaware_stem_norm", True)),
+        norm_per_scale=bool(model_cfg.get("scaleaware_norm_per_scale", True)),
+        adapter_norm=bool(model_cfg.get("scaleaware_adapter_norm", True)),
+        final_norm=bool(model_cfg.get("scaleaware_final_norm", True)),
     ).to(device)
 
 
@@ -1167,7 +1186,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     # --- Pre-compute CDD once on GPU, store in CPU RAM ---
     # Only CDD/pyramid encoders require CDD channels. Plain image ConvNeXt
     # mask-token runs build masks directly on the raw image.
-    uses_cdd_channels = (not is_3d_mode) and str(getattr(model_without_ddp, "encoder_type", "")).lower() in CDD_CUBE_ENCODER_TYPES
+    encoder_type_lower = str(getattr(model_without_ddp, "encoder_type", "")).lower()
+    uses_cdd_channels = encoder_type_lower in CDD_CUBE_ENCODER_TYPES
     cdd_cache = _precompute_cdd_cache(
         data_cfg=data_cfg,
         model_cfg=model_cfg,
@@ -1208,10 +1228,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             num_samples=int(data_cfg.get("num_samples", 2000)),
             crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
             crop_depth=crop_depth_3d,
+            slab_depth=crop_depth_3d,
             depth_axis=int(data_cfg.get("volume_depth_axis", data_cfg.get("cube_slice_axis", 0))),
             random_axis=bool(data_cfg.get("volume_random_axis", False)),
             normalize=bool(data_cfg.get("normalize", True)),
             crop_strategy=str(data_cfg.get("crop_strategy", "random")),
+            cdd_cache=cdd_cache,
         )
         val_dataset = None
         train_dataset = dataset
@@ -1221,10 +1243,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             num_samples=max(1, int(train_cfg.get("inference_num_samples", 8))),
             crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
             crop_depth=crop_depth_3d,
+            slab_depth=crop_depth_3d,
             depth_axis=int(data_cfg.get("volume_depth_axis", data_cfg.get("cube_slice_axis", 0))),
             random_axis=False,
             normalize=bool(data_cfg.get("normalize", True)),
             crop_strategy="center",
+            cdd_cache=cdd_cache,
         )
         train_idx = []
         val_idx = []
@@ -1554,7 +1578,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     if is_main_process and not os.path.exists(visited_targets_log_path):
         with open(visited_targets_log_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "batch", "sample_idx", "target_idx", "y", "x", "scale"])
+            writer.writerow(["epoch", "batch", "sample_idx", "target_idx", "z", "y", "x", "scale"])
 
     loss_weights_path = os.path.join(session_dir, "loss_weights.json")
     if is_main_process and not os.path.exists(loss_weights_path):
@@ -1773,13 +1797,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 if (not is_3d_mode) and visit_counts is None:
                     hh, ww = int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])
                     visit_counts = np.zeros((hh, ww), dtype=np.float32)
+                ndim_loc = int(tloc.shape[-1])
                 for bi in range(tloc.shape[0]):
                     for ki in range(tloc.shape[1]):
                         if not bool(tvalid[bi, ki]):
                             continue
                         yy = int(tloc[bi, ki, 0])
                         xx = int(tloc[bi, ki, 1])
-                        if (visit_counts is not None) and 0 <= yy < visit_counts.shape[0] and 0 <= xx < visit_counts.shape[1]:
+                        zz = int(tloc[bi, ki, 2]) if ndim_loc >= 3 else 0
+                        if (visit_counts is not None) and ndim_loc == 2 and 0 <= yy < visit_counts.shape[0] and 0 <= xx < visit_counts.shape[1]:
                             visit_counts[yy, xx] += 1.0
                         visited_rows.append(
                             [
@@ -1787,6 +1813,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                                 batch_idx,
                                 bi,
                                 ki,
+                                zz,
                                 yy,
                                 xx,
                                 float(scales[bi, ki]),
@@ -1967,6 +1994,22 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 config_name=config_name,
                 force_recompute_inference=force_recompute_inference,
             )
+            if cdd_cache:
+                target_slab_depth_3d = max(
+                    int(model_cfg.get("patch_size", 2)),
+                    int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
+                )
+                run_full_volume_inference_3d(
+                    model=model_without_ddp,
+                    cdd_cache=cdd_cache,
+                    session_dir=session_dir,
+                    config_name=config_name,
+                    device=device,
+                    slab_depth=int(getattr(model_without_ddp, "required_input_depth", target_slab_depth_3d)),
+                    post_log_transform=bool(model_cfg.get("post_log_transform", True)),
+                    log_eps=float(model_cfg.get("log_eps", 1.0)),
+                    cdd_log_std_floor_mult=float(model_cfg.get("cdd_log_std_floor_mult", 0.05)),
+                )
         else:
             session_dir = run_post_training_inference(
                 model=model_without_ddp,
