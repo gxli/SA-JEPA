@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sajepa"
+version = "0.1.0"
+description = "Scale-Aware Joint-Embedding Predictive Architecture for Physical Fields"
+readme = "README.md"
+authors = [{ name = "Guang-Xing Li", email = "ligx.ngc7293@gmail.com" }]
+dependencies = [
+    "torch>=2.0",
+    "torchvision",
+    "torchdr>=0.1.0",
+    "pyyaml",
+    "numpy",
+    "constrained-diffusion",
+    "plotly",
+    "umap-learn",
+]
+
+[project.scripts]
+sajepa-train = "scripts.train:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src", "src.*", "scripts"]

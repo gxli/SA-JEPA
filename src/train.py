@@ -218,8 +218,8 @@ def _precompute_cdd_cache(
     cdd_append_last_residual = bool(model_cfg.get("cdd_append_last_residual", True))
     cdd_pre_log_transform = bool(model_cfg.get("cdd_pre_log_transform", False))
     sigmas = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
-    if device.type != "cuda":
-        raise RuntimeError(f"[{config_name}] CDD precompute requires CUDA. Got device={device.type}.")
+    if device.type not in ("cuda", "mps"):
+        raise RuntimeError(f"[{config_name}] CDD precompute requires CUDA or MPS. Got device={device.type}.")
     npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
     if not npy_files:
         print(f"[{config_name}] CDD precompute: no files found for pattern, skipping")
@@ -289,7 +289,7 @@ def _precompute_cdd_cache(
             sm_mode=cdd_sm_mode,
             return_scales=False,
             verbose=False,
-            use_gpu=True,
+            use_gpu=(device.type == "cuda"),
         )
         # CDD always introduces one leading scale axis:
         # image (H,W) -> (S,H,W), cube (D,H,W) -> (S,D,H,W).
@@ -501,6 +501,33 @@ def evaluate_validation(
     }
 
 
+def _flatten_structured_config(cfg: dict) -> dict:
+    """Convert the clean YAML config structure to the legacy flat format.
+    
+    Passes through ALL keys from each section, so any key valid in the
+    legacy flat format works unchanged in the structured YAML.
+    """
+    # If already flat, return as-is.
+    if "cdd_scale_space" not in cfg and "masking" not in cfg and "diagnostics" not in cfg:
+        return cfg
+
+    out: dict = {}
+    out["data"] = dict(cfg.get("data", {}))
+    out["model"] = dict(cfg.get("model", {}))
+    out["train"] = dict(cfg.get("training", {}))
+
+    # Merge cdd_scale_space → model (all keys pass through)
+    out["model"].update(cfg.get("cdd_scale_space", {}))
+
+    # Merge masking → model (all keys pass through)
+    out["model"].update(cfg.get("masking", {}))
+
+    # Merge diagnostics → train (all keys pass through)
+    out["train"].update(cfg.get("diagnostics", {}))
+
+    return out
+
+
 def load_config(path: str) -> dict:
     def _deep_merge(base: dict, override: dict) -> dict:
         out = dict(base)
@@ -518,7 +545,11 @@ def load_config(path: str) -> dict:
             raise ValueError(f"Cyclic base_config reference detected: {chain}")
         seen.add(abs_path)
         with open(abs_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+            if abs_path.endswith((".yaml", ".yml")):
+                import yaml as _yaml
+                cfg = _yaml.safe_load(f)
+            else:
+                cfg = json.load(f)
 
         base_ref = cfg.pop("base_config", None)
         if base_ref is None:
@@ -533,6 +564,7 @@ def load_config(path: str) -> dict:
         return merged
 
     cfg = _load_with_base(path, seen=set())
+    cfg = _flatten_structured_config(cfg)  # flatten after base merge
     cfg.setdefault("data", {})
     cfg.setdefault("model", {})
     cfg.setdefault("train", {})
@@ -1027,9 +1059,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 missing, unexpected = [], []
             print(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
             if missing:
-                print(f"[{config_name}] resume_model missing_keys_list={missing}")
+                print(f"[{config_name}] resume_model missing_keys={len(missing)} keys: {missing[:10]}")
             if unexpected:
-                print(f"[{config_name}] resume_model unexpected_keys_list={unexpected}")
+                print(f"[{config_name}] resume_model unexpected_keys={len(unexpected)} keys: {unexpected[:10]}")
             if missing or unexpected:
                 error_msg = (
                     f"CRITICAL: Checkpoint architecture mismatch!\n"
@@ -1092,9 +1124,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             resume_model_ignored = True
         print(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
         if missing:
-            print(f"[{config_name}] resume_model missing_keys_list={missing}")
+            print(f"[{config_name}] resume_model missing_keys={len(missing)} keys: {missing[:10]}")
         if unexpected:
-            print(f"[{config_name}] resume_model unexpected_keys_list={unexpected}")
+            print(f"[{config_name}] resume_model unexpected_keys={len(unexpected)} keys: {unexpected[:10]}")
         if missing or unexpected:
             error_msg = (
                 f"CRITICAL: Model checkpoint mismatch!\n"

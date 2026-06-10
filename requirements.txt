@@ -1,6 +1,11 @@
 torch>=2.0.0
 torchvision>=0.15.0
+torchdr>=0.1.0
 timm>=0.9.0
 numpy
 matplotlib>=3.7.0
+constrained-diffusion
+plotly
+umap-learn
 escnn
+pyyaml

@@ -119,6 +119,16 @@ def _tile_crops_2d(
             return [padded]
         return [np.asarray(arr2d, dtype=np.float32).copy()]
 
+    # Center mode: extract single center crop directly, no tiling needed.
+    if crop_mode == "center":
+        y0 = max(0, (h - cs) // 2)
+        x0 = max(0, (w - cs) // 2)
+        tile = np.zeros((cs, cs), dtype=np.float32)
+        th = min(cs, h - y0)
+        tw = min(cs, w - x0)
+        tile[:th, :tw] = np.asarray(arr2d[y0 : y0 + th, x0 : x0 + tw], dtype=np.float32)
+        return [tile]
+
     tiles = []
     stride = max(1, cs // 2)  # 50% overlap
     for y0 in range(0, h, stride):
@@ -130,16 +140,6 @@ def _tile_crops_2d(
             tw = x1 - x0
             tile[:th, :tw] = np.asarray(arr2d[y0:y1, x0:x1], dtype=np.float32)
             tiles.append(tile)
-
-    # If only one tile requested (center mode)
-    if crop_mode == "center" and len(tiles) > 1:
-        y0 = max(0, (h - cs) // 2)
-        x0 = max(0, (w - cs) // 2)
-        tile = np.zeros((cs, cs), dtype=np.float32)
-        th = min(cs, h - y0)
-        tw = min(cs, w - x0)
-        tile[:th, :tw] = np.asarray(arr2d[y0 : y0 + th, x0 : x0 + tw], dtype=np.float32)
-        return [tile]
 
     return tiles
 
@@ -657,7 +657,7 @@ Examples:
   # 3D slab mode — processes all depth slices
   python -m src.inference_from_session \\
       --session sessions/gen_121_mhd_run_006_ms1p2 \\
-      --input data/ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy \\
+      --input data/ngc3627_mom0.npy \\
       --mode 3d_slab \\
       --slice-axis 0 \\
       --output-session sessions/inference_ngc_3d

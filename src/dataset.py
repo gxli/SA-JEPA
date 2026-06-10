@@ -165,7 +165,7 @@ class JEPADataset(Dataset):
             import torch.utils.data
 
             worker_info = torch.utils.data.get_worker_info()
-            seed = worker_info.seed % (2**32) if worker_info is not None else np.random.randint(2**32)
+            seed = worker_info.seed % (2**31 - 1) if worker_info is not None else int(torch.randint(0, 2**31 - 1, (1,)).item())
             self._rng = np.random.default_rng(seed)
         return self._rng
 

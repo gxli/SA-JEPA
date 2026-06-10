@@ -924,7 +924,7 @@ def make_pyramid_grid_context(
                     priority_centers_dithered.append((int(cy1), int(cx1)))
                     dithered_boxes.append(int(cand_box))
 
-                # Non-overlap enforcement on the *dithered* centres so that
+                # Non-overlap enforcement on the *dithered* centers so that
                 # dithering cannot undo the protection.
                 if bool(target_nonoverlap) and len(priority_centers_dithered) > 1:
                     if bool(random_mask_box_per_target):
