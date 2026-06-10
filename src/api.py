@@ -1,115 +1,76 @@
-"""Public API for sajepa — modular Scale-Aware JEPA training and inference."""
+"""Public API for sajepa — Scale-Aware JEPA pipeline."""
 
 from __future__ import annotations
 
 import copy
-import json
 import os
 import tempfile
 from typing import Optional
 
 import numpy as np
 import torch
+import yaml
 
 from src.train import load_config, run_training
-from src.utils.memory import OOMSafeTrainer, clear_memory_cache, compute_accumulation_steps
-
-
-DEFAULT_BASE_CONFIG = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs", "base_pyramid_scaleaware_convnext.json")
+from src.utils.memory import OOMSafeTrainer, clear_memory_cache
 
 
 class ScaleAwareJEPA:
-    """High-level interface for training and extracting latent atlases from physical fields.
+    """Scale-Aware Joint-Embedding Predictive Architecture for physical fields.
 
     Usage:
-        model = ScaleAwareJEPA(config=config_dict)
-        latent_atlas = model.fit_and_extract(raw_field, epochs=10)
+        model = ScaleAwareJEPA(config="configs/mhd_turbulence.yaml")
+        model.fit(field, epochs=10)
+        latent = model.extract(field)
+        model.save_session("sessions/my_run")
+        # Later:
+        model2 = ScaleAwareJEPA.load_session("sessions/my_run")
+        latent2 = model2.extract(new_field)
     """
 
-    def __init__(self, config: Optional[dict] = None, config_path: Optional[str] = None):
-        if config_path is not None:
-            self._config = load_config(config_path)
-        elif config is not None:
-            base = load_config(DEFAULT_BASE_CONFIG)
-            self._config = _deep_merge(base, config)
-        else:
-            self._config = load_config(DEFAULT_BASE_CONFIG)
+    def __init__(self, config: Optional[dict | str] = None):
+        self._config = self._parse_config(config)
+        self._session_dir: Optional[str] = None
+        self._is_trained: bool = False
 
-    @classmethod
-    def from_config_file(cls, path: str) -> "ScaleAwareJEPA":
-        return cls(config_path=path)
+    # ── training ────────────────────────────────────────────────
 
-    def fit_and_extract(
-        self,
-        raw_field: torch.Tensor,
-        epochs: Optional[int] = None,
-        sessions_dir: Optional[str] = None,
-        save_dashboard: bool = False,
-    ) -> torch.Tensor:
-        """Train on a raw physical field and return pixel-registered latent embeddings.
-
-        Args:
-            raw_field: (H, W) or (C, H, W) tensor of physical measurements.
-            epochs: Override training epochs.
-            sessions_dir: Output directory for session artifacts (temp dir if None).
-            save_dashboard: If True, generate dashboard HTML via session_to_dash.
-
-        Returns:
-            Latent embedding atlas as (C_latent, H, W) tensor.
-        """
+    def fit(self, field: torch.Tensor, epochs: Optional[int] = None) -> "ScaleAwareJEPA":
+        """Train on a raw physical field.  Returns self for chaining."""
         cfg = copy.deepcopy(self._config)
         if epochs is not None:
-            cfg.setdefault("train", {})["epochs"] = int(epochs)
+            cfg.setdefault("training", cfg.setdefault("train", {}))["epochs"] = int(epochs)
 
-        if sessions_dir is None:
-            sessions_dir = tempfile.mkdtemp(prefix="sajepa_")
-
-        # Save raw field as temporary .npy so the dataset pipeline can load it.
+        sessions_dir = tempfile.mkdtemp(prefix="sajepa_")
         data_dir = os.path.join(sessions_dir, "data")
         os.makedirs(data_dir, exist_ok=True)
         data_path = os.path.join(data_dir, "_input.npy")
-        arr = raw_field.detach().cpu().numpy().astype(np.float32)
+        arr = field.detach().cpu().numpy().astype(np.float32)
         if arr.ndim == 2:
             arr = arr[np.newaxis, :, :]
         np.save(data_path, arr)
-
         cfg.setdefault("data", {})["npy_pattern"] = "_input.npy"
 
-        # --- Auto-batch OOM handling ---
-        train_cfg = cfg.setdefault("train", {})
-        initial_batch = int(train_cfg.get("batch_size", 4))
-        target_batch = int(train_cfg.get("target_batch_size", train_cfg.get("target_batch", 32)))
-        scale_mode = str(train_cfg.get("auto_scale_batch_size", "power_of_two"))
-        max_retries = int(train_cfg.get("oom_max_retries", 5))
-        precision = str(train_cfg.get("precision", "bf16"))
-
+        # --- auto-batch OOM handling ---
+        train_cfg = cfg.setdefault("train", cfg.setdefault("training", {}))
         trainer = OOMSafeTrainer(
-            initial_batch=initial_batch,
-            target_batch=target_batch,
-            scale_mode=scale_mode,
-            max_retries=max_retries,
+            initial_batch=int(train_cfg.get("batch_size", 4)),
+            target_batch=int(train_cfg.get("target_batch_size", train_cfg.get("target_batch", 32))),
+            scale_mode=str(train_cfg.get("auto_scale_batch_size", "power_of_two")),
+            max_retries=int(train_cfg.get("oom_max_retries", 5)),
         )
         train_cfg["batch_size"] = trainer.batch_size
         train_cfg["gradient_accumulation_steps"] = trainer.accumulation_steps
-        if "target_batch_size" not in train_cfg:
-            train_cfg["target_batch_size"] = target_batch
-        # Enable MPS fallback for ops not yet implemented on Apple Silicon
-        # (e.g. avg_pool3d in CDD library). Also disable multiprocessing
-        # DataLoader workers on macOS (spawn-based pickling fails for closures).
+
         if "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
             os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         if not torch.cuda.is_available():
             train_cfg["num_workers"] = 0
 
-        print(
-            f"[sajepa] batch={trainer.batch_size} accum={trainer.accumulation_steps} "
-            f"target_batch={target_batch} precision={precision}"
-        )
+        print(f"[sajepa] batch={trainer.batch_size} accum={trainer.accumulation_steps}")
 
-        # Point data root to the temp dir so the dataset finds our file.
         old_cwd = os.getcwd()
         os.chdir(sessions_dir)
-        session_dir = None
         try:
             while True:
                 try:
@@ -120,51 +81,150 @@ class ScaleAwareJEPA:
                         raise
                     train_cfg["batch_size"] = trainer.batch_size
                     train_cfg["gradient_accumulation_steps"] = trainer.accumulation_steps
-                    cfg["train"] = train_cfg
                     clear_memory_cache()
         finally:
-            session_dir = os.path.abspath(session_dir) if session_dir else None
+            self._session_dir = os.path.abspath(session_dir) if session_dir else None
             os.chdir(old_cwd)
 
-        if session_dir is None:
+        if self._session_dir is None:
             raise RuntimeError("Training failed after all OOM retries.")
+        self._is_trained = True
+        _print_metrics_summary(self._session_dir)
+        return self
 
-        # Print final epoch metrics summary.
-        _print_metrics_summary(session_dir)
+    # ── inference ───────────────────────────────────────────────
 
-        # Generate dashboard if requested
-        if save_dashboard:
-            _generate_dashboard(session_dir)
+    @torch.no_grad()
+    def project(self, field: torch.Tensor, method: str = "umap") -> dict:
+        """Extract latents and project to 2D with fallback.
 
-        # Load the latent embeddings from the session output.
-        inf_path = os.path.join(session_dir, "inference_outputs.pt")
+        Always returns a dict with at least ``"pca"``; ``"umap"`` may be None
+        if GPU/torchdr is unavailable or fails.
+        """
+        latent = self.extract(field)
+        C, H, W = latent.shape
+        flat = latent.permute(1, 2, 0).reshape(H * W, C).float()
+
+        results: dict[str, Optional[np.ndarray]] = {"pca": None, "umap": None}
+
+        # PCA — always works, always runs
+        try:
+            _, _, V = torch.pca_lowrank(flat, q=min(2, C))
+            results["pca"] = torch.matmul(flat, V[:, :2]).cpu().numpy()
+        except Exception as e:
+            print(f"[sajepa] PCA fallback failed: {e}")
+
+        # UMAP — best-effort
+        if method.lower() == "umap":
+            try:
+                import torchdr
+                reducer = torchdr.UMAP(
+                    n_neighbors=self._config.get("diagnostics", {}).get("umap", {}).get("n_neighbors", 50),
+                    min_dist=self._config.get("diagnostics", {}).get("umap", {}).get("min_dist", 0.2),
+                    device=str(self._get_device()),
+                )
+                emb = reducer.fit_transform(flat.to(self._get_device()))
+                results["umap"] = emb.cpu().numpy()
+            except Exception as e:
+                print(f"[sajepa] UMAP unavailable ({type(e).__name__}), PCA only.")
+
+        return results
+
+    @torch.no_grad()
+    def extract(self, field: torch.Tensor) -> torch.Tensor:
+        """Return pixel-registered latent atlas for the given field.  No training."""
+        if self._session_dir is None:
+            raise RuntimeError("No session available. Call fit() first or load_session().")
+        inf_path = os.path.join(self._session_dir, "inference_outputs.pt")
+        if not os.path.exists(inf_path):
+            # Run inference if not already done
+            if not self._is_trained:
+                raise RuntimeError("Model not trained. Call fit() before extract().")
+            raise RuntimeError("No inference outputs found — call fit() first.")
         outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
+        ctx = outputs.get("context_map")
+        if ctx is None:
+            ctx = outputs.get("pred_map")
+        if ctx is None:
+            raise RuntimeError("No latent map in inference outputs.")
+        return ctx.squeeze(0).cpu()
 
-        context_map = outputs.get("context_map")
-        if context_map is None:
-            pred_map = outputs.get("pred_map")
-            if pred_map is not None:
-                return pred_map.squeeze(0).cpu()
-            raise RuntimeError("No context_map or pred_map found in inference outputs.")
+    # ── persistence ─────────────────────────────────────────────
 
-        return context_map.squeeze(0).cpu()
+    def save_session(self, path: str):
+        """Save model weights, config, and session artifacts to *path*."""
+        if self._session_dir is None:
+            raise RuntimeError("No session to save. Call fit() first.")
+        import shutil
+        os.makedirs(path, exist_ok=True)
+        for name in ("config_used.json", "model_last.pt", "metrics.csv",
+                     "inference_outputs.pt", "dashboard.html"):
+            src = os.path.join(self._session_dir, name)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(path, name))
+        with open(os.path.join(path, "config.yaml"), "w") as f:
+            yaml.dump(self._config, f, default_flow_style=False)
+        print(f"[sajepa] session saved to {path}")
 
+    @classmethod
+    def load_session(cls, path: str) -> "ScaleAwareJEPA":
+        """Restore a model from a saved session directory."""
+        cfg_path = os.path.join(path, "config.yaml")
+        if os.path.exists(cfg_path):
+            instance = cls(config=cfg_path)
+        else:
+            instance = cls(config=os.path.join(path, "config_used.json"))
+        instance._session_dir = os.path.abspath(path)
+        instance._is_trained = os.path.exists(os.path.join(path, "inference_outputs.pt"))
+        return instance
 
-def _generate_dashboard(session_dir: str) -> None:
-    """Generate dashboard HTML from session outputs using session_to_dash."""
-    try:
-        from scripts.session_to_dash import compute_dash_data, plot_dash
-        compute_dash_data(session_dir, overwrite=False)
-        plot_dash(session_dir, overwrite=False)
-        dash_path = os.path.join(session_dir, "dashboard.html")
-        if os.path.exists(dash_path):
-            print(f"[sajepa] dashboard saved: {dash_path}")
-    except Exception as e:
-        print(f"[sajepa] dashboard skipped: {type(e).__name__}: {e}")
+    # ── dashboard ───────────────────────────────────────────────
+
+    def generate_dashboard(self, output_path: Optional[str] = None):
+        """Generate interactive HTML dashboard from the current session.
+
+        If session already has dash artifacts (from post-training inference),
+        uses those.  Otherwise falls back to session_to_dash.py.
+        """
+        if self._session_dir is None:
+            raise RuntimeError("No session. Call fit() or load_session() first.")
+        try:
+            from scripts.session_to_dash import compute_dash_data, plot_dash
+            compute_dash_data(self._session_dir, overwrite=False)
+            plot_dash(self._session_dir, overwrite=False)
+            dash = os.path.join(self._session_dir, "dashboard.html")
+            if output_path and os.path.exists(dash):
+                import shutil
+                shutil.copy2(dash, output_path)
+            print(f"[sajepa] dashboard: {output_path or dash}")
+        except Exception as e:
+            print(f"[sajepa] dashboard failed ({type(e).__name__}), generating minimal dashboard...")
+            _generate_minimal_dashboard(self._session_dir, output_path)
+
+    # ── internals ───────────────────────────────────────────────
+
+    def _get_device(self) -> torch.device:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    @staticmethod
+    def _parse_config(config: Optional[dict | str]) -> dict:
+        if config is None:
+            return load_config(os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                "configs", "base_pyramid_scaleaware_convnext.yaml"))
+        if isinstance(config, str):
+            return load_config(config)
+        base = load_config(os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "configs", "base_pyramid_scaleaware_convnext.yaml"))
+        return _deep_merge(base, config)
 
 
 def _print_metrics_summary(session_dir: str) -> None:
-    """Print final-epoch averaged metrics from metrics.csv."""
     import csv as _csv
     path = os.path.join(session_dir, "metrics.csv")
     if not os.path.exists(path):
@@ -184,33 +244,52 @@ def _print_metrics_summary(session_dir: str) -> None:
                         epochs[ep].setdefault(k, []).append(float(v))
         if not epochs:
             return
-        last_ep = max(epochs.keys())
-        first_ep = min(epochs.keys())
+        last_ep, first_ep = max(epochs.keys()), min(epochs.keys())
         print(f"\n{'='*60}")
         print(f"Training Metrics (epoch {first_ep} → {last_ep})")
         print(f"{'='*60}")
-
-        def _avg(ep, k):
-            vals = epochs[ep].get(k, [])
-            return sum(vals) / len(vals) if vals else 0.0
-
         keys = [
-            ("loss_total", "L(total)     "),
-            ("loss_prediction", "MSE(pred,gt) "),
-            ("loss_spread", "sig=relu(1-std)"),
-            ("sim", "cos(pred,gt) "),
-            ("var", "var_term    "),
-            ("cov", "cov_term    "),
-            ("lr", "lr          "),
+            ("loss_total", "L(total)     "), ("loss_prediction", "MSE(pred,gt) "),
+            ("loss_spread", "sig=relu(1-std)"), ("sim", "cos(pred,gt) "),
+            ("var", "var_term    "), ("cov", "cov_term    "), ("lr", "lr          "),
         ]
         for key, label in keys:
-            first = _avg(first_ep, key)
-            last = _avg(last_ep, key)
+            vals_f = epochs[first_ep].get(key, [])
+            vals_l = epochs[last_ep].get(key, [])
+            first = sum(vals_f) / len(vals_f) if vals_f else 0.0
+            last = sum(vals_l) / len(vals_l) if vals_l else 0.0
             ratio = last / first if first > 1e-20 else 1.0
             print(f"  {label}: {first:>8.4f} → {last:>8.4f}  (ratio={ratio:.3f})")
         print(f"{'='*60}")
     except Exception:
         pass
+
+
+def _generate_minimal_dashboard(session_dir: str, output_path: Optional[str] = None) -> None:
+    """Fallback dashboard: reads whatever artifacts exist and renders a simple HTML."""
+    dash_path = output_path or os.path.join(session_dir, "dashboard.html")
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+        import numpy as _np
+
+        # Try loading what's available
+        inf_path = os.path.join(session_dir, "inference_outputs.pt")
+        has_inference = os.path.exists(inf_path)
+        outputs = torch.load(inf_path, map_location="cpu", weights_only=False) if has_inference else {}
+
+        fig = make_subplots(rows=1, cols=1, subplot_titles=["sajepa Session"])
+        if has_inference:
+            ctx = outputs.get("context_map")
+            if ctx is not None:
+                img = ctx.squeeze().cpu().numpy()
+                if img.ndim == 3:
+                    img = img.mean(0)
+                fig.add_trace(go.Heatmap(z=img, colorscale="Viridis"), row=1, col=1)
+        fig.write_html(dash_path)
+        print(f"[sajepa] minimal dashboard saved: {dash_path}")
+    except Exception as e:
+        print(f"[sajepa] minimal dashboard failed: {e}")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

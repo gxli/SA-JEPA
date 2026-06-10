@@ -127,8 +127,8 @@ def _build_priority_catalogue_from_cdd_ratio(
         valid[:half_lo, :] = False
         valid[:, :half_lo] = False
     if half_hi > 0:
-        valid[h - half_hi :, :] = False
-        valid[:, w - half_hi :] = False
+        valid[h - half_hi + 1 :, :] = False
+        valid[:, w - half_hi + 1 :] = False
     valid_idx = np.flatnonzero(valid.reshape(-1))
     if valid_idx.size == 0:
         return []
@@ -162,8 +162,8 @@ def _build_random_catalogue_from_cdd(
         valid[:half_lo, :] = False
         valid[:, :half_lo] = False
     if half_hi > 0:
-        valid[h - half_hi :, :] = False
-        valid[:, w - half_hi :] = False
+        valid[h - half_hi + 1 :, :] = False
+        valid[:, w - half_hi + 1 :] = False
     valid_idx = np.flatnonzero(valid.reshape(-1))
     if valid_idx.size == 0:
         return []
@@ -189,8 +189,8 @@ def _build_random_catalogue_from_array(
         valid[:half_lo, :] = False
         valid[:, :half_lo] = False
     if half_hi > 0:
-        valid[h - half_hi :, :] = False
-        valid[:, w - half_hi :] = False
+        valid[h - half_hi + 1 :, :] = False
+        valid[:, w - half_hi + 1 :] = False
     valid_idx = np.flatnonzero(valid.reshape(-1))
     if valid_idx.size == 0:
         return []

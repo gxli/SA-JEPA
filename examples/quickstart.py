@@ -42,8 +42,9 @@ def main():
 
     model = ScaleAwareJEPA(config=config)
 
-    # 3. Train and extract
-    latent_atlas = model.fit_and_extract(field)
+    # 3. Train, then extract
+    model.fit(field)
+    latent_atlas = model.extract(field)
 
     print(f"\n{'='*60}")
     print(f"Training complete")

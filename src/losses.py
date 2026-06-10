@@ -140,7 +140,10 @@ def spread_regularizer_loss(
 
     n = z.shape[0]
     z = z - z.mean(dim=0, keepdim=True)
-    std = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
+    # Escape jitter: tiny noise prevents zero-gradient trap at perfect collapse.
+    escape_jitter = max(float(eps) ** 0.5, 1e-3)
+    z_escape = z + escape_jitter * torch.randn_like(z)
+    std = torch.sqrt(z_escape.var(dim=0, unbiased=False) + float(eps))
     loss = torch.relu(float(target_std) - std).mean()
 
     effective_n = 256.0
@@ -172,7 +175,10 @@ def weak_sigreg_loss(
     n, c = z.shape
     z = z - z.mean(dim=0, keepdim=True)
 
-    std_full = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
+    # Escape jitter: tiny noise prevents zero-gradient trap at perfect collapse.
+    escape_jitter = max(float(eps) ** 0.5, 1e-3)
+    z_escape = z + escape_jitter * torch.randn_like(z)
+    std_full = torch.sqrt(z_escape.var(dim=0, unbiased=False) + float(eps))
     var_loss = torch.relu(float(target_std) - std_full).mean()
 
     k = min(int(sketch_dim), int(c))
@@ -340,8 +346,12 @@ def _compute_sim_var_cov_tensors(
         z = sim * 0.0
         return sim, z, z
 
-    std_ctx = torch.sqrt(z_ctx.var(dim=0, unbiased=False) + 1e-4)
-    std_gt = torch.sqrt(z_gt.var(dim=0, unbiased=False) + 1e-4)
+    # Escape jitter: tiny noise prevents zero-gradient trap at perfect collapse.
+    escape_jitter = 1e-2
+    z_ctx_esc = z_ctx + escape_jitter * torch.randn_like(z_ctx)
+    z_gt_esc = z_gt + escape_jitter * torch.randn_like(z_gt)
+    std_ctx = torch.sqrt(z_ctx_esc.var(dim=0, unbiased=False) + 1e-4)
+    std_gt = torch.sqrt(z_gt_esc.var(dim=0, unbiased=False) + 1e-4)
     var_term = 0.5 * (torch.relu(1.0 - std_ctx).mean() + torch.relu(1.0 - std_gt).mean())
 
     z1c = z_ctx - z_ctx.mean(dim=0, keepdim=True)

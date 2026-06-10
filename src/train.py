@@ -1356,7 +1356,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
     requested_workers = int(train_cfg.get("num_workers", 4))
     # macOS/MPS-safe default: avoid multiprocessing worker hangs unless explicitly set.
-    if "num_workers" in train_cfg:
+    if device.type == "mps":
+        num_workers = 0  # macOS spawn can't pickle closures
+    elif "num_workers" in train_cfg:
         num_workers = requested_workers
     else:
         num_workers = 4 if device.type == "cuda" else 0
@@ -1686,8 +1688,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             # PyTorch scheduler handles warmup + cosine automatically
             current_step = epoch * max(1, len(dataloader)) + batch_idx
 
-            optimizer.zero_grad(set_to_none=True)
-
             with autocast(device_type=autocast_device, enabled=use_amp):
                 outputs = model(x_clean, context_data=context_data) if not is_3d_mode else model(x_clean)
                 _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
@@ -1716,12 +1716,16 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             else:
                 log_loss_val = float(total_loss.item())
 
-            scaler.scale(total_loss).backward()
-            scaler_scale_before_step = scaler.get_scale()
-            scaler.step(optimizer)
-            scaler.update()
-            if (not use_amp) or scaler.get_scale() >= scaler_scale_before_step:
-                scheduler.step()
+            accum_steps = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
+            scaler.scale(total_loss / accum_steps).backward()
+
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+                scaler_scale_before_step = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                if (not use_amp) or scaler.get_scale() >= scaler_scale_before_step:
+                    scheduler.step()
             current_lr = scheduler.get_last_lr()[0]
 
             total_steps_sched = max(1, int(epochs) * max(1, len(dataloader)))

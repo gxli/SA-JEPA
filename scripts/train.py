@@ -7,6 +7,7 @@ import copy
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 from src.train import load_config, run_training
 

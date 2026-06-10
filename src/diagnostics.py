@@ -127,7 +127,8 @@ def compute_error_by_scale(outputs: dict) -> dict[float, float]:
     valid = outputs["target_valid"].detach()  # B,K
 
     # Per-target MSE averaged over C,P,P
-    mse_bk = torch.mean((pred - gt) ** 2, dim=(2, 3, 4))  # B,K
+    reduce_dims = tuple(range(2, pred.dim()))
+    mse_bk = torch.mean((pred - gt) ** 2, dim=reduce_dims)  # B,K
     out = defaultdict(list)
     b, k = mse_bk.shape
     for bi in range(b):

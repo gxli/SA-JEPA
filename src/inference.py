@@ -91,8 +91,9 @@ def _forward_tta_streaming_2d(
         "dip_field_per_channel",
         "pyramid_mask_token",
     }
+    cdd_iter = _iter_tta_views_2d(cdd, mode) if cdd is not None else None
     for name, xv in _iter_tta_views_2d(x, mode):
-        cdv = _apply_tta_2d(name, cdd) if cdd is not None else None
+        cdv = next(cdd_iter)[1] if cdd_iter is not None else None
         out_v = forward_one(xv, cdv)
         n_views += 1
         for key in align_keys:

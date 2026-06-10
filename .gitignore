@@ -1,0 +1,98 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Data ---
+data/
+
+# --- Experiment Outputs ---
+sessions/
+results/
+result_local/
+results_local*/
+plots/
+visuals/
+outputs/
+snapshots/
+coverage/
+prepare_cube/
+
+# --- Large Artifacts ---
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.mp4
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.html
+
+# --- Logs ---
+*.log
+training_log.txt
+summary.txt
+
+# --- IDEs ---
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# --- Config Sweeps ---
+configs/experiments/
+configs/examples/
+configs/inference/
+configs_bk/
+
+# --- Sync & Local Scripts ---
+sync_scripts/
+scripts/local_scripts/
+scripts/legacy/
+scripts/demos/
+
+# --- Runtime / Temp ---
+.cache/
+tmp/
+temp/
+prepare_cube/
+typescript
+script/
+
+# --- Project junk ---
+.deepseek/
+.mplconfig/
+.reasonix/
+REASONIX.md
+notes
+*.aux
+*.fdb_latexmk
+*.fls
+*.out
+*.pdf
+*.synctex.gz
+*.bib
+extract_rank_gen_17.sh
+generate_summary.py
+run.sh
+run_all_session_plots.sh
+run_movie.sh
+session_to_movie.sh
+train_jepa.py
+update_gen_17.sh
+configs/base_pyramid_scaleaware_convnext_bk.json

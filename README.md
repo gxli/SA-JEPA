@@ -52,18 +52,29 @@ if you encounter missing MPS ops (e.g. `avg_pool3d` in CDD).
 weights required.
 
 ```python
-import torch, numpy as np
+import torch
 from sajepa import ScaleAwareJEPA
 
-# Load your physical field: (H, W) or (C, H, W)
+# Load your physical field (H, W)
 field = torch.load("data/ngc3627_co_emission.pt")
 
-# Train and extract pixel-registered latent atlas
-model = ScaleAwareJEPA(config_path="configs/examples/mhd_2d_ms1p2.json")
-latent = model.fit_and_extract(field, epochs=10, save_dashboard=True)
+# 1. Configure
+model = ScaleAwareJEPA(config="configs/mhd_turbulence.yaml")
 
+# 2. Train
+model.fit(field, epochs=10)
+
+# 3. Extract pixel-registered latent atlas
+latent = model.extract(field)
 print(f"Latent atlas: {latent.shape}")  # (C_latent, H, W)
-np.save("outputs/latent_atlas.npy", latent.cpu().numpy())
+
+# 4. Persist and visualize
+model.save_session("sessions/my_run")
+model.generate_dashboard()
+
+# 5. Restore later
+model2 = ScaleAwareJEPA.load_session("sessions/my_run")
+latent2 = model2.extract(new_field)
 ```
 
 ### CLI

@@ -47,6 +47,7 @@ model:
   post_log_transform: true
   use_symmetric_feature_loss: true
   ema_momentum: 0.996
+  scaleaware_adapter_norm: true
 masking:
   patch_size: 3
   mask_spacing_scaling: 2.0
@@ -57,21 +58,31 @@ masking:
   target_nonoverlap: true
   target_allow_partial_overlap: 0.0
   target_invalid_region_skip: true
+  priority_top_percent: 100
+  priority_n_target: auto
+  priority_min_targets_per_map: 10
+  priority_dithering_pixels: 6
+  priority_candidate_oversample: 0
 training:
   batch_size: 4
   lr: 0.0001
   weight_decay: 1.0e-05
-  num_workers: 4
+  num_workers: 8
   epochs: 10
-  symmetry_loss_weight: 0
-  ema_momentum_base: 0.996
-  ema_momentum_final: 1.0
+  symmetry_loss_weight: 0.003
+  ema_momentum_base: 0.99
+  ema_momentum_final: 0.9999
   spread_regularizer:
     type: std_hinge
     target: context
     weight: 2
     target_std: 1.0
     eps: 0.0001
+  mse_loss_weight: 50
+  vicreg_spatial_mode: pooled
+  scale_probe_enabled: true
+  inference_tta_enabled: true
+  inference_tta_mode: flip4
 diagnostics:
   compute_effective_rank: true
   viz_crop_border: true
