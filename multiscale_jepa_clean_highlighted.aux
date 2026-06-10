@@ -1,0 +1,109 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{li2022constrained}
+\citation{lecun2022path,assran2023ijepa}
+\citation{douady1991direct}
+\citation{biskamp2003magnetohydrodynamic}
+\citation{bond1996cosmic}
+\citation{frisch1995turbulence,pope2000turbulent,falkovich2001particles}
+\citation{aragon2007multiscale,bond2010filaments}
+\citation{rosolowsky2008decomposition}
+\citation{platen2007cosmic}
+\citation{kauffman2000investigations}
+\citation{takens1981detecting}
+\citation{mezic2005spectral}
+\citation{bengio2013representation,fefferman2016testing}
+\citation{lecun2022path,assran2023ijepa}
+\citation{assran2023ijepa}
+\citation{li2022constrained}
+\citation{liu2022convnext}
+\newlabel{FirstPage}{{}{1}{}{section*.1}{}}
+\@writefile{toc}{\contentsline {title}{\textbf  {Self-Supervised Latent Topology Extraction of Physical Fields with Multiscale-JEPA}}{1}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {abstract}{Abstract}{1}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {}Introduction}{1}{section*.3}\protected@file@percent }
+\citation{lecun2022path,assran2023ijepa}
+\citation{vonKugelgen2021sslAugmentations,ericsson2021why,balestriero2022contrastive}
+\citation{li2022constrained}
+\citation{liu2022convnext}
+\@writefile{toc}{\contentsline {section}{\numberline {I}Method: The Multiscale-JEPA Framework}{2}{section*.4}\protected@file@percent }
+\newlabel{sec:method}{{I}{2}{}{section*.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {A}Overview}{2}{section*.5}\protected@file@percent }
+\newlabel{sec:overview}{{I\,A}{2}{}{section*.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {B}CDD Multiscale Coordinates}{2}{section*.6}\protected@file@percent }
+\newlabel{sec:cdd_coordinates}{{I\,B}{2}{}{section*.6}{}}
+\newlabel{eq:cdd}{{1}{2}{}{equation.1.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {C}Scale-Aware ConvNeXt Encoder}{2}{section*.7}\protected@file@percent }
+\newlabel{sec:scale_aware_encoder}{{I\,C}{2}{}{section*.7}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces \textbf  {CDD-scale-aware JEPA architecture.} The CDD frontend decomposes the raw physical field into scale-separated components. The context branch applies scale-aware masking and encodes the masked context with a CDD-scale-aware encoder. The target branch bypasses masking and uses an EMA-updated copy of the encoder to provide target latent representations. A lightweight predictor maps the context representation to the target latent space. Training combines latent prediction, a weak context spread regularizer, and weak symmetry consistency. At inference, masking is disabled and the encoder produces dense latent maps for structural analysis.}}{3}{figure.1}\protected@file@percent }
+\newlabel{fig:framework}{{1}{3}{\textbf {CDD-scale-aware JEPA architecture.} The CDD frontend decomposes the raw physical field into scale-separated components. The context branch applies scale-aware masking and encodes the masked context with a CDD-scale-aware encoder. The target branch bypasses masking and uses an EMA-updated copy of the encoder to provide target latent representations. A lightweight predictor maps the context representation to the target latent space. Training combines latent prediction, a weak context spread regularizer, and weak symmetry consistency. At inference, masking is disabled and the encoder produces dense latent maps for structural analysis}{figure.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces  \textbf  {CDD decomposition and pyramid masking.} \textit  {Left:} Constrained Diffusion Decomposition applied to a physical field, yielding a stack of dense, pixel-registered scale layers ordered from fine (top) to coarse (bottom). Each layer isolates coherent structures at a distinct physical scale — fine filaments and compact cores at small scales, extended morphology and large-scale envelopes at coarser scales — without spectral leakage between levels. \textit  {Right:} Scale-aware pyramid masking applied to the CDD stack. At each scale level, a spatially contiguous block is masked, with the masked region growing proportionally with scale. This forces the JEPA predictor to infer fine-scale structural targets from macroscopic context, calibrating the predictive bottleneck along the true physical hierarchy of the field rather than at an arbitrary fixed resolution. }}{4}{figure.2}\protected@file@percent }
+\newlabel{fig:masking_demo}{{2}{4}{\textbf {CDD decomposition and pyramid masking.} \textit {Left:} Constrained Diffusion Decomposition applied to a physical field, yielding a stack of dense, pixel-registered scale layers ordered from fine (top) to coarse (bottom). Each layer isolates coherent structures at a distinct physical scale — fine filaments and compact cores at small scales, extended morphology and large-scale envelopes at coarser scales — without spectral leakage between levels. \textit {Right:} Scale-aware pyramid masking applied to the CDD stack. At each scale level, a spatially contiguous block is masked, with the masked region growing proportionally with scale. This forces the JEPA predictor to infer fine-scale structural targets from macroscopic context, calibrating the predictive bottleneck along the true physical hierarchy of the field rather than at an arbitrary fixed resolution}{figure.2}{}}
+\citation{grill2020byol,assran2023ijepa}
+\citation{Collins2012}
+\citation{Burkhart2020}
+\@writefile{toc}{\contentsline {subsection}{\numberline {D}Multiscale Masking}{5}{section*.8}\protected@file@percent }
+\newlabel{sec:multiscale_masking}{{I\,D}{5}{}{section*.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {E}Training Objective and Latent-Space Analysis}{5}{section*.9}\protected@file@percent }
+\newlabel{sec:loss_training}{{I\,E}{5}{}{section*.9}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {}Multiscale-JEPA on MHD Turbulence}{5}{section*.10}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces \textbf  {Dense latent topology learned for MHD turbulence.} Target-encoder embeddings are projected to three dimensions using PCA and UMAP and mapped back to their original spatial locations. The PCA projection provides a linear view of the dominant latent directions, while the UMAP projection emphasizes nonlinear neighborhood structure in the learned representation. Both projections reveal spatially coherent organization: extended sheets, filamentary interfaces, and compact high-contrast structures occupy distinct regions of latent space. The inset point clouds show the corresponding three-dimensional projected latent distributions.}}{6}{figure.3}\protected@file@percent }
+\newlabel{fig:jepa_mhd}{{3}{6}{\textbf {Dense latent topology learned for MHD turbulence.} Target-encoder embeddings are projected to three dimensions using PCA and UMAP and mapped back to their original spatial locations. The PCA projection provides a linear view of the dominant latent directions, while the UMAP projection emphasizes nonlinear neighborhood structure in the learned representation. Both projections reveal spatially coherent organization: extended sheets, filamentary interfaces, and compact high-contrast structures occupy distinct regions of latent space. The inset point clouds show the corresponding three-dimensional projected latent distributions}{figure.3}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces \textbf  {Dense latent topology learned for the NGC molecular-gas field.} Target-encoder embeddings are projected with PCA and UMAP and back-mapped to the observed field. The PCA projection highlights large-scale latent variation across spiral-arm and interarm morphology, while the UMAP projection separates nonlinear structural neighborhoods associated with bright molecular complexes, diffuse emission, and elongated arm-like features. The inset point clouds show the projected latent geometry, indicating that the representation forms a continuous but structured manifold rather than a set of discrete supervised classes.}}{7}{figure.4}\protected@file@percent }
+\newlabel{fig:jepa_ngc}{{4}{7}{\textbf {Dense latent topology learned for the NGC molecular-gas field.} Target-encoder embeddings are projected with PCA and UMAP and back-mapped to the observed field. The PCA projection highlights large-scale latent variation across spiral-arm and interarm morphology, while the UMAP projection separates nonlinear structural neighborhoods associated with bright molecular complexes, diffuse emission, and elongated arm-like features. The inset point clouds show the projected latent geometry, indicating that the representation forms a continuous but structured manifold rather than a set of discrete supervised classes}{figure.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces \textbf  {Dense latent topology learned for the Chengdu nighttime-light field.} Target-encoder embeddings are projected with PCA and UMAP and mapped back to their original spatial locations. The projections reveal coherent latent organization across the urban field, separating compact high-intensity cores, extended road-like structures, diffuse emission, and low-intensity surrounding regions. The inset shows the original nighttime-light image, providing the spatial reference for the latent back-mapping.}}{8}{figure.5}\protected@file@percent }
+\newlabel{fig:jepa_chengdu}{{5}{8}{\textbf {Dense latent topology learned for the Chengdu nighttime-light field.} Target-encoder embeddings are projected with PCA and UMAP and mapped back to their original spatial locations. The projections reveal coherent latent organization across the urban field, separating compact high-intensity cores, extended road-like structures, diffuse emission, and low-intensity surrounding regions. The inset shows the original nighttime-light image, providing the spatial reference for the latent back-mapping}{figure.5}{}}
+\citation{Leroyetal2021}
+\@writefile{toc}{\contentsline {section}{\numberline {}Cross-domain Application Examples}{9}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {a}Nighttime lights in Chengdu.}{9}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\numberline {b}Molecular gas in NGC 3927.}{9}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {}Conclusion}{9}{section*.14}\protected@file@percent }
+\@writefile{toc}{\appendix }
+\@writefile{toc}{\contentsline {section}{\numberline {A}CDD: Numerical Implementation}{10}{section*.15}\protected@file@percent }
+\newlabel{app:cdd}{{A}{10}{}{section*.15}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {}Scale Extraction and Normalization}{10}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {}Scale-Aware Encoder Implementation}{10}{section*.17}\protected@file@percent }
+\newlabel{app:scale_aware_encoder}{{A}{10}{}{section*.17}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {}Projector and Predictor}{10}{section*.18}\protected@file@percent }
+\newlabel{app:projector_predictor}{{A}{10}{}{section*.18}{}}
+\citation{micikevicius2018mixed}
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces \textbf  {Scale-aware ConvNeXt encoder.} The input field $x$ is first decomposed into a CDD pyramid of pixel-registered scale components. The encoder then processes each CDD component along a per-scale adapter path before cross-scale fusion, preserving scale identity before spatial mixing. The fused multiscale representation is passed through a dense ConvNeXt encoder to produce the full-resolution latent map $z_c$.}}{11}{figure.6}\protected@file@percent }
+\newlabel{fig:cdd_scaleaware_convnext_encoder}{{6}{11}{\textbf {Scale-aware ConvNeXt encoder.} The input field $x$ is first decomposed into a CDD pyramid of pixel-registered scale components. The encoder then processes each CDD component along a per-scale adapter path before cross-scale fusion, preserving scale identity before spatial mixing. The fused multiscale representation is passed through a dense ConvNeXt encoder to produce the full-resolution latent map $z_c$}{figure.6}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces \textbf  {Default scale-aware ConvNeXt encoder settings.} Implementation defaults used in the reported experiments, grouped by functional role.}}{11}{table.1}\protected@file@percent }
+\newlabel{tab:scale_aware_encoder_defaults}{{I}{11}{\textbf {Default scale-aware ConvNeXt encoder settings.} Implementation defaults used in the reported experiments, grouped by functional role}{table.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {}Mixed precision}{11}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {B}Training Configuration}{11}{section*.20}\protected@file@percent }
+\newlabel{app:training_config}{{B}{11}{}{section*.20}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {}Data and Preprocessing}{12}{section*.21}\protected@file@percent }
+\newlabel{app:data_preprocessing}{{B}{12}{}{section*.21}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {}Mask Parameterization and Target Sampling}{12}{section*.22}\protected@file@percent }
+\newlabel{app:mask_target_sampling}{{B}{12}{}{section*.22}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {II}{\ignorespaces \textbf  {Masking and target-sampling defaults.} The masking parameters define the context--target prediction task. Sweep results are reported separately.}}{12}{table.2}\protected@file@percent }
+\newlabel{tab:training_masking_sampling}{{II}{12}{\textbf {Masking and target-sampling defaults.} The masking parameters define the context--target prediction task. Sweep results are reported separately}{table.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {}Loss Terms}{12}{section*.23}\protected@file@percent }
+\newlabel{app:loss_terms}{{B}{12}{}{section*.23}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {}Optimization Defaults}{12}{section*.24}\protected@file@percent }
+\newlabel{app:optimization_defaults}{{B}{12}{}{section*.24}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {}Inference Diagnostics}{12}{section*.25}\protected@file@percent }
+\newlabel{app:inference_diagnostics_defaults}{{B}{12}{}{section*.25}{}}
+\citation{mcinnes2018umap}
+\@writefile{lot}{\contentsline {table}{\numberline {III}{\ignorespaces \textbf  {Loss terms used in the final training configuration.}}}{13}{table.3}\protected@file@percent }
+\newlabel{tab:training_loss_terms}{{III}{13}{\textbf {Loss terms used in the final training configuration.}}{table.3}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {IV}{\ignorespaces \textbf  {Optimization defaults.}}}{13}{table.4}\protected@file@percent }
+\newlabel{tab:training_optimization_defaults}{{IV}{13}{\textbf {Optimization defaults.}}{table.4}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {V}{\ignorespaces \textbf  {Inference and diagnostic defaults.}}}{13}{table.5}\protected@file@percent }
+\newlabel{tab:training_inference_diagnostics}{{V}{13}{\textbf {Inference and diagnostic defaults.}}{table.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {C}Masking Sweeps and Run Selection}{13}{section*.26}\protected@file@percent }
+\newlabel{app:run_sweeps}{{C}{13}{}{section*.26}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {D}Latent Map Visualization and Diagnostics}{13}{section*.27}\protected@file@percent }
+\newlabel{app:vis}{{D}{13}{}{section*.27}{}}
+\bibdata{multiscale_jepa_clean_highlightedNotes,references}
+\bibstyle{apj}
+\@writefile{lot}{\contentsline {table}{\numberline {VI}{\ignorespaces \textbf  {Final Gen 125 sweep summary.} Effective rank is used as a latent-use diagnostic, while final selection also uses visual topology and physical interpretability. Selected runs are marked with an asterisk. All runs have zero dead channels.}}{14}{table.6}\protected@file@percent }
+\newlabel{tab:gen125_sweep_summary}{{VI}{14}{\textbf {Final Gen 125 sweep summary.} Effective rank is used as a latent-use diagnostic, while final selection also uses visual topology and physical interpretability. Selected runs are marked with an asterisk. All runs have zero dead channels}{table.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {}Resource Acknowledgment}{14}{section*.28}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces \textbf  {Selected-run input fields and training losses.} For each selected Gen~125 run, the left panel shows the scalar input field and the right panel shows the corresponding training-loss history. Rows correspond to Chengdu nighttime lights, MHD turbulence, and the NGC molecular-gas field, respectively. The selected runs are Run~2, Run~15, and Run~22 in Table~\ref {tab:gen125_sweep_summary}. These diagnostics show the optimization behavior associated with the dense latent topologies shown in Figures~\ref {fig:jepa_chengdu}, \ref {fig:jepa_mhd}, and~\ref {fig:jepa_ngc}.}}{15}{figure.7}\protected@file@percent }
+\newlabel{fig:app_selected_data_loss}{{7}{15}{\textbf {Selected-run input fields and training losses.} For each selected Gen~125 run, the left panel shows the scalar input field and the right panel shows the corresponding training-loss history. Rows correspond to Chengdu nighttime lights, MHD turbulence, and the NGC molecular-gas field, respectively. The selected runs are Run~2, Run~15, and Run~22 in Table~\ref {tab:gen125_sweep_summary}. These diagnostics show the optimization behavior associated with the dense latent topologies shown in Figures~\ref {fig:jepa_chengdu}, \ref {fig:jepa_mhd}, and~\ref {fig:jepa_ngc}}{figure.7}{}}
+\newlabel{LastPage}{{}{15}{}{}{}}
+\gdef \@abspage@last{15}
