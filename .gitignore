@@ -54,8 +54,20 @@ summary.txt
 .idea/
 .ipynb_checkpoints/
 
+# --- Config Sweeps ---
+configs/experiments/
+configs/examples/
+
+# --- Sync Tools ---
+sync_scripts/
+
 # --- Runtime / Temp ---
 .cache/
 tmp/
 temp/
 prepare_cube/
+scripts/local_scripts/
+scripts/demos/
+scripts/legacy/
+scripts/legacy/
+configs/inference/

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from src.utils.npy import _safe_load_npy
+from src.utils.npy import _safe_load_npy, normalize01
 
 try:
     import h5py  # optional — enables chunked HDF5 reading for large 3D arrays
@@ -292,12 +292,7 @@ class JEPADataset(Dataset):
 
     @staticmethod
     def _normalize01(arr: np.ndarray) -> np.ndarray:
-        amin = float(arr.min())
-        amax = float(arr.max())
-        denom = amax - amin
-        if denom > 1e-20:
-            return (arr - amin) / denom
-        return np.zeros_like(arr, dtype=np.float32)
+        return normalize01(arr)
 
     def _apply_augmentations(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Apply d4 flips + random_roll to all tensors identically. Shared by both data paths."""

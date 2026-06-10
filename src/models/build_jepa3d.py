@@ -12,6 +12,7 @@ from .masking import _fractional_spatial_target_budget
 from .masking3d import extract_location_cubes, sample_target_locations_3d
 from .predictor3d import FullResPredictor3D
 from .symmetry import symmetric_forward_3d
+from src.losses import l2_normalize_patches
 
 
 def compute_3d_encoder_receptive_field_depth(encoder_depth: int = 3, encoder_kernel_size: int = 5) -> int:
@@ -341,10 +342,8 @@ class PyramidGridJEPA3D(nn.Module):
 
         if self.normalize_loss_l2:
             # Normalize the full cube vector so spatial contrast is preserved.
-            b, k = pred.shape[:2]
-            cube_shape = pred.shape[2:]
-            pred = F.normalize(pred.reshape(b, k, -1), dim=2).reshape(b, k, *cube_shape)
-            gt = F.normalize(gt.reshape(b, k, -1), dim=2).reshape(b, k, *cube_shape)
+            pred = l2_normalize_patches(pred)
+            gt = l2_normalize_patches(gt)
             outputs["pred_patches"] = pred
             outputs["gt_patches"] = gt
 

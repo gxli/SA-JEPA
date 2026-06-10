@@ -4,6 +4,15 @@ import torch
 import torch.nn.functional as F
 
 
+def l2_normalize_patches(tensor: torch.Tensor) -> torch.Tensor:
+    """L2-normalize per-target patch/cube tensors across all non-B/K dimensions."""
+    if tensor.dim() < 3:
+        raise ValueError(f"Expected tensor with B,K,... shape, got {tuple(tensor.shape)}")
+    b, k = tensor.shape[:2]
+    patch_shape = tensor.shape[2:]
+    return F.normalize(tensor.reshape(b, k, -1), dim=2).reshape(b, k, *patch_shape)
+
+
 def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     removed_flat_keys = {
         "spread_regularizer_weight",

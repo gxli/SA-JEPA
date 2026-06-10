@@ -26,3 +26,17 @@ def _safe_load_npy(path: str, *, mmap_mode: str | None = "r") -> np.ndarray:
         else:
             arr = arr.tolist()
     return np.asarray(arr)
+
+
+def normalize01(x: np.ndarray) -> np.ndarray:
+    """Normalize finite array values to [0, 1], replacing non-finite values safely."""
+    arr = np.asarray(x, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if not bool(finite.any()):
+        return np.zeros_like(arr, dtype=np.float32)
+    lo = float(arr[finite].min())
+    hi = float(arr[finite].max())
+    arr = np.nan_to_num(arr, nan=lo, posinf=hi, neginf=lo)
+    if hi > lo + 1e-20:
+        return ((arr - lo) / (hi - lo)).astype(np.float32)
+    return np.zeros_like(arr, dtype=np.float32)

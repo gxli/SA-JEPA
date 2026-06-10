@@ -44,7 +44,7 @@ from src.inference import (
     _save_npz,
     _forward_tta_streaming_2d,
 )
-from src.utils.npy import _safe_load_npy
+from src.utils.npy import _safe_load_npy, normalize01
 from src.utils.viz import save_inference_dashboard
 
 
@@ -102,18 +102,6 @@ def load_model_from_session(session_dir: str, device: torch.device, *, strict_lo
 # ---------------------------------------------------------------------------
 # Raw data loading (no JEPADataset dependencies)
 # ---------------------------------------------------------------------------
-
-def _normalize01(arr: np.ndarray) -> np.ndarray:
-    a = np.asarray(arr, dtype=np.float32)
-    finite = np.isfinite(a)
-    if not bool(finite.any()):
-        return np.zeros_like(a, dtype=np.float32)
-    amin, amax = float(a[finite].min()), float(a[finite].max())
-    a = np.nan_to_num(a, nan=amin, posinf=amax, neginf=amin)
-    if amax - amin > 1e-20:
-        return ((a - amin) / (amax - amin)).astype(np.float32)
-    return np.zeros_like(a, dtype=np.float32)
-
 
 def _tile_crops_2d(
     arr2d: np.ndarray,
@@ -315,7 +303,7 @@ def load_raw_data(
             raise ValueError(f"3D slab mode requires 3D input, got shape {arr.shape}")
         axis = int(slice_axis) % 3
         volume = np.moveaxis(np.asarray(arr, dtype=np.float32), axis, 0)
-        volume = _normalize01(volume)
+        volume = normalize01(volume)
         slabs = _make_depth_slabs(volume, slab_depth, slice_index=slice_index)
         processed = []
         for slab in slabs:
@@ -350,12 +338,12 @@ def load_raw_data(
             )
 
     if crop_size and max(arr.shape) > crop_size:
-        arr_norm = _normalize01(np.asarray(arr, dtype=np.float32))
+        arr_norm = normalize01(np.asarray(arr, dtype=np.float32))
         tiles, layout = _tile_crops_2d_with_layout(arr_norm, crop_size, crop_mode)
         tensor = np.stack([np.asarray(t, dtype=np.float32) for t in tiles], axis=0)
     else:
         layout = None
-        tensor = _normalize01(np.asarray(arr, dtype=np.float32))[np.newaxis, ...]  # 1×H×W
+        tensor = normalize01(np.asarray(arr, dtype=np.float32))[np.newaxis, ...]  # 1×H×W
 
     out = torch.from_numpy(tensor).unsqueeze(1)  # B×1×H×W
     return (out, layout) if return_layout else out

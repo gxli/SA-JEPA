@@ -1,38 +1,240 @@
-# Dual-Encoder Target-Pair ConvNeXt-JEPA
+````markdown
+# Multiscale-JEPA: Scale-Informed Masking for Self-Supervised Structure Discovery in Physical Fields
 
-Config-driven training pipeline for a dual-encoder ConvNeXt-Tiny JEPA with EMA teacher updates and pixel-level decoder supervision.
+**Multiscale-JEPA** is a self-supervised framework for learning dense latent
+coordinates of continuous physical fields. The goal is not classification or
+pixel reconstruction, but **structure discovery**: learning an embedding whose
+neighborhoods can be mapped back to coherent spatial morphology in the original
+field.
 
-## Project Layout
+The central idea is that masking geometry in physical fields should be tied to
+the physical scale hierarchy of the data, rather than chosen as an arbitrary
+fixed box in image space. Multiscale-JEPA implements this by combining:
+
+1. **Constrained Diffusion Decomposition (CDD)**  
+   Converts a scalar field into pixel-registered, scale-separated components.
+
+2. **Scale-aware masking**  
+   Masks each CDD component with a footprint proportional to its diffusion
+   scale, so the prediction task is posed separately at fine, intermediate, and
+   coarse levels.
+
+3. **Joint-Embedding Predictive Architecture (JEPA)**  
+   Predicts projected target representations from projected context
+   representations, without reconstructing pixels.
+
+4. **Dense latent analysis**  
+   Applies the frozen target branch densely to the full field, then visualizes
+   the resulting latent map with PCA/UMAP and maps latent neighborhoods back to
+   spatial locations.
+
+---
+
+## Science Motivation
+
+Physical fields are intrinsically multiscale. Turbulent density fields contain
+diffuse regions, filaments, shocks, and compact structures; molecular-gas maps
+contain spiral arms, interarm regions, dense complexes, and extended envelopes;
+nighttime-light maps contain compact bright cores, corridors, and diffuse urban
+structure.
+
+A fixed image-space mask probes only one arbitrary pixel scale. Multiscale-JEPA
+instead ties the mask footprint to a physical scale coordinate supplied by CDD.
+This makes the context--target prediction task scale-aware: the model must infer
+hidden structure at the scale represented by each CDD component.
+
+The learned embedding is therefore used as an exploratory coordinate system for
+the field. Latent neighborhoods are interpreted as **structural hypotheses**,
+not as supervised classes or validated physical phases.
+
+---
+
+## Method Overview
+
+<!-- TODO: replace with paper figure -->
+![Multiscale-JEPA architecture placeholder](docs/figures/framework_placeholder.png)
+
+**Figure placeholder:** CDD-scale-aware JEPA architecture.  
+Suggested file: `docs/figures/framework.png`
+
+The training path is:
+
+```text
+target field
+    → target encoder
+    → EMA target projector
+    → projected target map q_t
+
+masked context field
+    → context encoder
+    → online projector
+    → projected context map q_c
+    → predictor
+    → predicted target map q_hat_t
+
+loss = MSE(q_hat_t, q_t) at hidden target patches
+     + weak spread regularizer on projected context patches
+     + optional weak symmetry loss for MHD
+````
+
+The spread regularizer is applied **after the online projector and before the
+predictor**, so it constrains the projected representation used as predictor
+input, not the predictor output.
+
+At inference, masking is disabled and the frozen target branch is applied
+densely to the full field. The resulting projected latent map is used for
+PCA/UMAP visualization and spatial back-mapping.
+
+---
+
+## Scale-Informed Masking
+
+<!-- TODO: replace with masking demo from paper -->
+
+![CDD pyramid masking placeholder](docs/figures/masking_demo_placeholder.png)
+
+**Figure placeholder:** CDD decomposition and pyramid masking.
+Suggested file: `docs/figures/masking_demo.png`
+
+For CDD channel `s`, the nominal mask footprint is
+
+```text
+B_s_nom = sigma_s * f_mask + B_0
+```
+
+where:
+
+* `sigma_s` is the CDD diffusion scale,
+* `f_mask` is the scale multiplier,
+* `B_0` is a fixed image-space offset.
+
+The actual footprint is lower-bounded by the central target patch:
+
+```text
+B_s = oddceil(max(3, B_s_nom))
+```
+
+so the context mask always covers the central `3 × 3` prediction target.
+
+Setting `B_0 = 0` gives a pure scale-tied pyramid mask. Setting
+`f_mask = 0` gives a fixed-box mask. Fixed-box and randomized masks are used as
+controls in the masking sweeps.
+
+---
+
+## CDD Frontend
+
+<!-- TODO: replace with CDD vs wavelet figure -->
+
+![CDD versus wavelet placeholder](docs/figures/cdd_vs_wavelet_placeholder.png)
+
+**Figure placeholder:** CDD versus matched wavelet decomposition.
+Suggested file: `docs/figures/cdd_vs_wavelet.png`
+
+The selected runs use four CDD diffusion scales:
+
+```text
+[2, 4, 8, 16]
+```
+
+The unresolved residual is folded into the last scale channel, so the encoder
+receives four CDD channels total. The last channel contains the coarsest
+component plus residual structure not represented by the preceding scale bands.
+
+CDD is used because it provides localized, pixel-registered scale components
+that align naturally with scale-tied masking.
+
+---
+
+## Example Results
+
+### MHD turbulence
+
+<!-- TODO: replace with MHD latent map -->
+
+![MHD dense latent map placeholder](docs/figures/mhd_latent_placeholder.png)
+
+**Figure placeholder:** PCA/UMAP dense latent maps for the MHD density field.
+Suggested file: `docs/figures/jepa_mhd.png`
+
+<!-- TODO: replace with MHD back-mapping -->
+
+![MHD back-mapping placeholder](docs/figures/mhd_backmapping_placeholder.png)
+
+**Figure placeholder:** latent-neighborhood back-mapping for MHD.
+Suggested file: `docs/figures/mhd_backmapping.png`
+
+### Nighttime lights
+
+<!-- TODO: replace with Chengdu latent map -->
+
+![Chengdu dense latent map placeholder](docs/figures/chengdu_latent_placeholder.png)
+
+**Figure placeholder:** dense latent map for Chengdu nighttime lights.
+Suggested file: `docs/figures/jepa_chengdu.png`
+
+### Molecular gas
+
+<!-- TODO: replace with NGC latent map -->
+
+![NGC dense latent map placeholder](docs/figures/ngc_latent_placeholder.png)
+
+**Figure placeholder:** dense latent map for NGC 3627 molecular gas.
+Suggested file: `docs/figures/jepa_ngc.png`
+
+---
+
+## Repository Layout
 
 ```text
 convnext_jepa/
-├── configs/                 # Experiment configs (*.json)
-├── data/                    # Your datasets
-├── results/                 # Generated plots/reports
-├── sessions/                # Per-run artifacts
-├── scripts/
-│   └── session_to_plots.py  # Convert session metrics -> plots
+├── configs/                  # Training and inference configs
+├── data/                     # Local input data; not tracked by git
+├── docs/
+│   └── figures/              # README and paper figures
+├── results/                  # Generated plots and reports
+├── sessions/                 # Per-run checkpoints and artifacts
+├── scripts/                  # Plotting, diagnostics, and demo scripts
 ├── src/
-│   ├── dataset.py
-│   ├── train.py
-│   ├── models/
+│   ├── dataset.py            # Dataset and CDD-aware loading
+│   ├── train.py              # Training loop
+│   ├── inference_from_session.py
+│   ├── models/               # Scale-aware ConvNeXt and JEPA modules
 │   └── utils/
-├── main.py                  # Single-config entrypoint
-├── run.sh                   # Loop all configs
+├── main.py                   # Single-config training entry point
+├── run.sh                    # Batch launcher over configs
 └── requirements.txt
 ```
 
-## Setup
+---
+
+## Installation
 
 ```bash
-cd /Users/gxli/proj/ml/multiscale_conv_jepa/convnext_jepa
-python3 -m venv .venv
+git clone <repo-url>
+cd convnext_jepa
+
+python -m venv .venv
 source .venv/bin/activate
+
 pip install -U pip
 pip install -r requirements.txt
 ```
 
-## Run Training
+CUDA is recommended for training. CPU and Apple MPS may work for smaller
+inference runs, but large CDD precomputation and training are GPU-oriented.
+
+---
+
+## Training
+
+Run a single configuration:
+
+```bash
+python main.py \
+    --config configs/example_mhd_ms1p2.json \
+    --sessions-dir sessions
+```
 
 Run all configs in `configs/`:
 
@@ -40,328 +242,243 @@ Run all configs in `configs/`:
 ./run.sh
 ```
 
-Run a single config:
+Each run writes a session directory:
 
-```bash
-python3 main.py --config configs/base_3090.json --sessions-dir sessions
+```text
+sessions/<session_name>/
+├── config_used.json
+├── metrics.csv
+├── model_last.pt
+├── inference_outputs.pt
+├── pred_map.npz
+├── gt_map.npz
+├── context_map.npz
+└── dashboard / diagnostic artifacts
 ```
 
-## Inference from a Trained Session
+---
 
-Load any trained session checkpoint and run inference on arbitrary `.npy` data — supports large files via crop/tile and 3D volumes via slab mode. Two interfaces: config file or CLI flags.
+## Inference
 
-### Config-driven (recommended)
-
-```bash
-python -m src.inference_from_session --config configs/inference/chengdu.json
-```
-
-CLI flags override config values:
-
-```bash
-python -m src.inference_from_session --config configs/inference/chengdu.json --crop-size 128
-```
-
-### CLI flags
+Run inference from a trained session on a new `.npy` field:
 
 ```bash
 python -m src.inference_from_session \
-    --session sessions/gen_121_mhd_run_006_ms1p2 \
-    --input data/chengdu.npy \
-    --output-session sessions/inference_chengdu
+    --session sessions/<trained_session> \
+    --input data/example_field.npy \
+    --output-session sessions/inference_example \
+    --tta \
+    --tta-mode flip4
 ```
 
-### Inference config schema
-
-```json
-{
-  "session": "sessions/gen_121_mhd_run_006_ms1p2",
-  "input": "data/chengdu.npy",
-  "output_session": "sessions/inference_chengdu",
-  "crop_size": null,
-  "crop_mode": "center",
-  "mode": "image",
-  "slice_axis": 0,
-  "slice_index": null,
-  "batch_size": 2,
-  "tta": false,
-  "tta_mode": "d4",
-  "device": null
-}
-```
-
-### Crop / Tile for large data
-
-When input exceeds GPU memory, crop to a fixed size:
+For large images, use tiled inference:
 
 ```bash
-# Center crop (single patch)
 python -m src.inference_from_session \
-    --session sessions/gen_121_mhd_run_006_ms1p2 \
-    --input data/huge_mosaic.npy \
-    --crop-size 256 \
-    --crop-mode center \
-    --output-session sessions/inference_mosaic_center
-
-# Tiled (sliding window, 50% overlap, all tiles processed)
-python -m src.inference_from_session \
-    --session sessions/gen_121_mhd_run_006_ms1p2 \
-    --input data/huge_mosaic.npy \
+    --session sessions/<trained_session> \
+    --input data/large_field.npy \
     --crop-size 256 \
     --crop-mode tile \
-    --output-session sessions/inference_mosaic_tiled
+    --output-session sessions/inference_large_tiled
 ```
 
-### 3D slab mode
-
-For 3D volumes (e.g., NGC data), each depth slice is processed independently:
+For 3D volumes, process slices independently:
 
 ```bash
-# All slices
 python -m src.inference_from_session \
-    --session sessions/gen_121_mhd_run_006_ms1p2 \
-    --input data/ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy \
+    --session sessions/<trained_session> \
+    --input data/volume.npy \
     --mode 3d_slab \
     --slice-axis 0 \
-    --output-session sessions/inference_ngc_3d
-
-# Single slice
-python -m src.inference_from_session \
-    --session sessions/gen_121_mhd_run_006_ms1p2 \
-    --input data/ngc3627_12m+7m+tp_co21_strict_mom0.npy_sm.npy \
-    --mode 3d_slab \
-    --slice-axis 0 \
-    --slice-index 42 \
-    --output-session sessions/inference_ngc_slice42
+    --output-session sessions/inference_volume
 ```
 
-### TTA (Test-Time Augmentation)
+---
 
-Enable D4 augmentation during inference to average rotations and flips:
+## Plotting and Diagnostics
+
+Generate loss curves and session plots:
 
 ```bash
-python -m src.inference_from_session \
-    --session sessions/gen_121_mhd_run_006_ms1p2 \
-    --input data/chengdu.npy \
-    --tta \
-    --tta-mode d4 \
-    --output-session sessions/inference_chengdu_tta
+python scripts/session_to_plots.py \
+    --sessions-dir sessions \
+    --results-dir results
 ```
 
-### CLI reference
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--session` | (required) | Path to trained session directory |
-| `--input` | (required) | Path to input `.npy` file |
-| `--output-session` | auto | Output session directory (auto-generates if omitted) |
-| `--crop-size` | `None` | Crop/tile size for large inputs |
-| `--crop-mode` | `center` | `center` (single patch) or `tile` (sliding window) |
-| `--mode` | `image` | `image` (2D) or `3d_slab` (3D volume) |
-| `--slice-axis` | `0` | Depth axis for 3D slab mode |
-| `--slice-index` | `None` | Specific slice for 3D mode (omitted = all) |
-| `--batch-size` | `2` | Batch size for inference |
-| `--tta` | disabled | Enable test-time augmentation |
-| `--tta-mode` | `flip4` | TTA view set: `flip4`, `rot4`, or `d4` |
-| `--device` | auto | Override device (`cuda`, `mps`, `cpu`) |
-
-### Inference session structure
-
-The output session at `sessions/<name>/` contains:
-
-- `config_used.json` — frozen config with `_inference.inference_only: true`
-- `inference_outputs.pt` — full output dict with `pred_map`, `gt_map`, `context_map`
-- `pred_map.npz`, `gt_map.npz`, `context_map.npz` — compressed latent maps
-- `network_input_clean.npz`, `network_input_context.npz` — input snapshots
-- `jepa_energy_summary.json` — scalar energy + metadata
-- `dash_data.npz` — dashboard-compatible visualization data
-
-## Session Artifacts
-
-Each run creates/updates `sessions/<config_name>/` with:
-
-- `config_used.json`: exact config snapshot
-- `metrics.csv`: training metrics by batch
-- `model_last.pt`: final model checkpoint
-- `inference_outputs.pt`: saved inference tensors
-
-## Blur Demo / Channel Maps
-
-Generate the blur demo outputs for one config:
+Print effective-rank diagnostics for a group of sessions:
 
 ```bash
-python3 scripts/blur_demo.py --config configs/test_run_data.json --sessions-dir sessions
+python scripts/print_effective_rank.py sessions/gen_*
 ```
 
-Outputs in `sessions/<config_name>/`:
+Typical reported diagnostics include:
 
-- `blur_demo.png`: 4-panel plot
-  - Original
-  - Center Masked
-  - Ratio `(I2 / I1)`
-  - Fractional change `(I2 - I1) / (I2 + I1)`
-- `blur_demo_channels.png`: per-channel maps (`Original`, `Masked`, `Delta`) when enabled
-- `cdd_result.npy`: CDD component channels (all channels returned by CDD)
-- `cdd_residual.npy`: CDD residual
-- `blur_demo_meta.json`: run metadata (scales, spacing, center count, etc.)
+* effective rank,
+* context / predictor / target rank,
+* target participation,
+* top eigenvalue fraction,
+* dead-channel count,
+* hinge-loss ratio,
+* final loss terms.
 
-Enable/disable channel maps in config:
+These are used as **screening diagnostics** for collapse and latent-space usage.
+Final selection of visualizations is based on dense latent morphology and
+spatial back-mapping, not scalar diagnostics alone.
 
-```json
-"blur_demo": {
-  "make_channel_plot": true
+---
+
+## Masking Demo
+
+Generate a CDD-aware masking demo using the same masking pipeline as training:
+
+```bash
+python scripts/masking_demo.py \
+    --config configs/example_mhd_ms1p2.json \
+    --sessions-dir sessions \
+    --sample-index 0 \
+    --seed 42
+```
+
+Outputs:
+
+```text
+sessions/<config_name>/
+├── masking_demo.png
+└── masking_demo_meta.json
+```
+
+---
+
+## CDD / Decomposition Demo
+
+Generate decomposition and channel maps:
+
+```bash
+python scripts/blur_demo.py \
+    --config configs/example_mhd_ms1p2.json \
+    --sessions-dir sessions
+```
+
+Outputs may include:
+
+```text
+sessions/<config_name>/
+├── blur_demo.png
+├── blur_demo_channels.png
+├── cdd_result.npy
+├── cdd_residual.npy
+└── blur_demo_meta.json
+```
+
+---
+
+## Reproducing the Paper Runs
+
+The paper uses selected pyramid-mask runs with scale multiplier:
+
+```text
+f_mask = 1.2
+```
+
+for the main MHD, Chengdu, and NGC visualizations.
+
+Default selected settings include:
+
+```text
+CDD scales:              [2, 4, 8, 16]
+residual handling:       folded into last CDD channel
+encoder:                 dense scale-aware ConvNeXt
+encoder depth:           4
+ConvNeXt dilations:      [1, 1, 2, 4]
+latent channels:         32
+projected channels:      96
+predictor hidden width:  96
+mask hard cap:           48 px
+prediction loss:         unnormalized MSE in projected latent space
+spread regularizer:      std-hinge on projected context patches
+target patch:            central 3 × 3
+TTA:                     flip4
+```
+
+Example run pattern:
+
+```bash
+python main.py \
+    --config configs/paper/mhd_ms1p2.json \
+    --sessions-dir sessions
+
+python -m src.inference_from_session \
+    --config configs/inference/mhd_ms1p2.json
+```
+
+---
+
+## Data
+
+This repository does not include large scientific datasets by default.
+
+Expected input format:
+
+* `.npy` scalar fields for 2D images,
+* `.npy` volumes for 3D slab inference,
+* optionally `.fits` files if FITS support is enabled in the local environment.
+
+Place local data under:
+
+```text
+data/
+```
+
+and update the corresponding config entries.
+
+---
+
+## Citation
+
+If you use this code, please cite the associated paper:
+
+```bibtex
+@misc{li2026multiscalejepa,
+  title  = {Scale-Informed Masking for Self-Supervised Structure Discovery in Physical Fields},
+  author = {Li, Guang-Xing},
+  year   = {2026},
+  note   = {Preprint}
 }
 ```
 
-Key spacing controls in config:
+CDD is described in:
 
-```json
-"blur_demo": {
-  "mask_scale": 2.0,
-  "pyramid_spacing_mult": 2.0
+```bibtex
+@article{li2022constrained,
+  title={Multi-scale Decomposition of Astronomical Maps: A Constrained Diffusion Method},
+  author={Li, Guang-Xing},
+  journal={The Astrophysical Journal Supplement Series},
+  volume={258},
+  number={2},
+  pages={44},
+  year={2022},
+  doi={10.3847/1538-4365/ac4bc4}
 }
 ```
 
-Current spacing rule:
+---
 
-- `spacing_px = largest_scale * mask_scale * pyramid_spacing_mult`
-- center count is auto-determined from available area when `num_random_centers` is `"auto"`.
+## License
 
-Note on macOS/MPS:
+Add license information here.
 
-- The message `No supported GPU was found.` is printed by the CDD package's GPU check (CUDA-oriented).  
-  It does not mean your Apple MPS runtime is unavailable for PyTorch generally.
+Recommended:
 
-## Masking Demo (JEPA Context Mask)
-
-Generate a masking demo that uses the current config and current dataset pipeline:
-
-```bash
-python3 scripts/masking_demo.py --config configs/test_run_data.json --sessions-dir sessions
+```text
+MIT License for code.
+Separate data licenses for external scientific datasets.
 ```
 
-Optional reproducibility controls:
+---
 
-```bash
-python3 scripts/masking_demo.py \
-  --config configs/test_run_data.json \
-  --sessions-dir sessions \
-  --sample-index 0 \
-  --seed 42
+## Contact
+
+For questions, open an issue or contact the maintainer.
+
 ```
-
-Outputs in `sessions/<config_name>/`:
-
-- `masking_demo.png`: 4-panel visualization
-  - Original
-  - Masked/Context
-  - Mask overlay (changed regions in red)
-  - `|Context - Original|` magnitude map
-- `masking_demo_meta.json`: run metadata (config, sample, sigmas, cell sizes, target count)
-
-How it matches training:
-
-- Loads data through `JEPADataset` with your config values (`data_root`, `npy_pattern`, slice strategy, crop settings, etc.).
-- Applies context masking via the same function used in model forward pass: `make_pyramid_grid_context(...)`.
-- Uses `model.sigmas`, `model.cell_sizes`, and `model.sigmas` and `model.cell_sizes` from the active config.
-
-## Generate Plots
-
-```bash
-python3 scripts/session_to_plots.py --sessions-dir sessions --results-dir results
 ```
-
-Outputs loss curves as PNG files in `results/` (one per session).
-
-## Config Schema
-
-Example: `configs/base_3090.json`
-
-- `model.pretrained` (bool)
-- `data.num_samples` (int)
-- `data.crop_mode` / `data.crop_size` (optional crop training)
-- `train.epochs` (int)
-- `train.batch_size` (int)
-- `train.num_workers` (int)
-- `train.lr` (float)
-- `train.weight_decay` (float)
-- `train.momentum` (float, EMA)
-- `train.log_interval` (int)
-- `loss.weight_jepa` (float)
-- `loss.weight_pixel` (float)
-
-## Inference Mode
-
-Run a trained model on arbitrary `.npy` or `.fits` data without a config file:
-
-```bash
-python -m src.inference_from_session \
-    --session sessions/gen_127_mhd_run_001_ms1p2 \
-    --input data/chengdu.npy \
-    --output-session sessions/inference_chengdu
-```
-
-Or via config:
-
-```bash
-python -m src.inference_from_session --config configs/inference/chengdu.json
-```
-
-### Large images — tiled inference
-
-For images that exceed GPU memory, use `--crop-mode tile` with `--crop-size`:
-
-```bash
-python -m src.inference_from_session \
-    --session sessions/gen_127_mhd_run_001_ms1p2 \
-    --input data/huge_mosaic.npy \
-    --crop-size 256 --crop-mode tile \
-    --output-session sessions/inference_mosaic
-```
-
-Tiles are stitched on CPU to avoid GPU OOM. 50% overlap, simple averaging.
-
-### Test-time augmentation
-
-```bash
-python -m src.inference_from_session \
-    --session ... --input ... \
-    --tta --tta-mode flip4
-```
-
-### 3D slab mode
-
-```bash
-python -m src.inference_from_session \
-    --session ... --input data/volume.npy \
-    --mode 3d_slab --slice-axis 0
-```
-
-### Output
-
-Creates `sessions/<name>/` with:
-- `inference_outputs.pt` — full tensors
-- `pred_map.npz`, `gt_map.npz`, `context_map.npz`
-- `config_used.json` — marked `inference_only: true`
-- Dashboard artifacts (PCA/UMAP arrays for `session_to_dash.py`)
-
-### CLI reference
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--session` | required | Path to trained session |
-| `--input` | required | Path to `.npy` or `.fits` file |
-| `--crop-size` | None | Crop size for large inputs |
-| `--crop-mode` | center | `center` or `tile` |
-| `--mode` | image | `image` or `3d_slab` |
-| `--output-session` | auto | Output directory |
-| `--batch-size` | 2 | Per-GPU batch size |
-| `--tta` | off | Enable test-time augmentation |
-| `--tta-mode` | flip4 | `flip4`, `rot4`, or `d4` |
-| `--device` | auto | `cuda`, `mps`, or `cpu` |
-| `--allow-partial-load` | off | Skip strict checkpoint matching |
-
-## Notes
-
-- Mixed precision (`torch.amp`) is enabled automatically when CUDA is available.
-- The dataset is currently a template with synthetic tensors; replace `src/dataset.py` with real data loading.

@@ -1,8 +1,8 @@
 import numpy as np
 import torch
 
-from scripts.check_session_integrity import check_session
-from scripts.migrate_embedding_artifacts import migrate_results
+from scripts.legacy.check_session_integrity import check_session
+from scripts.legacy.migrate_embedding_artifacts import migrate_results
 from scripts.session_to_dash import compute_dash_data
 from src.models.masking import (
     ALLOWED_TARGET_SAMPLING_MODES,

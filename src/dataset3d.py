@@ -6,6 +6,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.utils.npy import _safe_load_npy, normalize01
+
 
 class JEPA3DCropDataset(Dataset):
     """3D dataset that consumes precomputed CDD cache entries.
@@ -55,13 +57,7 @@ class JEPA3DCropDataset(Dataset):
 
     @staticmethod
     def _normalize01(x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=np.float32)
-        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        lo = float(x.min())
-        hi = float(x.max())
-        if hi > lo + 1e-20:
-            return (x - lo) / (hi - lo)
-        return np.zeros_like(x, dtype=np.float32)
+        return normalize01(x)
 
     def _choose_axis(self) -> int:
         if self.random_axis:
@@ -118,7 +114,6 @@ class JEPA3DCropDataset(Dataset):
     def _get_raw_volume(self, idx: int) -> np.ndarray:
         """Fallback: load raw .npy, normalize, return as (1, D, H, W)."""
         path = self.npy_files[idx % len(self.npy_files)]
-        from src.utils.npy import _safe_load_npy
         arr = _safe_load_npy(path, mmap_mode="r")
         if arr.ndim != 3:
             raise ValueError(f"Expected 3D array D,H,W, got shape={arr.shape} in {path}")

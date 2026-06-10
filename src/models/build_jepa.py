@@ -21,6 +21,7 @@ from .masking import (
 )
 from .predictor import FullResPredictor
 from .symmetry import symmetric_forward_2d
+from src.losses import l2_normalize_patches
 
 # Shared encoder-type sets used by both build_jepa.py and train.py.
 CDD_CUBE_ENCODER_TYPES = frozenset({
@@ -727,9 +728,8 @@ class PyramidGridJEPA(nn.Module):
 
         if self.normalize_loss_l2:
             # Normalize the full patch vector so spatial contrast is preserved.
-            b, k, c, p1, p2 = pred.shape
-            pred = F.normalize(pred.reshape(b, k, -1), dim=2).reshape(b, k, c, p1, p2)
-            gt = F.normalize(gt.reshape(b, k, -1), dim=2).reshape(b, k, c, p1, p2)
+            pred = l2_normalize_patches(pred)
+            gt = l2_normalize_patches(gt)
             outputs["pred_patches"] = pred
             outputs["gt_patches"] = gt
         loss_map = F.mse_loss(pred, gt, reduction="none")  # B x K x C x P x P
