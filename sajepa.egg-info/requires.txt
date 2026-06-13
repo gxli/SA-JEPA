@@ -1,0 +1,8 @@
+torch>=2.0
+torchvision
+torchdr>=0.1.0
+pyyaml
+numpy
+constrained-diffusion
+plotly
+umap-learn

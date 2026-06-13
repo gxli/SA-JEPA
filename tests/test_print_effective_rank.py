@@ -79,6 +79,38 @@ class PrintEffectiveRankTests(unittest.TestCase):
         self.assertIn("   9.5000  4.0000  3.0000  2.0000", run_b)
         self.assertNotEqual(run_a.split()[13:17], run_b.split()[13:17])
 
+    def test_api_rank_summary_columns_match_script_rows(self) -> None:
+        from src.api import ScaleAwareJEPA
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp)
+            (session / "config_used.json").write_text(
+                json.dumps(
+                    {
+                        "model": {
+                            "mode": "3d_full_volume",
+                            "mask_size_scaling": 1.2,
+                            "mask_size": 5,
+                            "encoder_depth": 2,
+                            "dilations": [1, 2],
+                            "mask_box_hardcap": 9,
+                        },
+                        "train": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (session / "rank_diagnostics.json").write_text(json.dumps({"energy": 3.5}), encoding="utf-8")
+            model = ScaleAwareJEPA(config={"model": {}, "train": {}, "data": {}})
+            model._session_dir = str(session)
+
+            summary = model.analyze_rank()
+
+        self.assertEqual(summary["depth"], "2")
+        self.assertEqual(summary["dilations"], "[1,2]")
+        self.assertEqual(summary["hardcap"], "9")
+        self.assertEqual(summary["energy"], "   3.5000")
+
 
 if __name__ == "__main__":
     unittest.main()

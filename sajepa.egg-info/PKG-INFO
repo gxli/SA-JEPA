@@ -1,3 +1,18 @@
+Metadata-Version: 2.4
+Name: sajepa
+Version: 0.1.0
+Summary: Scale-Aware Joint-Embedding Predictive Architecture for Physical Fields
+Author-email: Guang-Xing Li <ligx.ngc7293@gmail.com>
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.0
+Requires-Dist: torchvision
+Requires-Dist: torchdr>=0.1.0
+Requires-Dist: pyyaml
+Requires-Dist: numpy
+Requires-Dist: constrained-diffusion
+Requires-Dist: plotly
+Requires-Dist: umap-learn
+
 # `sajepa` — Scale-Aware JEPA for Continuous Physical Fields
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

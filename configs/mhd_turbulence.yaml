@@ -98,7 +98,7 @@ training:
   # Variance-Based Non-Collapse Constraint (Crucial for Energy-Based JEPAs)
   spread_regularizer:
     type: "std_hinge"
-    target: "context"
+    target: "predictor"
     weight: 2
     target_std: 1.0
     eps: 0.0001

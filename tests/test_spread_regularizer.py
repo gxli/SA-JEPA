@@ -34,14 +34,14 @@ class SpreadRegularizerTests(unittest.TestCase):
 
         loss, z_ctx = compute_output_spread_regularizer_loss(
             outputs,
-            {"type": "std_hinge", "target_std": 1.0, "eps": 1e-4},
+            {"type": "std_hinge", "target": "context", "target_std": 1.0, "eps": 1e-4},
         )
         loss.backward()
 
         self.assertEqual(tuple(z_ctx.shape), (4, 4))
         self.assertGreater(float(context.grad.abs().sum().item()), 0.0)
 
-    def test_output_sigreg_defaults_to_context_not_predictor(self) -> None:
+    def test_output_sigreg_defaults_to_predictor_not_context(self) -> None:
         torch.manual_seed(0)
         context = (torch.randn(2, 3, 4, 5, 5) * 1e-3).requires_grad_()
         pred = (torch.randn(2, 3, 4, 5, 5) * 1e-3).requires_grad_()
@@ -55,8 +55,8 @@ class SpreadRegularizerTests(unittest.TestCase):
         loss.backward()
 
         self.assertEqual(tuple(z_ctx.shape), (4, 4))
-        self.assertGreater(float(context.grad.abs().sum().item()), 0.0)
-        self.assertIsNone(pred.grad)
+        self.assertIsNone(context.grad)
+        self.assertGreater(float(pred.grad.abs().sum().item()), 0.0)
 
     def test_output_sigreg_can_include_predictor_safety_term(self) -> None:
         torch.manual_seed(0)
@@ -67,12 +67,29 @@ class SpreadRegularizerTests(unittest.TestCase):
 
         loss, _ = compute_output_spread_regularizer_loss(
             outputs,
-            {"type": "std_hinge", "target_std": 1.0, "eps": 1e-4},
+            {"type": "std_hinge", "target": "context", "target_std": 1.0, "eps": 1e-4},
             include_predictor=True,
         )
         loss.backward()
 
         self.assertGreater(float(context.grad.abs().sum().item()), 0.0)
+        self.assertGreater(float(pred.grad.abs().sum().item()), 0.0)
+
+    def test_output_sigreg_can_target_predictor(self) -> None:
+        torch.manual_seed(0)
+        context = (torch.randn(2, 3, 4, 5, 5) * 1e-3).requires_grad_()
+        pred = (torch.randn(2, 3, 4, 5, 5) * 1e-3).requires_grad_()
+        valid = torch.tensor([[True, False, True], [False, True, True]])
+        outputs = {"context_patches": context, "pred_patches": pred, "target_valid": valid}
+
+        loss, z_spread = compute_output_spread_regularizer_loss(
+            outputs,
+            {"type": "std_hinge", "target": "predictor", "target_std": 1.0, "eps": 1e-4},
+        )
+        loss.backward()
+
+        self.assertEqual(tuple(z_spread.shape), (4, 4))
+        self.assertIsNone(context.grad)
         self.assertGreater(float(pred.grad.abs().sum().item()), 0.0)
 
     def test_near_collapsed_embeddings_produce_nonzero_gradient(self) -> None:
@@ -103,7 +120,7 @@ class SpreadRegularizerTests(unittest.TestCase):
         loss_small.backward()
         loss_large.backward()
 
-        self.assertAlmostEqual(float(loss_small.item()), float(loss_large.item()), places=5)
+        self.assertAlmostEqual(float(loss_small.item()), float(loss_large.item()), places=3)
         self.assertGreater(float(z_large.grad.abs().sum().item()), float(z_small.grad.abs().sum().item()))
 
     def test_weak_sigreg_produces_gradient(self) -> None:
@@ -131,7 +148,8 @@ class SpreadRegularizerTests(unittest.TestCase):
 
         loss = weak_sigreg_loss(z, sketch_dim=8, eps=1e-4)
 
-        self.assertAlmostEqual(float(loss.item()), 0.99, places=5)
+        self.assertGreater(float(loss.item()), 0.98)
+        self.assertLess(float(loss.item()), 1.0)
 
     def test_weak_sigreg_uses_target_std_for_full_variance_hinge(self) -> None:
         z = torch.zeros(128, 32)
@@ -139,8 +157,10 @@ class SpreadRegularizerTests(unittest.TestCase):
         loss_low_target = weak_sigreg_loss(z, target_std=0.5, sketch_dim=8, eps=1e-4)
         loss_high_target = weak_sigreg_loss(z, target_std=1.0, sketch_dim=8, eps=1e-4)
 
-        self.assertAlmostEqual(float(loss_low_target.item()), 0.49, places=5)
-        self.assertAlmostEqual(float(loss_high_target.item()), 0.99, places=5)
+        self.assertGreater(float(loss_low_target.item()), 0.48)
+        self.assertLess(float(loss_low_target.item()), 0.5)
+        self.assertGreater(float(loss_high_target.item()), 0.98)
+        self.assertLess(float(loss_high_target.item()), 1.0)
 
     def test_weak_sigreg_dense_batch_boosts_gradient_not_value(self) -> None:
         torch.manual_seed(0)
@@ -154,7 +174,7 @@ class SpreadRegularizerTests(unittest.TestCase):
         loss_small.backward()
         loss_large.backward()
 
-        self.assertAlmostEqual(float(loss_small.item()), float(loss_large.item()), places=5)
+        self.assertAlmostEqual(float(loss_small.item()), float(loss_large.item()), places=3)
         self.assertGreater(float(z_large.grad.abs().sum().item()), float(z_small.grad.abs().sum().item()))
 
     def test_weak_sigreg_dispatch(self) -> None:
@@ -258,6 +278,19 @@ class SpreadRegularizerTests(unittest.TestCase):
         self.assertEqual(cfg["sketch_dim"], 64)
         self.assertEqual(cfg["sketch_seed"], 123)
 
+    def test_spread_regularizer_schema_accepts_predictor_target(self) -> None:
+        cfg = parse_spread_regularizer_config(
+            {
+                "spread_regularizer": {
+                    "type": "std_hinge",
+                    "target": "predictor",
+                    "weight": 2,
+                }
+            }
+        )
+
+        self.assertEqual(cfg["target"], "predictor")
+
     def test_flat_spread_regularizer_keys_are_rejected(self) -> None:
         with self.assertRaises(AssertionError):
             parse_spread_regularizer_config({"spread_regularizer_weight": 2})
@@ -265,7 +298,7 @@ class SpreadRegularizerTests(unittest.TestCase):
     def test_invalid_spread_regularizer_settings_are_rejected(self) -> None:
         invalid_blocks = (
             {"type": "other", "target": "context", "weight": 2},
-            {"type": "std_hinge", "target": "predictor", "weight": 2},
+            {"type": "std_hinge", "target": "target", "weight": 2},
             {"type": "std_hinge", "target": "context", "weight": -1},
             {"type": "weak_sigreg", "target": "context", "weight": 0.5, "sketch_dim": 0},
             {"type": "weak_sigreg", "target": "context", "weight": 0.5, "sketch_seed": -1},

@@ -48,7 +48,7 @@
     "vicreg_cov_weight": 0,
     "spread_regularizer": {
       "type": "std_hinge",
-      "target": "context",
+      "target": "predictor",
       "weight": 2.0,
       "target_std": 1.0,
       "eps": 0.0001

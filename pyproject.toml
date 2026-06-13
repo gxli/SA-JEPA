@@ -24,4 +24,4 @@ sajepa-train = "scripts.train:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src", "src.*", "scripts"]
+include = ["sajepa", "sajepa.*", "src", "src.*", "scripts"]

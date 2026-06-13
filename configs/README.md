@@ -48,12 +48,16 @@ and normalizes images without running CDD or maintaining a CDD cache.
 Use `model.sigmas` as the single source of truth for CDD decomposition scales.
 There is no standalone Gaussian masking mode or `model.blur_mode` selector.
 
-## 3D Slab Mode
+## 3D Modes
 
-The only supported 3D mode is `model.mode: "3d_slab"` with
-`data.input_type: "cube"`. The model consumes the raw 3D field directly,
-applies box masks that intersect a thin center slab, and computes 3D patch loss
-inside that slab. Use `model.slab_depth` to set its thickness.
+Supported 3D modes require `data.input_type: "cube"`.
+
+- `model.mode: "3d_slab"` consumes 3D crops, applies box masks that intersect
+  a thin center slab, and computes 3D patch loss inside that slab. Use
+  `model.slab_depth` to set its thickness.
+- `model.mode: "3d_full_volume"` uses the same 3D encoder path but computes
+  targets across the full crop depth. Set `data.volume_crop_depth: full` to
+  train on the full cube depth, or provide an integer crop depth.
 
 ## Shared CDD/log knobs
 
@@ -84,13 +88,13 @@ CDD always adds one leading scale dimension: `(H, W) -> (S, H, W)` and
 cached on the full cube first. The dataset then selects one aligned CDD slice
 and finally applies the 2D crop.
 
-The spread regularizer uses pre-predictor context patch embeddings. Configure
-only the explicit standard-deviation hinge:
+The spread regularizer uses predictor patch embeddings by default, matching the
+JEPA prediction manifold. Configure only the explicit standard-deviation hinge:
 
 ```yaml
 spread_regularizer:
   type: std_hinge
-  target: context
+  target: predictor
   weight: 2
   target_std: 1.0
   eps: 1.0e-4

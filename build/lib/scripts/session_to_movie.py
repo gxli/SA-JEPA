@@ -18,14 +18,6 @@ from sklearn.decomposition import PCA
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-# ── Projection fit strategy toggles ──────────────────────────────────────
-# "per_frame"  = fit PCA + UMAP independently for each epoch
-# "final"      = fit on the final epoch only, then transform all frames
-# "all"        = fit on all frames concatenated (heavy on memory)
-PCA_FIT_MODE = "per_frame"
-UMAP_FIT_MODE = "per_frame"
-# ─────────────────────────────────────────────────────────────────────────
-
 
 def _fit_pca_3d(all_pred: np.ndarray, all_gt: np.ndarray):
     """Fit one PCA (3 components) on concatenated pred+gt from all frames."""
@@ -387,9 +379,6 @@ def main():
 
     session_name = os.path.basename(session_dir.rstrip("/"))
     out_root = args.out_dir or os.path.join(ROOT, "results", "movie_pngs")
-    save_pngs = not args.dump_only and not args.make_mp4
-    print(f"[session_to_movie] save_pngs={save_pngs}  out_dir={out_dir}")
-
     out_dir = os.path.join(out_root, session_name)
     if not args.dump_only:
         os.makedirs(out_dir, exist_ok=True)
@@ -467,7 +456,6 @@ def main():
         print("[session_to_movie] removed stale non-3D PCA/UMAP cache")
 
     # Step 1: fit or load cached PCA/UMAP
-    print(f"[session_to_movie] PCA mode={PCA_FIT_MODE}  UMAP mode={UMAP_FIT_MODE}")
     if _cache_has_3d_embeddings():
         print("[session_to_movie] loading cached PCA/UMAP, skipping fit...")
     else:
@@ -480,28 +468,10 @@ def main():
             pass
         print(f"[session_to_movie] UMAP backend: {_umap_backend}")
 
-        # ── Build global PCA (for "final" / "all" modes) ──
-        if PCA_FIT_MODE == "final":
-            _fit_data = np.concatenate([all_pred_chunks[-1], all_gt_chunks[-1]] + ([all_ctx_chunks[-1]] if has_ctx else []), axis=0)
-            print(f"[session_to_movie] fitting PCA on final frame (n_samples={_fit_data.shape[0]})...")
-            pca_global = PCA(n_components=3, random_state=42).fit(_fit_data)
-        elif PCA_FIT_MODE == "all":
-            _fit_data = np.concatenate([all_pred, all_gt] + ([all_ctx] if has_ctx else []), axis=0)
-            print(f"[session_to_movie] fitting PCA on all frames (n_samples={_fit_data.shape[0]})...")
-            pca_global = PCA(n_components=3, random_state=42).fit(_fit_data)
-        else:
-            pca_global = None  # per_frame — fit inside loop
-
-        # ── Build global UMAP (for "final" / "all" modes) ──
-        umap_global = None
-        if UMAP_FIT_MODE == "final":
-            _umap_data = np.concatenate([all_pred_chunks[-1], all_gt_chunks[-1]] + ([all_ctx_chunks[-1]] if has_ctx else []), axis=0)
-            print(f"[session_to_movie] fitting UMAP on final frame (n_samples={_umap_data.shape[0]})...")
-            umap_global = _fit_umap_3d(_umap_data, n_neighbors=_umap_n, min_dist=_umap_d, metric=_umap_m)
-        elif UMAP_FIT_MODE == "all":
-            _umap_data = np.concatenate([all_pred, all_gt] + ([all_ctx] if has_ctx else []), axis=0)
-            print(f"[session_to_movie] fitting UMAP on all frames (n_samples={_umap_data.shape[0]})...")
-            umap_global = _fit_umap_3d(_umap_data, n_neighbors=_umap_n, min_dist=_umap_d, metric=_umap_m)
+        _fit_data = np.concatenate([all_pred, all_gt] + ([all_ctx] if has_ctx else []), axis=0)
+        print(f"[session_to_movie] fitting PCA (seed=42, n_samples={_fit_data.shape[0]})...")
+        pca = PCA(n_components=3, random_state=42).fit(_fit_data)
+        print(f"[session_to_movie] PCA (3D) fit done (shared across all frames). UMAP will be fit per-frame.")
 
     # Load loss weights for annotation
     lw_path = os.path.join(session_dir, "loss_weights.json")
@@ -510,9 +480,10 @@ def main():
         with open(lw_path) as f:
             loss_weights = json.load(f)
 
+    # Per-frame UMAP: fit fresh UMAP for each frame independently.
+    # Shared projection across epochs causes "stretched snakes" when embeddings drift.
     if not os.path.exists(pca_cache):
-        mode_label = f"PCA={PCA_FIT_MODE} UMAP={UMAP_FIT_MODE}"
-        print(f"[session_to_movie] precomputing frames [{mode_label}]...")
+        print("[session_to_movie] precomputing per-frame PCA + per-frame UMAP...")
         frame0 = torch.load(frame_paths[0], map_location="cpu", weights_only=False)
         H0, W0 = int(frame0["pred_map"].shape[-2]), int(frame0["pred_map"].shape[-1])
         all_pred_pca, all_gt_pca = [], []
@@ -524,28 +495,17 @@ def main():
             C = pm.shape[0]
             pred_flat = pm.reshape(C, -1).T
             gt_flat = gm.reshape(C, -1).T
-
-            # PCA
-            if PCA_FIT_MODE == "per_frame":
-                pca_frame = PCA(n_components=3, random_state=42).fit(np.concatenate([pred_flat, gt_flat], axis=0))
-                pred_pca = pca_frame.transform(pred_flat).astype(np.float32)
-                gt_pca = pca_frame.transform(gt_flat).astype(np.float32)
-            else:
-                pred_pca = pca_global.transform(pred_flat).astype(np.float32)
-                gt_pca = pca_global.transform(gt_flat).astype(np.float32)
-
-            # UMAP
-            if UMAP_FIT_MODE == "per_frame":
-                combined = np.concatenate([pred_flat, gt_flat], axis=0)
-                frame_umap = _fit_umap_3d(combined, n_neighbors=_umap_n, min_dist=_umap_d, metric=_umap_m)
-            else:
-                frame_umap = umap_global
+            # PCA: shared global fit across all frames
+            pred_pca = pca.transform(pred_flat).astype(np.float32)
+            gt_pca = pca.transform(gt_flat).astype(np.float32)
+            # UMAP: per-frame fresh fit (captures epoch-specific structure)
+            combined = np.concatenate([pred_flat, gt_flat], axis=0)
+            frame_umap = _fit_umap_3d(combined, n_neighbors=_umap_n, min_dist=_umap_d, metric=_umap_m)
             if frame_umap is not None:
                 pred_umap = frame_umap.transform(pred_flat).astype(np.float32)
                 gt_umap = frame_umap.transform(gt_flat).astype(np.float32)
             else:
                 pred_umap, gt_umap = pred_pca, gt_pca
-
             all_pred_pca.append(pred_pca)
             all_gt_pca.append(gt_pca)
             all_pred_umap.append(pred_umap)
@@ -586,15 +546,7 @@ def main():
         if args.dump_only:
             return
         if not args.make_mp4:
-            import shutil
-            import glob as _glob
-            for src in sorted(_glob.glob(os.path.join(frame_dir, "frame_*.png"))):
-                dst = os.path.join(out_dir, os.path.basename(src))
-                shutil.copy2(src, dst)
-            n_saved = len(os.listdir(out_dir))
-            frame_tmp.cleanup()
-            frame_tmp = None
-            print(f"[session_to_movie] saved {n_saved} PNG frames to {out_dir}")
+            print("[session_to_movie] rendered transient frames only; no PNG files retained")
             return
 
         mp4_path = os.path.join(out_dir, f"{session_name}.mp4")

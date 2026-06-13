@@ -61,7 +61,7 @@ def _read_model_inputs(session_dir: str) -> dict:
             "sigtype": str(spread.get("type", "NA")),
             "spread_w": str(spread.get("weight", t.get("sigreg_weight", "NA"))),
             "spread_t": str(spread.get("target_std", "NA")),
-            "symw": str(t.get("symmetry_loss_weight", t.get("symmetric_feature_loss_weight", "NA"))),
+            "symw": str(t.get("symmetric_feature_loss_weight", "NA")),
             "depth": str(m.get("encoder_depth", "NA")),
             "dilations": _fmt_cfg_value(m.get("dilations", "None")),
             "hardcap": str(m.get("mask_box_hardcap", "—")),

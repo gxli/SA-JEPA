@@ -28,10 +28,10 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     extra_keys = set(cfg) - expected_keys
     assert not extra_keys, f"Unsupported train.spread_regularizer keys: {sorted(extra_keys)}"
     sigreg_type = str(cfg.get("type", "std_hinge"))
-    sigreg_target = str(cfg.get("target", "predictor"))
+    sigreg_target = str(cfg.get("target", "context"))
     sigreg_weight = float(cfg.get("weight", 0.0))
     assert sigreg_type in {"std_hinge", "weak_sigreg", "sketched_sigreg"}
-    assert sigreg_target in {"context", "predictor", "both"}
+    assert sigreg_target == "context"
     assert sigreg_weight >= 0
     target_std = float(cfg.get("target_std", 1.0))
     eps = float(cfg.get("eps", 1e-4))
@@ -279,31 +279,14 @@ def compute_output_spread_regularizer_loss(
     *,
     include_predictor: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    target = str(cfg.get("target", "predictor"))
-    if include_predictor and target == "context":
-        target = "both"
-
-    if target in {"context", "both"} and "context_patches" not in outputs:
-        raise KeyError("SIGReg target='context' requires outputs['context_patches']")
-    if target in {"predictor", "both"} and "pred_patches" not in outputs:
-        raise KeyError("SIGReg target='predictor' requires outputs['pred_patches']")
-
-    loss = None
-    z_primary = None
-    if target in {"context", "both"}:
-        z_ctx = extract_valid_pooled_embeddings(outputs, key="context_patches")
-        loss_ctx = compute_spread_regularizer_loss(z_ctx, cfg)
-        loss = loss_ctx if loss is None else loss + loss_ctx
-        z_primary = z_ctx
-    if target in {"predictor", "both"}:
+    if "context_patches" not in outputs:
+        raise KeyError("SIGReg requires outputs['context_patches']; refusing to regularize predictor-only outputs")
+    z_ctx = extract_valid_pooled_embeddings(outputs, key="context_patches")
+    loss = compute_spread_regularizer_loss(z_ctx, cfg)
+    if include_predictor:
         z_pred = extract_valid_pooled_embeddings(outputs, key="pred_patches")
-        loss_pred = compute_spread_regularizer_loss(z_pred, cfg)
-        loss = loss_pred if loss is None else loss + loss_pred
-        z_primary = z_pred if target == "predictor" else z_primary
-
-    if loss is None or z_primary is None:
-        raise ValueError(f"Unsupported SIGReg target={target!r}")
-    return loss, z_primary
+        loss = loss + compute_spread_regularizer_loss(z_pred, cfg)
+    return loss, z_ctx
 
 
 @torch.no_grad()
