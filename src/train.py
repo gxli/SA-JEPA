@@ -1225,7 +1225,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     else:
         max_box = round(scale_max * _msb + _mb)
     _mss = float(model_cfg.get("mask_spacing_scaling", 1.5))
-    auto_roll_max = max(1, int(round(float(max_box) * _mss)))
 
     # --- image_batch pre-selection ---
     image_batch_selected_indices = None
@@ -1353,7 +1352,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cube_slice_index=data_cfg.get("cube_slice_index", 0),
             crop_mode=train_crop_mode,
             crop_size=train_crop_size,
-            random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
             d4_augment=bool(data_cfg.get("d4_augment", False)),
             input_type=input_type,
             image_batch_selected_indices=image_batch_selected_indices,
@@ -1387,7 +1385,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 cube_slice_index=data_cfg.get("cube_slice_index", 0),
                 crop_mode=val_crop_mode,
                 crop_size=train_crop_size,
-                random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
                 d4_augment=False,
                 input_type=input_type,
                 image_batch_selected_indices=image_batch_selected_indices,
@@ -1398,11 +1395,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         f"[{config_name}] Dataset split: total_index={n_total}, train_index={len(train_idx)}, "
         f"val_index={len(val_idx)}, val_fraction={val_fraction:.3f}"
     )
-    if hasattr(dataset, "random_roll_max"):
-        print(
-            f"[{config_name}] Data jitter: random_roll_max={dataset.random_roll_max} "
-            f"(symmetric inclusive roll in [-max, +max])"
-        )
     if (not is_3d_mode) and getattr(dataset, "crop_mode", "none") != "none":
         print(
             f"[{config_name}] Training crop: mode={dataset.crop_mode} "
@@ -1479,7 +1471,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cube_slice_index=data_cfg.get("cube_slice_index", 0),
             crop_mode="none",
             crop_size=None,
-            random_roll_max=int(max(0, data_cfg.get("random_roll_max", auto_roll_max))),
             d4_augment=False,
             input_type=input_type,
             image_batch_inference=image_batch_inference,
@@ -1922,9 +1913,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 _flush_csv_rows(visited_targets_log_path, visited_rows)
             metrics_bar.set_description_str(
                 f"L={log_loss_val:.4f} "
-                f"MSE(pred,gt)={loss_prediction.item():.4f} "
-                f"E={energy_val:.4f} "
+                f"mse={loss_prediction.item():.4f} "
                 f"reg={loss_spread.item():.4f} "
+                f"wreg={(spread_regularizer_weight * loss_spread).item():.4f} "
                 f"cos(pred,gt)={sim_val:.4f} "
                 f"std(ch)={ctx_stats['embed_spread_mean']:.3f} "
                 f"rank=exp(H(p))={ctx_stats['context_manifold_size']:.2f} "
@@ -2003,7 +1994,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 prev_str = f" [{prev_str}]"
             tqdm.write(
                 f"[{config_name}] E {epoch + 1}/{epochs} "
-                f"L={avg_total:.4f} mse={avg_prediction:.4f} reg={_fmt_metric(epoch_spread/epoch_batches)} "
+                f"L={avg_total:.4f} mse={avg_prediction:.4f} "
+                f"reg={_fmt_metric(epoch_spread/epoch_batches)} "
+                f"wreg={_fmt_metric((spread_regularizer_weight * epoch_spread)/epoch_batches)} "
                 f"cos={_fmt_metric(epoch_sim/epoch_batches)} "
                 f"std={_fmt_metric(epoch_embed_spread_mean/epoch_batches)} "
                 f"rank={_fmt_metric(epoch_context_manifold_size/epoch_batches)} "

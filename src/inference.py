@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from src.losses import representation_dense_energy
-from src.models.masking import _max_effective_mask_box_size
 
 
 def _save_npz(path: str, arr: np.ndarray) -> None:
@@ -248,7 +247,6 @@ def _first_full_resolution_batch(dataloader, max_diagnostic_size: int = 768):
         ("crop_mode", target_crop_mode),
         ("crop_size", target_crop_size),
         ("d4_augment", False),
-        ("random_roll_max", 0),
         ("crop_min_valid_fraction", 0.0),
     ):
         if hasattr(dataset, name):
@@ -339,38 +337,14 @@ def run_post_training_inference(
             cdd_raw = None
             x_raw = raw_batch if not isinstance(raw_batch, (tuple, list)) else raw_batch[0]
         x_raw = x_raw.to(next(model.parameters()).device)
-        # Deterministic lattice sweep is only meaningful when mask inference is enabled.
-        mask_scale = float(getattr(model, "mask_scale", 1.0))
-        mask_box_size = int(getattr(model, "mask_box_size", 16))
-        max_box = _max_effective_mask_box_size(
-            sigmas=tuple(float(s) for s in getattr(model, "sigmas", (16.0,))),
-            mask_scale=mask_scale,
-            mask_box_size=mask_box_size,
-            inner_target_size=int(getattr(model, "patch_size", 3)),
-            hardcap=getattr(model, "mask_box_hardcap", None),
-            manual_mask_box_sizes=getattr(model, "manual_mask_box_sizes", None),
-        )
-        spacing = int(
-            max(
-                1,
-                round(float(max_box) * float(getattr(model, "spacing_scale", 1.5))),
-            )
-        )
         if bool(mask_inference):
-            # Lattice sweep provides a dense inference map from discrete block masks.
-            import warnings
-            warnings.warn(
-                "Lattice sweep inference is deprecated and will be removed. "
-                "Switch to block masking for single-pass dense energy maps.",
-                FutureWarning,
-                stacklevel=2,
+            raise ValueError(
+                "Post-training lattice-sweep mask inference has been removed. "
+                "Run post-training inference with mask_inference=false and use "
+                "the dense prediction/target maps for energy diagnostics."
             )
-            all_shifts = [(dy, dx) for dy in range(spacing) for dx in range(spacing)]
-            n_passes = max(1, int(inference_mask_passes))
-            shifts = all_shifts if n_passes <= 0 else all_shifts[: min(len(all_shifts), n_passes)]
-        else:
-            shifts = [(0, 0)]
-        print(f"[{config_name}] post_training_inference model forward deterministic_shifts={len(shifts)} spacing={spacing}")
+        shifts = [(0, 0)]
+        print(f"[{config_name}] post_training_inference model forward deterministic_shifts=1")
         outputs = None
         energy_sum = None
         count_map = None
@@ -601,7 +575,6 @@ def run_post_training_inference(
                 "jepa_energy": float(energy_scalar),
                 "jepa_energy_normalized": float(energy_scalar_norm),
                 "inference_mask_passes": int(len(shifts)),
-                "inference_grid_spacing": int(spacing),
                 "mask_inference": bool(mask_inference),
                 "inference_tta_enabled": bool(inference_tta_enabled),
                 "inference_tta_mode": str(inference_tta_mode),

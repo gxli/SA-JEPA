@@ -29,7 +29,6 @@ class JEPADataset(Dataset):
         cube_slice_index: int = 0,
         crop_mode: str = "none",
         crop_size: int | tuple[int, int] | list[int] | None = None,
-        random_roll_max: int = 0,
         d4_augment: bool = False,
         input_type: str = "image",
         image_batch_inference: bool = False,
@@ -62,7 +61,6 @@ class JEPADataset(Dataset):
         self.crop_size = self._coerce_crop_size(crop_size)
         if self.crop_mode != "none" and self.crop_size is None:
             raise ValueError("crop_size is required when crop_mode is not 'none'")
-        self.random_roll_max = int(random_roll_max)
         self.d4_augment = bool(d4_augment)
         self.cdd_cache = cdd_cache or None
         self.crop_min_valid_fraction = float(crop_min_valid_fraction) if crop_min_valid_fraction is not None else 0.0
@@ -295,7 +293,7 @@ class JEPADataset(Dataset):
         return normalize01(arr)
 
     def _apply_augmentations(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Apply d4 flips + random_roll to all tensors identically. Shared by both data paths."""
+        """Apply d4 flips to all tensors identically. Shared by both data paths."""
         if not tensors:
             return tensors
         if self.d4_augment:
@@ -310,19 +308,6 @@ class JEPADataset(Dataset):
                 tensors = tuple(torch.flip(t, dims=(-2,)) for t in tensors)
             if h != w and bool(self.rng.integers(0, 2)):
                 tensors = tuple(torch.flip(t, dims=(-1,)) for t in tensors)
-        if self.random_roll_max > 0:
-            h, w = tensors[0].shape[-2], tensors[0].shape[-1]
-            pad_val = int(min(self.random_roll_max, max(0, h - 1), max(0, w - 1)))
-            if pad_val <= 0:
-                return tensors
-            dy = int(self.rng.integers(-pad_val, pad_val + 1))
-            dx = int(self.rng.integers(-pad_val, pad_val + 1))
-            padded = tuple(
-                torch.nn.functional.pad(t, (pad_val, pad_val, pad_val, pad_val), mode='reflect')
-                for t in tensors
-            )
-            y0, x0 = pad_val - dy, pad_val - dx
-            tensors = tuple(p[..., y0:y0 + h, x0:x0 + w] for p in padded)
         return tensors
 
     def __len__(self):

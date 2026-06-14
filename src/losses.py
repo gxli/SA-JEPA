@@ -28,7 +28,7 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     extra_keys = set(cfg) - expected_keys
     assert not extra_keys, f"Unsupported train.spread_regularizer keys: {sorted(extra_keys)}"
     sigreg_type = str(cfg.get("type", "std_hinge"))
-    sigreg_target = str(cfg.get("target", "predictor"))
+    sigreg_target = str(cfg.get("target", "context"))
     sigreg_weight = float(cfg.get("weight", 0.0))
     assert sigreg_type in {"std_hinge", "weak_sigreg", "sketched_sigreg"}
     assert sigreg_target in {"context", "predictor", "both"}
@@ -157,15 +157,14 @@ def weak_sigreg_loss(
     target_std: float = 1.0,
     sketch_dim: int = 64,
     eps: float = 1e-4,
-    sketch_seed: int = 0,
 ) -> torch.Tensor:
-    """Sketched isotropic Gaussian regularization on context embeddings.
+    """Variance hinge plus an off-diagonal covariance penalty.
 
     Applies the variance hinge on the full embedding dimension for consistent
-    anti-collapse gradients, then uses a rotating sketch only for the cheaper
-    off-diagonal covariance penalty.
+    anti-collapse gradients. If ``sketch_dim`` is smaller than the channel
+    count, the covariance term uses a fresh random orthonormal projection as a
+    stochastic approximation; otherwise it uses the full embedding.
     """
-    del sketch_seed  # Kept as a config key for reproducibility metadata/backward compatibility.
     z = z.float()
     if z.numel() == 0 or z.shape[0] < 2:
         return torch.tensor(0.0, device=z.device, dtype=z.dtype)
@@ -195,9 +194,15 @@ def sketched_sigreg_loss(
     target_std: float = 1.0,
     sketch_dim: int = 64,
     eps: float = 1e-6,
-    sketch_seed: int = 0,
 ) -> torch.Tensor:
-    del sketch_seed  # Preserve config shape; projection is intentionally stochastic.
+    """Experimental sketched SIGReg variant kept for ablations.
+
+    This combines projected variance matching, the shared standard-deviation
+    hinge, and a correlation penalty. On low-dimensional continuous fields such
+    as MHD turbulence it can inflate apparent rank while producing weaker
+    predictor/target balance than ``weak_sigreg``; prefer ``weak_sigreg`` for
+    production sweeps.
+    """
     z = z.float()
     if z.numel() == 0 or z.shape[0] < 2:
         return z.sum() * 0.0
@@ -237,7 +242,6 @@ def compute_spread_regularizer_loss(z: torch.Tensor, cfg: dict[str, float | str]
             target_std=float(cfg.get("target_std", 1.0)),
             sketch_dim=int(cfg.get("sketch_dim", 64)),
             eps=float(cfg.get("eps", 1e-4)),
-            sketch_seed=int(cfg.get("sketch_seed", 0)),
         )
     if sigreg_type == "sketched_sigreg":
         return sketched_sigreg_loss(
@@ -245,7 +249,6 @@ def compute_spread_regularizer_loss(z: torch.Tensor, cfg: dict[str, float | str]
             target_std=float(cfg.get("target_std", 1.0)),
             sketch_dim=int(cfg.get("sketch_dim", 64)),
             eps=float(cfg.get("eps", 1e-6)),
-            sketch_seed=int(cfg.get("sketch_seed", 0)),
         )
     raise ValueError(f"Unsupported spread regularizer type: {sigreg_type}")
 
@@ -256,7 +259,7 @@ def compute_output_spread_regularizer_loss(
     *,
     include_predictor: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    target = str(cfg.get("target", "predictor"))
+    target = str(cfg.get("target", "context"))
     if include_predictor and target == "context":
         target = "both"
 

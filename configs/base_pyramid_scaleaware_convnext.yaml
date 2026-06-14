@@ -74,7 +74,7 @@ training:
   ema_momentum_final: 0.9999
   spread_regularizer:
     type: std_hinge
-    target: predictor
+    target: context
     weight: 2
     target_std: 1.0
     eps: 0.0001

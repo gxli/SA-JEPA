@@ -41,7 +41,7 @@ class SpreadRegularizerTests(unittest.TestCase):
         self.assertEqual(tuple(z_ctx.shape), (4, 4))
         self.assertGreater(float(context.grad.abs().sum().item()), 0.0)
 
-    def test_output_sigreg_defaults_to_predictor_not_context(self) -> None:
+    def test_output_sigreg_defaults_to_context_not_predictor(self) -> None:
         torch.manual_seed(0)
         context = (torch.randn(2, 3, 4, 5, 5) * 1e-3).requires_grad_()
         pred = (torch.randn(2, 3, 4, 5, 5) * 1e-3).requires_grad_()
@@ -55,8 +55,8 @@ class SpreadRegularizerTests(unittest.TestCase):
         loss.backward()
 
         self.assertEqual(tuple(z_ctx.shape), (4, 4))
-        self.assertIsNone(context.grad)
-        self.assertGreater(float(pred.grad.abs().sum().item()), 0.0)
+        self.assertGreater(float(context.grad.abs().sum().item()), 0.0)
+        self.assertIsNone(pred.grad)
 
     def test_output_sigreg_can_include_predictor_safety_term(self) -> None:
         torch.manual_seed(0)
@@ -200,7 +200,7 @@ class SpreadRegularizerTests(unittest.TestCase):
         cfg = {"type": "sketched_sigreg", "sketch_dim": 8, "eps": 1e-6, "sketch_seed": 123}
 
         torch.manual_seed(123)
-        direct = sketched_sigreg_loss(z, target_std=1.0, sketch_dim=8, eps=1e-6, sketch_seed=123)
+        direct = sketched_sigreg_loss(z, target_std=1.0, sketch_dim=8, eps=1e-6)
         torch.manual_seed(123)
         loss = compute_spread_regularizer_loss(z, cfg)
         loss.backward()
