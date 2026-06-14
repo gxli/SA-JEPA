@@ -59,6 +59,17 @@ def _offdiag(x: torch.Tensor) -> torch.Tensor:
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 
+def _std_hinge(z: torch.Tensor, target_std: float, eps: float = 1e-4) -> torch.Tensor:
+    z = z - z.mean(dim=0, keepdim=True)
+    std = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
+    return torch.relu(float(target_std) - std).mean()
+
+
+def _centered_std(z: torch.Tensor, eps: float) -> torch.Tensor:
+    z = z - z.mean(dim=0, keepdim=True)
+    return torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
+
+
 def _reshape_patch_pairs(
     pred: torch.Tensor,
     gt: torch.Tensor,
@@ -138,20 +149,7 @@ def spread_regularizer_loss(
     if z.numel() == 0 or z.shape[0] < 2:
         return torch.tensor(0.0, device=z.device, dtype=z.dtype)
 
-    n = z.shape[0]
-    z = z - z.mean(dim=0, keepdim=True)
-    # Escape jitter: tiny noise prevents zero-gradient trap at perfect collapse.
-    escape_jitter = max(float(eps) ** 0.5, 1e-3)
-    z_escape = z + escape_jitter * torch.randn_like(z)
-    std = torch.sqrt(z_escape.var(dim=0, unbiased=False) + float(eps))
-    loss = torch.relu(float(target_std) - std).mean()
-
-    effective_n = 256.0
-    if n > effective_n:
-        grad_scale = float(n) / effective_n
-        loss = loss * grad_scale - loss.detach() * (grad_scale - 1.0)
-
-    return loss
+    return _std_hinge(z, float(target_std), float(eps))
 
 
 def weak_sigreg_loss(
@@ -175,11 +173,7 @@ def weak_sigreg_loss(
     n, c = z.shape
     z = z - z.mean(dim=0, keepdim=True)
 
-    # Escape jitter: tiny noise prevents zero-gradient trap at perfect collapse.
-    escape_jitter = max(float(eps) ** 0.5, 1e-3)
-    z_escape = z + escape_jitter * torch.randn_like(z)
-    std_full = torch.sqrt(z_escape.var(dim=0, unbiased=False) + float(eps))
-    var_loss = torch.relu(float(target_std) - std_full).mean()
+    var_loss = _std_hinge(z, float(target_std), float(eps))
 
     k = min(int(sketch_dim), int(c))
     if c > k:
@@ -191,15 +185,9 @@ def weak_sigreg_loss(
 
     cov = (z_proj.t() @ z_proj) / (float(n - 1) + float(eps))
     cov = cov - torch.diag(cov.diag())
-    cov_loss = cov.pow(2).sum() / float(k)
-    loss = var_loss + cov_loss
-
-    effective_n = 256.0
-    if n > effective_n:
-        grad_scale = float(n) / effective_n
-        loss = loss * grad_scale - loss.detach() * (grad_scale - 1.0)
-
-    return loss
+    num_offdiag = max(1.0, float(k * (k - 1)))
+    cov_loss = cov.pow(2).sum() / num_offdiag
+    return var_loss + cov_loss
 
 
 def sketched_sigreg_loss(
@@ -222,20 +210,9 @@ def sketched_sigreg_loss(
     y = z @ a
     projected_var_loss = (y.var(dim=0, unbiased=False) - float(target_std) ** 2).pow(2).mean()
 
-    # The historical projected variance loss has zero gradient at exact
-    # collapse because d(var(z @ A))/dz is proportional to z. Keep the old
-    # isotropic pressure, but add a direct std hinge so near-zero embeddings
-    # have an escape gradient instead of sitting at loss ~= 1 forever.
-    # If all target embeddings are exactly identical, std(z) is high-loss but
-    # zero-gradient. Add tiny loss-local jitter so collapsed dimensions get a
-    # deterministic escape direction through the std hinge; the jitter is not
-    # applied to the model outputs or diagnostics.
-    escape_jitter = max(float(eps) ** 0.5, 1e-3)
-    z_escape = z + escape_jitter * torch.randn_like(z)
-    std_full = torch.sqrt(z_escape.var(dim=0, unbiased=False) + float(eps))
-    escape_loss = torch.relu(float(target_std) - std_full).mean()
+    escape_loss = _std_hinge(z, float(target_std), float(eps))
 
-    std_corr = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
+    std_corr = _centered_std(z, float(eps))
     z_corr = z / std_corr.clamp_min(float(eps)).unsqueeze(0)
     corr = (z_corr.t() @ z_corr) / float(max(1, z.shape[0] - 1))
     corr = corr - torch.diag(corr.diag())
@@ -363,20 +340,18 @@ def _compute_sim_var_cov_tensors(
         z = sim * 0.0
         return sim, z, z
 
-    # Escape jitter: tiny noise prevents zero-gradient trap at perfect collapse.
-    escape_jitter = 1e-2
-    z_ctx_esc = z_ctx + escape_jitter * torch.randn_like(z_ctx)
-    z_gt_esc = z_gt + escape_jitter * torch.randn_like(z_gt)
-    std_ctx = torch.sqrt(z_ctx_esc.var(dim=0, unbiased=False) + 1e-4)
-    std_gt = torch.sqrt(z_gt_esc.var(dim=0, unbiased=False) + 1e-4)
-    var_term = 0.5 * (torch.relu(1.0 - std_ctx).mean() + torch.relu(1.0 - std_gt).mean())
+    var_term = 0.5 * (_std_hinge(z_ctx, 1.0, 1e-4) + _std_hinge(z_gt, 1.0, 1e-4))
 
     z1c = z_ctx - z_ctx.mean(dim=0, keepdim=True)
     z2c = z_gt - z_gt.mean(dim=0, keepdim=True)
     cov_z1 = (z1c.T @ z1c) / max(1, z1c.shape[0] - 1)
     cov_z2 = (z2c.T @ z2c) / max(1, z2c.shape[0] - 1)
     dim = max(1, int(cov_z1.shape[0]))
-    cov_term = 0.5 * ((_offdiag(cov_z1).pow(2).sum() / dim) + (_offdiag(cov_z2).pow(2).sum() / dim))
+    num_offdiag = max(1.0, float(dim * (dim - 1)))
+    cov_term = 0.5 * (
+        (_offdiag(cov_z1).pow(2).sum() / num_offdiag)
+        + (_offdiag(cov_z2).pow(2).sum() / num_offdiag)
+    )
     return sim, var_term, cov_term
 
 

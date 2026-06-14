@@ -68,6 +68,10 @@ class PrintEffectiveRankTests(unittest.TestCase):
             try:
                 with contextlib.redirect_stdout(out):
                     self.assertEqual(module.main(), 0)
+                rows_by_name = {
+                    row[0]: row
+                    for row in module.rank_summary([str(root / "run_a"), str(root / "run_b")])
+                }
             finally:
                 sys.argv = old_argv
 
@@ -77,7 +81,7 @@ class PrintEffectiveRankTests(unittest.TestCase):
 
         self.assertIn("   1.2500  0.5000  0.5000  0.2000", run_a)
         self.assertIn("   9.5000  4.0000  3.0000  2.0000", run_b)
-        self.assertNotEqual(run_a.split()[13:17], run_b.split()[13:17])
+        self.assertNotEqual(rows_by_name["run_a"][17:21], rows_by_name["run_b"][17:21])
 
     def test_api_rank_summary_columns_match_script_rows(self) -> None:
         from src.api import ScaleAwareJEPA

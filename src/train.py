@@ -1598,9 +1598,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         "loss_prediction",
         "lr",
         "loss_spread",
+        "loss_vicreg_var",
+        "loss_vicreg_cov",
         "loss_symmetry",
         "weighted_prediction",
         "weighted_spread",
+        "weighted_vicreg_var",
+        "weighted_vicreg_cov",
         "weighted_symmetry",
         "ema_momentum",
         "sim",
@@ -1837,9 +1841,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     float(loss_prediction.item()),
                     float(current_lr),
                     float(loss_spread.item()),
+                    float(var_term_t.item()),
+                    float(cov_term_t.item()),
                     float(loss_symmetry.item()),
                     float((prediction_loss_weight * loss_prediction).item()),
                     float((spread_regularizer_weight * loss_spread).item()),
+                    float((vicreg_var_weight * var_term_t).item()),
+                    float((vicreg_cov_weight * cov_term_t).item()),
                     float((symmetry_loss_weight * loss_symmetry).item()),
                     float(new_momentum),
                     float(sim_val),
@@ -1916,7 +1924,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"L={log_loss_val:.4f} "
                 f"MSE(pred,gt)={loss_prediction.item():.4f} "
                 f"E={energy_val:.4f} "
-                f"sig=relu(1.0-std)={loss_spread.item():.4f} "
+                f"reg={loss_spread.item():.4f} "
                 f"cos(pred,gt)={sim_val:.4f} "
                 f"std(ch)={ctx_stats['embed_spread_mean']:.3f} "
                 f"rank=exp(H(p))={ctx_stats['context_manifold_size']:.2f} "
@@ -1995,7 +2003,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 prev_str = f" [{prev_str}]"
             tqdm.write(
                 f"[{config_name}] E {epoch + 1}/{epochs} "
-                f"L={avg_total:.4f} mse={avg_prediction:.4f} sig={_fmt_metric(epoch_spread/epoch_batches)} "
+                f"L={avg_total:.4f} mse={avg_prediction:.4f} reg={_fmt_metric(epoch_spread/epoch_batches)} "
                 f"cos={_fmt_metric(epoch_sim/epoch_batches)} "
                 f"std={_fmt_metric(epoch_embed_spread_mean/epoch_batches)} "
                 f"rank={_fmt_metric(epoch_context_manifold_size/epoch_batches)} "

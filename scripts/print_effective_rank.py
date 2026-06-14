@@ -61,6 +61,8 @@ def _read_model_inputs(session_dir: str) -> dict:
             "sigtype": str(spread.get("type", "NA")),
             "spread_w": str(spread.get("weight", t.get("sigreg_weight", "NA"))),
             "spread_t": str(spread.get("target_std", "NA")),
+            "vicvar_w": str(t.get("vicreg_var_weight", t.get("experimental_losses", {}).get("vicreg_var_weight", "0"))),
+            "viccov_w": str(t.get("vicreg_cov_weight", t.get("experimental_losses", {}).get("vicreg_cov_weight", "0"))),
             "symw": str(t.get("symmetry_loss_weight", t.get("symmetric_feature_loss_weight", "NA"))),
             "depth": str(m.get("encoder_depth", "NA")),
             "dilations": _fmt_cfg_value(m.get("dilations", "None")),
@@ -77,8 +79,8 @@ def _fmt_bool(value) -> str:
 
 def _missing_model_inputs() -> dict:
     return {k: "NA" for k in (
-        "mode", "ms", "mbox", "sampling", "l2", "psn", "fin", "sigtype", "spread_w", "spread_t", "symw", "depth",
-        "dilations", "hardcap", "pred_hidden",
+        "mode", "ms", "mbox", "sampling", "l2", "psn", "fin", "sigtype", "spread_w", "spread_t",
+        "vicvar_w", "viccov_w", "symw", "depth", "dilations", "hardcap", "pred_hidden",
     )}
 
 
@@ -112,7 +114,15 @@ def _read_loss_ratios(session_dir: str) -> dict[str, str]:
     try:
         epoch_sums: dict[str, dict[int, float]] = {}
         epoch_counts: dict[str, dict[int, int]] = {}
-        keys = ["sim", "loss_spread", "weighted_spread"]
+        keys = [
+            "sim",
+            "loss_spread",
+            "weighted_spread",
+            "loss_vicreg_var",
+            "loss_vicreg_cov",
+            "weighted_vicreg_var",
+            "weighted_vicreg_cov",
+        ]
         with open(path, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 ep = int(row.get("epoch", -1))
@@ -177,8 +187,8 @@ def _fmt_float(v: str, width: int = 8, digits: int = 4) -> str:
 
 def rank_summary(session_dirs: List[str], prefix: str = "") -> List[Tuple[str, ...]]:
     """Return list of (name, mode, ms, mbox, sampling, l2, psn, fin,
-    sigtype, sigw, sigt, symw, depth, dilations, hardcap, energy,
-    sim_r, hinge_r, sig_r, erank, context, predictor, target, top1,
+    sigtype, sigw, sigt, vicvar_w, viccov_w, symw, depth, dilations, hardcap, energy,
+    sim_r, hinge_r, sig_r, vicv_r, vicc_r, wvicv_r, wvicc_r, erank, context, predictor, target, top1,
     pred_part, target_part, part_ratio, dead_frac, dead_ch) tuples.
 
     Usage:
@@ -209,6 +219,10 @@ def rank_summary(session_dirs: List[str], prefix: str = "") -> List[Tuple[str, .
         sim_r = _fmt_float(ratios.get("sim", ""), 7, 4)
         hinge_r = _fmt_float(ratios.get("loss_spread", ""), 7, 4)
         sig_r = _fmt_float(ratios.get("weighted_spread", ""), 7, 4)
+        vicv_r = _fmt_float(ratios.get("loss_vicreg_var", ""), 7, 4)
+        vicc_r = _fmt_float(ratios.get("loss_vicreg_cov", ""), 7, 4)
+        wvicv_r = _fmt_float(ratios.get("weighted_vicreg_var", ""), 7, 4)
+        wvicc_r = _fmt_float(ratios.get("weighted_vicreg_cov", ""), 7, 4)
         p_dead = _diag_get(diag, "pred", "dead_channel_fraction")
         p_dead_n = diag.get("pred", {}).get("dead_channel_count", diag.get("pred", {}).get("num_dead_channels", 0))
         try:
@@ -220,9 +234,10 @@ def rank_summary(session_dirs: List[str], prefix: str = "") -> List[Tuple[str, .
              inputs.get("mode", "NA"), inputs.get("ms", "NA"), inputs.get("mbox", "NA"), inputs.get("sampling", "NA"),
              inputs.get("l2", "NA"), inputs.get("psn", "NA"), inputs.get("fin", "NA"),
              inputs.get("sigtype", "NA"), inputs.get("spread_w", "NA"), inputs.get("spread_t", "NA"),
+             inputs.get("vicvar_w", "NA"), inputs.get("viccov_w", "NA"),
              inputs.get("symw", "NA"), inputs.get("depth", "NA"),
              inputs.get("dilations", "NA"), inputs.get("hardcap", "NA"),
-             energy, sim_r, hinge_r, sig_r,
+             energy, sim_r, hinge_r, sig_r, vicv_r, vicc_r, wvicv_r, wvicc_r,
              rank, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_str))
     return sorted(rows, key=lambda x: x[0])
 
@@ -237,20 +252,25 @@ def print_rank_table(session_dirs: List[str], prefix: str = "") -> None:
     session_w = max(len("session"), *(len(row[0]) for row in rows))
     header = (
         f"{'session':<{session_w}} {'mode':<9} {'sampling':<9} {'mask_scale':>12} {'mask_box':>9} "
-        f"{'l2_norm':>7} {'psnorm':>6} {'final_norm':>10} {'sig_type':>14} {'sig_w':>7} {'sig_t':>6} {'sym_loss':>9} {'depth':>6} {'dil':>10} {'hardcap':>7} "
+        f"{'l2_norm':>7} {'psnorm':>6} {'final_norm':>10} {'sig_type':>14} {'sig_w':>7} {'sig_t':>6} "
+        f"{'vicvar_w':>8} {'viccov_w':>8} {'sym_loss':>9} {'depth':>6} {'dil':>10} {'hardcap':>7} "
         f"{'energy':>9} {'sim_r':>7} {'hinge_r':>7} {'sig_r':>7} "
+        f"{'vicv_r':>7} {'vicc_r':>7} {'wvv_r':>7} {'wvc_r':>7} "
         f"{'erank':>8} {'context':>9} {'predictor':>10} {'target':>9} "
         f"{'top1':>7} {'pred_part':>10} {'target_part':>11} {'part_ratio':>10} {'dead_frac':>10} {'dead_ch':>7}"
     )
     print(header)
     print("-" * len(header))
     for row in rows:
-        (s, mode, ms, mbox, sampling, l2, psn, fin, sigtype, sigw, sigt, symw, d, dil, hc,
-         energy, sim_r, hinge_r, sig_r, rk, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_n) = row
+        (s, mode, ms, mbox, sampling, l2, psn, fin, sigtype, sigw, sigt, vicvar_w, viccov_w, symw, d, dil, hc,
+         energy, sim_r, hinge_r, sig_r, vicv_r, vicc_r, wvicv_r, wvicc_r,
+         rk, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_n) = row
         print(
             f"{s:<{session_w}} {mode:<9} {sampling:<9} {ms:>12} {mbox:>9} "
-            f"{l2:>7} {psn:>6} {fin:>10} {sigtype:>14} {_fmt_float(sigw,7,2)} {_fmt_float(sigt,6,2)} {_fmt_float(symw,9,4)} {d:>6} {dil:>10} {hc:>7} "
+            f"{l2:>7} {psn:>6} {fin:>10} {sigtype:>14} {_fmt_float(sigw,7,2)} {_fmt_float(sigt,6,2)} "
+            f"{_fmt_float(vicvar_w,8,2)} {_fmt_float(viccov_w,8,2)} {_fmt_float(symw,9,4)} {d:>6} {dil:>10} {hc:>7} "
             f"{energy:>9} {sim_r:>7} {hinge_r:>7} {sig_r:>7} "
+            f"{vicv_r:>7} {vicc_r:>7} {wvicv_r:>7} {wvicc_r:>7} "
             f"{_fmt_float(rk,8,4)} {_fmt_float(c_er,9,4)} {_fmt_float(p_er,10,4)} {_fmt_float(g_er,9,4)} "
             f"{_fmt_float(p_t1,7,3)} {_fmt_float(p_pr,10,2)} {_fmt_float(g_pr,11,2)} {_fmt_float(pr_match,10,4)} "
             f"{_fmt_float(p_dead,10,3)} {p_dead_n:>7}"
