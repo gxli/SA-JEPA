@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import sys
 import copy
@@ -30,6 +31,7 @@ def parse_args():
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
     config = load_config(args.config)
     config_name = os.path.splitext(os.path.basename(args.config))[0]

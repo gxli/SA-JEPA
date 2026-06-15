@@ -43,7 +43,7 @@
     "ema_momentum_base": 0.99,
     "ema_momentum_final": 0.9999,
     "ema_warmup_fraction": 0.25,
-    "mse_loss_weight": 50,
+    "prediction_loss_weight": 50,
     "vicreg_var_weight": 0,
     "vicreg_cov_weight": 0,
     "spread_regularizer": {
@@ -53,7 +53,7 @@
       "target_std": 1.0,
       "eps": 0.0001
     },
-    "symmetric_feature_loss_weight": 0.003,
+    "symmetry_loss_weight": 0.003,
     "compute_effective_rank": true,
     "scale_probe_enabled": true,
     "inference_tta_enabled": true,

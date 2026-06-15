@@ -26,7 +26,7 @@ class SpreadRegularizerTests(unittest.TestCase):
 
         self.assertEqual(tuple(z.shape), (4 * 5 * 5, 4))
 
-    def test_output_sigreg_uses_pooled_semantic_targets(self) -> None:
+    def test_output_sigreg_defaults_to_dense_spatial_tokens(self) -> None:
         torch.manual_seed(0)
         context = torch.randn(2, 3, 4, 5, 5).requires_grad_()
         valid = torch.tensor([[True, False, True], [False, True, True]])
@@ -35,6 +35,21 @@ class SpreadRegularizerTests(unittest.TestCase):
         loss, z_ctx = compute_output_spread_regularizer_loss(
             outputs,
             {"type": "std_hinge", "target": "context", "target_std": 1.0, "eps": 1e-4},
+        )
+        loss.backward()
+
+        self.assertEqual(tuple(z_ctx.shape), (4 * 5 * 5, 4))
+        self.assertGreater(float(context.grad.abs().sum().item()), 0.0)
+
+    def test_output_sigreg_can_use_pooled_patch_tokens(self) -> None:
+        torch.manual_seed(0)
+        context = torch.randn(2, 3, 4, 5, 5).requires_grad_()
+        valid = torch.tensor([[True, False, True], [False, True, True]])
+        outputs = {"context_patches": context, "target_valid": valid}
+
+        loss, z_ctx = compute_output_spread_regularizer_loss(
+            outputs,
+            {"type": "std_hinge", "target": "context", "target_std": 1.0, "eps": 1e-4, "spatial_mode": "pooled"},
         )
         loss.backward()
 
@@ -54,7 +69,7 @@ class SpreadRegularizerTests(unittest.TestCase):
         )
         loss.backward()
 
-        self.assertEqual(tuple(z_ctx.shape), (4, 4))
+        self.assertEqual(tuple(z_ctx.shape), (4 * 5 * 5, 4))
         self.assertGreater(float(context.grad.abs().sum().item()), 0.0)
         self.assertIsNone(pred.grad)
 
@@ -88,7 +103,7 @@ class SpreadRegularizerTests(unittest.TestCase):
         )
         loss.backward()
 
-        self.assertEqual(tuple(z_spread.shape), (4, 4))
+        self.assertEqual(tuple(z_spread.shape), (4 * 5 * 5, 4))
         self.assertIsNone(context.grad)
         self.assertGreater(float(pred.grad.abs().sum().item()), 0.0)
 
@@ -186,7 +201,7 @@ class SpreadRegularizerTests(unittest.TestCase):
     def test_weak_sigreg_dispatch(self) -> None:
         torch.manual_seed(0)
         z = torch.randn(128, 32).requires_grad_()
-        cfg = {"type": "weak_sigreg", "target_std": 1.0, "sketch_dim": 8, "eps": 1e-4, "sketch_seed": 123}
+        cfg = {"type": "weak_sigreg", "target_std": 1.0, "sketch_dim": 8, "eps": 1e-4}
 
         loss = compute_spread_regularizer_loss(z, cfg)
         loss.backward()
@@ -197,7 +212,7 @@ class SpreadRegularizerTests(unittest.TestCase):
     def test_sketched_sigreg_legacy_dispatch(self) -> None:
         torch.manual_seed(0)
         z = torch.randn(128, 32).requires_grad_()
-        cfg = {"type": "sketched_sigreg", "sketch_dim": 8, "eps": 1e-6, "sketch_seed": 123}
+        cfg = {"type": "sketched_sigreg", "sketch_dim": 8, "eps": 1e-6}
 
         torch.manual_seed(123)
         direct = sketched_sigreg_loss(z, target_std=1.0, sketch_dim=8, eps=1e-6)
@@ -263,6 +278,7 @@ class SpreadRegularizerTests(unittest.TestCase):
         self.assertEqual(cfg["type"], "std_hinge")
         self.assertEqual(cfg["target"], "context")
         self.assertEqual(cfg["weight"], 2.0)
+        self.assertEqual(cfg["spatial_mode"], "dense")
 
     def test_weak_sigreg_schema_is_explicit(self) -> None:
         cfg = parse_spread_regularizer_config(
@@ -272,7 +288,6 @@ class SpreadRegularizerTests(unittest.TestCase):
                     "target": "context",
                     "weight": 0.5,
                     "sketch_dim": 64,
-                    "sketch_seed": 123,
                     "eps": 1e-6,
                 }
             }
@@ -282,7 +297,6 @@ class SpreadRegularizerTests(unittest.TestCase):
         self.assertEqual(cfg["target"], "context")
         self.assertEqual(cfg["weight"], 0.5)
         self.assertEqual(cfg["sketch_dim"], 64)
-        self.assertEqual(cfg["sketch_seed"], 123)
 
     def test_spread_regularizer_schema_accepts_predictor_target(self) -> None:
         cfg = parse_spread_regularizer_config(
@@ -306,8 +320,8 @@ class SpreadRegularizerTests(unittest.TestCase):
             {"type": "other", "target": "context", "weight": 2},
             {"type": "std_hinge", "target": "target", "weight": 2},
             {"type": "std_hinge", "target": "context", "weight": -1},
+            {"type": "std_hinge", "target": "context", "weight": 2, "spatial_mode": "tokens"},
             {"type": "weak_sigreg", "target": "context", "weight": 0.5, "sketch_dim": 0},
-            {"type": "weak_sigreg", "target": "context", "weight": 0.5, "sketch_seed": -1},
         )
         for block in invalid_blocks:
             with self.subTest(block=block), self.assertRaises(AssertionError):

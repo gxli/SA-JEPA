@@ -24,31 +24,31 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     stale_keys = removed_flat_keys & set(train_cfg)
     assert not stale_keys, f"Use train.spread_regularizer instead of flat keys: {sorted(stale_keys)}"
     cfg = dict(train_cfg.get("spread_regularizer", {}))
-    expected_keys = {"type", "target", "weight", "target_std", "eps", "sketch_dim", "sketch_seed"}
+    expected_keys = {"type", "target", "weight", "target_std", "eps", "sketch_dim", "spatial_mode"}
     extra_keys = set(cfg) - expected_keys
     assert not extra_keys, f"Unsupported train.spread_regularizer keys: {sorted(extra_keys)}"
     sigreg_type = str(cfg.get("type", "std_hinge"))
     sigreg_target = str(cfg.get("target", "context"))
-    sigreg_weight = float(cfg.get("weight", 0.0))
+    spread_weight = float(cfg.get("weight", 0.0))
     assert sigreg_type in {"std_hinge", "weak_sigreg", "sketched_sigreg"}
     assert sigreg_target in {"context", "predictor", "both"}
-    assert sigreg_weight >= 0
+    assert spread_weight >= 0
     target_std = float(cfg.get("target_std", 1.0))
     eps = float(cfg.get("eps", 1e-4))
     sketch_dim = int(cfg.get("sketch_dim", 64))
-    sketch_seed = int(cfg.get("sketch_seed", 0))
+    spatial_mode = str(cfg.get("spatial_mode", "dense"))
     assert target_std >= 0
     assert eps > 0
     assert sketch_dim > 0
-    assert sketch_seed >= 0
+    assert spatial_mode in {"pooled", "dense"}
     return {
         "type": sigreg_type,
         "target": sigreg_target,
-        "weight": sigreg_weight,
+        "weight": spread_weight,
         "target_std": target_std,
         "eps": eps,
         "sketch_dim": sketch_dim,
-        "sketch_seed": sketch_seed,
+        "spatial_mode": spatial_mode,
     }
 
 
@@ -268,15 +268,23 @@ def compute_output_spread_regularizer_loss(
     if target in {"predictor", "both"} and "pred_patches" not in outputs:
         raise KeyError("SIGReg target='predictor' requires outputs['pred_patches']")
 
+    spatial_mode = str(cfg.get("spatial_mode", "dense"))
+    if spatial_mode == "dense":
+        extract = extract_valid_dense_embeddings
+    elif spatial_mode == "pooled":
+        extract = extract_valid_pooled_embeddings
+    else:
+        raise ValueError(f"Unsupported SIGReg spatial_mode={spatial_mode!r}")
+
     loss = None
     z_primary = None
     if target in {"context", "both"}:
-        z_ctx = extract_valid_pooled_embeddings(outputs, key="context_patches")
+        z_ctx = extract(outputs, key="context_patches")
         loss_ctx = compute_spread_regularizer_loss(z_ctx, cfg)
         loss = loss_ctx if loss is None else loss + loss_ctx
         z_primary = z_ctx
     if target in {"predictor", "both"}:
-        z_pred = extract_valid_pooled_embeddings(outputs, key="pred_patches")
+        z_pred = extract(outputs, key="pred_patches")
         loss_pred = compute_spread_regularizer_loss(z_pred, cfg)
         loss = loss_pred if loss is None else loss + loss_pred
         z_primary = z_pred if target == "predictor" else z_primary

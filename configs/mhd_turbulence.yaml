@@ -18,7 +18,6 @@ data:
   crop_mode: "none"
 
   # Data Augmentation (D4 = Dihedral group; preserves physical isotropy via rotations/flips)
-  random_roll_max: 0
   d4_augment: true
 
 # ------------------------------------------------------------------------------
@@ -83,8 +82,8 @@ training:
   lr: 0.0001
   weight_decay: 1e-05
   num_workers: 4
+  prediction_loss_weight: 50
   symmetry_loss_weight: 0
-  normalize_loss_l2: false
 
   # Target Network Exponential Moving Average (EMA) Scheduling
   ema_momentum: 0.996
@@ -98,7 +97,7 @@ training:
   # Variance-Based Non-Collapse Constraint (Crucial for Energy-Based JEPAs)
   spread_regularizer:
     type: "std_hinge"
-    target: "predictor"
+    target: "context"
     weight: 2
     target_std: 1.0
     eps: 0.0001

@@ -10,7 +10,6 @@ data:
   cube_slice_axis: 0
   cube_slice_index: 0
   crop_mode: none
-  random_roll_max: 0
   d4_augment: true
 cdd_scale_space:
   cdd_mode: log
@@ -75,10 +74,11 @@ training:
   spread_regularizer:
     type: std_hinge
     target: context
+    spatial_mode: dense
     weight: 2
     target_std: 1.0
     eps: 0.0001
-  mse_loss_weight: 50
+  prediction_loss_weight: 50
   vicreg_spatial_mode: pooled
   scale_probe_enabled: true
   inference_tta_enabled: true

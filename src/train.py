@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
 
 from tqdm import tqdm
@@ -41,6 +42,13 @@ from src.models.masking import prepare_context_batch
 from src.utils import log_error, set_error_log_path
 from src.utils.npy import _safe_load_npy
 from src.utils.viz import save_inference_dashboard, save_volumetric_umap_embeddings
+
+LOGGER = logging.getLogger(__name__)
+
+
+def log_info(*parts: object) -> None:
+    LOGGER.info(" ".join(str(part) for part in parts))
+
 
 def _fmt_metric(v: float) -> str:
     x = float(v)
@@ -161,7 +169,7 @@ def _write_data_profile(*, data_cfg: dict, session_dir: str, config_name: str) -
             item.update(_summarize_data_array(_safe_load_npy(path, mmap_mode="r")))
         profile["files"].append(item)
         shape_str = f"shape={tuple(item.get('shape', '?'))}" if 'shape' in item else ""
-        print(
+        log_info(
             f"[{config_name}] Data profile: path={path} {shape_str} "
             f"nan={item.get('nan_count', '?')} normalized_zero_fraction={item.get('normalized_zero_fraction', -1):.4f} "
             f"aspect_h_over_w={item.get('aspect_ratio_h_over_w', -1)}"
@@ -189,7 +197,7 @@ def _write_cdd_cache_profile(*, cdd_cache: dict | None, session_dir: str, config
             "max": float(arr[finite].max()) if finite.any() else None,
         }
         entries.append(item)
-        print(
+        log_info(
             f"[{config_name}] CDD cache profile: path={path} shape={tuple(item['shape'])} "
             f"nan={item['nan_count']} zero_fraction={item['zero_fraction']:.4f} max={item['max']}"
         )
@@ -222,11 +230,11 @@ def _precompute_cdd_cache(
         raise RuntimeError(f"[{config_name}] CDD precompute requires CUDA or MPS. Got device={device.type}.")
     npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
     if not npy_files:
-        print(f"[{config_name}] CDD precompute: no files found for pattern, skipping")
+        log_info(f"[{config_name}] CDD precompute: no files found for pattern, skipping")
         return {}
     enabled = bool(data_cfg.get("cdd_precompute", True))
     if not enabled:
-        print(f"[{config_name}] CDD precompute: disabled by data.cdd_precompute=false")
+        log_info(f"[{config_name}] CDD precompute: disabled by data.cdd_precompute=false")
         return {}
     max_files = int(data_cfg.get("cdd_precompute_max_files", 4096))
     if max_files > 0 and len(npy_files) > max_files:
@@ -253,7 +261,7 @@ def _precompute_cdd_cache(
                 f"data.cdd_precompute_max_gb={max_gb:.2f}. Bump the limit, reduce dataset size, "
                 "or disable RAM precompute for DDP."
             )
-    print(f"[{config_name}] CDD precompute: {len(npy_files)} file(s) on GPU...")
+    log_info(f"[{config_name}] CDD precompute: {len(npy_files)} file(s) on GPU...")
     cache = {}
     for path in npy_files:
         if path.endswith(".fits"):
@@ -310,7 +318,7 @@ def _precompute_cdd_cache(
     # Free GPU memory used by CDD.
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    print(f"[{config_name}] CDD precompute: {len(cache)} entries cached, GPU freed")
+    log_info(f"[{config_name}] CDD precompute: {len(cache)} entries cached, GPU freed")
     return cache
 
 
@@ -790,7 +798,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         priority_dithering_pixels=int(model_cfg.get("priority_dithering_pixels", model_cfg.get("target_dithering_pixels", 6))),
         priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False))
-        and float(train_cfg.get("symmetry_loss_weight", train_cfg.get("symmetric_feature_loss_weight", 0.0))) > 0.0,
+        and float(train_cfg.get("symmetry_loss_weight", 0.0)) > 0.0,
         target_nonoverlap=bool(model_cfg.get("target_nonoverlap", True)),
         target_allow_partial_overlap=float(model_cfg.get("target_allow_partial_overlap", 0.0)),
         mask_box_hardcap=model_cfg.get("mask_box_hardcap"),
@@ -847,7 +855,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         num_mask_boxes=int(model_cfg.get("num_mask_boxes", 8)),
         slab_depth=int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False))
-        and float(train_cfg.get("symmetry_loss_weight", train_cfg.get("symmetric_feature_loss_weight", 0.0))) > 0.0,
+        and float(train_cfg.get("symmetry_loss_weight", 0.0)) > 0.0,
         use_film=bool(model_cfg.get("use_film", True)),
         use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
         priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
@@ -953,7 +961,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     cdd_cache_replicas = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1"))) if is_ddp else 1
 
     if is_main_process:
-        print(
+        log_info(
             f"[{config_name}] Backend discovered: device={device.type}, "
             f"cuda_available={torch.cuda.is_available()}, "
             f"mps_available={device.type == 'mps'}, "
@@ -969,7 +977,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     if is_ddp and bool(data_cfg.get("cdd_precompute", True)):
         data_cfg["cdd_precompute"] = False
         if is_main_process:
-            print(f"[{config_name}] DDP detected: disabling in-process CDD RAM precompute")
+            log_info(f"[{config_name}] DDP detected: disabling in-process CDD RAM precompute")
     seed = int(train_cfg.get("seed", train_cfg.get("split_seed", 42)))
     rank_seed = seed + int(global_rank)
     random.seed(rank_seed)
@@ -978,7 +986,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(rank_seed)
     if is_main_process:
-        print(f"[{config_name}] global_seed={seed} rank_seed={rank_seed}")
+        log_info(f"[{config_name}] global_seed={seed} rank_seed={rank_seed}")
     is_3d_mode = _is_3d_jepa_mode(model_cfg.get("mode", "image"))
     is_3d_full_volume_mode = _is_3d_full_volume_mode(model_cfg.get("mode", "image"))
 
@@ -995,9 +1003,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 config=config,
                 dir=os.path.join(sessions_root, "wandb"),
             )
-            print(f"[{config_name}] wandb initialized project={train_cfg.get('wandb_project', 'jepa-training')}")
+            log_info(f"[{config_name}] wandb initialized project={train_cfg.get('wandb_project', 'jepa-training')}")
         except ImportError:
-            print(f"[{config_name}] wandb not installed; pip install wandb to enable")
+            log_info(f"[{config_name}] wandb not installed; pip install wandb to enable")
 
     session_dir = make_session_dir(sessions_root, config_name)
     set_error_log_path(os.path.join(session_dir, "errors.log"))
@@ -1032,7 +1040,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         _write_data_profile(data_cfg=data_cfg, session_dir=session_dir, config_name=config_name)
 
     if is_main_process:
-        print(
+        log_info(
             f"[{config_name}] Resolved pipeline: "
             "dataset_preprocess=normalize01, "
             f"model.post_log_transform={model_cfg.get('post_log_transform', True)}, "
@@ -1090,7 +1098,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         "Checkpoint model-state load failed. "
                         "Set train.allow_partial_resume=true only if this architecture change is intentional."
                     ) from e
-                print(
+                log_info(
                     f"[{config_name}] warning: resume checkpoint model-state load failed; "
                     "skipping checkpoint and starting fresh model/optimizer/scaler."
                 )
@@ -1104,11 +1112,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 model_without_ddp = model
                 model = _ddp_wrap(model)
                 missing, unexpected = [], []
-            print(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
+            log_info(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
             if missing:
-                print(f"[{config_name}] resume_model missing_keys={len(missing)} keys: {missing[:10]}")
+                log_info(f"[{config_name}] resume_model missing_keys={len(missing)} keys: {missing[:10]}")
             if unexpected:
-                print(f"[{config_name}] resume_model unexpected_keys={len(unexpected)} keys: {unexpected[:10]}")
+                log_info(f"[{config_name}] resume_model unexpected_keys={len(unexpected)} keys: {unexpected[:10]}")
             if missing or unexpected:
                 error_msg = (
                     f"CRITICAL: Checkpoint architecture mismatch!\n"
@@ -1117,16 +1125,16 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 )
                 if not allow_partial_resume:
                     raise RuntimeError(error_msg + "\nSet train.allow_partial_resume=true if intentional.")
-                print("=" * 60)
-                print(f"[WARNING] {error_msg}")
-                print("[WARNING] Proceeding anyway due to allow_partial_resume=True")
-                print("=" * 60)
+                log_info("=" * 60)
+                log_info(f"[WARNING] {error_msg}")
+                log_info("[WARNING] Proceeding anyway due to allow_partial_resume=True")
+                log_info("=" * 60)
                 if resume_mismatch_action == "error":
                     raise RuntimeError(
                         "Checkpoint model-state mismatch detected and allow_partial_resume=False. "
                         "Set train.allow_partial_resume=true to permit partial model resume."
                     )
-                print(
+                log_info(
                     f"[{config_name}] Warning: checkpoint model-state mismatch; "
                     "skipping resume checkpoint and starting fresh model/optimizer/scaler."
                 )
@@ -1138,10 +1146,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
                 )
                 model = _ddp_wrap(model)
-                print(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
+                log_info(f"[{config_name}] resume_checkpoint_ignored={resume_ckpt_path}")
         if resume_state is not None:
             start_epoch = int(resume_state.get("epoch", 0))
-            print(f"resume_checkpoint={resume_ckpt_path} start_epoch={start_epoch}")
+            log_info(f"resume_checkpoint={resume_ckpt_path} start_epoch={start_epoch}")
     elif resume_from_existing:
         resume_model_ignored = False
         try:
@@ -1157,7 +1165,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     "Model checkpoint load failed. "
                     "Set train.allow_partial_resume=true only if this architecture change is intentional."
                 ) from e
-            print(
+            log_info(
                 f"[{config_name}] warning: model checkpoint load failed; "
                 "ignoring model_last and starting fresh model/optimizer/scaler."
             )
@@ -1169,11 +1177,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             model = _ddp_wrap(model)
             missing, unexpected = [], []
             resume_model_ignored = True
-        print(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
+        log_info(f"[{config_name}] Resume model: missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
         if missing:
-            print(f"[{config_name}] resume_model missing_keys={len(missing)} keys: {missing[:10]}")
+            log_info(f"[{config_name}] resume_model missing_keys={len(missing)} keys: {missing[:10]}")
         if unexpected:
-            print(f"[{config_name}] resume_model unexpected_keys={len(unexpected)} keys: {unexpected[:10]}")
+            log_info(f"[{config_name}] resume_model unexpected_keys={len(unexpected)} keys: {unexpected[:10]}")
         if missing or unexpected:
             error_msg = (
                 f"CRITICAL: Model checkpoint mismatch!\n"
@@ -1182,11 +1190,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             )
             if not allow_partial_resume:
                 raise RuntimeError(error_msg + "\nSet train.allow_partial_resume=true if intentional.")
-            print("=" * 60)
-            print(f"[WARNING] {error_msg}")
-            print("[WARNING] Proceeding anyway due to allow_partial_resume=True")
-            print("=" * 60)
-            print(
+            log_info("=" * 60)
+            log_info(f"[WARNING] {error_msg}")
+            log_info("[WARNING] Proceeding anyway due to allow_partial_resume=True")
+            log_info("=" * 60)
+            log_info(
                 f"[{config_name}] warning: model checkpoint mismatch; "
                 "ignoring model_last and starting fresh model/optimizer/scaler."
             )
@@ -1196,10 +1204,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
             )
             model = _ddp_wrap(model)
-            print(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
+            log_info(f"[{config_name}] resume_model_ignored={model_ckpt_path}")
         else:
             if not resume_model_ignored:
-                print(f"resume_model={model_ckpt_path}")
+                log_info(f"resume_model={model_ckpt_path}")
 
     scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
     def _param_max(value_key: str, default: float) -> float:
@@ -1255,7 +1263,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 json.dump({k: list(v) for k, v in selected.items()}, f, indent=2)
         total_selected = sum(len(v) for v in selected.values())
         if is_main_process:
-            print(
+            log_info(
                 f"[{config_name}] image_batch_n_sample={image_batch_n_sample} "
                 f"files={len(selected)} total_selected={total_selected} "
                 f"saved_to={sel_path}"
@@ -1301,7 +1309,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"(encoder_rf={encoder_rf_depth_3d}, target_slab_depth={target_slab_depth_3d})"
             )
         if is_main_process:
-            print(
+            log_info(
                 f"[{config_name}] {model_without_ddp.mode} geometry: spatial_crop="
                 f"{int(data_cfg.get('volume_crop_size', data_cfg.get('crop_size_3d', 64)))} "
                 f"crop_depth={crop_depth_3d} encoder_rf_depth={encoder_rf_depth_3d} "
@@ -1391,12 +1399,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 cdd_cache=cdd_cache,
             )
             val_dataset.sample_index = val_idx
-    print(
+    log_info(
         f"[{config_name}] Dataset split: total_index={n_total}, train_index={len(train_idx)}, "
         f"val_index={len(val_idx)}, val_fraction={val_fraction:.3f}"
     )
     if (not is_3d_mode) and getattr(dataset, "crop_mode", "none") != "none":
-        print(
+        log_info(
             f"[{config_name}] Training crop: mode={dataset.crop_mode} "
             f"size={dataset.crop_size}; validation=center; inference=native"
         )
@@ -1411,7 +1419,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     pin_memory = bool(device.type == "cuda")
     persistent_workers = bool(num_workers > 0)
     prefetch_factor = max(1, int(train_cfg.get("prefetch_factor", 2))) if num_workers > 0 else None
-    print(
+    log_info(
         f"[{config_name}] Dataloader setup: num_workers={num_workers}, "
         f"pin_memory={pin_memory}, persistent_workers={persistent_workers}, "
         f"prefetch_factor={prefetch_factor}"
@@ -1510,7 +1518,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 if optimizer_mismatch_action == "restart_epoch0":
                     start_epoch = 0
                 else:
-                    print(
+                    log_info(
                         f"[{config_name}] warning: optimizer_state_incompatible, "
                         f"continuing from epoch {start_epoch} with fresh optimizer: {e}"
                     )
@@ -1534,18 +1542,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     inference_visit_batches = int(train_cfg.get("inference_visit_batches", 32))
     inference_tta_enabled = bool(train_cfg.get("inference_tta_enabled", False))
     inference_tta_mode = str(train_cfg.get("inference_tta_mode", "flip4"))
-    print(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
-    prediction_loss_weight = float(train_cfg.get("prediction_loss_weight", train_cfg.get("mse_loss_weight", 100.0)))
+    log_info(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
+    prediction_loss_weight = float(train_cfg.get("prediction_loss_weight", 100.0))
     normalize_loss_l2_active = bool(model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", False)))
     spread_regularizer = parse_spread_regularizer_config(train_cfg)
     spread_regularizer_weight = float(spread_regularizer["weight"])
     embed_spread_target = float(spread_regularizer["target_std"])
     spread_regularizer_eps = float(spread_regularizer["eps"])
-    print(f"[{config_name}] spread_regularizer={json.dumps(spread_regularizer, sort_keys=True)}")
+    log_info(f"[{config_name}] spread_regularizer={json.dumps(spread_regularizer, sort_keys=True)}")
     experimental_losses = dict(train_cfg.get("experimental_losses", {}))
     vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", experimental_losses.get("vicreg_var_weight", 0.0)))
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", experimental_losses.get("vicreg_cov_weight", 0.0)))
-    symmetry_loss_weight = float(train_cfg.get("symmetry_loss_weight", train_cfg.get("symmetric_feature_loss_weight", 0.0)))
+    symmetry_loss_weight = float(train_cfg.get("symmetry_loss_weight", 0.0))
     vicreg_spatial_mode = str(train_cfg.get("vicreg_spatial_mode", "dense")).lower()
     if vicreg_spatial_mode not in ("dense", "pooled"):
         raise ValueError(
@@ -1690,7 +1698,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     start = time.time()
     visit_counts = None
     if start_epoch >= int(epochs):
-        print(f"[{config_name}] checkpoint epoch {start_epoch} already >= configured epochs {epochs}, skipping training loop")
+        log_info(f"[{config_name}] checkpoint epoch {start_epoch} already >= configured epochs {epochs}, skipping training loop")
     prev_epochs = []
     for epoch in range(start_epoch, epochs):
         if is_ddp:
@@ -1911,11 +1919,40 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             if is_main_process and (batch_idx + 1) % log_flush_interval == 0:
                 _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
                 _flush_csv_rows(visited_targets_log_path, visited_rows)
+            loss_terms_desc = [
+                f"L={log_loss_val:.4f}",
+                f"mse={loss_prediction.item():.4f}",
+            ]
+            if abs(spread_regularizer_weight) > 1e-12:
+                loss_terms_desc.extend(
+                    [
+                        f"reg={loss_spread.item():.4f}",
+                        f"wreg={(spread_regularizer_weight * loss_spread).item():.4f}",
+                    ]
+                )
+            if abs(vicreg_var_weight) > 1e-12:
+                loss_terms_desc.extend(
+                    [
+                        f"vicv={var_term_t.item():.4f}",
+                        f"wvicv={(vicreg_var_weight * var_term_t).item():.4f}",
+                    ]
+                )
+            if abs(vicreg_cov_weight) > 1e-12:
+                loss_terms_desc.extend(
+                    [
+                        f"vicc={cov_term_t.item():.4f}",
+                        f"wvicc={(vicreg_cov_weight * cov_term_t).item():.4f}",
+                    ]
+                )
+            if abs(symmetry_loss_weight) > 1e-12:
+                loss_terms_desc.extend(
+                    [
+                        f"sym={loss_symmetry.item():.4f}",
+                        f"wsym={(symmetry_loss_weight * loss_symmetry).item():.4f}",
+                    ]
+                )
             metrics_bar.set_description_str(
-                f"L={log_loss_val:.4f} "
-                f"mse={loss_prediction.item():.4f} "
-                f"reg={loss_spread.item():.4f} "
-                f"wreg={(spread_regularizer_weight * loss_spread).item():.4f} "
+                " ".join(loss_terms_desc) + " "
                 f"cos(pred,gt)={sim_val:.4f} "
                 f"std(ch)={ctx_stats['embed_spread_mean']:.3f} "
                 f"rank=exp(H(p))={ctx_stats['context_manifold_size']:.2f} "
@@ -1992,11 +2029,41 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             )
             if prev_str:
                 prev_str = f" [{prev_str}]"
+            epoch_terms_desc = [
+                f"L={avg_total:.4f}",
+                f"mse={avg_prediction:.4f}",
+            ]
+            if abs(spread_regularizer_weight) > 1e-12:
+                epoch_terms_desc.extend(
+                    [
+                        f"reg={_fmt_metric(epoch_spread/epoch_batches)}",
+                        f"wreg={_fmt_metric((spread_regularizer_weight * epoch_spread)/epoch_batches)}",
+                    ]
+                )
+            if abs(vicreg_var_weight) > 1e-12:
+                epoch_terms_desc.extend(
+                    [
+                        f"vicv={_fmt_metric(epoch_var/epoch_batches)}",
+                        f"wvicv={_fmt_metric((vicreg_var_weight * epoch_var)/epoch_batches)}",
+                    ]
+                )
+            if abs(vicreg_cov_weight) > 1e-12:
+                epoch_terms_desc.extend(
+                    [
+                        f"vicc={_fmt_metric(epoch_cov/epoch_batches)}",
+                        f"wvicc={_fmt_metric((vicreg_cov_weight * epoch_cov)/epoch_batches)}",
+                    ]
+                )
+            if abs(symmetry_loss_weight) > 1e-12:
+                epoch_terms_desc.extend(
+                    [
+                        f"sym={_fmt_metric(epoch_symmetric/epoch_batches)}",
+                        f"wsym={_fmt_metric((symmetry_loss_weight * epoch_symmetric)/epoch_batches)}",
+                    ]
+                )
             tqdm.write(
                 f"[{config_name}] E {epoch + 1}/{epochs} "
-                f"L={avg_total:.4f} mse={avg_prediction:.4f} "
-                f"reg={_fmt_metric(epoch_spread/epoch_batches)} "
-                f"wreg={_fmt_metric((spread_regularizer_weight * epoch_spread)/epoch_batches)} "
+                f"{' '.join(epoch_terms_desc)} "
                 f"cos={_fmt_metric(epoch_sim/epoch_batches)} "
                 f"std={_fmt_metric(epoch_embed_spread_mean/epoch_batches)} "
                 f"rank={_fmt_metric(epoch_context_manifold_size/epoch_batches)} "
@@ -2128,7 +2195,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         try:
             outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
             artifacts_dir = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)
-            print(f"[{config_name}] artifacts_saved={artifacts_dir}")
+            log_info(f"[{config_name}] artifacts_saved={artifacts_dir}")
             effective_rank = ""
             rank_diag = {}
             try:
@@ -2195,11 +2262,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             try:
                 outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
                 umap_meta_path = save_volumetric_umap_embeddings(session_dir, outputs, umap_cfg=umap_cfg)
-                print(f"[{config_name}] volumetric_umap_saved={umap_meta_path}")
+                log_info(f"[{config_name}] volumetric_umap_saved={umap_meta_path}")
             except Exception as e:
                 log_error("volumetric_umap", e)
         elif is_main_process:
-            print(f"[{config_name}] warning: inference_outputs.pt missing; skip artifact generation")
+            log_info(f"[{config_name}] warning: inference_outputs.pt missing; skip artifact generation")
 
     if is_main_process and not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)) and model_without_ddp.mode == "pyramid":
         try:
@@ -2229,9 +2296,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         out_dir=session_dir,
                         run_name=config_name,
                     )
-                    print(f"[{config_name}] scale_probe_report={json.dumps(report['scale_drop_sensitivity_fraction'])}")
+                    log_info(f"[{config_name}] scale_probe_report={json.dumps(report['scale_drop_sensitivity_fraction'])}")
                 else:
-                    print(f"[{config_name}] scale_probe: cdd_channels not available, skipping")
+                    log_info(f"[{config_name}] scale_probe: cdd_channels not available, skipping")
             model_without_ddp.train()
         except Exception as e:
             log_error("scale_probe", e)

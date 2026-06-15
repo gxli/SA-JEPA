@@ -191,7 +191,7 @@ class ScaleAwareJEPA:
             return {}
         cols = [
             "session", "mode", "mask_scale", "mask_box", "sampling",
-            "l2_norm", "psnorm", "final_norm", "sig_type", "sig_w", "sig_t",
+            "l2_norm", "psnorm", "final_norm", "sig_type", "sig_spatial_mode", "sig_w", "sig_t",
             "vicreg_var_weight", "vicreg_cov_weight", "sym_loss", "depth", "dilations", "hardcap",
             "energy", "sim_r", "hinge_r", "sig_r",
             "vicreg_var_r", "vicreg_cov_r", "weighted_vicreg_var_r", "weighted_vicreg_cov_r",

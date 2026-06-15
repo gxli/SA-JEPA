@@ -11,7 +11,6 @@
     "cube_slice_axis": 0,
     "cube_slice_index": 0,
     "crop_mode": "none",
-    "random_roll_max": 0,
     "d4_augment": true
   },
   "model": {
@@ -71,7 +70,8 @@
     "ema_momentum_final": 1.0,
     "spread_regularizer": {
       "type": "std_hinge",
-      "target": "predictor",
+      "target": "context",
+      "spatial_mode": "dense",
       "weight": 2,
       "target_std": 1.0,
       "eps": 0.0001

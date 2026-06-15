@@ -59,11 +59,12 @@ def _read_model_inputs(session_dir: str) -> dict:
             "psn": _fmt_bool(m.get("scaleaware_norm_per_scale", False)),
             "fin": _fmt_bool(m.get("scaleaware_final_norm", False)),
             "sigtype": str(spread.get("type", "NA")),
-            "spread_w": str(spread.get("weight", t.get("sigreg_weight", "NA"))),
+            "spread_mode": str(spread.get("spatial_mode", "dense")),
+            "spread_w": str(spread.get("weight", "NA")),
             "spread_t": str(spread.get("target_std", "NA")),
             "vicvar_w": str(t.get("vicreg_var_weight", t.get("experimental_losses", {}).get("vicreg_var_weight", "0"))),
             "viccov_w": str(t.get("vicreg_cov_weight", t.get("experimental_losses", {}).get("vicreg_cov_weight", "0"))),
-            "symw": str(t.get("symmetry_loss_weight", t.get("symmetric_feature_loss_weight", "NA"))),
+            "symw": str(t.get("symmetry_loss_weight", "NA")),
             "depth": str(m.get("encoder_depth", "NA")),
             "dilations": _fmt_cfg_value(m.get("dilations", "None")),
             "hardcap": str(m.get("mask_box_hardcap", "—")),
@@ -79,7 +80,7 @@ def _fmt_bool(value) -> str:
 
 def _missing_model_inputs() -> dict:
     return {k: "NA" for k in (
-        "mode", "ms", "mbox", "sampling", "l2", "psn", "fin", "sigtype", "spread_w", "spread_t",
+        "mode", "ms", "mbox", "sampling", "l2", "psn", "fin", "sigtype", "spread_mode", "spread_w", "spread_t",
         "vicvar_w", "viccov_w", "symw", "depth", "dilations", "hardcap", "pred_hidden",
     )}
 
@@ -187,7 +188,7 @@ def _fmt_float(v: str, width: int = 8, digits: int = 4) -> str:
 
 def rank_summary(session_dirs: List[str], prefix: str = "") -> List[Tuple[str, ...]]:
     """Return list of (name, mode, ms, mbox, sampling, l2, psn, fin,
-    sigtype, sigw, sigt, vicvar_w, viccov_w, symw, depth, dilations, hardcap, energy,
+    sigtype, sigmode, sigw, sigt, vicvar_w, viccov_w, symw, depth, dilations, hardcap, energy,
     sim_r, hinge_r, sig_r, vicv_r, vicc_r, wvicv_r, wvicc_r, erank, context, predictor, target, top1,
     pred_part, target_part, part_ratio, dead_frac, dead_ch) tuples.
 
@@ -233,7 +234,7 @@ def rank_summary(session_dirs: List[str], prefix: str = "") -> List[Tuple[str, .
             (name,
              inputs.get("mode", "NA"), inputs.get("ms", "NA"), inputs.get("mbox", "NA"), inputs.get("sampling", "NA"),
              inputs.get("l2", "NA"), inputs.get("psn", "NA"), inputs.get("fin", "NA"),
-             inputs.get("sigtype", "NA"), inputs.get("spread_w", "NA"), inputs.get("spread_t", "NA"),
+             inputs.get("sigtype", "NA"), inputs.get("spread_mode", "dense"), inputs.get("spread_w", "NA"), inputs.get("spread_t", "NA"),
              inputs.get("vicvar_w", "NA"), inputs.get("viccov_w", "NA"),
              inputs.get("symw", "NA"), inputs.get("depth", "NA"),
              inputs.get("dilations", "NA"), inputs.get("hardcap", "NA"),
@@ -252,7 +253,7 @@ def print_rank_table(session_dirs: List[str], prefix: str = "") -> None:
     session_w = max(len("session"), *(len(row[0]) for row in rows))
     header = (
         f"{'session':<{session_w}} {'mode':<9} {'sampling':<9} {'mask_scale':>12} {'mask_box':>9} "
-        f"{'l2_norm':>7} {'psnorm':>6} {'final_norm':>10} {'sig_type':>14} {'sig_w':>7} {'sig_t':>6} "
+        f"{'l2_norm':>7} {'psnorm':>6} {'final_norm':>10} {'sig_type':>14} {'sig_sp':>6} {'sig_w':>7} {'sig_t':>6} "
         f"{'vicvar_w':>8} {'viccov_w':>8} {'sym_loss':>9} {'depth':>6} {'dil':>10} {'hardcap':>7} "
         f"{'energy':>9} {'sim_r':>7} {'hinge_r':>7} {'sig_r':>7} "
         f"{'vicv_r':>7} {'vicc_r':>7} {'wvv_r':>7} {'wvc_r':>7} "
@@ -262,12 +263,12 @@ def print_rank_table(session_dirs: List[str], prefix: str = "") -> None:
     print(header)
     print("-" * len(header))
     for row in rows:
-        (s, mode, ms, mbox, sampling, l2, psn, fin, sigtype, sigw, sigt, vicvar_w, viccov_w, symw, d, dil, hc,
+        (s, mode, ms, mbox, sampling, l2, psn, fin, sigtype, sigmode, sigw, sigt, vicvar_w, viccov_w, symw, d, dil, hc,
          energy, sim_r, hinge_r, sig_r, vicv_r, vicc_r, wvicv_r, wvicc_r,
          rk, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_n) = row
         print(
             f"{s:<{session_w}} {mode:<9} {sampling:<9} {ms:>12} {mbox:>9} "
-            f"{l2:>7} {psn:>6} {fin:>10} {sigtype:>14} {_fmt_float(sigw,7,2)} {_fmt_float(sigt,6,2)} "
+            f"{l2:>7} {psn:>6} {fin:>10} {sigtype:>14} {sigmode[:6]:>6} {_fmt_float(sigw,7,2)} {_fmt_float(sigt,6,2)} "
             f"{_fmt_float(vicvar_w,8,2)} {_fmt_float(viccov_w,8,2)} {_fmt_float(symw,9,4)} {d:>6} {dil:>10} {hc:>7} "
             f"{energy:>9} {sim_r:>7} {hinge_r:>7} {sig_r:>7} "
             f"{vicv_r:>7} {vicc_r:>7} {wvicv_r:>7} {wvicc_r:>7} "

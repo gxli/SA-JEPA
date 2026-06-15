@@ -57,8 +57,8 @@ from sajepa import ScaleAwareJEPA
 
 field = torch.load("data/ngc3627_co_emission.pt")  # (H, W)
 
-# 1. Configure
-model = ScaleAwareJEPA(config="configs/mhd_turbulence.yaml")
+# 1. Use the default scale-aware ConvNeXt baseline
+model = ScaleAwareJEPA()
 
 # 2. Train
 model.fit(field, epochs=10)
@@ -74,7 +74,7 @@ metrics = model.analyze_rank()               # → dict: erank, energy, sim_r, h
 
 # 6. Persist and visualize
 model.save_session("sessions/my_run")
-model.generate_dashboard()
+model.generate_dashboard("results/api_dashboard.html")
 
 # 7. Restore later
 model2 = ScaleAwareJEPA.load_session("sessions/my_run")
@@ -92,6 +92,20 @@ latent2 = model2.extract(new_field)
 | `model.generate_dashboard(path?)` | — | interactive Plotly HTML dashboard |
 | `ScaleAwareJEPA.load_session(path)` | model | restore from saved session |
 
+### Current Baseline Knobs
+
+The default `ScaleAwareJEPA()` baseline follows the current config convention:
+
+- `model.normalize_loss_l2: false` keeps JEPA prediction in the unnormalized amplitude space.
+- `training.prediction_loss_weight: 50` is the main predictor-target MSE weight.
+- `training.spread_regularizer` defaults to dense-token `std_hinge` on `target: context` with `weight: 2`.
+- `training.symmetry_loss_weight: 0.003` is enabled in the base MHD baseline; dataset-specific examples may set it to `0`.
+- `vicreg_var_weight` and `vicreg_cov_weight` are optional ablation terms and are off unless explicitly set.
+
+Recent experiment families used larger hinge weights (`weight: 20`) and
+explicit L2-on/off sweeps. Treat those as ablations; the import-route default
+uses the baseline values above.
+
 ### CLI
 
 ```bash
@@ -101,6 +115,7 @@ sajepa-train --config configs/examples/mhd_2d_ms1p2.json --sessions-dir sessions
 ### Built-in Examples
 
 ```bash
+python examples/api_dashboard_smoke.py    # Minimal public API + dashboard smoke
 python examples/quickstart.py             # Synthetic 128×128, 3 epochs
 python examples/test_mhd.py               # C12 MHD data, gen_139 config, 10 epochs
 python examples/inspect_cdd_masking.py    # CDD channel + mask consistency check
