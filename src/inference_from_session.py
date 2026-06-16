@@ -496,6 +496,9 @@ def run_inference_on_data(
         "target_scales": _stack_or_none(all_target_scales),
         "target_valid": _stack_or_none(all_target_valid),
     }
+    # Keep inference-only sessions compatible with the training dashboard path.
+    outputs["x_clean"] = outputs["x_clean_raw"]
+    outputs["x_context"] = outputs["x_context_raw"]
     return outputs
 
 
@@ -511,6 +514,8 @@ def save_inference_session(
     crop_size: int | None = None,
     mode: str = "image",
     mask_inference: bool = True,
+    make_dashboard: bool = True,
+    umap_cfg: dict | None = None,
 ) -> str:
     """Save inference outputs as a new inference-only session.
 
@@ -533,6 +538,11 @@ def save_inference_session(
         json.dump(config_out, f, indent=2)
 
     # Save raw tensors
+    outputs = dict(outputs)
+    if outputs.get("x_clean") is None and outputs.get("x_clean_raw") is not None:
+        outputs["x_clean"] = outputs["x_clean_raw"]
+    if outputs.get("x_context") is None and outputs.get("x_context_raw") is not None:
+        outputs["x_context"] = outputs["x_context_raw"]
     torch.save(outputs, os.path.join(output_dir, "inference_outputs.pt"))
 
     # Save compressed NPZ maps and target metadata.
@@ -566,12 +576,13 @@ def save_inference_session(
     with open(os.path.join(output_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
         json.dump(energy_summary, f, indent=2)
 
-    # Dashboard data
-    try:
-        artifacts_dir = save_inference_dashboard(output_dir, outputs, umap_cfg={})
-        print(f"[inference] dashboard_saved={artifacts_dir}")
-    except Exception as e:
-        print(f"[inference] dashboard generation failed (non-fatal): {e}")
+    # Dashboard/UMAP data can be CPU-heavy; keep it opt-in for API smoke paths.
+    if make_dashboard:
+        try:
+            artifacts_dir = save_inference_dashboard(output_dir, outputs, umap_cfg=umap_cfg or {})
+            print(f"[inference] dashboard_saved={artifacts_dir}")
+        except Exception as e:
+            print(f"[inference] dashboard generation failed (non-fatal): {e}")
 
     print(f"[inference] session saved to {output_dir}")
     return output_dir

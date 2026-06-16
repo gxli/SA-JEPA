@@ -423,10 +423,16 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     umap_l2_normalize = bool(umap_cfg.get("l2_normalize", False))
     umap_standardize = bool(umap_cfg.get("standardize", False))
 
-    x_clean_raw = outputs.get("x_clean_raw", outputs["x_clean"])
-    x_context_raw = outputs.get("x_context_raw", outputs["x_context"])
-    x_clean = outputs["x_clean"]
-    x_context = outputs["x_context"]
+    x_clean = outputs.get("x_clean")
+    if x_clean is None:
+        x_clean = outputs.get("x_clean_raw")
+    x_context = outputs.get("x_context")
+    if x_context is None:
+        x_context = outputs.get("x_context_raw", x_clean)
+    if x_clean is None:
+        raise RuntimeError("Inference dashboard requires x_clean or x_clean_raw in outputs.")
+    x_clean_raw = outputs.get("x_clean_raw", x_clean)
+    x_context_raw = outputs.get("x_context_raw", x_context)
     target_locations = outputs["target_locations"]
     pred_map = outputs["pred_map"]
     gt_map = outputs["gt_map"]

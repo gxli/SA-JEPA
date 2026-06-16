@@ -80,15 +80,18 @@ def symmetric_forward_2d(
     x: torch.Tensor,
     return_var: bool = False,
     max_views_per_forward: int = 1,
+    view_mode: str = "flip4",
     **kwargs,
 ):
     """
-    Four-way rotational group average for dense 2D spatial features.
+    View-averaged dense 2D spatial features.
 
-    Pads to square, evaluates the four rotations in view chunks, unrotates,
-    crops back, and averages. Handles non-square (H != W) inputs transparently.
+    The default ``flip4`` mode evaluates identity, horizontal flip, vertical
+    flip, and both flips. ``d4`` additionally includes the four rotations and
+    their horizontally flipped counterparts. Views are inverse-aligned before
+    averaging. Non-square (H != W) inputs are padded and cropped transparently.
 
-    When return_var=True, also returns the per-pixel variance across the 4 rotation
+    When return_var=True, also returns the per-pixel variance across aligned
     views as a regularisation signal (shape matches the averaged output).
     """
     if x.ndim < 4:
@@ -97,11 +100,42 @@ def symmetric_forward_2d(
     B, C, H, W = x.shape
 
     x_sq, orig_shape = _pad_to_square(x)
-    view_fns = [lambda t, k=k: torch.rot90(t, k=k, dims=(-2, -1)) for k in range(4)]
-    inverse_fns = [
-        lambda t, k=k: _crop_from_square(torch.rot90(t, k=-k, dims=(-2, -1)), orig_shape)
-        for k in range(4)
-    ]
+
+    mode = str(view_mode).lower()
+
+    def _flip_view(dims: tuple[int, ...]):
+        return lambda t: torch.flip(t, dims=dims) if dims else t
+
+    def _flip_inverse(dims: tuple[int, ...]):
+        return lambda t: _crop_from_square(torch.flip(t, dims=dims) if dims else t, orig_shape)
+
+    def _rot_view(k: int):
+        return lambda t: torch.rot90(t, k=k, dims=(-2, -1))
+
+    def _rot_inverse(k: int):
+        return lambda t: _crop_from_square(torch.rot90(t, k=-k, dims=(-2, -1)), orig_shape)
+
+    def _fliprot_view(k: int):
+        return lambda t: torch.flip(torch.rot90(t, k=k, dims=(-2, -1)), dims=(-1,))
+
+    def _fliprot_inverse(k: int):
+        return lambda t: _crop_from_square(
+            torch.rot90(torch.flip(t, dims=(-1,)), k=-k, dims=(-2, -1)),
+            orig_shape,
+        )
+
+    if mode in ("flip4", "flips", "flip"):
+        flip_dims = [(), (-1,), (-2,), (-2, -1)]
+        view_fns = [_flip_view(dims) for dims in flip_dims]
+        inverse_fns = [_flip_inverse(dims) for dims in flip_dims]
+    elif mode in ("d4", "dihedral8", "rotflip8"):
+        view_fns = [_rot_view(k) for k in range(4)] + [_fliprot_view(k) for k in range(4)]
+        inverse_fns = [_rot_inverse(k) for k in range(4)] + [_fliprot_inverse(k) for k in range(4)]
+    elif mode in ("rot4", "c4", "rot"):
+        view_fns = [_rot_view(k) for k in range(4)]
+        inverse_fns = [_rot_inverse(k) for k in range(4)]
+    else:
+        raise ValueError(f"Unsupported symmetric_forward_2d view_mode={view_mode!r}")
     view_inputs = [fn(x_sq) for fn in view_fns]
     view_kwargs = _stack_spatial_kwargs(kwargs, (H, W), view_fns, pad_2d=True)
     feats_stacked_inv = _encode_view_chunks(

@@ -1477,9 +1477,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 weight = loss_weights.get("spread_regularizer", {}).get("weight")
             else:
                 weight = loss_weights.get(weight_key)
-            configured_active = weight is not None and abs(float(weight)) > 1e-12
             observed_active = np.isfinite(weighted).any() and np.nanmax(np.abs(weighted)) > 1e-12
-            if configured_active or observed_active:
+            if weight is not None:
+                active = abs(float(weight)) > 1e-12
+            else:
+                active = observed_active
+            if active:
                 active_loss_terms.append((name, raw_arr[:n], weighted, color))
 
     active_loss_legend = dict(

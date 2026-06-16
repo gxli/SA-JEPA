@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import tempfile
 from typing import Optional
@@ -10,8 +11,9 @@ from typing import Optional
 import numpy as np
 import torch
 import yaml
+from torch.utils.data import DataLoader
 
-from src.train import load_config, run_training
+from src.train import load_config, reject_removed_config_aliases, run_training
 from src.utils.memory import OOMSafeTrainer, clear_memory_cache
 
 
@@ -35,13 +37,58 @@ class ScaleAwareJEPA:
 
     # ── training ────────────────────────────────────────────────
 
-    def fit(self, field: torch.Tensor, epochs: Optional[int] = None) -> "ScaleAwareJEPA":
-        """Train on a raw physical field.  Returns self for chaining."""
+    @property
+    def session_dir(self) -> Optional[str]:
+        """Current training or inference session directory, if one exists."""
+        return self._session_dir
+
+    def train(
+        self,
+        configs: Optional[dict | str] = None,
+        *,
+        config_name: str = "sajepa",
+        sessions_dir: str = "sessions",
+        dashboard: bool = False,
+    ) -> "ScaleAwareJEPA":
+        """Train from the default/current config plus optional overrides."""
+        cfg = copy.deepcopy(self._config)
+        if configs is not None:
+            if isinstance(configs, str):
+                override = load_config(configs)
+            else:
+                override = copy.deepcopy(configs)
+                reject_removed_config_aliases(override)
+            cfg = _deep_merge(cfg, override)
+        session_dir = run_training(cfg, config_name=config_name, sessions_root=sessions_dir)
+        self._config = cfg
+        self._session_dir = os.path.abspath(session_dir)
+        self._is_trained = True
+        if dashboard:
+            self.generate_dashboard(os.path.join(self._session_dir, "dashboard.html"))
+        return self
+
+    def fit(
+        self,
+        field: torch.Tensor,
+        epochs: Optional[int] = None,
+        *,
+        session_dir: Optional[str] = None,
+    ) -> "ScaleAwareJEPA":
+        """Train on a raw physical field.  Returns self for chaining.
+
+        When *session_dir* is provided, training persists to that directory
+        and resumes from the last checkpoint if one exists.  Without it, a
+        temporary directory is used and no resume is attempted.
+        """
         cfg = copy.deepcopy(self._config)
         if epochs is not None:
-            cfg.setdefault("training", cfg.setdefault("train", {}))["epochs"] = int(epochs)
+            cfg.setdefault("train", {})["epochs"] = int(epochs)
 
-        sessions_dir = tempfile.mkdtemp(prefix="sajepa_")
+        if session_dir is not None:
+            sessions_dir = os.path.abspath(session_dir)
+            os.makedirs(sessions_dir, exist_ok=True)
+        else:
+            sessions_dir = tempfile.mkdtemp(prefix="sajepa_")
         data_dir = os.path.join(sessions_dir, "data")
         os.makedirs(data_dir, exist_ok=True)
         data_path = os.path.join(data_dir, "_input.npy")
@@ -50,9 +97,10 @@ class ScaleAwareJEPA:
             arr = arr[np.newaxis, :, :]
         np.save(data_path, arr)
         cfg.setdefault("data", {})["npy_pattern"] = "_input.npy"
+        cfg.setdefault("data", {})["data_root"] = sessions_dir
 
         # --- auto-batch OOM handling ---
-        train_cfg = cfg.setdefault("train", cfg.setdefault("training", {}))
+        train_cfg = cfg.setdefault("train", {})
         trainer = OOMSafeTrainer(
             initial_batch=int(train_cfg.get("batch_size", 4)),
             target_batch=int(train_cfg.get("target_batch_size", train_cfg.get("target_batch", 32))),
@@ -67,15 +115,16 @@ class ScaleAwareJEPA:
         if not torch.cuda.is_available():
             train_cfg["num_workers"] = 0
 
-        print(f"[sajepa] batch={trainer.batch_size} accum={trainer.accumulation_steps}")
+        print(f"[sajepa] batch={trainer.batch_size} accum={trainer.accumulation_steps}"
+              f" session={session_dir or '(temp)'}")
 
         old_cwd = os.getcwd()
         os.chdir(sessions_dir)
-        session_dir = None
+        sd = None
         try:
             while True:
                 try:
-                    session_dir = run_training(cfg, config_name="sajepa", sessions_root=".")
+                    sd = run_training(cfg, config_name="sajepa", sessions_root=".")
                     break
                 except RuntimeError as e:
                     if not trainer.handle_oom(e):
@@ -84,7 +133,7 @@ class ScaleAwareJEPA:
                     train_cfg["gradient_accumulation_steps"] = trainer.accumulation_steps
                     clear_memory_cache()
         finally:
-            self._session_dir = os.path.abspath(session_dir) if session_dir else None
+            self._session_dir = os.path.abspath(sd) if sd else None
             os.chdir(old_cwd)
 
         if self._session_dir is None:
@@ -94,6 +143,125 @@ class ScaleAwareJEPA:
         return self
 
     # ── inference ───────────────────────────────────────────────
+
+    @classmethod
+    def infer_from_session(
+        cls,
+        session_dir: str,
+        input_path: str,
+        output_dir: str,
+        **kwargs,
+    ) -> str:
+        """Create an inference-only session from a trained session and a new ``.npy``."""
+        model = cls.load_session(session_dir)
+        return model.infer_npy(input_path, output_dir, **kwargs)
+
+    @torch.no_grad()
+    def infer_npy(
+        self,
+        input_path: str,
+        output_dir: Optional[str] = None,
+        *,
+        crop_size: Optional[int] = None,
+        crop_mode: str = "center",
+        mode: str = "image",
+        mask_inference: bool = True,
+        batch_size: int = 2,
+        device: Optional[str | torch.device] = None,
+        tta: bool = False,
+        tta_mode: str = "flip4",
+        allow_partial_load: bool = False,
+        make_dashboard: bool = True,
+    ) -> str:
+        """Run a loaded session on an arbitrary ``.npy`` file.
+
+        The result is saved as an inference-only session directory containing
+        ``inference_outputs.pt``, map artifacts, UMAP/PCA artifacts, and
+        optionally ``dashboard.html``.
+        """
+        if self._session_dir is None:
+            raise RuntimeError("No session. Call load_session() or fit() first.")
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(input_path)
+
+        from src.inference_from_session import (
+            _collate_pad_spatial,
+            _stitch_tiled_outputs,
+            load_model_from_session,
+            load_raw_data,
+            run_inference_on_data,
+            save_inference_session,
+        )
+
+        run_device = torch.device(device) if device is not None else self._get_device()
+        model, config, source_session = load_model_from_session(
+            self._session_dir,
+            run_device,
+            strict_load=not bool(allow_partial_load),
+        )
+        config["_source_session"] = source_session
+
+        data_tensor, tile_layout = load_raw_data(
+            input_path,
+            crop_size=crop_size,
+            crop_mode=crop_mode,
+            mode=mode,
+            return_layout=True,
+            slab_depth=(
+                getattr(model, "required_input_depth", None)
+                if str(mode).strip().lower() in ("3d_slab", "3d-slab")
+                else None
+            ),
+        )
+
+        class _TensorDataset(torch.utils.data.Dataset):
+            def __init__(self, tensor: torch.Tensor):
+                self.tensor = tensor
+
+            def __len__(self) -> int:
+                return int(self.tensor.shape[0])
+
+            def __getitem__(self, idx: int) -> torch.Tensor:
+                return self.tensor[idx]
+
+        loader = DataLoader(
+            _TensorDataset(data_tensor),
+            batch_size=max(1, int(batch_size)),
+            shuffle=False,
+            num_workers=0,
+            collate_fn=_collate_pad_spatial,
+        )
+        outputs = run_inference_on_data(
+            model,
+            loader,
+            run_device,
+            mask_inference=bool(mask_inference),
+            inference_tta_enabled=bool(tta),
+            inference_tta_mode=str(tta_mode),
+        )
+        outputs = _stitch_tiled_outputs(outputs, tile_layout)
+
+        if output_dir is None:
+            base = os.path.basename(self._session_dir.rstrip(os.sep))
+            stem = os.path.splitext(os.path.basename(input_path))[0]
+            output_dir = os.path.abspath(os.path.join("sessions", f"inference_{base}_{stem}"))
+
+        out = save_inference_session(
+            outputs,
+            output_dir,
+            config,
+            input_path,
+            crop_size=crop_size,
+            mode=mode,
+            mask_inference=bool(mask_inference),
+            make_dashboard=bool(make_dashboard),
+            umap_cfg=config.get("train", {}).get("umap", {}),
+        )
+        self._session_dir = os.path.abspath(out)
+        self._is_trained = True
+        if make_dashboard:
+            self.generate_dashboard(os.path.join(self._session_dir, "dashboard.html"))
+        return self._session_dir
 
     @torch.no_grad()
     def project(self, field: torch.Tensor, method: str = "umap") -> dict:
@@ -172,9 +340,11 @@ class ScaleAwareJEPA:
         """Restore a model from a saved session directory."""
         cfg_path = os.path.join(path, "config.yaml")
         if os.path.exists(cfg_path):
-            instance = cls(config=cfg_path)
+            cfg = cls._parse_config_exact(cfg_path)
         else:
-            instance = cls(config=os.path.join(path, "config_used.json"))
+            cfg = cls._parse_config_exact(os.path.join(path, "config_used.json"))
+        instance = cls(config=None)
+        instance._config = cfg
         instance._session_dir = os.path.abspath(path)
         instance._is_trained = os.path.exists(os.path.join(path, "inference_outputs.pt"))
         return instance
@@ -191,12 +361,13 @@ class ScaleAwareJEPA:
             return {}
         cols = [
             "session", "mode", "mask_scale", "mask_box", "sampling",
-            "l2_norm", "psnorm", "final_norm", "sig_type", "sig_spatial_mode", "sig_w", "sig_t",
-            "vicreg_var_weight", "vicreg_cov_weight", "sym_loss", "depth", "dilations", "hardcap",
+            "l2_norm", "psnorm", "final_norm", "spread_type", "spread_spatial_mode", "spread_w", "spread_t",
+            "vicreg_var_weight", "vicreg_cov_weight", "sym_loss", "depth", "dilations", "hardcap", "cdd_scales",
             "energy", "sim_r", "hinge_r", "sig_r",
             "vicreg_var_r", "vicreg_cov_r", "weighted_vicreg_var_r", "weighted_vicreg_cov_r",
-            "erank", "context_erank", "predictor_erank", "target_erank",
+            "target_effrank", "context_effrank", "predictor_effrank", "target_branch_effrank",
             "top1", "pred_part", "target_part", "part_ratio", "dead_frac", "dead_ch",
+            "loss_total_last", "loss_prediction_last", "loss_spread_last",
         ]
         return dict(zip(cols, rows[0]))
 
@@ -211,17 +382,44 @@ class ScaleAwareJEPA:
         if self._session_dir is None:
             raise RuntimeError("No session. Call fit() or load_session() first.")
         try:
+            self._ensure_inference_umap_artifacts()
             from scripts.session_to_dash import compute_dash_data, plot_dash
             compute_dash_data(self._session_dir, overwrite=False)
             plot_dash(self._session_dir, overwrite=False)
             dash = os.path.join(self._session_dir, "dashboard.html")
             if output_path and os.path.exists(dash):
                 import shutil
-                shutil.copy2(dash, output_path)
+                if os.path.abspath(dash) != os.path.abspath(output_path):
+                    shutil.copy2(dash, output_path)
             print(f"[sajepa] dashboard: {output_path or dash}")
         except Exception as e:
             print(f"[sajepa] dashboard failed ({type(e).__name__}), generating minimal dashboard...")
             _generate_minimal_dashboard(self._session_dir, output_path)
+
+    def _ensure_inference_umap_artifacts(self) -> None:
+        if self._session_dir is None:
+            return
+        cfg_path = os.path.join(self._session_dir, "config_used.json")
+        inf_path = os.path.join(self._session_dir, "inference_outputs.pt")
+        if not (os.path.exists(cfg_path) and os.path.exists(inf_path)):
+            return
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            is_inference_only = bool(cfg.get("_inference", {}).get("inference_only", False))
+            if not is_inference_only:
+                return
+            results_dir = os.path.join(self._session_dir, "results")
+            required = os.path.join(results_dir, "predict_umap_xyz.npy")
+            if os.path.exists(required):
+                return
+            from src.utils.viz import save_inference_dashboard
+
+            outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
+            umap_cfg = cfg.get("train", {}).get("umap", {})
+            save_inference_dashboard(self._session_dir, outputs, umap_cfg=umap_cfg)
+        except Exception as e:
+            print(f"[sajepa] inference UMAP artifact generation failed: {type(e).__name__}: {e}")
 
     # ── internals ───────────────────────────────────────────────
 
@@ -234,16 +432,23 @@ class ScaleAwareJEPA:
 
     @staticmethod
     def _parse_config(config: Optional[dict | str]) -> dict:
+        default_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "configs", "base_pyramid_scaleaware_convnext.yaml")
+        base = load_config(default_path)
         if config is None:
-            return load_config(os.path.join(
-                os.path.dirname(os.path.dirname(__file__)),
-                "configs", "base_pyramid_scaleaware_convnext.yaml"))
+            return base
+        if isinstance(config, str):
+            return _deep_merge(base, load_config(config))
+        override = copy.deepcopy(config)
+        reject_removed_config_aliases(override)
+        return _deep_merge(base, override)
+
+    @staticmethod
+    def _parse_config_exact(config: dict | str) -> dict:
         if isinstance(config, str):
             return load_config(config)
-        base = load_config(os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            "configs", "base_pyramid_scaleaware_convnext.yaml"))
-        return _deep_merge(base, config)
+        return copy.deepcopy(config)
 
 
 def _print_metrics_summary(session_dir: str) -> None:
@@ -252,6 +457,14 @@ def _print_metrics_summary(session_dir: str) -> None:
     if not os.path.exists(path):
         return
     try:
+        loss_weights = {}
+        weights_path = os.path.join(session_dir, "loss_weights.json")
+        if os.path.exists(weights_path):
+            try:
+                with open(weights_path, "r", encoding="utf-8") as f:
+                    loss_weights = json.load(f)
+            except Exception:
+                loss_weights = {}
         epochs: dict[int, dict[str, list[float]]] = {}
         with open(path, "r") as f:
             for row in _csv.DictReader(f):
@@ -260,7 +473,7 @@ def _print_metrics_summary(session_dir: str) -> None:
                     continue
                 if ep not in epochs:
                     epochs[ep] = {}
-                for k in ("loss_total", "loss_prediction", "loss_spread", "sim", "var", "cov", "lr"):
+                for k in ("loss_total", "loss_prediction", "loss_spread", "var", "cov", "lr"):
                     v = row.get(k, "")
                     if v:
                         epochs[ep].setdefault(k, []).append(float(v))
@@ -270,11 +483,28 @@ def _print_metrics_summary(session_dir: str) -> None:
         print(f"\n{'='*60}")
         print(f"Training Metrics (epoch {first_ep} → {last_ep})")
         print(f"{'='*60}")
+        def _weight_active(key: str, nested: str | None = None) -> bool:
+            if not loss_weights:
+                return any(epochs[ep].get(key) for ep in epochs)
+            if nested is not None:
+                value = loss_weights.get(nested, {}).get("weight")
+            else:
+                value = loss_weights.get(key)
+            try:
+                return value is not None and abs(float(value)) > 1e-12
+            except Exception:
+                return False
+
         keys = [
             ("loss_total", "L(total)     "), ("loss_prediction", "MSE(pred,gt) "),
-            ("loss_spread", "sig=relu(1-std)"), ("sim", "cos(pred,gt) "),
-            ("var", "var_term    "), ("cov", "cov_term    "), ("lr", "lr          "),
         ]
+        if _weight_active("loss_spread", "spread_regularizer"):
+            keys.append(("loss_spread", "spread      "))
+        if _weight_active("vicreg_var_weight"):
+            keys.append(("var", "vicreg_var  "))
+        if _weight_active("vicreg_cov_weight"):
+            keys.append(("cov", "vicreg_cov  "))
+        keys.append(("lr", "lr          "))
         for key, label in keys:
             vals_f = epochs[first_ep].get(key, [])
             vals_l = epochs[last_ep].get(key, [])

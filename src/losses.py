@@ -36,20 +36,22 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     target_std = float(cfg.get("target_std", 1.0))
     eps = float(cfg.get("eps", 1e-4))
     sketch_dim = int(cfg.get("sketch_dim", 64))
-    spatial_mode = str(cfg.get("spatial_mode", "dense"))
+    spatial_mode = str(cfg.get("spatial_mode", "pooled"))
     assert target_std >= 0
     assert eps > 0
     assert sketch_dim > 0
     assert spatial_mode in {"pooled", "dense"}
-    return {
+    result = {
         "type": sigreg_type,
         "target": sigreg_target,
         "weight": spread_weight,
         "target_std": target_std,
         "eps": eps,
-        "sketch_dim": sketch_dim,
         "spatial_mode": spatial_mode,
     }
+    if sigreg_type in ("weak_sigreg", "sketched_sigreg"):
+        result["sketch_dim"] = sketch_dim
+    return result
 
 
 def _offdiag(x: torch.Tensor) -> torch.Tensor:
@@ -268,7 +270,7 @@ def compute_output_spread_regularizer_loss(
     if target in {"predictor", "both"} and "pred_patches" not in outputs:
         raise KeyError("SIGReg target='predictor' requires outputs['pred_patches']")
 
-    spatial_mode = str(cfg.get("spatial_mode", "dense"))
+    spatial_mode = str(cfg.get("spatial_mode", "pooled"))
     if spatial_mode == "dense":
         extract = extract_valid_dense_embeddings
     elif spatial_mode == "pooled":
@@ -313,7 +315,10 @@ def embedding_spread_stats(
     z = z - z.mean(dim=0, keepdim=True)
     var = z.var(dim=0, unbiased=False)
     cov = (z.T @ z) / max(1, int(z.shape[0]))
-    eig = torch.linalg.eigvalsh(cov).clamp_min(0.0)
+    try:
+        eig = torch.linalg.eigvalsh(cov).clamp_min(0.0)
+    except NotImplementedError:
+        eig = torch.linalg.eigvalsh(cov.cpu()).clamp_min(0.0).to(cov.device)
     eig_sum = eig.sum()
     rank = 0.0
     if float(eig_sum.item()) > 1e-20:

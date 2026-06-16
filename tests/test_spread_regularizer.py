@@ -26,7 +26,7 @@ class SpreadRegularizerTests(unittest.TestCase):
 
         self.assertEqual(tuple(z.shape), (4 * 5 * 5, 4))
 
-    def test_output_sigreg_defaults_to_dense_spatial_tokens(self) -> None:
+    def test_output_sigreg_defaults_to_pooled_patch_tokens(self) -> None:
         torch.manual_seed(0)
         context = torch.randn(2, 3, 4, 5, 5).requires_grad_()
         valid = torch.tensor([[True, False, True], [False, True, True]])
@@ -38,10 +38,10 @@ class SpreadRegularizerTests(unittest.TestCase):
         )
         loss.backward()
 
-        self.assertEqual(tuple(z_ctx.shape), (4 * 5 * 5, 4))
+        self.assertEqual(tuple(z_ctx.shape), (4, 4))
         self.assertGreater(float(context.grad.abs().sum().item()), 0.0)
 
-    def test_output_sigreg_can_use_pooled_patch_tokens(self) -> None:
+    def test_output_sigreg_can_use_dense_spatial_tokens(self) -> None:
         torch.manual_seed(0)
         context = torch.randn(2, 3, 4, 5, 5).requires_grad_()
         valid = torch.tensor([[True, False, True], [False, True, True]])
@@ -49,11 +49,11 @@ class SpreadRegularizerTests(unittest.TestCase):
 
         loss, z_ctx = compute_output_spread_regularizer_loss(
             outputs,
-            {"type": "std_hinge", "target": "context", "target_std": 1.0, "eps": 1e-4, "spatial_mode": "pooled"},
+            {"type": "std_hinge", "target": "context", "target_std": 1.0, "eps": 1e-4, "spatial_mode": "dense"},
         )
         loss.backward()
 
-        self.assertEqual(tuple(z_ctx.shape), (4, 4))
+        self.assertEqual(tuple(z_ctx.shape), (4 * 5 * 5, 4))
         self.assertGreater(float(context.grad.abs().sum().item()), 0.0)
 
     def test_output_sigreg_defaults_to_context_not_predictor(self) -> None:
@@ -69,7 +69,7 @@ class SpreadRegularizerTests(unittest.TestCase):
         )
         loss.backward()
 
-        self.assertEqual(tuple(z_ctx.shape), (4 * 5 * 5, 4))
+        self.assertEqual(tuple(z_ctx.shape), (4, 4))
         self.assertGreater(float(context.grad.abs().sum().item()), 0.0)
         self.assertIsNone(pred.grad)
 
@@ -103,7 +103,7 @@ class SpreadRegularizerTests(unittest.TestCase):
         )
         loss.backward()
 
-        self.assertEqual(tuple(z_spread.shape), (4 * 5 * 5, 4))
+        self.assertEqual(tuple(z_spread.shape), (4, 4))
         self.assertIsNone(context.grad)
         self.assertGreater(float(pred.grad.abs().sum().item()), 0.0)
 
@@ -278,7 +278,7 @@ class SpreadRegularizerTests(unittest.TestCase):
         self.assertEqual(cfg["type"], "std_hinge")
         self.assertEqual(cfg["target"], "context")
         self.assertEqual(cfg["weight"], 2.0)
-        self.assertEqual(cfg["spatial_mode"], "dense")
+        self.assertEqual(cfg["spatial_mode"], "pooled")
 
     def test_weak_sigreg_schema_is_explicit(self) -> None:
         cfg = parse_spread_regularizer_config(

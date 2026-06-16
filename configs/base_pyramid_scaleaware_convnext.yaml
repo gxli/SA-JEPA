@@ -6,23 +6,12 @@ data:
   cdd_mode: log
   cdd_constrained: true
   cdd_sm_mode: reflect
+  cdd_precompute: true
   cube_slice_strategy: center
   cube_slice_axis: 0
   cube_slice_index: 0
   crop_mode: none
   d4_augment: true
-cdd_scale_space:
-  cdd_mode: log
-  cdd_constrained: true
-  cdd_sm_mode: reflect
-  cdd_log_std_floor_mult: 0.05
-  cdd_append_last_residual: true
-  sigmas:
-  - 2
-  - 4
-  - 8
-  - 16
-  align_scales: true
 model:
   mode: pyramid
   model_key: cdd_scaleaware_convnext
@@ -36,6 +25,7 @@ model:
   scaleaware_norm_per_scale: true
   scaleaware_final_norm: true
   scaleaware_stem_norm: true
+  scaleaware_adapter_norm: true
   global_shift: false
   normalize_loss_l2: false
   predictor_layernorm: true
@@ -46,8 +36,17 @@ model:
   post_log_transform: true
   use_symmetric_feature_loss: true
   ema_momentum: 0.996
-  scaleaware_adapter_norm: true
-masking:
+  cdd_mode: log
+  cdd_constrained: true
+  cdd_sm_mode: reflect
+  cdd_log_std_floor_mult: 0.05
+  cdd_append_last_residual: true
+  sigmas:
+  - 2
+  - 4
+  - 8
+  - 16
+  align_scales: true
   patch_size: 3
   mask_spacing_scaling: 2.0
   mask_size_scaling: 1.0
@@ -62,7 +61,7 @@ masking:
   priority_min_targets_per_map: 10
   priority_dithering_pixels: 6
   priority_candidate_oversample: 0
-training:
+train:
   batch_size: 4
   lr: 0.0001
   weight_decay: 1.0e-05
@@ -74,7 +73,6 @@ training:
   spread_regularizer:
     type: std_hinge
     target: context
-    spatial_mode: dense
     weight: 2
     target_std: 1.0
     eps: 0.0001
@@ -83,7 +81,6 @@ training:
   scale_probe_enabled: true
   inference_tta_enabled: true
   inference_tta_mode: flip4
-diagnostics:
   compute_effective_rank: true
   viz_crop_border: true
   umap:

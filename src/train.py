@@ -60,6 +60,22 @@ def _fmt_metric(v: float) -> str:
     return f"{x:.4f}"
 
 
+def _format_metric_dict(metrics: dict[str, str]) -> str:
+    return " ".join(f"{key}={value}" for key, value in metrics.items())
+
+
+def _format_progress_line(
+    prefix: str,
+    losses: dict[str, str],
+    diagnostics: dict[str, str],
+    optim_state: dict[str, str] | None = None,
+) -> str:
+    parts = [prefix, _format_metric_dict(losses), _format_metric_dict(diagnostics)]
+    if optim_state:
+        parts.append(_format_metric_dict(optim_state))
+    return " | ".join(part for part in parts if part)
+
+
 def _flush_csv_rows(path: str, rows: list[list]) -> None:
     if not rows:
         return
@@ -218,6 +234,10 @@ def _precompute_cdd_cache(
     import glob as _glob
     import constrained_diffusion as cdd
 
+    enabled = bool(data_cfg.get("cdd_precompute", True))
+    if not enabled:
+        log_info(f"[{config_name}] CDD precompute: disabled by data.cdd_precompute=false")
+        return {}
     data_root = data_cfg.get("data_root", "data")
     npy_pattern = data_cfg.get("npy_pattern", "*.npy")
     cdd_mode = str(model_cfg.get("cdd_mode", data_cfg.get("cdd_mode", "log")))
@@ -231,10 +251,6 @@ def _precompute_cdd_cache(
     npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
     if not npy_files:
         log_info(f"[{config_name}] CDD precompute: no files found for pattern, skipping")
-        return {}
-    enabled = bool(data_cfg.get("cdd_precompute", True))
-    if not enabled:
-        log_info(f"[{config_name}] CDD precompute: disabled by data.cdd_precompute=false")
         return {}
     max_files = int(data_cfg.get("cdd_precompute_max_files", 4096))
     if max_files > 0 and len(npy_files) > max_files:
@@ -509,31 +525,13 @@ def evaluate_validation(
     }
 
 
-def _flatten_structured_config(cfg: dict) -> dict:
-    """Convert the clean YAML config structure to the legacy flat format.
-    
-    Passes through ALL keys from each section, so any key valid in the
-    legacy flat format works unchanged in the structured YAML.
-    """
-    # If already flat, return as-is.
-    if "cdd_scale_space" not in cfg and "masking" not in cfg and "diagnostics" not in cfg:
-        return cfg
-
-    out: dict = {}
-    out["data"] = dict(cfg.get("data", {}))
-    out["model"] = dict(cfg.get("model", {}))
-    out["train"] = dict(cfg.get("training", {}))
-
-    # Merge cdd_scale_space → model (all keys pass through)
-    out["model"].update(cfg.get("cdd_scale_space", {}))
-
-    # Merge masking → model (all keys pass through)
-    out["model"].update(cfg.get("masking", {}))
-
-    # Merge diagnostics → train (all keys pass through)
-    out["train"].update(cfg.get("diagnostics", {}))
-
-    return out
+def reject_removed_config_aliases(cfg: dict) -> None:
+    alias_sections = sorted(set(cfg) & {"cdd_scale_space", "masking", "training", "diagnostics"})
+    if alias_sections:
+        raise ValueError(
+            "Removed config alias sections present: "
+            f"{alias_sections}. Use canonical data/model/train sections."
+        )
 
 
 def load_config(path: str) -> dict:
@@ -572,10 +570,10 @@ def load_config(path: str) -> dict:
         return merged
 
     cfg = _load_with_base(path, seen=set())
-    cfg = _flatten_structured_config(cfg)  # flatten after base merge
     cfg.setdefault("data", {})
     cfg.setdefault("model", {})
     cfg.setdefault("train", {})
+    reject_removed_config_aliases(cfg)
     removed = {
         "data.log_transform": "model.post_log_transform",
         "data.image_size": "native-resolution data or explicit crop_size",
@@ -921,6 +919,7 @@ def _dump_movie_frame(
 
 
 def run_training(config: dict, config_name: str, sessions_root: str = "sessions") -> str:
+    reject_removed_config_aliases(config)
     # ── DDP: detect torchrun-launched multi-GPU ──
     is_ddp = "LOCAL_RANK" in os.environ
     if is_ddp:
@@ -974,6 +973,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     train_cfg = config["train"]
     model_cfg = config["model"]
     data_cfg = config["data"]
+    if "num_threads" in train_cfg:
+        num_threads = max(1, int(train_cfg["num_threads"]))
+        torch.set_num_threads(num_threads)
+        try:
+            torch.set_num_interop_threads(num_threads)
+        except RuntimeError:
+            pass
+        if is_main_process:
+            log_info(f"[{config_name}] torch_threads={num_threads}")
     if is_ddp and bool(data_cfg.get("cdd_precompute", True)):
         data_cfg["cdd_precompute"] = False
         if is_main_process:
@@ -1569,6 +1577,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     # PyTorch native LR scheduler: warmup → cosine decay
     total_steps_sched = max(1, int(epochs) * max(1, len(dataloader)))
     warmup_steps_sched = int(warmup_epochs * max(1, len(dataloader)))
+    if total_steps_sched > 1:
+        warmup_steps_sched = min(max(1, warmup_steps_sched), total_steps_sched - 1)
+    else:
+        warmup_steps_sched = 1
+    cosine_steps_sched = max(1, total_steps_sched - warmup_steps_sched)
     from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
     warmup_sched = LinearLR(
@@ -1579,7 +1592,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     )
     cosine_sched = CosineAnnealingLR(
         optimizer,
-        T_max=total_steps_sched - warmup_steps_sched,
+        T_max=cosine_steps_sched,
         eta_min=min_lr,
     )
     scheduler = SequentialLR(
@@ -1699,7 +1712,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     visit_counts = None
     if start_epoch >= int(epochs):
         log_info(f"[{config_name}] checkpoint epoch {start_epoch} already >= configured epochs {epochs}, skipping training loop")
-    prev_epochs = []
     for epoch in range(start_epoch, epochs):
         if is_ddp:
             train_sampler.set_epoch(epoch)
@@ -1919,44 +1931,29 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             if is_main_process and (batch_idx + 1) % log_flush_interval == 0:
                 _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
                 _flush_csv_rows(visited_targets_log_path, visited_rows)
-            loss_terms_desc = [
-                f"L={log_loss_val:.4f}",
-                f"mse={loss_prediction.item():.4f}",
-            ]
+            loss_terms = {
+                "total": f"{log_loss_val:.4f}",
+                "pred": f"{loss_prediction.item():.4f}",
+            }
             if abs(spread_regularizer_weight) > 1e-12:
-                loss_terms_desc.extend(
-                    [
-                        f"reg={loss_spread.item():.4f}",
-                        f"wreg={(spread_regularizer_weight * loss_spread).item():.4f}",
-                    ]
-                )
+                spread_value = float(loss_spread.item())
+                loss_terms["spread"] = "0.0000(off)" if abs(spread_value) <= 1e-8 else f"{spread_value:.4f}(active)"
             if abs(vicreg_var_weight) > 1e-12:
-                loss_terms_desc.extend(
-                    [
-                        f"vicv={var_term_t.item():.4f}",
-                        f"wvicv={(vicreg_var_weight * var_term_t).item():.4f}",
-                    ]
-                )
+                loss_terms["vicvar"] = f"{var_term_t.item():.4f}"
             if abs(vicreg_cov_weight) > 1e-12:
-                loss_terms_desc.extend(
-                    [
-                        f"vicc={cov_term_t.item():.4f}",
-                        f"wvicc={(vicreg_cov_weight * cov_term_t).item():.4f}",
-                    ]
-                )
+                loss_terms["viccov"] = f"{cov_term_t.item():.4f}"
             if abs(symmetry_loss_weight) > 1e-12:
-                loss_terms_desc.extend(
-                    [
-                        f"sym={loss_symmetry.item():.4f}",
-                        f"wsym={(symmetry_loss_weight * loss_symmetry).item():.4f}",
-                    ]
-                )
+                loss_terms["sym"] = f"{loss_symmetry.item():.4f}"
+            batch_diag = {
+                "ctx_std": f"{ctx_stats['embed_spread_mean']:.3f}",
+                "ctx_effrank": f"{ctx_stats['context_manifold_size']:.2f}",
+                "valid": f"{valid_frac:.3f}",
+            }
+            batch_optim = {
+                "lr": f"{current_lr:.1e}",
+            }
             metrics_bar.set_description_str(
-                " ".join(loss_terms_desc) + " "
-                f"cos(pred,gt)={sim_val:.4f} "
-                f"std(ch)={ctx_stats['embed_spread_mean']:.3f} "
-                f"rank=exp(H(p))={ctx_stats['context_manifold_size']:.2f} "
-                f"v={valid_frac:.3f} lr={current_lr:.1e}",
+                _format_progress_line("[batch]", loss_terms, batch_diag, batch_optim),
                 refresh=True,
             )
             if _use_wandb and (batch_idx + 1) % log_flush_interval == 0:
@@ -2022,53 +2019,27 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         if epoch_batches > 0:
             avg_total = epoch_total / epoch_batches
             avg_prediction = epoch_prediction / epoch_batches
-            prev_epochs.append(avg_total)
-            prev_str = " | ".join(
-                f"e{e_idx + 1}={prev_epochs[e_idx]:.4f}"
-                for e_idx in range(max(0, len(prev_epochs) - 5), len(prev_epochs) - 1)
-            )
-            if prev_str:
-                prev_str = f" [{prev_str}]"
-            epoch_terms_desc = [
-                f"L={avg_total:.4f}",
-                f"mse={avg_prediction:.4f}",
-            ]
+            epoch_terms = {
+                "total": f"{avg_total:.4f}",
+                "pred": f"{avg_prediction:.4f}",
+            }
             if abs(spread_regularizer_weight) > 1e-12:
-                epoch_terms_desc.extend(
-                    [
-                        f"reg={_fmt_metric(epoch_spread/epoch_batches)}",
-                        f"wreg={_fmt_metric((spread_regularizer_weight * epoch_spread)/epoch_batches)}",
-                    ]
-                )
+                spread_avg = epoch_spread / epoch_batches
+                epoch_terms["spread"] = "0.0000(off)" if abs(spread_avg) <= 1e-8 else f"{_fmt_metric(spread_avg)}(active)"
             if abs(vicreg_var_weight) > 1e-12:
-                epoch_terms_desc.extend(
-                    [
-                        f"vicv={_fmt_metric(epoch_var/epoch_batches)}",
-                        f"wvicv={_fmt_metric((vicreg_var_weight * epoch_var)/epoch_batches)}",
-                    ]
-                )
+                epoch_terms["vicvar"] = _fmt_metric(epoch_var / epoch_batches)
             if abs(vicreg_cov_weight) > 1e-12:
-                epoch_terms_desc.extend(
-                    [
-                        f"vicc={_fmt_metric(epoch_cov/epoch_batches)}",
-                        f"wvicc={_fmt_metric((vicreg_cov_weight * epoch_cov)/epoch_batches)}",
-                    ]
-                )
+                epoch_terms["viccov"] = _fmt_metric(epoch_cov / epoch_batches)
             if abs(symmetry_loss_weight) > 1e-12:
-                epoch_terms_desc.extend(
-                    [
-                        f"sym={_fmt_metric(epoch_symmetric/epoch_batches)}",
-                        f"wsym={_fmt_metric((symmetry_loss_weight * epoch_symmetric)/epoch_batches)}",
-                    ]
-                )
+                epoch_terms["sym"] = _fmt_metric(epoch_symmetric / epoch_batches)
+            epoch_diag = {
+                "ctx_std": _fmt_metric(epoch_embed_spread_mean / epoch_batches),
+                "ctx_effrank": _fmt_metric(epoch_context_manifold_size / epoch_batches),
+                "valid": _fmt_metric(epoch_valid_frac / epoch_batches),
+            }
             tqdm.write(
                 f"[{config_name}] E {epoch + 1}/{epochs} "
-                f"{' '.join(epoch_terms_desc)} "
-                f"cos={_fmt_metric(epoch_sim/epoch_batches)} "
-                f"std={_fmt_metric(epoch_embed_spread_mean/epoch_batches)} "
-                f"rank={_fmt_metric(epoch_context_manifold_size/epoch_batches)} "
-                f"v={_fmt_metric(epoch_valid_frac/epoch_batches)}"
-                f"{prev_str}"
+                f"{_format_progress_line('[epoch]', epoch_terms, epoch_diag)}"
             )
         val_loss = 0.0
         val_sim = 0.0
@@ -2191,7 +2162,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     # Save NPY artifacts (PCA/UMAP/latent embeddings) required by session_to_dash.py.
     # No PNG, HTML, or dashboard rendering is performed here.
     inf_path = os.path.join(session_dir, "inference_outputs.pt")
-    if is_main_process and (not is_3d_mode) and os.path.exists(inf_path):
+    post_training_artifacts = bool(train_cfg.get("post_training_artifacts", True))
+    if is_main_process and (not is_3d_mode) and os.path.exists(inf_path) and post_training_artifacts:
         try:
             outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
             artifacts_dir = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)
@@ -2258,13 +2230,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         except Exception as e:
             log_error("artifact_generation", e)
     else:
-        if is_main_process and is_3d_mode and os.path.exists(inf_path):
+        if is_main_process and is_3d_mode and os.path.exists(inf_path) and post_training_artifacts:
             try:
                 outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
                 umap_meta_path = save_volumetric_umap_embeddings(session_dir, outputs, umap_cfg=umap_cfg)
                 log_info(f"[{config_name}] volumetric_umap_saved={umap_meta_path}")
             except Exception as e:
                 log_error("volumetric_umap", e)
+        elif is_main_process and os.path.exists(inf_path) and not post_training_artifacts:
+            log_info(f"[{config_name}] post_training_artifacts=false; skip PCA/UMAP artifact generation")
         elif is_main_process:
             log_info(f"[{config_name}] warning: inference_outputs.pt missing; skip artifact generation")
 

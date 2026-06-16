@@ -36,6 +36,12 @@ def _fmt_cfg_value(value) -> str:
     return str(value)
 
 
+def _count_cfg_list(value) -> str:
+    if isinstance(value, (list, tuple)):
+        return str(len(value))
+    return "NA"
+
+
 def _read_model_inputs(session_dir: str) -> dict:
     cfg_path = os.path.join(session_dir, "config_used.json")
     if not os.path.exists(cfg_path):
@@ -59,16 +65,17 @@ def _read_model_inputs(session_dir: str) -> dict:
             "psn": _fmt_bool(m.get("scaleaware_norm_per_scale", False)),
             "fin": _fmt_bool(m.get("scaleaware_final_norm", False)),
             "sigtype": str(spread.get("type", "NA")),
-            "spread_mode": str(spread.get("spatial_mode", "dense")),
+            "spread_mode": str(spread.get("spatial_mode", "pooled")),
             "spread_w": str(spread.get("weight", "NA")),
             "spread_t": str(spread.get("target_std", "NA")),
             "vicvar_w": str(t.get("vicreg_var_weight", t.get("experimental_losses", {}).get("vicreg_var_weight", "0"))),
             "viccov_w": str(t.get("vicreg_cov_weight", t.get("experimental_losses", {}).get("vicreg_cov_weight", "0"))),
             "symw": str(t.get("symmetry_loss_weight", "NA")),
             "depth": str(m.get("encoder_depth", "NA")),
-            "dilations": _fmt_cfg_value(m.get("dilations", "None")),
+            "dilations": _fmt_cfg_value(_first_present(m, ("convnext_layer_dilations", "dilations"), "None")),
             "hardcap": str(m.get("mask_box_hardcap", "—")),
             "pred_hidden": str(m.get("predictor_hidden", "NA")),
+            "cdd_scales": _count_cfg_list(m.get("sigmas")),
         }
     except Exception:
         return _missing_model_inputs()
@@ -81,7 +88,7 @@ def _fmt_bool(value) -> str:
 def _missing_model_inputs() -> dict:
     return {k: "NA" for k in (
         "mode", "ms", "mbox", "sampling", "l2", "psn", "fin", "sigtype", "spread_mode", "spread_w", "spread_t",
-        "vicvar_w", "viccov_w", "symw", "depth", "dilations", "hardcap", "pred_hidden",
+        "vicvar_w", "viccov_w", "symw", "depth", "dilations", "hardcap", "pred_hidden", "cdd_scales",
     )}
 
 
@@ -116,7 +123,9 @@ def _read_loss_ratios(session_dir: str) -> dict[str, str]:
         epoch_sums: dict[str, dict[int, float]] = {}
         epoch_counts: dict[str, dict[int, int]] = {}
         keys = [
+            "loss_total",
             "sim",
+            "loss_prediction",
             "loss_spread",
             "weighted_spread",
             "loss_vicreg_var",
@@ -142,10 +151,12 @@ def _read_loss_ratios(session_dir: str) -> dict[str, str]:
                         epoch_counts[k][ep] += 1
         result = {}
         for k in keys:
-            if k in epoch_sums and len(epoch_sums[k]) >= 2:
+            if k in epoch_sums:
                 eps = sorted(epoch_sums[k].keys())
                 fa = epoch_sums[k][eps[0]] / max(1, epoch_counts[k][eps[0]])
                 la = epoch_sums[k][eps[-1]] / max(1, epoch_counts[k][eps[-1]])
+                result[f"{k}_last"] = str(la)
+            if k in epoch_sums and len(epoch_sums[k]) >= 2:
                 if fa > 1e-20:
                     result[k] = str(la / fa)
         return result
@@ -184,13 +195,21 @@ def _fmt_float(v: str, width: int = 8, digits: int = 4) -> str:
         return f"{'-':>{width}}"
 
 
+def _is_nonzero_value(value: str) -> bool:
+    try:
+        x = float(str(value).strip())
+        return math.isfinite(x) and abs(x) > 1e-12
+    except Exception:
+        return False
+
+
 # ── public API ─────────────────────────────────────────────────
 
 def rank_summary(session_dirs: List[str], prefix: str = "") -> List[Tuple[str, ...]]:
     """Return list of (name, mode, ms, mbox, sampling, l2, psn, fin,
-    sigtype, sigmode, sigw, sigt, vicvar_w, viccov_w, symw, depth, dilations, hardcap, energy,
+    spread_type, spread_spatial, spread_w, spread_t, vicvar_w, viccov_w, symw, depth, dilations, hardcap, cdd_scales, energy,
     sim_r, hinge_r, sig_r, vicv_r, vicc_r, wvicv_r, wvicc_r, erank, context, predictor, target, top1,
-    pred_part, target_part, part_ratio, dead_frac, dead_ch) tuples.
+    pred_part, target_part, part_ratio, dead_frac, dead_ch, total_last, pred_last, spread_last) tuples.
 
     Usage:
         from scripts.print_effective_rank import rank_summary
@@ -218,6 +237,9 @@ def rank_summary(session_dirs: List[str], prefix: str = "") -> List[Tuple[str, .
         energy = _fmt_float(str(diag.get("energy", "")), 9, 4)
         ratios = _read_loss_ratios(path)
         sim_r = _fmt_float(ratios.get("sim", ""), 7, 4)
+        total_last = _fmt_float(ratios.get("loss_total_last", ""), 7, 4)
+        pred_last = _fmt_float(ratios.get("loss_prediction_last", ""), 7, 4)
+        spread_last = _fmt_float(ratios.get("loss_spread_last", ""), 7, 4)
         hinge_r = _fmt_float(ratios.get("loss_spread", ""), 7, 4)
         sig_r = _fmt_float(ratios.get("weighted_spread", ""), 7, 4)
         vicv_r = _fmt_float(ratios.get("loss_vicreg_var", ""), 7, 4)
@@ -234,50 +256,109 @@ def rank_summary(session_dirs: List[str], prefix: str = "") -> List[Tuple[str, .
             (name,
              inputs.get("mode", "NA"), inputs.get("ms", "NA"), inputs.get("mbox", "NA"), inputs.get("sampling", "NA"),
              inputs.get("l2", "NA"), inputs.get("psn", "NA"), inputs.get("fin", "NA"),
-             inputs.get("sigtype", "NA"), inputs.get("spread_mode", "dense"), inputs.get("spread_w", "NA"), inputs.get("spread_t", "NA"),
+             inputs.get("sigtype", "NA"), inputs.get("spread_mode", "pooled"), inputs.get("spread_w", "NA"), inputs.get("spread_t", "NA"),
              inputs.get("vicvar_w", "NA"), inputs.get("viccov_w", "NA"),
              inputs.get("symw", "NA"), inputs.get("depth", "NA"),
              inputs.get("dilations", "NA"), inputs.get("hardcap", "NA"),
+             inputs.get("cdd_scales", "NA"),
              energy, sim_r, hinge_r, sig_r, vicv_r, vicc_r, wvicv_r, wvicc_r,
-             rank, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_str))
+             rank, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_str,
+             total_last, pred_last, spread_last))
     return sorted(rows, key=lambda x: x[0])
 
 
 def print_rank_table(session_dirs: List[str], prefix: str = "") -> None:
     """Print a formatted rank-summary table to stdout."""
     rows = rank_summary(session_dirs, prefix=prefix)
-    print("Effective Rank Summary (sorted by session filename A-Z)")
+    print("Sampled Embedding Diagnostics (sorted by session filename A-Z)")
     if not rows:
         print("No matching sessions found.")
         return
-    session_w = max(len("session"), *(len(row[0]) for row in rows))
-    header = (
-        f"{'session':<{session_w}} {'mode':<9} {'sampling':<9} {'mask_scale':>12} {'mask_box':>9} "
-        f"{'l2_norm':>7} {'psnorm':>6} {'final_norm':>10} {'sig_type':>14} {'sig_sp':>6} {'sig_w':>7} {'sig_t':>6} "
-        f"{'vicvar_w':>8} {'viccov_w':>8} {'sym_loss':>9} {'depth':>6} {'dil':>10} {'hardcap':>7} "
-        f"{'energy':>9} {'sim_r':>7} {'hinge_r':>7} {'sig_r':>7} "
-        f"{'vicv_r':>7} {'vicc_r':>7} {'wvv_r':>7} {'wvc_r':>7} "
-        f"{'erank':>8} {'context':>9} {'predictor':>10} {'target':>9} "
-        f"{'top1':>7} {'pred_part':>10} {'target_part':>11} {'part_ratio':>10} {'dead_frac':>10} {'dead_ch':>7}"
-    )
+    include_vicreg = any(_is_nonzero_value(row[12]) or _is_nonzero_value(row[13]) for row in rows)
+    include_sim_ratio = any(str(row[5]).strip() == "1" for row in rows)
+    include_spread_ratio = any(_is_nonzero_value(row[10]) for row in rows)
+    setup_columns = [
+        ("session", 0, "str", "<"),
+        ("status", -1, "status", "<"),
+        ("mask_scale", 2, "str", ">"),
+        ("mask_box", 3, "str", ">"),
+        ("sampling", 4, "str", "<"),
+        ("cdd_n", 18, "str", ">"),
+        ("dil", 16, "str", ">"),
+        ("hardcap", 17, "str", ">"),
+        ("spread_type", 8, "str", ">"),
+        ("spread_sp", 9, "short", ">"),
+        ("spread_w", 10, "float2", ">"),
+    ]
+    vicreg_columns = [
+        ("vicvar_w", 12, "float2", ">"),
+        ("viccov_w", 13, "float2", ">"),
+    ] if include_vicreg else []
+    diagnostic_columns = [
+        ("energy", 19, "raw", ">"),
+        ("total", 37, "raw", ">"),
+        ("pred", 38, "raw", ">"),
+        ("spread", 39, "raw", ">"),
+    ]
+    ratio_columns = []
+    if include_sim_ratio:
+        ratio_columns.append(("sim_r", 20, "raw", ">"))
+    if include_spread_ratio:
+        ratio_columns.append(("hinge_r", 21, "raw", ">"))
+    vicreg_ratio_columns = [
+        ("vicv_r", 23, "raw", ">"),
+        ("vicc_r", 24, "raw", ">"),
+        ("wvv_r", 25, "raw", ">"),
+        ("wvc_r", 26, "raw", ">"),
+    ] if include_vicreg else []
+    representation_columns = [
+        ("context_effrank", 28, "float4", ">"),
+        ("predictor_effrank", 29, "float4", ">"),
+        ("target_effrank", 27, "float4", ">"),
+        ("pred_top1", 31, "float3", ">"),
+        ("target_part", 33, "float2", ">"),
+        ("part_ratio", 34, "float4", ">"),
+        ("dead_frac", 35, "float3", ">"),
+    ]
+    columns = setup_columns + vicreg_columns + diagnostic_columns + ratio_columns + vicreg_ratio_columns + representation_columns
+
+    def row_status(row: tuple[str, ...]) -> str:
+        if str(row[27]).strip():
+            return "ok"
+        if any(str(row[idx]).strip() for idx in (28, 29, 30, 31, 32, 33, 34, 35)):
+            return "partial_diag"
+        return "missing_diag"
+
+    def format_cell(row: tuple[str, ...], idx: int, kind: str) -> str:
+        if kind == "status":
+            return row_status(row)
+        value = row[idx]
+        if kind == "short":
+            return str(value)[:6]
+        if kind == "float2":
+            return _fmt_float(value, 0, 2).strip()
+        if kind == "float3":
+            return _fmt_float(value, 0, 3).strip()
+        if kind == "float4":
+            return _fmt_float(value, 0, 4).strip()
+        return str(value).strip()
+
+    widths = []
+    for name, idx, kind, _align in columns:
+        cells = [format_cell(row, idx, kind) for row in rows]
+        widths.append(max(len(name), *(len(cell) for cell in cells)))
+
+    header = " ".join(f"{name:{align}{width}}" for (name, _idx, _kind, align), width in zip(columns, widths))
     print(header)
     print("-" * len(header))
     for row in rows:
-        (s, mode, ms, mbox, sampling, l2, psn, fin, sigtype, sigmode, sigw, sigt, vicvar_w, viccov_w, symw, d, dil, hc,
-         energy, sim_r, hinge_r, sig_r, vicv_r, vicc_r, wvicv_r, wvicc_r,
-         rk, c_er, p_er, g_er, p_t1, p_pr, g_pr, pr_match, p_dead, p_dead_n) = row
-        print(
-            f"{s:<{session_w}} {mode:<9} {sampling:<9} {ms:>12} {mbox:>9} "
-            f"{l2:>7} {psn:>6} {fin:>10} {sigtype:>14} {sigmode[:6]:>6} {_fmt_float(sigw,7,2)} {_fmt_float(sigt,6,2)} "
-            f"{_fmt_float(vicvar_w,8,2)} {_fmt_float(viccov_w,8,2)} {_fmt_float(symw,9,4)} {d:>6} {dil:>10} {hc:>7} "
-            f"{energy:>9} {sim_r:>7} {hinge_r:>7} {sig_r:>7} "
-            f"{vicv_r:>7} {vicc_r:>7} {wvicv_r:>7} {wvicc_r:>7} "
-            f"{_fmt_float(rk,8,4)} {_fmt_float(c_er,9,4)} {_fmt_float(p_er,10,4)} {_fmt_float(g_er,9,4)} "
-            f"{_fmt_float(p_t1,7,3)} {_fmt_float(p_pr,10,2)} {_fmt_float(g_pr,11,2)} {_fmt_float(pr_match,10,4)} "
-            f"{_fmt_float(p_dead,10,3)} {p_dead_n:>7}"
-        )
+        cells = [
+            format_cell(row, idx, kind)
+            for _name, idx, kind, _align in columns
+        ]
+        print(" ".join(f"{cell:{align}{width}}" for cell, (_name, _idx, _kind, align), width in zip(cells, columns, widths)))
     n_total = len(rows)
-    n_rank = sum(1 for r in rows if r[19] != "")
+    n_rank = sum(1 for r in rows if r[27] != "")
     print("-" * len(header))
     print(f"sessions={n_total} with_rank={n_rank} missing_rank={n_total - n_rank}")
 

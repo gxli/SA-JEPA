@@ -544,7 +544,7 @@ class PyramidGridJEPA(nn.Module):
         if not bool(mask_inference):
             # In mask-free inference, predictor branch should consume clean features.
             enc_context = enc_target
-        symmetric_var = None  # trainable context-encoder rotation-view variance
+        symmetric_var = None  # trainable context-encoder symmetry-view variance
         target_symmetric_var = None  # detached EMA diagnostic only
         if self.encoder_type == "cdd_scaleaware_convnext":
             if self.mode != "pyramid":

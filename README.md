@@ -60,51 +60,69 @@ field = torch.load("data/ngc3627_co_emission.pt")  # (H, W)
 # 1. Use the default scale-aware ConvNeXt baseline
 model = ScaleAwareJEPA()
 
-# 2. Train
+# 2. Train (resumes from checkpoint if session_dir exists)
 model.fit(field, epochs=10)
+# or with explicit session dir:
+model.fit(field, epochs=10, session_dir="sessions/my_run")
 
-# 3. Extract pixel-registered latent atlas
+# 3. Continue training (auto-resume)
+model.fit(field, epochs=20, session_dir="sessions/my_run")
+
+# 4. Extract pixel-registered latent atlas
 latent = model.extract(field)                # → (C_latent, H, W)
 
-# 4. Project to 2D (PCA + UMAP with GPU fallback)
+# 5. Project to 2D (PCA + UMAP with GPU fallback)
 proj = model.project(field, method="umap")   # → {"pca": np.array, "umap": np.array|None}
 
-# 5. Diagnostics
+# 6. Diagnostics
 metrics = model.analyze_rank()               # → dict: erank, energy, sim_r, hinge_r, ...
 
-# 6. Persist and visualize
+# 7. Persist and visualize
 model.save_session("sessions/my_run")
 model.generate_dashboard("results/api_dashboard.html")
 
-# 7. Restore later
+# 8. Restore later
 model2 = ScaleAwareJEPA.load_session("sessions/my_run")
 latent2 = model2.extract(new_field)
 ```
 
 | method | returns | purpose |
 |--------|---------|---------|
-| `ScaleAwareJEPA(config)` | model | init from dict or YAML/JSON path |
-| `model.fit(field, epochs)` | self | train encoder + predictor |
+| `ScaleAwareJEPA(config?)` | model | init from dict, YAML/JSON path, or defaults |
+| `model.fit(field, epochs, *, session_dir?)` | self | train; resumes if *session_dir* exists |
+| `model.train(configs?, *, config_name?, sessions_dir?, dashboard?)` | self | train from config with full pipeline |
 | `model.extract(field)` | `(C,H,W)` tensor | pixel-registered latent atlas |
-| `model.project(field, method="umap")` | `{"pca":..., "umap":...}` | 2D projection with GPU fallback |
-| `model.analyze_rank()` | dict | effective rank, energy, hinge ratio |
-| `model.save_session(path)` | — | persist config + weights |
+| `model.project(field, method="umap")` | `{"pca":..., "umap":...}` | 2D projection (PCA + UMAP) |
+| `model.infer_npy(path, output_dir?, **kwargs)` | str | run inference on a new `.npy` file |
+| `model.analyze_rank()` | dict | effective rank, sim, hinge, dead channels |
+| `model.save_session(path)` | — | persist config, weights, inference, dashboard |
 | `model.generate_dashboard(path?)` | — | interactive Plotly HTML dashboard |
 | `ScaleAwareJEPA.load_session(path)` | model | restore from saved session |
+| `ScaleAwareJEPA.infer_from_session(session, in, out)` | str | classmethod: inference without loading |
 
-### Current Baseline Knobs
+### Configurable Knobs
 
-The default `ScaleAwareJEPA()` baseline follows the current config convention:
+All knobs sit under `model.*` or `training.*` in config files. The default
+`ScaleAwareJEPA()` baseline uses the values shown below.
 
-- `model.normalize_loss_l2: false` keeps JEPA prediction in the unnormalized amplitude space.
-- `training.prediction_loss_weight: 50` is the main predictor-target MSE weight.
-- `training.spread_regularizer` defaults to dense-token `std_hinge` on `target: context` with `weight: 2`.
-- `training.symmetry_loss_weight: 0.003` is enabled in the base MHD baseline; dataset-specific examples may set it to `0`.
-- `vicreg_var_weight` and `vicreg_cov_weight` are optional ablation terms and are off unless explicitly set.
+| Section | Key | Default | Purpose |
+|---|---|---|---|
+| `training` | `epochs` | 10 | training duration |
+| `training` | `batch_size` | 4 | per-step samples |
+| `training` | `gradient_accumulation_steps` | 1 | effective batch = bs × accum |
+| `model` | `convnext_layer_dilations` | `null` | dilation per ConvNeXt block; `[1,1,2,4]` for large FOV on big images |
+| `model` | `mask_box_hardcap` | `null` | ceiling on mask box pixels; 48 for NGC-style 686×398 fields |
+| `training.spread_regularizer` | `weight` | 2 | anti-collapse hinge strength |
+| `training.spread_regularizer` | `spatial_mode` | `pooled` | `pooled` (per-patch mean) or `dense` (per-token) |
+| `training.spread_regularizer` | `target` | `context` | which branch to regularise |
+| `training` | `prediction_loss_weight` | 50 | MSE weight |
+| `training` | `symmetry_loss_weight` | 0.003 | MHD D₄ equivariance; 0 for NGC/Chengdu (OOM-prone) |
+| `model` | `normalize_loss_l2` | false | angular vs amplitude MSE |
+| `model` | `use_symmetric_feature_loss` | true | disable on large non-square images |
 
-Recent experiment families used larger hinge weights (`weight: 20`) and
-explicit L2-on/off sweeps. Treat those as ablations; the import-route default
-uses the baseline values above.
+The program prints the effective receptive field at startup when custom
+dilations are set.  NGC-style runs should use `convnext_layer_dilations:
+[1,1,2,4]` plus `mask_box_hardcap: 48` and `symmetry_loss_weight: 0`.
 
 ### CLI
 
@@ -131,7 +149,7 @@ scales gradient accumulation to maintain the target effective batch:
 
 ```yaml
 # configs/mhd_turbulence.yaml
-training:
+train:
   batch_size: 4
   target_batch_size: 32
   auto_scale_batch_size: "power_of_two"   # OOM → 4 → 2 → 1
