@@ -35,6 +35,42 @@ class ScaleAwareJEPA:
         self._session_dir: Optional[str] = None
         self._is_trained: bool = False
 
+    @staticmethod
+    def _seed_session_from_base(base_session: str, target_session: str, mode: str = "weights") -> None:
+        """Seed a new training session from an existing session.
+
+        mode="weights" copies only model_last.pt, resetting epoch/optimizer.
+        mode="resume" also copies checkpoint_last.pt for full optimizer resume.
+        """
+        import shutil
+
+        mode = str(mode).strip().lower()
+        if mode not in {"weights", "resume"}:
+            raise ValueError("base_session_mode must be 'weights' or 'resume'.")
+        base_session = os.path.abspath(base_session)
+        target_session = os.path.abspath(target_session)
+        if not os.path.isdir(base_session):
+            raise FileNotFoundError(f"base_session does not exist: {base_session}")
+        if os.path.abspath(base_session) == os.path.abspath(target_session):
+            raise ValueError("base_session and target session must be different directories.")
+
+        os.makedirs(target_session, exist_ok=True)
+        copied = []
+        ckpt_names = ["model_last.pt"]
+        if mode == "resume":
+            ckpt_names.append("checkpoint_last.pt")
+        for ckpt_name in ckpt_names:
+            src = os.path.join(base_session, ckpt_name)
+            if os.path.exists(src):
+                dst = os.path.join(target_session, ckpt_name)
+                shutil.copy2(src, dst)
+                copied.append(ckpt_name)
+        if not copied:
+            raise FileNotFoundError(
+                f"base_session has no model_last.pt: {base_session}"
+            )
+        print(f"[sajepa] seeded {target_session} from {base_session} mode={mode}: {', '.join(copied)}")
+
     # ── training ────────────────────────────────────────────────
 
     @property
@@ -49,8 +85,16 @@ class ScaleAwareJEPA:
         config_name: str = "sajepa",
         sessions_dir: str = "sessions",
         dashboard: bool = False,
+        base_session: Optional[str] = None,
+        base_session_mode: str = "weights",
     ) -> "ScaleAwareJEPA":
-        """Train from the default/current config plus optional overrides."""
+        """Train from the current config plus optional overrides.
+
+        When *base_session* is provided, seeds the new session from that
+        session.  ``base_session_mode="weights"`` copies only model weights
+        and resets optimizer/epoch; ``"resume"`` also copies optimizer,
+        scheduler, scaler, and epoch state.
+        """
         cfg = copy.deepcopy(self._config)
         if configs is not None:
             if isinstance(configs, str):
@@ -59,6 +103,11 @@ class ScaleAwareJEPA:
                 override = copy.deepcopy(configs)
                 reject_removed_config_aliases(override)
             cfg = _deep_merge(cfg, override)
+
+        if base_session is not None:
+            new_dir = os.path.join(sessions_dir, config_name)
+            self._seed_session_from_base(base_session, new_dir, mode=base_session_mode)
+
         session_dir = run_training(cfg, config_name=config_name, sessions_root=sessions_dir)
         self._config = cfg
         self._session_dir = os.path.abspath(session_dir)
@@ -73,12 +122,19 @@ class ScaleAwareJEPA:
         epochs: Optional[int] = None,
         *,
         session_dir: Optional[str] = None,
+        base_session: Optional[str] = None,
+        base_session_mode: str = "weights",
     ) -> "ScaleAwareJEPA":
         """Train on a raw physical field.  Returns self for chaining.
 
         When *session_dir* is provided, training persists to that directory
         and resumes from the last checkpoint if one exists.  Without it, a
         temporary directory is used and no resume is attempted.
+
+        When *base_session* is provided, seeds the new session from that
+        session.  ``base_session_mode="weights"`` copies only model weights
+        and resets optimizer/epoch; ``"resume"`` also copies optimizer,
+        scheduler, scaler, and epoch state.
         """
         cfg = copy.deepcopy(self._config)
         if epochs is not None:
@@ -89,6 +145,12 @@ class ScaleAwareJEPA:
             os.makedirs(sessions_dir, exist_ok=True)
         else:
             sessions_dir = tempfile.mkdtemp(prefix="sajepa_")
+        if base_session is not None:
+            self._seed_session_from_base(
+                base_session,
+                os.path.join(sessions_dir, "sajepa"),
+                mode=base_session_mode,
+            )
         data_dir = os.path.join(sessions_dir, "data")
         os.makedirs(data_dir, exist_ok=True)
         data_path = os.path.join(data_dir, "_input.npy")

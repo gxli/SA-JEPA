@@ -68,20 +68,45 @@ model.fit(field, epochs=10, session_dir="sessions/my_run")
 # 3. Continue training (auto-resume)
 model.fit(field, epochs=20, session_dir="sessions/my_run")
 
-# 4. Extract pixel-registered latent atlas
+# 4. Refine from precomputed weights on new data
+model.fit(
+    new_field,
+    epochs=10,
+    session_dir="sessions/refine_new_data",
+    base_session="sessions/pretrained_run",
+)  # weights-only by default; optimizer/epoch reset
+
+# Full continuation, including optimizer/scheduler/epoch state:
+model.fit(
+    new_field,
+    epochs=30,
+    session_dir="sessions/continue_old_run",
+    base_session="sessions/pretrained_run",
+    base_session_mode="resume",
+)
+
+# Config-driven refinement uses the same base_session mode:
+model.train(
+    configs={"data": {"npy_pattern": "new_field.npy"}},
+    config_name="refine_new_data",
+    sessions_dir="sessions",
+    base_session="sessions/pretrained_run",
+)
+
+# 5. Extract pixel-registered latent atlas
 latent = model.extract(field)                # → (C_latent, H, W)
 
-# 5. Project to 2D (PCA + UMAP with GPU fallback)
+# 6. Project to 2D (PCA + UMAP with GPU fallback)
 proj = model.project(field, method="umap")   # → {"pca": np.array, "umap": np.array|None}
 
-# 6. Diagnostics
+# 7. Diagnostics
 metrics = model.analyze_rank()               # → dict: erank, energy, sim_r, hinge_r, ...
 
-# 7. Persist and visualize
+# 8. Persist and visualize
 model.save_session("sessions/my_run")
 model.generate_dashboard("results/api_dashboard.html")
 
-# 8. Restore later
+# 9. Restore later
 model2 = ScaleAwareJEPA.load_session("sessions/my_run")
 latent2 = model2.extract(new_field)
 ```
@@ -89,8 +114,8 @@ latent2 = model2.extract(new_field)
 | method | returns | purpose |
 |--------|---------|---------|
 | `ScaleAwareJEPA(config?)` | model | init from dict, YAML/JSON path, or defaults |
-| `model.fit(field, epochs, *, session_dir?)` | self | train; resumes if *session_dir* exists |
-| `model.train(configs?, *, config_name?, sessions_dir?, dashboard?)` | self | train from config with full pipeline |
+| `model.fit(field, epochs, *, session_dir?, base_session?, base_session_mode="weights")` | self | train; resumes if *session_dir* exists; optionally seed from another session |
+| `model.train(configs?, *, config_name?, sessions_dir?, dashboard?, base_session?, base_session_mode="weights")` | self | config-driven train; optionally seed from another session |
 | `model.extract(field)` | `(C,H,W)` tensor | pixel-registered latent atlas |
 | `model.project(field, method="umap")` | `{"pca":..., "umap":...}` | 2D projection (PCA + UMAP) |
 | `model.infer_npy(path, output_dir?, **kwargs)` | str | run inference on a new `.npy` file |
@@ -100,9 +125,14 @@ latent2 = model2.extract(new_field)
 | `ScaleAwareJEPA.load_session(path)` | model | restore from saved session |
 | `ScaleAwareJEPA.infer_from_session(session, in, out)` | str | classmethod: inference without loading |
 
+`base_session_mode="weights"` copies only `model_last.pt`, so refinement starts
+from precomputed weights but resets optimizer, scheduler, scaler, and epoch.
+Use `base_session_mode="resume"` to also copy `checkpoint_last.pt` for full
+continuation.
+
 ### Configurable Knobs
 
-All knobs sit under `model.*` or `training.*` in config files. The default
+All knobs sit under `model.*` or `train.*` in config files. The default
 `ScaleAwareJEPA()` baseline uses the values shown below.
 
 | Section | Key | Default | Purpose |
@@ -112,9 +142,9 @@ All knobs sit under `model.*` or `training.*` in config files. The default
 | `training` | `gradient_accumulation_steps` | 1 | effective batch = bs × accum |
 | `model` | `convnext_layer_dilations` | `null` | dilation per ConvNeXt block; `[1,1,2,4]` for large FOV on big images |
 | `model` | `mask_box_hardcap` | `null` | ceiling on mask box pixels; 48 for NGC-style 686×398 fields |
-| `training.spread_regularizer` | `weight` | 2 | anti-collapse hinge strength |
-| `training.spread_regularizer` | `spatial_mode` | `pooled` | `pooled` (per-patch mean) or `dense` (per-token) |
-| `training.spread_regularizer` | `target` | `context` | which branch to regularise |
+| `train.spread_regularizer` | `weight` | 2 | anti-collapse hinge strength |
+| `train.spread_regularizer` | `spatial_mode` | `pooled` | `pooled` (per-patch mean) or `dense` (per-token) |
+| `train.spread_regularizer` | `target` | `context` | which branch to regularise |
 | `training` | `prediction_loss_weight` | 50 | MSE weight |
 | `training` | `symmetry_loss_weight` | 0.003 | MHD D₄ equivariance; 0 for NGC/Chengdu (OOM-prone) |
 | `model` | `normalize_loss_l2` | false | angular vs amplitude MSE |
