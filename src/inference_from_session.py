@@ -144,26 +144,56 @@ def _tile_crops_2d(
     return tiles
 
 
-@dataclass(frozen=True)
+@dataclass
 class TileLayout2D:
     original_shape: tuple[int, int]
     crop_size: int
     origins: tuple[tuple[int, int], ...]
     valid_shapes: tuple[tuple[int, int], ...]
+    visit_map: np.ndarray | None = None  # H×W count of tile coverage per pixel
+    min_valid_fraction: float = 0.5
+
+
+def _tile_starts(length: int, crop_size: int, stride: int) -> list[int]:
+    if length <= crop_size:
+        return [0]
+    starts = list(range(0, max(1, length - crop_size + 1), stride))
+    last = length - crop_size
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
+def _valid_pixel_mask(arr: np.ndarray) -> np.ndarray:
+    """Default inference validity: finite and nonzero pixels are valid."""
+    a = np.asarray(arr)
+    return np.isfinite(a) & (~np.isclose(a, 0.0, equal_nan=False))
 
 
 def _tile_crops_2d_with_layout(
     arr2d: np.ndarray,
     crop_size: int,
     crop_mode: str = "center",
+    crop_min_valid_fraction: float = 0.5,
+    valid_mask: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], TileLayout2D | None]:
     h, w = arr2d.shape
     cs = int(crop_size)
+    valid_mask_arr = _valid_pixel_mask(arr2d) if valid_mask is None else np.asarray(valid_mask, dtype=bool)
+    if valid_mask_arr.shape != (h, w):
+        raise ValueError(f"valid_mask shape {valid_mask_arr.shape} must match input shape {(h, w)}")
     if h <= cs and w <= cs:
+        valid_fraction = float(valid_mask_arr.sum()) / float(cs * cs)
+        if valid_fraction <= float(crop_min_valid_fraction):
+            raise ValueError(
+                f"No valid inference tile: only {valid_fraction:.3f} valid pixels in padded "
+                f"{cs}x{cs} cutout, below crop_min_valid_fraction={crop_min_valid_fraction:.3f}."
+            )
         if h < cs or w < cs:
             padded = np.zeros((cs, cs), dtype=np.float32)
             padded[:h, :w] = np.asarray(arr2d, dtype=np.float32)
-            return [padded], TileLayout2D((h, w), cs, ((0, 0),), ((h, w),))
+            visit_map = np.ones((h, w), dtype=np.int32)
+            return [padded], TileLayout2D((h, w), cs, ((0, 0),), ((h, w),), visit_map, float(crop_min_valid_fraction))
         return [np.asarray(arr2d, dtype=np.float32).copy()], None
 
     if crop_mode == "center":
@@ -179,18 +209,40 @@ def _tile_crops_2d_with_layout(
     origins = []
     valid_shapes = []
     stride = max(1, cs // 2)
-    for y0 in range(0, h, stride):
+    y_starts = _tile_starts(h, cs, stride)
+    x_starts = _tile_starts(w, cs, stride)
+    min_valid = float(crop_min_valid_fraction)
+    for y0 in y_starts:
         y1 = min(y0 + cs, h)
-        for x0 in range(0, w, stride):
+        for x0 in x_starts:
             x1 = min(x0 + cs, w)
-            tile = np.zeros((cs, cs), dtype=np.float32)
             th = y1 - y0
             tw = x1 - x0
-            tile[:th, :tw] = np.asarray(arr2d[y0:y1, x0:x1], dtype=np.float32)
+            region = np.asarray(arr2d[y0:y1, x0:x1], dtype=np.float32)
+            valid_fraction = float(valid_mask_arr[y0:y1, x0:x1].sum()) / float(cs * cs)
+            if valid_fraction <= min_valid:
+                continue
+            tile = np.zeros((cs, cs), dtype=np.float32)
+            tile[:th, :tw] = region
             tiles.append(tile)
             origins.append((y0, x0))
             valid_shapes.append((th, tw))
-    return tiles, TileLayout2D((h, w), cs, tuple(origins), tuple(valid_shapes))
+    if not tiles:
+        raise ValueError(
+            f"No inference tiles passed crop_min_valid_fraction={min_valid:.3f} "
+            f"for input shape {(h, w)} and crop_size={cs}."
+        )
+    visit_map = np.zeros((h, w), dtype=np.int32)
+    for (y0, x0), (th, tw) in zip(origins, valid_shapes):
+        visit_map[y0:y0+th, x0:x0+tw] += 1
+    return tiles, TileLayout2D(
+        (h, w),
+        cs,
+        tuple(origins),
+        tuple(valid_shapes),
+        visit_map=visit_map,
+        min_valid_fraction=min_valid,
+    )
 
 
 def _stitch_tile_tensor(value, layout: TileLayout2D | None):
@@ -278,6 +330,7 @@ def load_raw_data(
     slice_index: int | None = None,
     return_layout: bool = False,
     slab_depth: int | None = None,
+    crop_min_valid_fraction: float = 0.5,
 ) -> torch.Tensor | tuple[torch.Tensor, TileLayout2D | None]:
     """Load an arbitrary .npy and return a B×1×H×W tensor (or B×1×D×H×W for 3D).
 
@@ -338,8 +391,16 @@ def load_raw_data(
             )
 
     if crop_size and max(arr.shape) > crop_size:
-        arr_norm = normalize01(np.asarray(arr, dtype=np.float32))
-        tiles, layout = _tile_crops_2d_with_layout(arr_norm, crop_size, crop_mode)
+        arr_raw = np.asarray(arr, dtype=np.float32)
+        raw_valid_mask = _valid_pixel_mask(arr_raw)
+        arr_norm = normalize01(arr_raw)
+        tiles, layout = _tile_crops_2d_with_layout(
+            arr_norm,
+            crop_size,
+            crop_mode,
+            crop_min_valid_fraction,
+            valid_mask=raw_valid_mask,
+        )
         tensor = np.stack([np.asarray(t, dtype=np.float32) for t in tiles], axis=0)
     else:
         layout = None
@@ -516,6 +577,8 @@ def save_inference_session(
     mask_inference: bool = True,
     make_dashboard: bool = True,
     umap_cfg: dict | None = None,
+    tile_layout: TileLayout2D | None = None,
+    crop_min_valid_fraction: float | None = None,
 ) -> str:
     """Save inference outputs as a new inference-only session.
 
@@ -530,9 +593,17 @@ def save_inference_session(
         "source_session": config_out.pop("_source_session", None),
         "input_file": os.path.abspath(input_path),
         "crop_size": crop_size,
+        "crop_min_valid_fraction": crop_min_valid_fraction,
         "mode": mode,
         "mask_inference": bool(mask_inference),
     }
+    if tile_layout is not None:
+        config_out["_inference"]["tile_layout"] = {
+            "original_shape": list(tile_layout.original_shape),
+            "crop_size": int(tile_layout.crop_size),
+            "num_tiles": int(len(tile_layout.origins)),
+            "min_valid_fraction": float(tile_layout.min_valid_fraction),
+        }
 
     with open(os.path.join(output_dir, "config_used.json"), "w", encoding="utf-8") as f:
         json.dump(config_out, f, indent=2)
@@ -544,6 +615,9 @@ def save_inference_session(
     if outputs.get("x_context") is None and outputs.get("x_context_raw") is not None:
         outputs["x_context"] = outputs["x_context_raw"]
     torch.save(outputs, os.path.join(output_dir, "inference_outputs.pt"))
+    # Save tile visit heatmap for tiled inference
+    if tile_layout is not None and tile_layout.visit_map is not None:
+        np.save(os.path.join(output_dir, "tile_visit_map.npy"), tile_layout.visit_map.astype(np.int32))
 
     # Save compressed NPZ maps and target metadata.
     for key in ("pred_map", "gt_map", "context_map", "target_locations", "target_scales", "target_valid"):
@@ -687,6 +761,12 @@ Examples:
     parser.add_argument("--input", default=None, help="Path to input .npy file")
     parser.add_argument("--crop-size", type=int, default=None, help="Crop/tile size for large inputs")
     parser.add_argument("--crop-mode", default="center", choices=["center", "tile"], help="Crop mode")
+    parser.add_argument(
+        "--crop-min-valid-fraction",
+        type=float,
+        default=0.5,
+        help="Keep only tiled cutouts with more than this fraction of finite nonzero pixels",
+    )
     parser.add_argument("--mode", default="image", choices=["image", "3d_slab"], help="Inference mode")
     parser.add_argument(
         "--no-mask-inference",
@@ -750,6 +830,7 @@ Examples:
         args.input,
         crop_size=args.crop_size,
         crop_mode=args.crop_mode,
+        crop_min_valid_fraction=args.crop_min_valid_fraction,
         mode=args.mode,
         slice_axis=args.slice_axis,
         slice_index=args.slice_index,
@@ -810,6 +891,8 @@ Examples:
         crop_size=args.crop_size,
         mode=args.mode,
         mask_inference=args.mask_inference,
+        tile_layout=tile_layout,
+        crop_min_valid_fraction=args.crop_min_valid_fraction,
     )
 
     print(f"[inference] done → {output_dir}")

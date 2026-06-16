@@ -226,6 +226,7 @@ class ScaleAwareJEPA:
         *,
         crop_size: Optional[int] = None,
         crop_mode: str = "center",
+        crop_min_valid_fraction: float = 0.5,
         mode: str = "image",
         mask_inference: bool = True,
         batch_size: int = 2,
@@ -267,6 +268,7 @@ class ScaleAwareJEPA:
             input_path,
             crop_size=crop_size,
             crop_mode=crop_mode,
+            crop_min_valid_fraction=crop_min_valid_fraction,
             mode=mode,
             return_layout=True,
             slab_depth=(
@@ -318,6 +320,8 @@ class ScaleAwareJEPA:
             mask_inference=bool(mask_inference),
             make_dashboard=bool(make_dashboard),
             umap_cfg=config.get("train", {}).get("umap", {}),
+            tile_layout=tile_layout,
+            crop_min_valid_fraction=float(crop_min_valid_fraction),
         )
         self._session_dir = os.path.abspath(out)
         self._is_trained = True

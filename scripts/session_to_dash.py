@@ -506,8 +506,20 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     visit_path = _prefer_npz(os.path.join(session_dir, "visited_target_frequency_canonical.npy"))
     if not os.path.exists(visit_path):
         visit_path = _prefer_npz(os.path.join(session_dir, "visited_target_frequency.npy"))
-    visit_heatmap = np.asarray(_load_array(visit_path), dtype=np.float32) if os.path.exists(visit_path) else np.zeros((h, w), dtype=np.float32)
-    if visit_heatmap.shape != (h, w):
+    # Auto-detect tile visit map from tiled inference
+    tile_visit_path = _prefer_npz(os.path.join(session_dir, "tile_visit_map.npy"))
+    visit_heatmap_kind = "Visit Frequency Heatmap"
+    if os.path.exists(tile_visit_path):
+        visit_heatmap = np.asarray(_load_array(tile_visit_path), dtype=np.float32)
+        if visit_heatmap.shape != (h, w):
+            visit_heatmap = np.zeros((h, w), dtype=np.float32)
+        else:
+            visit_heatmap_kind = "Tile Coverage Heatmap"
+    elif os.path.exists(visit_path):
+        visit_heatmap = np.asarray(_load_array(visit_path), dtype=np.float32)
+        if visit_heatmap.shape != (h, w):
+            visit_heatmap = np.zeros((h, w), dtype=np.float32)
+    else:
         visit_heatmap = np.zeros((h, w), dtype=np.float32)
 
     # Load first-sample pyramid mask cube (S,H,W), save a canonical artifact in session dir.
@@ -870,6 +882,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         target_loc_heatmap=target_loc_heatmap.astype(np.float32),
         energy_map=energy_map.astype(np.float32),
         visit_heatmap=visit_heatmap.astype(np.float32),
+        visit_heatmap_kind=np.asarray(visit_heatmap_kind),
         context_pca3d=bundles["context"]["pca3d"],
         context_umap3d=bundles["context"]["umap3d"],
         context_pca_rgb=bundles["context"]["pca_rgb"],
@@ -1814,9 +1827,9 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             {"title": "Target Location Heatmap", "fig": heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma"), "group": "target-heat", "raw_png": _raw_png_data_url(data["target_loc_heatmap"])},
             {"title": "Energy Map", "fig": heat("Energy Map", data["energy_map"], "Inferno"), "group": "energy", "raw_png": _raw_png_data_url(data["energy_map"])},
             {
-                "title": "Visit Frequency Heatmap",
+                "title": str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap",
                 "fig": heat(
-                    "Visit Frequency Heatmap (log1p, unvisited=NaN)",
+                    f"{str(data['visit_heatmap_kind']) if 'visit_heatmap_kind' in data.files else 'Visit Frequency Heatmap'} (log1p, zero=NaN)",
                     data["visit_heatmap"],
                     "Cividis",
                     percentile_scale=False,
@@ -2348,7 +2361,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         ("Target Locations", "target"),
         ("Target Location Heatmap", "target_loc_heatmap"),
         ("Energy Map", "energy_map"),
-        ("Visit Frequency Heatmap", "visit_heatmap"),
+        (str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap", "visit_heatmap"),
     ):
         finite = int(np.isfinite(np.asarray(data[key])).sum())
         print(f"dashboard_plot_item={title}: {'ok' if finite > 0 else 'empty'} (finite_pixels={finite})")
