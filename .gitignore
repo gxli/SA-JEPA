@@ -102,3 +102,5 @@ local_tests/inference_full_simple/
 build/
 sajepa.egg-info/
 .codex_worktrees/
+w
+scripts/_*.py
