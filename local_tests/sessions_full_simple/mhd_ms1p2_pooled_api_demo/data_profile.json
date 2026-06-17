@@ -1,0 +1,44 @@
+{
+  "pattern": "/Users/gxli/proj/ml/multiscale_conv_jepa/convnext_jepa/data/C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy",
+  "crop_mode": "none",
+  "crop_size": null,
+  "files": [
+    {
+      "path": "/Users/gxli/proj/ml/multiscale_conv_jepa/convnext_jepa/data/C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy",
+      "shape": [
+        256,
+        256
+      ],
+      "ndim": 2,
+      "dtype": ">f4",
+      "size": 65536,
+      "finite_count": 65536,
+      "nan_count": 0,
+      "posinf_count": 0,
+      "neginf_count": 0,
+      "raw_finite_zero_count": 0,
+      "raw_finite_zero_fraction": 0.0,
+      "raw_quantiles": {
+        "0.0": 2.0855675842570596e-23,
+        "0.5": 9.311217332185151e-22,
+        "0.9": 6.2523422010552684e-21,
+        "0.99": 4.257394940584061e-20,
+        "1.0": 3.6247729111260786e-19
+      },
+      "normalized_zero_count": 1,
+      "normalized_zero_fraction": 1.52587890625e-05,
+      "normalized_positive_count": 65535,
+      "normalized_nonzero_bbox": [
+        [
+          0,
+          255
+        ],
+        [
+          0,
+          255
+        ]
+      ],
+      "aspect_ratio_h_over_w": 1.0
+    }
+  ]
+}

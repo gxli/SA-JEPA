@@ -1,0 +1,13 @@
+{
+  "prediction_loss_weight": 50.0,
+  "spread_regularizer": {
+    "type": "std_hinge",
+    "target": "context",
+    "weight": 5.0,
+    "target_std": 1.0,
+    "eps": 0.0001,
+    "spatial_mode": "pooled"
+  },
+  "symmetry_loss_weight": 0.003,
+  "experimental_losses": {}
+}

@@ -56,6 +56,19 @@ def _read_model_inputs(session_dir: str) -> dict:
             spread = {}
         mask_scale = _first_present(m, ("mask_size_scaling", "mask_scale_factor", "mask_scale"))
         mask_box = _first_present(m, ("mask_size_manual", "mask_size", "mask_footprint_px", "mask_box_size"))
+        # Compute encoder FOV
+        depth = int(m.get("encoder_depth", 4))
+        kernel = int(m.get("encoder_kernel_size", 7))
+        dils_raw = _first_present(m, ("convnext_layer_dilations", "dilations"), None)
+        if dils_raw and dils_raw != "None":
+            try:
+                dils = [int(x) for x in dils_raw.strip("[]").replace(" ", "").split(",")]
+                dils = dils[:depth] + [1] * max(0, depth - len(dils))
+            except Exception:
+                dils = [1] * depth
+        else:
+            dils = [1] * depth
+        encoder_fov = 1 + sum((kernel - 1) * d for d in dils)
         return {
             "mode": str(m.get("mode", "NA")),
             "ms": _fmt_cfg_value(mask_scale),
@@ -72,7 +85,8 @@ def _read_model_inputs(session_dir: str) -> dict:
             "viccov_w": str(t.get("vicreg_cov_weight", t.get("experimental_losses", {}).get("vicreg_cov_weight", "0"))),
             "symw": str(t.get("symmetry_loss_weight", "NA")),
             "depth": str(m.get("encoder_depth", "NA")),
-            "dilations": _fmt_cfg_value(_first_present(m, ("convnext_layer_dilations", "dilations"), "None")),
+            "dilations": _fmt_cfg_value(_first_present(m, ("convnext_layer_dilations", "dilations"), "None")) + f" ({encoder_fov}px)",
+            "fov": str(encoder_fov),
             "hardcap": str(m.get("mask_box_hardcap", "—")),
             "pred_hidden": str(m.get("predictor_hidden", "NA")),
             "cdd_scales": _count_cfg_list(m.get("sigmas")),
@@ -88,7 +102,7 @@ def _fmt_bool(value) -> str:
 def _missing_model_inputs() -> dict:
     return {k: "NA" for k in (
         "mode", "ms", "mbox", "sampling", "l2", "psn", "fin", "sigtype", "spread_mode", "spread_w", "spread_t",
-        "vicvar_w", "viccov_w", "symw", "depth", "dilations", "hardcap", "pred_hidden", "cdd_scales",
+        "vicvar_w", "viccov_w", "symw", "depth", "dilations", "fov", "hardcap", "pred_hidden", "cdd_scales",
     )}
 
 

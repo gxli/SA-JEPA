@@ -449,7 +449,7 @@ class ScaleAwareJEPA:
             raise RuntimeError("No session. Call fit() or load_session() first.")
         try:
             self._ensure_inference_umap_artifacts()
-            from scripts.session_to_dash import compute_dash_data, plot_dash
+            from src.dashboard import compute_dash_data, plot_dash
             compute_dash_data(self._session_dir, overwrite=False)
             plot_dash(self._session_dir, overwrite=False)
             dash = os.path.join(self._session_dir, "dashboard.html")
@@ -546,8 +546,26 @@ def _print_metrics_summary(session_dir: str) -> None:
         if not epochs:
             return
         last_ep, first_ep = max(epochs.keys()), min(epochs.keys())
+        # Read encoder config for FOV
+        encoder_fov = None
+        try:
+            cfg_path = os.path.join(session_dir, "config_used.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    mcfg = json.load(f).get("model", {})
+                depth = int(mcfg.get("encoder_depth", 4))
+                kernel = int(mcfg.get("encoder_kernel_size", 7))
+                dils = mcfg.get("convnext_layer_dilations")
+                if dils is None:
+                    dils = [1] * depth
+                encoder_fov = 1 + sum((kernel - 1) * int(d) for d in dils[:depth])
+        except Exception:
+            pass
+
         print(f"\n{'='*60}")
         print(f"Training Metrics (epoch {first_ep} → {last_ep})")
+        if encoder_fov is not None:
+            print(f"  Encoder FOV: {encoder_fov} px")
         print(f"{'='*60}")
         def _weight_active(key: str, nested: str | None = None) -> bool:
             if not loss_weights:

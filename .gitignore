@@ -98,3 +98,6 @@ update_gen_17.sh
 configs/base_pyramid_scaleaware_convnext_bk.json
 local_tests/sessions/
 local_tests/api_test_output/
+build/
+sajepa.egg-info/
+.codex_worktrees/
