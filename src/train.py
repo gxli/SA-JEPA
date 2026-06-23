@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -276,6 +277,49 @@ def _write_cdd_cache_profile(*, cdd_cache: dict | None, session_dir: str, config
         f.write("\n")
 
 
+def _cdd_disk_cache_paths(*, cache_dir: str, path: str, meta: dict) -> tuple[str, str]:
+    abs_path = os.path.abspath(path)
+    stat = os.stat(abs_path)
+    key_payload = {
+        "path": abs_path,
+        "mtime_ns": int(stat.st_mtime_ns),
+        "size": int(stat.st_size),
+        "meta": meta,
+    }
+    key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return (
+        os.path.join(cache_dir, f"{stem}_{key}.npy"),
+        os.path.join(cache_dir, f"{stem}_{key}.json"),
+    )
+
+
+def _load_cdd_disk_cache(data_path: str, meta_path: str, expected_meta: dict) -> np.ndarray | None:
+    if not (os.path.exists(data_path) and os.path.exists(meta_path)):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            got_meta = json.load(f)
+        if got_meta != expected_meta:
+            return None
+        return _safe_load_npy(data_path, mmap_mode=None).astype(np.float32, copy=False)
+    except Exception as e:
+        log_info(f"CDD disk cache ignored: {type(e).__name__}: {e}")
+        return None
+
+
+def _save_cdd_disk_cache(data_path: str, meta_path: str, value: np.ndarray, meta: dict) -> None:
+    os.makedirs(os.path.dirname(data_path), exist_ok=True)
+    tmp_data = f"{data_path}.tmp"
+    tmp_meta = f"{meta_path}.tmp"
+    np.save(tmp_data, value.astype(np.float32, copy=False))
+    with open(tmp_meta, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(f"{tmp_data}.npy", data_path)
+    os.replace(tmp_meta, meta_path)
+
+
 def _precompute_cdd_cache(
     *,
     data_cfg: dict,
@@ -300,12 +344,38 @@ def _precompute_cdd_cache(
     cdd_append_last_residual = bool(model_cfg.get("cdd_append_last_residual", True))
     cdd_pre_log_transform = bool(model_cfg.get("cdd_pre_log_transform", False))
     sigmas = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
+    cdd_num_channels = int(model_cfg.get("cdd_num_channels", len(sigmas)))
+    cdd_request_num_channels = model_cfg.get("cdd_request_num_channels", None)
+    expected_default_scales = cdd_num_channels
+    model_num_scales = int(model_cfg.get("num_scales", expected_default_scales))
     if device.type not in ("cuda", "mps"):
         raise RuntimeError(f"[{config_name}] CDD precompute requires CUDA or MPS. Got device={device.type}.")
     npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
     if not npy_files:
         log_info(f"[{config_name}] CDD precompute: no files found for pattern, skipping")
         return {}
+    disk_cache_enabled = bool(data_cfg.get("cdd_disk_cache", True))
+    cdd_cache_mode = str(data_cfg.get("cdd_cache_mode", "session")).lower()
+    if "cdd_cache_dir" in data_cfg:
+        disk_cache_dir = str(data_cfg["cdd_cache_dir"])
+    elif cdd_cache_mode == "data":
+        disk_cache_dir = os.path.join(data_root, "cdd_cache")
+    else:
+        disk_cache_dir = os.path.join("sessions", "cdd_cache")
+    cdd_meta = {
+        "version": 2,
+        "cdd_mode": cdd_mode,
+        "cdd_constrained": cdd_constrained,
+        "cdd_sm_mode": cdd_sm_mode,
+        "cdd_append_last_residual": cdd_append_last_residual,
+        "cdd_pre_log_transform": cdd_pre_log_transform,
+        "log_eps": float(model_cfg.get("log_eps", 1.0)),
+        "cdd_log_std_floor_mult": float(model_cfg.get("cdd_log_std_floor_mult", 0.05)),
+        "sigmas": [float(s) for s in sigmas],
+        "cdd_num_channels": cdd_num_channels,
+        "cdd_request_num_channels": None if cdd_request_num_channels is None else int(cdd_request_num_channels),
+        "model_num_scales": model_num_scales,
+    }
     max_files = int(data_cfg.get("cdd_precompute_max_files", 4096))
     if max_files > 0 and len(npy_files) > max_files:
         raise RuntimeError(
@@ -320,7 +390,7 @@ def _precompute_cdd_cache(
             sample_shape = _fits.getdata(sample_path, memmap=True).shape
         else:
             sample_shape = _safe_load_npy(sample_path, mmap_mode="r").shape
-        n_channels = len(sigmas) + (1 if cdd_append_last_residual else 0)
+        n_channels = int(model_num_scales)
         est_bytes_per = int(n_channels) * int(np.prod(sample_shape)) * np.dtype(np.float32).itemsize
         est_process_gb = (est_bytes_per * len(npy_files)) / float(1024 ** 3)
         est_node_gb = est_process_gb * max(1, int(cache_replicas))
@@ -331,9 +401,38 @@ def _precompute_cdd_cache(
                 f"data.cdd_precompute_max_gb={max_gb:.2f}. Bump the limit, reduce dataset size, "
                 "or disable RAM precompute for DDP."
             )
-    log_info(f"[{config_name}] CDD precompute: {len(npy_files)} file(s) on GPU...")
+    log_info(
+        f"[{config_name}] CDD precompute: {len(npy_files)} file(s), "
+        f"disk_cache={'on' if disk_cache_enabled else 'off'}"
+        + (f" dir={disk_cache_dir}" if disk_cache_enabled else "")
+    )
     cache = {}
+    disk_hits = 0
+    disk_writes = 0
     for path in npy_files:
+        disk_data_path = disk_meta_path = None
+        if disk_cache_enabled:
+            disk_data_path, disk_meta_path = _cdd_disk_cache_paths(
+                cache_dir=disk_cache_dir,
+                path=path,
+                meta=cdd_meta,
+            )
+            cached = _load_cdd_disk_cache(disk_data_path, disk_meta_path, cdd_meta)
+            if cached is not None:
+                if cached.shape[0] != model_num_scales:
+                    raise RuntimeError(
+                        f"[{config_name}] CDD disk cache channel mismatch for {path}: "
+                        f"cached_channels={cached.shape[0]}, model_expected={model_num_scales}, "
+                        f"cache_file={disk_data_path}"
+                    )
+                cache[(path, None)] = cached
+                disk_hits += 1
+                log_info(
+                    f"[{config_name}] CDD disk cache hit: path={path} cache={disk_data_path} "
+                    f"shape={tuple(cached.shape)}"
+                )
+                continue
+        log_info(f"[{config_name}] CDD GPU compute: path={path}")
         if path.endswith(".fits"):
             from astropy.io import fits as _fits
             arr = np.asarray(_fits.getdata(path, memmap=True), dtype=np.float32)
@@ -358,9 +457,7 @@ def _precompute_cdd_cache(
             arr_std = float(np.std(arr_clamp))
             log_floor = max(eps_f, arr_std * log_floor_mult)
             arr = np.log(arr_clamp + log_floor).astype(np.float32)
-        cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(
-            arr,
-            num_channels=len(sigmas),
+        cdd_kwargs = dict(
             max_scale=max(float(s) for s in sigmas),
             mode=cdd_mode,
             constrained=cdd_constrained,
@@ -369,9 +466,22 @@ def _precompute_cdd_cache(
             verbose=False,
             use_gpu=(device.type == "cuda"),
         )
+        if cdd_request_num_channels is not None:
+            cdd_kwargs["num_channels"] = int(cdd_request_num_channels)
+        cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(arr, **cdd_kwargs)
+        actual_cdd_channels = int(len(cdd_channels_arr))
+        if actual_cdd_channels < cdd_num_channels:
+            raise RuntimeError(
+                f"[{config_name}] CDD returned too few result bands for {path}: "
+                f"requested_keep={cdd_num_channels}, returned_bands={actual_cdd_channels}, "
+                f"residual_channel={int(cdd_append_last_residual)}, input_shape={tuple(arr.shape)}. "
+                "The vanilla CDD contract is results + residual; the model can ignore extra results, "
+                "but it cannot invent missing configured result channels."
+            )
+        selected_cdd_channels = list(cdd_channels_arr[:cdd_num_channels])
         # CDD always introduces one leading scale axis:
         # image (H,W) -> (S,H,W), cube (D,H,W) -> (S,D,H,W).
-        cdd_orig = np.clip(np.stack(cdd_channels_arr, axis=0).astype(np.float32), a_min=0.0, a_max=None)
+        cdd_orig = np.clip(np.stack(selected_cdd_channels, axis=0).astype(np.float32), a_min=0.0, a_max=None)
         if cdd_orig.ndim != arr.ndim + 1 or cdd_orig.shape[1:] != arr.shape:
             raise ValueError(
                 f"CDD output for {path} must have one leading scale axis over input shape {arr.shape}, "
@@ -383,12 +493,38 @@ def _precompute_cdd_cache(
                 raise ValueError(
                     f"CDD residual for {path} must match input shape {arr.shape}, got {cdd_residual.shape}"
                 )
-            cdd_orig[-1] = cdd_orig[-1] + cdd_residual
+            cdd_orig[-1] = cdd_orig[-1] + np.clip(cdd_residual, a_min=0.0, a_max=None).astype(np.float32)
+        cached_channels = int(cdd_orig.shape[0])
+        request_arg = "auto" if cdd_request_num_channels is None else str(int(cdd_request_num_channels))
+        ignored_channels = max(0, actual_cdd_channels - cdd_num_channels)
+        log_info(
+            f"[{config_name}] CDD channels: request_arg={request_arg} keep_results={cdd_num_channels} "
+            f"returned_bands={actual_cdd_channels} ignored_bands={ignored_channels} "
+            f"residual_added_to_last={int(cdd_append_last_residual)} "
+            f"cached_channels={cached_channels} model_expected={model_num_scales} "
+            f"input_shape={tuple(arr.shape)}"
+        )
+        if cached_channels != model_num_scales:
+            raise RuntimeError(
+                f"[{config_name}] CDD/model scale mismatch for {path}: "
+                f"request_arg={request_arg}, keep_results={cdd_num_channels}, "
+                f"returned_bands={actual_cdd_channels}, ignored_bands={ignored_channels}, "
+                f"residual_added_to_last={int(cdd_append_last_residual)}, cached_channels={cached_channels}, "
+                f"model_expected={model_num_scales}. CDD results and residual must align with "
+                "the encoder input channel count."
+            )
         cache[(path, None)] = cdd_orig.astype(np.float32, copy=False)
+        if disk_cache_enabled and disk_data_path is not None and disk_meta_path is not None:
+            _save_cdd_disk_cache(disk_data_path, disk_meta_path, cdd_orig, cdd_meta)
+            disk_writes += 1
+            log_info(f"[{config_name}] CDD disk cache saved: {disk_data_path}")
     # Free GPU memory used by CDD.
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    log_info(f"[{config_name}] CDD precompute: {len(cache)} entries cached, GPU freed")
+    log_info(
+        f"[{config_name}] CDD precompute: {len(cache)} entries cached, "
+        f"disk_hits={disk_hits}, disk_writes={disk_writes}, GPU freed"
+    )
     return cache
 
 
@@ -892,8 +1028,9 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
     encoder_depth = int(model_cfg.get("encoder_depth", 3))
     encoder_kernel_size = int(model_cfg.get("encoder_kernel_size", 5))
     sigmas = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
-    cdd_append_last_residual = bool(model_cfg.get("cdd_append_last_residual", True))
-    num_scales = 1 if enc_type == "convnext_dense3d" else len(sigmas) + (1 if cdd_append_last_residual else 0)
+    cdd_num_channels = int(model_cfg.get("cdd_num_channels", len(sigmas)))
+    expected_default_scales = cdd_num_channels
+    num_scales = 1 if enc_type == "convnext_dense3d" else int(model_cfg.get("num_scales", expected_default_scales))
     encoder_rf_depth = compute_3d_encoder_receptive_field_depth(
         encoder_depth=encoder_depth,
         encoder_kernel_size=encoder_kernel_size,

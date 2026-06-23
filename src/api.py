@@ -564,7 +564,7 @@ class ScaleAwareJEPA:
         if config is None:
             return base
         if isinstance(config, str):
-            return _deep_merge(base, load_config(config))
+            return load_config(config)
         override = copy.deepcopy(config)
         reject_removed_config_aliases(override)
         return _deep_merge(base, override)
