@@ -73,22 +73,6 @@ latent atlas. The bundled examples use
 `configs/examples/mhd_example.yaml` as the canonical prototype: MHD data, `mask_size_scaling=1.2`, pooled context `std_hinge`,
 and spread weight `5`.
 
-### 📊 Dashboard Output
-
-After any run, two self-contained HTML files land in the session directory:
-
-| Path | Purpose |
-|:---|:---|
-| `<outdir>/<session_name>/dashboard.html` | Plotly diagnostic dashboard (loss curves, latent projections, rank metrics) |
-| `<outdir>/<session_name>/results/interactive_umap_predict.html` | Click-to-similarity interactive UMAP browser |
-
-Reopen later:
-```python
-model = ScaleAwareJEPA.load_session("sessions/my_run")
-model.open_dashboard()           # opens dashboard.html
-model.open_interactive_umap()    # opens interactive UMAP
-```
-
 ### 🐍 Python API
 
 ```python
@@ -115,6 +99,22 @@ model.save_session("sessions/my_run")
 
 print(f"Dashboard:     sessions/my_run/dashboard.html")
 print(f"Interactive:   {umap_html}")
+```
+
+### 📊 Dashboard Output
+
+After any run, two self-contained HTML files land in the session directory:
+
+| Path | Purpose |
+|:---|:---|
+| `<outdir>/<session_name>/dashboard.html` | Plotly diagnostic dashboard (loss curves, latent projections, rank metrics) |
+| `<outdir>/<session_name>/results/interactive_umap_predict.html` | Click-to-similarity interactive UMAP browser |
+
+Reopen later:
+```python
+model = ScaleAwareJEPA.load_session("sessions/my_run")
+model.open_dashboard()           # opens dashboard.html
+model.open_interactive_umap()    # opens interactive UMAP
 ```
 
 ### ⚙️ Config-driven
