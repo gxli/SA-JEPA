@@ -130,6 +130,9 @@ def _format_active_loss_terms(
 def _flush_csv_rows(path: str, rows: list[list]) -> None:
     if not rows:
         return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(rows)
     rows.clear()
