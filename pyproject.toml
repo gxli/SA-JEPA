@@ -25,3 +25,4 @@ sajepa-train = "scripts.train:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["sajepa", "sajepa.*", "src", "src.*", "scripts"]
+# clean metadata update
