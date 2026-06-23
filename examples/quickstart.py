@@ -1,65 +1,27 @@
-"""Quickstart example: train sajepa on synthetic data and extract latent embeddings."""
+#!/usr/bin/env python3
+"""Quickstart MHD example — inline config, 10 epochs."""
+import os, sys
 
-import os
-import sys
-
-# Ensure the project root is on the Python path.
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-
-# Enable MPS fallback for ops not yet supported on Apple Silicon.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+sys.path.insert(0, ROOT)
+from sajepa import ScaleAwareJEPA
 
-import numpy as np
-import torch
+DATA = os.path.join(ROOT, "data", "C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy")
 
-from src.api import ScaleAwareJEPA
+model = ScaleAwareJEPA(config={
+    "data": {"data_root": os.path.dirname(DATA), "npy_pattern": os.path.basename(DATA),
+             "num_samples": 200, "d4_augment": True},
+    "model": {"mask_size_scaling": 1.2},
+    "train": {"epochs": 10, "symmetry_loss_weight": 0.0,
+              "spread_regularizer": {"type": "std_hinge", "target": "context",
+              "spatial_mode": "pooled", "weight": 5.0, "target_std": 1.0}},
+})
 
-
-def main():
-    # 1. Generate synthetic physical field (128×128 log-normal turbulence-like)
-    rng = np.random.default_rng(42)
-    field = rng.lognormal(mean=0.0, sigma=0.4, size=(128, 128)).astype(np.float32)
-    field = torch.from_numpy(field)
-
-    # 2. Create model with minimal config for quick training
-    config = {
-        "model": {
-            "encoder_depth": 4,
-            "mask_size_scaling": 1.2,
-            "normalize_loss_l2": False,
-            "predictor_layernorm": True,
-        },
-        "train": {
-            "epochs": 3,
-            "batch_size": 4,
-            "target_batch_size": 32,
-            "auto_scale_batch_size": "power_of_two",
-            "precision": "bf16",
-        },
-    }
-
-    model = ScaleAwareJEPA(config=config)
-
-    # 3. Train, then extract
-    model.fit(field)
-    latent_atlas = model.extract(field)
-
-    print(f"\n{'='*60}")
-    print(f"Training complete")
-    print(f"{'='*60}")
-    print(f"Latent atlas shape:  {tuple(latent_atlas.shape)}")
-    print(f"  channels={latent_atlas.shape[0]}, spatial={latent_atlas.shape[1]}×{latent_atlas.shape[2]}")
-    print(f"  dtype={latent_atlas.dtype}, device={latent_atlas.device}")
-    print(f"  value range: [{float(latent_atlas.min()):.4f}, {float(latent_atlas.max()):.4f}]  mean={float(latent_atlas.mean()):.4f}")
-    std_per_ch = latent_atlas.float().std(dim=(1, 2))
-    dead = (std_per_ch < 1e-5).sum().item()
-    print(f"  per-channel std:  mean={float(std_per_ch.mean()):.4f}  min={float(std_per_ch.min()):.4f}  max={float(std_per_ch.max()):.4f}")
-    print(f"  dead channels (std<1e-5): {dead}/{latent_atlas.shape[0]}")
-    print(f"{'='*60}")
-    print("Done.")
-
-
-if __name__ == "__main__":
-    main()
+model.train(config_name="mhd_quickstart", sessions_dir=os.path.join(ROOT, "sessions"), dashboard=True)
+dashboard = os.path.join(model.session_dir, "dashboard.html")
+umap_npy = os.path.join(model.session_dir, "results", "predict_umap_xyz.npy")
+umap_html = os.path.join(model.session_dir, "results", "interactive_umap_predict.html")
+if os.path.exists(umap_npy):
+    model.save_interactive_umap(umap_npy, umap_html)
+print(f"\nDone.\n  session:          {model.session_dir}\n  dashboard:        {dashboard}\n  interactive_umap: {umap_html}")

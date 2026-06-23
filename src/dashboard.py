@@ -445,6 +445,15 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             if scale_pt is not None:
                 missing.extend(sorted(SCALE_PROBE_KEYS.difference(existing.files)))
             existing.close()
+            npz_mtime = os.path.getmtime(out_npz)
+            stale_inputs = []
+            for dep_name in ("metrics.csv", "loss_weights.json", "rank_diagnostics.json"):
+                dep_path = os.path.join(session_dir, dep_name)
+                if os.path.exists(dep_path) and os.path.getmtime(dep_path) > npz_mtime:
+                    stale_inputs.append(dep_name)
+            if stale_inputs:
+                print(f"dash_data_stale_recompute={out_npz} newer={','.join(stale_inputs)}")
+                missing.extend(stale_inputs)
             if not missing:
                 return out_npz
             print(f"dash_data_stale_recompute={out_npz} missing={','.join(missing)}")
@@ -1483,20 +1492,26 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     active_loss_terms = []
     if n > 0:
         for name, weight_key, raw_arr, weighted_arr, color in loss_terms:
-            if raw_arr.size < n or weighted_arr.size < n:
+            if raw_arr.size < n:
                 continue
-            weighted = weighted_arr[:n]
             if weight_key == "spread_regularizer.weight":
                 weight = loss_weights.get("spread_regularizer", {}).get("weight")
             else:
                 weight = loss_weights.get(weight_key)
+            raw = raw_arr[:n]
+            if weighted_arr.size >= n:
+                weighted = weighted_arr[:n]
+            elif weight is not None:
+                weighted = raw * float(weight)
+            else:
+                weighted = np.full(n, np.nan, dtype=np.float32)
             observed_active = np.isfinite(weighted).any() and np.nanmax(np.abs(weighted)) > 1e-12
             if weight is not None:
                 active = abs(float(weight)) > 1e-12
             else:
                 active = observed_active
             if active:
-                active_loss_terms.append((name, raw_arr[:n], weighted, color))
+                active_loss_terms.append((name, raw, weighted, color))
 
     active_loss_legend = dict(
         orientation="v",

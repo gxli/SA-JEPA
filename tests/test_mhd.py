@@ -18,8 +18,8 @@ from src.utils.npy import _safe_load_npy
 arr = _safe_load_npy("data/C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy")
 field = torch.from_numpy(arr.astype(np.float32))
 
-# Use gen_139 ms=1.2 config
-model = ScaleAwareJEPA(config="configs/mhd_turbulence.yaml")
+# Use the canonical base config.
+model = ScaleAwareJEPA(config="configs/base_pyramid_scaleaware_convnext.yaml")
 
 # Train, extract, save
 out_dir = "examples/output"

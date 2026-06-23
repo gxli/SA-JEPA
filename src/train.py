@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import math
+import warnings
 
 from tqdm import tqdm
 import os
@@ -44,6 +45,20 @@ from src.utils.npy import _safe_load_npy
 from src.utils.viz import save_inference_dashboard, save_volumetric_umap_embeddings
 
 LOGGER = logging.getLogger(__name__)
+warnings.filterwarnings(
+    "ignore",
+    message=r"The epoch parameter in `scheduler\.step\(\)` was not necessary.*",
+    category=UserWarning,
+    module=r"torch\.optim\.lr_scheduler",
+)
+
+
+def _ensure_training_logging() -> None:
+    """Install a small default logger for API/imported training runs."""
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+    LOGGER.setLevel(logging.INFO)
 
 
 def log_info(*parts: object) -> None:
@@ -74,6 +89,42 @@ def _format_progress_line(
     if optim_state:
         parts.append(_format_metric_dict(optim_state))
     return " | ".join(part for part in parts if part)
+
+
+def _format_active_loss_terms(
+    *,
+    total: float,
+    prediction: float,
+    prediction_weight: float,
+    spread: float,
+    spread_weight: float,
+    symmetry: float,
+    symmetry_weight: float,
+    vicreg_var: float,
+    vicreg_var_weight: float,
+    vicreg_cov: float,
+    vicreg_cov_weight: float,
+) -> dict[str, str]:
+    """Runtime loss printout: raw active terms plus weighted contribution."""
+    terms = {
+        "total": _fmt_metric(total),
+        "pred": _fmt_metric(prediction),
+        "wpred": _fmt_metric(prediction_weight * prediction),
+    }
+    if abs(spread_weight) > 1e-12:
+        spread_label = "0.0000(off)" if abs(spread) <= 1e-8 else f"{_fmt_metric(spread)}(active)"
+        terms["spread"] = spread_label
+        terms["wspread"] = _fmt_metric(spread_weight * spread)
+    if abs(vicreg_var_weight) > 1e-12:
+        terms["vicvar"] = _fmt_metric(vicreg_var)
+        terms["wvicvar"] = _fmt_metric(vicreg_var_weight * vicreg_var)
+    if abs(vicreg_cov_weight) > 1e-12:
+        terms["viccov"] = _fmt_metric(vicreg_cov)
+        terms["wviccov"] = _fmt_metric(vicreg_cov_weight * vicreg_cov)
+    if abs(symmetry_weight) > 1e-12:
+        terms["sym"] = _fmt_metric(symmetry)
+        terms["wsym"] = _fmt_metric(symmetry_weight * symmetry)
+    return terms
 
 
 def _flush_csv_rows(path: str, rows: list[list]) -> None:
@@ -351,9 +402,15 @@ def _move_to_device(value, device: torch.device):
 
 
 class _MaskingCollator:
-    def __init__(self, model: PyramidGridJEPA, return_debug: bool = False):
+    def __init__(
+        self,
+        model: PyramidGridJEPA,
+        return_debug: bool = False,
+        require_precomputed_cdd: bool = False,
+    ):
         enc_type = str(getattr(model, "encoder_type", "")).lower()
         self.use_cdd = bool(enc_type in CDD_CUBE_ENCODER_TYPES)
+        self.require_precomputed_cdd = bool(require_precomputed_cdd)
         self.return_debug = bool(
             return_debug
             or enc_type in CDD_DEBUG_ENCODER_TYPES
@@ -403,6 +460,11 @@ class _MaskingCollator:
 
     def __call__(self, batch):
         use_cdd = isinstance(batch[0], (tuple, list)) and len(batch[0]) == 2
+        if self.use_cdd and self.require_precomputed_cdd and not use_cdd:
+            raise RuntimeError(
+                "CDD precompute cache was built, but the dataloader batch did not include cached CDD. "
+                "Refusing to fall back to per-batch constrained_diffusion_decomposition."
+            )
         if use_cdd:
             cdd_list = [item[0] for item in batch]
             x_clean_list = [item[1] for item in batch]
@@ -920,6 +982,7 @@ def _dump_movie_frame(
 
 def run_training(config: dict, config_name: str, sessions_root: str = "sessions") -> str:
     reject_removed_config_aliases(config)
+    _ensure_training_logging()
     # ── DDP: detect torchrun-launched multi-GPU ──
     is_ddp = "LOCAL_RANK" in os.environ
     if is_ddp:
@@ -1450,7 +1513,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     masking_collate = None if is_3d_mode else _MaskingCollator(
         model,
         return_debug=bool(train_cfg.get("debug_masking_tensors", False)),
+        require_precomputed_cdd=bool(cdd_cache),
     )
+    if is_main_process and (not is_3d_mode) and str(getattr(model, "encoder_type", "")).lower() in CDD_CUBE_ENCODER_TYPES:
+        log_info(
+            f"[{config_name}] CDD batch source: "
+            f"{'precomputed_cache' if cdd_cache else 'on_the_fly_fallback'}"
+        )
     dataloader = DataLoader(
         train_dataset,
         batch_size=train_cfg.get("batch_size", 32),
@@ -1740,7 +1809,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             position=0,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         )
-        metrics_bar = tqdm(total=0, bar_format="{desc}", position=1, leave=False, dynamic_ncols=True)
         for batch_idx, batch in pbar:
             if is_3d_mode:
                 x_clean = batch.to(device, non_blocking=True)
@@ -1759,17 +1827,32 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
             with autocast(device_type=autocast_device, enabled=use_amp):
                 outputs = model(x_clean, context_data=context_data) if not is_3d_mode else model(x_clean)
-                _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
-                    outputs,
-                    spatial_mode=vicreg_spatial_mode,
-                )
-                loss_spread, z_ctx = compute_output_spread_regularizer_loss(
-                    outputs,
-                    spread_regularizer,
-                    include_predictor=False,
-                )
-                loss_prediction = model.compute_loss(outputs)
-                loss_symmetry = model.compute_symmetric_loss(outputs)
+                zero_loss = outputs["pred_patches"].new_zeros(())
+                if abs(vicreg_var_weight) > 1e-12 or abs(vicreg_cov_weight) > 1e-12:
+                    _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
+                        outputs,
+                        spatial_mode=vicreg_spatial_mode,
+                    )
+                else:
+                    var_term_t = zero_loss
+                    cov_term_t = zero_loss
+                if abs(spread_regularizer_weight) > 1e-12:
+                    loss_spread, z_ctx = compute_output_spread_regularizer_loss(
+                        outputs,
+                        spread_regularizer,
+                        include_predictor=False,
+                    )
+                else:
+                    loss_spread = zero_loss
+                    z_ctx = outputs["pred_patches"].new_empty((0, int(outputs["pred_patches"].shape[2])))
+                if abs(prediction_loss_weight) > 1e-12:
+                    loss_prediction = model.compute_loss(outputs)
+                else:
+                    loss_prediction = zero_loss
+                if abs(symmetry_loss_weight) > 1e-12:
+                    loss_symmetry = model.compute_symmetric_loss(outputs)
+                else:
+                    loss_symmetry = zero_loss
                 total_loss = (
                     (prediction_loss_weight * loss_prediction)
                     + (vicreg_var_weight * var_term_t)
@@ -1931,19 +2014,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             if is_main_process and (batch_idx + 1) % log_flush_interval == 0:
                 _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
                 _flush_csv_rows(visited_targets_log_path, visited_rows)
-            loss_terms = {
-                "total": f"{log_loss_val:.4f}",
-                "pred": f"{loss_prediction.item():.4f}",
-            }
-            if abs(spread_regularizer_weight) > 1e-12:
-                spread_value = float(loss_spread.item())
-                loss_terms["spread"] = "0.0000(off)" if abs(spread_value) <= 1e-8 else f"{spread_value:.4f}(active)"
-            if abs(vicreg_var_weight) > 1e-12:
-                loss_terms["vicvar"] = f"{var_term_t.item():.4f}"
-            if abs(vicreg_cov_weight) > 1e-12:
-                loss_terms["viccov"] = f"{cov_term_t.item():.4f}"
-            if abs(symmetry_loss_weight) > 1e-12:
-                loss_terms["sym"] = f"{loss_symmetry.item():.4f}"
+            loss_terms = _format_active_loss_terms(
+                total=log_loss_val,
+                prediction=float(loss_prediction.item()),
+                prediction_weight=prediction_loss_weight,
+                spread=float(loss_spread.item()),
+                spread_weight=spread_regularizer_weight,
+                symmetry=float(loss_symmetry.item()),
+                symmetry_weight=symmetry_loss_weight,
+                vicreg_var=float(var_term_t.item()),
+                vicreg_var_weight=vicreg_var_weight,
+                vicreg_cov=float(cov_term_t.item()),
+                vicreg_cov_weight=vicreg_cov_weight,
+            )
             batch_diag = {
                 "ctx_std": f"{ctx_stats['embed_spread_mean']:.3f}",
                 "ctx_effrank": f"{ctx_stats['context_manifold_size']:.2f}",
@@ -1952,10 +2035,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             batch_optim = {
                 "lr": f"{current_lr:.1e}",
             }
-            metrics_bar.set_description_str(
-                _format_progress_line("[batch]", loss_terms, batch_diag, batch_optim),
-                refresh=True,
-            )
+            if is_main_process and (
+                (batch_idx + 1) % log_flush_interval == 0 or (batch_idx + 1) == len(dataloader)
+            ):
+                tqdm.write(
+                    f"[{config_name}] E {epoch + 1}/{epochs} B {batch_idx + 1}/{len(dataloader)} "
+                    f"{_format_progress_line('[batch]', loss_terms, batch_diag, batch_optim)}"
+                )
             if _use_wandb and (batch_idx + 1) % log_flush_interval == 0:
                 import wandb
 
@@ -2005,7 +2091,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 )
                 model.train()
 
-        metrics_bar.close()
         # Only the main process writes files in DDP mode
         if is_main_process:
             if metrics_rows:
@@ -2019,19 +2104,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         if epoch_batches > 0:
             avg_total = epoch_total / epoch_batches
             avg_prediction = epoch_prediction / epoch_batches
-            epoch_terms = {
-                "total": f"{avg_total:.4f}",
-                "pred": f"{avg_prediction:.4f}",
-            }
-            if abs(spread_regularizer_weight) > 1e-12:
-                spread_avg = epoch_spread / epoch_batches
-                epoch_terms["spread"] = "0.0000(off)" if abs(spread_avg) <= 1e-8 else f"{_fmt_metric(spread_avg)}(active)"
-            if abs(vicreg_var_weight) > 1e-12:
-                epoch_terms["vicvar"] = _fmt_metric(epoch_var / epoch_batches)
-            if abs(vicreg_cov_weight) > 1e-12:
-                epoch_terms["viccov"] = _fmt_metric(epoch_cov / epoch_batches)
-            if abs(symmetry_loss_weight) > 1e-12:
-                epoch_terms["sym"] = _fmt_metric(epoch_symmetric / epoch_batches)
+            epoch_terms = _format_active_loss_terms(
+                total=avg_total,
+                prediction=avg_prediction,
+                prediction_weight=prediction_loss_weight,
+                spread=epoch_spread / epoch_batches,
+                spread_weight=spread_regularizer_weight,
+                symmetry=epoch_symmetric / epoch_batches,
+                symmetry_weight=symmetry_loss_weight,
+                vicreg_var=epoch_var / epoch_batches,
+                vicreg_var_weight=vicreg_var_weight,
+                vicreg_cov=epoch_cov / epoch_batches,
+                vicreg_cov_weight=vicreg_cov_weight,
+            )
             epoch_diag = {
                 "ctx_std": _fmt_metric(epoch_embed_spread_mean / epoch_batches),
                 "ctx_effrank": _fmt_metric(epoch_context_manifold_size / epoch_batches),

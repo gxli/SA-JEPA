@@ -343,12 +343,12 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
         self.adapter = nn.Sequential(*adapter_layers)
 
         dil_list = _normalize_convnext_dilations(dilations, depth)
-        eff_fov = 1
+        block_fov = 1
         for d in dil_list:
-            eff_fov += (int(kernel_size) - 1) * int(d)
+            block_fov += (int(kernel_size) - 1) * int(d)
         print(
             f"[CDDScaleAwareConvNeXt] depth={depth}, dilations={dil_list}, "
-            f"eff_fov={eff_fov}px, stem_norm={stem_norm}, adapter_norm={adapter_norm}, "
+            f"conv_footprint={block_fov}px, stem_norm={stem_norm}, adapter_norm={adapter_norm}, "
             f"final_norm={final_norm}({final_norm_type}), grn={use_grn}"
         )
         self.convnext = ConvNeXtDenseEncoder(

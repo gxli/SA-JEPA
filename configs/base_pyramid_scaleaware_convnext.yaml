@@ -34,7 +34,7 @@ model:
   predictor_residual: false
   use_grn: true
   post_log_transform: true
-  use_symmetric_feature_loss: true
+  use_symmetric_feature_loss: false
   ema_momentum: 0.996
   cdd_mode: log
   cdd_constrained: true
@@ -67,19 +67,20 @@ train:
   weight_decay: 1.0e-05
   num_workers: 8
   epochs: 10
-  symmetry_loss_weight: 0.003
+  symmetry_loss_weight: 0.0
   ema_momentum_base: 0.99
   ema_momentum_final: 0.9999
   spread_regularizer:
     type: std_hinge
     target: context
+    spatial_mode: pooled
     weight: 2
     target_std: 1.0
     eps: 0.0001
   prediction_loss_weight: 50
   vicreg_spatial_mode: pooled
   scale_probe_enabled: true
-  inference_tta_enabled: true
+  inference_tta_enabled: false
   inference_tta_mode: flip4
   compute_effective_rank: true
   viz_crop_border: true

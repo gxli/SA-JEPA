@@ -27,11 +27,11 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     expected_keys = {"type", "target", "weight", "target_std", "eps", "sketch_dim", "spatial_mode"}
     extra_keys = set(cfg) - expected_keys
     assert not extra_keys, f"Unsupported train.spread_regularizer keys: {sorted(extra_keys)}"
-    sigreg_type = str(cfg.get("type", "std_hinge"))
-    sigreg_target = str(cfg.get("target", "context"))
+    spread_type = str(cfg.get("type", "std_hinge"))
+    spread_target = str(cfg.get("target", "context"))
     spread_weight = float(cfg.get("weight", 0.0))
-    assert sigreg_type in {"std_hinge", "weak_sigreg", "sketched_sigreg"}
-    assert sigreg_target in {"context", "predictor", "both"}
+    assert spread_type in {"std_hinge", "weak_sigreg", "sketched_sigreg"}
+    assert spread_target in {"context", "predictor", "both"}
     assert spread_weight >= 0
     target_std = float(cfg.get("target_std", 1.0))
     eps = float(cfg.get("eps", 1e-4))
@@ -42,14 +42,14 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     assert sketch_dim > 0
     assert spatial_mode in {"pooled", "dense"}
     result = {
-        "type": sigreg_type,
-        "target": sigreg_target,
+        "type": spread_type,
+        "target": spread_target,
         "weight": spread_weight,
         "target_std": target_std,
         "eps": eps,
         "spatial_mode": spatial_mode,
     }
-    if sigreg_type in ("weak_sigreg", "sketched_sigreg"):
+    if spread_type in ("weak_sigreg", "sketched_sigreg"):
         result["sketch_dim"] = sketch_dim
     return result
 

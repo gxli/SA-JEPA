@@ -18,45 +18,113 @@ from sklearn.decomposition import PCA
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+from src.utils.viz import _preprocess_latents_for_umap
+
 FIT_MODES = ("per_frame", "final", "all")
+# "separate" = fit PCA+UMAP on pred and target independently (matches dashboard)
+# "union"    = fit on pred+target concatenated (old behavior)
+UMAP_MERGE_MODE = "separate"
 
 
-def _fit_pca_3d(all_pred: np.ndarray, all_gt: np.ndarray):
+def _fit_pca_3d(all_pred: np.ndarray, all_gt: np.ndarray, random_state: int = 42):
     """Fit one PCA (3 components) on concatenated pred+gt from all frames."""
     x = np.concatenate([all_pred, all_gt], axis=0)
-    pca = PCA(n_components=3, random_state=42)
+    pca = PCA(n_components=3, random_state=int(random_state))
     pca.fit(x)
     return pca
 
 
-def _fit_umap_3d(x: np.ndarray, n_neighbors: int = 30, min_dist: float = 0.15, metric: str = "cosine"):
-    """Fit one 3D UMAP on *x* (N, C) — tries cuml GPU first."""
-    n_total = x.shape[0]
-    max_fit = 50000  # 3D needs less points to fit in GPU memory
+class _MovieUMAP:
+    """Small wrapper that applies the same preprocessing at fit and transform."""
 
-    if n_total > max_fit:
-        rng = np.random.default_rng(42)
-        idx = rng.choice(n_total, size=max_fit, replace=False)
+    def __init__(self, reducer, *, l2_normalize: bool, standardize: bool):
+        self.reducer = reducer
+        self.l2_normalize = bool(l2_normalize)
+        self.standardize = bool(standardize)
+
+    def _prep(self, x: np.ndarray) -> np.ndarray:
+        return _preprocess_latents_for_umap(
+            x,
+            l2_normalize=self.l2_normalize,
+            standardize=self.standardize,
+        ).astype(np.float32, copy=False)
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        x_prep = self._prep(x)
+        try:
+            import torch
+
+            if self.reducer.__class__.__module__.startswith("torchdr"):
+                z = self.reducer.transform(torch.from_numpy(x_prep))
+                return z.cpu().numpy() if isinstance(z, torch.Tensor) else np.asarray(z)
+        except Exception:
+            pass
+        return self.reducer.transform(x_prep)
+
+
+def _fit_umap_3d(
+    x: np.ndarray,
+    n_neighbors: int = 50,
+    min_dist: float = 0.2,
+    metric: str = "euclidean",
+    *,
+    random_state: int = 42,
+    init: str = "spectral",
+    fit_max_tokens: int = 65536,
+    l2_normalize: bool = False,
+    standardize: bool = False,
+):
+    """Fit one 3D UMAP on *x* using the same preprocessing contract as dashboard."""
+    x = _preprocess_latents_for_umap(
+        x,
+        l2_normalize=bool(l2_normalize),
+        standardize=bool(standardize),
+    ).astype(np.float32, copy=False)
+    n_total = x.shape[0]
+
+    if n_total > fit_max_tokens:
+        rng = np.random.default_rng(int(random_state))
+        idx = rng.choice(n_total, size=int(fit_max_tokens), replace=False)
         x_fit = x[idx]
-        print(f"[session_to_movie] UMAP subsampled {n_total} → {max_fit} points for fitting")
+        print(f"[session_to_movie] UMAP subsampled {n_total} → {fit_max_tokens} points for fitting")
     else:
         x_fit = x
+
+    init_mode = str(init).lower()
+    if init_mode not in ("spectral", "random"):
+        init_mode = "spectral"
 
     try:
         from cuml.manifold import UMAP as CuMLUMAP
         reducer = CuMLUMAP(
             n_components=3,
-            n_neighbors=min(n_neighbors, 30),
+            n_neighbors=int(n_neighbors),
             min_dist=min_dist,
             metric=metric,
-            random_state=42,
-            init="spectral",
+            random_state=int(random_state),
+            init=init_mode,
         )
         reducer.fit(x_fit)
         print("[session_to_movie] UMAP using cuML (GPU)")
-        return reducer
+        return _MovieUMAP(reducer, l2_normalize=l2_normalize, standardize=standardize)
     except Exception as e:
         print(f"[session_to_movie] cuML UMAP unavailable ({type(e).__name__}: {e})")
+
+    try:
+        import torch
+        import torchdr
+
+        if hasattr(torchdr, "UMAP"):
+            reducer = torchdr.UMAP(
+                n_components=3,
+                n_neighbors=int(n_neighbors),
+                min_dist=float(min_dist),
+            )
+            reducer.fit(torch.from_numpy(x_fit.astype(np.float32)))
+            print("[session_to_movie] UMAP using torchdr")
+            return _MovieUMAP(reducer, l2_normalize=l2_normalize, standardize=standardize)
+    except Exception as e:
+        print(f"[session_to_movie] torchdr UMAP unavailable ({type(e).__name__}: {e})")
 
     try:
         import umap
@@ -65,12 +133,12 @@ def _fit_umap_3d(x: np.ndarray, n_neighbors: int = 30, min_dist: float = 0.15, m
             n_neighbors=n_neighbors,
             min_dist=min_dist,
             metric=metric,
-            random_state=42,
-            init="spectral",
+            random_state=int(random_state),
+            init=init_mode,
         )
         reducer.fit(x_fit)
         print("[session_to_movie] UMAP using umap-learn (CPU)")
-        return reducer
+        return _MovieUMAP(reducer, l2_normalize=l2_normalize, standardize=standardize)
     except Exception as e:
         print(f"[session_to_movie] UMAP unavailable ({type(e).__name__}: {e}); falling back to PCA")
         return None
@@ -352,9 +420,13 @@ def main():
     parser.add_argument("--force", action="store_true", help="Remove existing movie PNG/MP4/cache outputs before rendering")
     parser.add_argument("--fps", type=int, default=5, help="Frames per second for MP4")
     parser.add_argument("--seed", type=int, default=42, help="UMAP random seed")
-    parser.add_argument("--n-neighbors", type=int, default=30, help="UMAP n_neighbors")
-    parser.add_argument("--min-dist", type=float, default=0.15, help="UMAP min_dist")
-    parser.add_argument("--umap-metric", default="cosine", help="UMAP distance metric")
+    parser.add_argument("--n-neighbors", type=int, default=50, help="UMAP n_neighbors")
+    parser.add_argument("--min-dist", type=float, default=0.2, help="UMAP min_dist")
+    parser.add_argument("--umap-metric", default="euclidean", help="UMAP distance metric")
+    parser.add_argument("--umap-init", default=None, help="UMAP init mode; defaults to session train.umap.init or spectral")
+    parser.add_argument("--umap-standardize", action="store_true", help="Force UMAP channel standardization")
+    parser.add_argument("--umap-l2-normalize", action="store_true", help="Force UMAP row L2 normalization")
+    parser.add_argument("--fit-max-tokens", type=int, default=None, help="Maximum tokens used to fit UMAP")
     parser.add_argument(
         "--pca-fit-mode",
         choices=FIT_MODES,
@@ -384,7 +456,7 @@ def main():
             cli_val = getattr(args, key.replace("-", "_"))
             cfg_key = f"umap_{key}" if key not in ("fps", "dpi", "seed") else key
             cfg_val = cfg.get(cfg_key)
-            default_map = {"seed": 42, "n_neighbors": 30, "min_dist": 0.15, "dpi": 100, "fps": 5, "umap_metric": "cosine"}
+            default_map = {"seed": 42, "n_neighbors": 50, "min_dist": 0.2, "dpi": 100, "fps": 5, "umap_metric": "euclidean"}
             if cli_val == default_map.get(key) and cfg_val is not None:
                 setattr(args, key.replace("-", "_"), cfg_val)
         if args.out_dir is None and "output_dir" in cfg:
@@ -421,6 +493,7 @@ def main():
             os.path.join(out_dir, f"{session_name}.mp4"),
             os.path.join(out_dir, "movie_pca_embeddings.npz"),
             os.path.join(out_dir, "movie_umap_embeddings.npz"),
+            os.path.join(out_dir, "movie_umap_embeddings_*.npz"),
         )
         for pattern in cleanup_patterns:
             for stale_path in glob.glob(pattern):
@@ -452,11 +525,20 @@ def main():
     _umap_n = int(session_umap_cfg.get("n_neighbors") or movie_umap_cfg.get("umap_n_neighbors") or 15)
     _umap_d = float(session_umap_cfg.get("min_dist") or movie_umap_cfg.get("umap_min_dist") or 0.05)
     _umap_m = str(session_umap_cfg.get("metric") or movie_umap_cfg.get("umap_metric") or "cosine")
+    _umap_seed = int(session_umap_cfg.get("random_state") or movie_umap_cfg.get("umap_random_state") or args.seed)
+    _umap_init = str(args.umap_init or session_umap_cfg.get("init") or movie_umap_cfg.get("umap_init") or "spectral")
+    _umap_standardize = bool(args.umap_standardize or session_umap_cfg.get("standardize", movie_umap_cfg.get("umap_standardize", False)))
+    _umap_l2 = bool(args.umap_l2_normalize or session_umap_cfg.get("l2_normalize", movie_umap_cfg.get("umap_l2_normalize", False)))
+    _umap_fit_max = int(args.fit_max_tokens or session_umap_cfg.get("fit_max_tokens") or movie_umap_cfg.get("umap_fit_max_tokens") or 65536)
 
     # Cache key includes UMAP params so changing them invalidates cache
     import hashlib
     _cache_key = hashlib.md5(
-        f"{_umap_n}_{_umap_d}_{_umap_m}_{args.pca_fit_mode}_{args.umap_fit_mode}".encode()
+        (
+            f"{_umap_n}_{_umap_d}_{_umap_m}_{_umap_seed}_{_umap_init}_"
+            f"std{int(_umap_standardize)}_l2{int(_umap_l2)}_max{_umap_fit_max}_"
+            f"{args.pca_fit_mode}_{args.umap_fit_mode}_{UMAP_MERGE_MODE}"
+        ).encode()
     ).hexdigest()[:8]
     cache_dir = out_dir
     os.makedirs(cache_dir, exist_ok=True)
@@ -485,7 +567,7 @@ def main():
         print("[session_to_movie] removed stale non-3D PCA/UMAP cache")
 
     # Step 1: fit or load cached PCA/UMAP
-    print(f"[session_to_movie] PCA mode={args.pca_fit_mode}  UMAP mode={args.umap_fit_mode}")
+    print(f"[session_to_movie] PCA={args.pca_fit_mode}  UMAP={args.umap_fit_mode}  merge={UMAP_MERGE_MODE}")
     if _cache_has_3d_embeddings():
         print("[session_to_movie] loading cached PCA/UMAP, skipping fit...")
     else:
@@ -502,24 +584,96 @@ def main():
         if args.pca_fit_mode == "final":
             _fit_data = np.concatenate([all_pred_chunks[-1], all_gt_chunks[-1]] + ([all_ctx_chunks[-1]] if has_ctx else []), axis=0)
             print(f"[session_to_movie] fitting PCA on final frame (n_samples={_fit_data.shape[0]})...")
-            pca_global = PCA(n_components=3, random_state=42).fit(_fit_data)
+            pca_global = PCA(n_components=3, random_state=_umap_seed).fit(_fit_data)
         elif args.pca_fit_mode == "all":
             _fit_data = np.concatenate([all_pred, all_gt] + ([all_ctx] if has_ctx else []), axis=0)
             print(f"[session_to_movie] fitting PCA on all frames (n_samples={_fit_data.shape[0]})...")
-            pca_global = PCA(n_components=3, random_state=42).fit(_fit_data)
+            pca_global = PCA(n_components=3, random_state=_umap_seed).fit(_fit_data)
         else:
             pca_global = None  # per_frame — fit inside loop
 
         # ── Build global UMAP (for "final" / "all" modes) ──
         umap_global = None
+        umap_global_pred = None
+        umap_global_gt = None
         if args.umap_fit_mode == "final":
-            _umap_data = np.concatenate([all_pred_chunks[-1], all_gt_chunks[-1]] + ([all_ctx_chunks[-1]] if has_ctx else []), axis=0)
-            print(f"[session_to_movie] fitting UMAP on final frame (n_samples={_umap_data.shape[0]})...")
-            umap_global = _fit_umap_3d(_umap_data, n_neighbors=_umap_n, min_dist=_umap_d, metric=_umap_m)
+            if UMAP_MERGE_MODE == "separate":
+                print(f"[session_to_movie] fitting UMAP on final frame (separate pred + target)...")
+                umap_global_pred = _fit_umap_3d(
+                    all_pred_chunks[-1],
+                    n_neighbors=_umap_n,
+                    min_dist=_umap_d,
+                    metric=_umap_m,
+                    random_state=_umap_seed,
+                    init=_umap_init,
+                    fit_max_tokens=_umap_fit_max,
+                    l2_normalize=_umap_l2,
+                    standardize=_umap_standardize,
+                )
+                umap_global_gt = _fit_umap_3d(
+                    all_gt_chunks[-1],
+                    n_neighbors=_umap_n,
+                    min_dist=_umap_d,
+                    metric=_umap_m,
+                    random_state=_umap_seed,
+                    init=_umap_init,
+                    fit_max_tokens=_umap_fit_max,
+                    l2_normalize=_umap_l2,
+                    standardize=_umap_standardize,
+                )
+            else:
+                _umap_data = np.concatenate([all_pred_chunks[-1], all_gt_chunks[-1]] + ([all_ctx_chunks[-1]] if has_ctx else []), axis=0)
+                print(f"[session_to_movie] fitting UMAP on final frame (n_samples={_umap_data.shape[0]})...")
+                umap_global = _fit_umap_3d(
+                    _umap_data,
+                    n_neighbors=_umap_n,
+                    min_dist=_umap_d,
+                    metric=_umap_m,
+                    random_state=_umap_seed,
+                    init=_umap_init,
+                    fit_max_tokens=_umap_fit_max,
+                    l2_normalize=_umap_l2,
+                    standardize=_umap_standardize,
+                )
         elif args.umap_fit_mode == "all":
-            _umap_data = np.concatenate([all_pred, all_gt] + ([all_ctx] if has_ctx else []), axis=0)
-            print(f"[session_to_movie] fitting UMAP on all frames (n_samples={_umap_data.shape[0]})...")
-            umap_global = _fit_umap_3d(_umap_data, n_neighbors=_umap_n, min_dist=_umap_d, metric=_umap_m)
+            if UMAP_MERGE_MODE == "separate":
+                print(f"[session_to_movie] fitting UMAP on all frames (separate pred + target)...")
+                umap_global_pred = _fit_umap_3d(
+                    all_pred,
+                    n_neighbors=_umap_n,
+                    min_dist=_umap_d,
+                    metric=_umap_m,
+                    random_state=_umap_seed,
+                    init=_umap_init,
+                    fit_max_tokens=_umap_fit_max,
+                    l2_normalize=_umap_l2,
+                    standardize=_umap_standardize,
+                )
+                umap_global_gt = _fit_umap_3d(
+                    all_gt,
+                    n_neighbors=_umap_n,
+                    min_dist=_umap_d,
+                    metric=_umap_m,
+                    random_state=_umap_seed,
+                    init=_umap_init,
+                    fit_max_tokens=_umap_fit_max,
+                    l2_normalize=_umap_l2,
+                    standardize=_umap_standardize,
+                )
+            else:
+                _umap_data = np.concatenate([all_pred, all_gt] + ([all_ctx] if has_ctx else []), axis=0)
+                print(f"[session_to_movie] fitting UMAP on all frames (n_samples={_umap_data.shape[0]})...")
+                umap_global = _fit_umap_3d(
+                    _umap_data,
+                    n_neighbors=_umap_n,
+                    min_dist=_umap_d,
+                    metric=_umap_m,
+                    random_state=_umap_seed,
+                    init=_umap_init,
+                    fit_max_tokens=_umap_fit_max,
+                    l2_normalize=_umap_l2,
+                    standardize=_umap_standardize,
+                )
 
     # Load loss weights for annotation
     lw_path = os.path.join(session_dir, "loss_weights.json")
@@ -528,8 +682,8 @@ def main():
         with open(lw_path) as f:
             loss_weights = json.load(f)
 
-    if not os.path.exists(pca_cache):
-        mode_label = f"PCA={args.pca_fit_mode} UMAP={args.umap_fit_mode}"
+    if not _cache_has_3d_embeddings():
+        mode_label = f"PCA={args.pca_fit_mode} UMAP={args.umap_fit_mode} merge={UMAP_MERGE_MODE}"
         print(f"[session_to_movie] precomputing frames [{mode_label}]...")
         frame0 = torch.load(frame_paths[0], map_location="cpu", weights_only=False)
         H0, W0 = int(frame0["pred_map"].shape[-2]), int(frame0["pred_map"].shape[-1])
@@ -545,22 +699,66 @@ def main():
 
             # PCA
             if args.pca_fit_mode == "per_frame":
-                pca_frame = PCA(n_components=3, random_state=42).fit(np.concatenate([pred_flat, gt_flat], axis=0))
-                pred_pca = pca_frame.transform(pred_flat).astype(np.float32)
-                gt_pca = pca_frame.transform(gt_flat).astype(np.float32)
+                if UMAP_MERGE_MODE == "separate":
+                    pca_pred = PCA(n_components=3, random_state=_umap_seed).fit(pred_flat)
+                    pca_gt = PCA(n_components=3, random_state=_umap_seed).fit(gt_flat)
+                else:
+                    pca_frame = PCA(n_components=3, random_state=_umap_seed).fit(np.concatenate([pred_flat, gt_flat], axis=0))
+                    pca_pred = pca_gt = pca_frame
+                pred_pca = pca_pred.transform(pred_flat).astype(np.float32)
+                gt_pca = pca_gt.transform(gt_flat).astype(np.float32)
             else:
                 pred_pca = pca_global.transform(pred_flat).astype(np.float32)
                 gt_pca = pca_global.transform(gt_flat).astype(np.float32)
 
             # UMAP
             if args.umap_fit_mode == "per_frame":
-                combined = np.concatenate([pred_flat, gt_flat], axis=0)
-                frame_umap = _fit_umap_3d(combined, n_neighbors=_umap_n, min_dist=_umap_d, metric=_umap_m)
+                if UMAP_MERGE_MODE == "separate":
+                    umap_pred = _fit_umap_3d(
+                        pred_flat,
+                        n_neighbors=_umap_n,
+                        min_dist=_umap_d,
+                        metric=_umap_m,
+                        random_state=_umap_seed,
+                        init=_umap_init,
+                        fit_max_tokens=_umap_fit_max,
+                        l2_normalize=_umap_l2,
+                        standardize=_umap_standardize,
+                    )
+                    umap_gt = _fit_umap_3d(
+                        gt_flat,
+                        n_neighbors=_umap_n,
+                        min_dist=_umap_d,
+                        metric=_umap_m,
+                        random_state=_umap_seed,
+                        init=_umap_init,
+                        fit_max_tokens=_umap_fit_max,
+                        l2_normalize=_umap_l2,
+                        standardize=_umap_standardize,
+                    )
+                else:
+                    combined = np.concatenate([pred_flat, gt_flat], axis=0)
+                    frame_umap = _fit_umap_3d(
+                        combined,
+                        n_neighbors=_umap_n,
+                        min_dist=_umap_d,
+                        metric=_umap_m,
+                        random_state=_umap_seed,
+                        init=_umap_init,
+                        fit_max_tokens=_umap_fit_max,
+                        l2_normalize=_umap_l2,
+                        standardize=_umap_standardize,
+                    )
+                    umap_pred = umap_gt = frame_umap
             else:
-                frame_umap = umap_global
-            if frame_umap is not None:
-                pred_umap = frame_umap.transform(pred_flat).astype(np.float32)
-                gt_umap = frame_umap.transform(gt_flat).astype(np.float32)
+                if UMAP_MERGE_MODE == "separate":
+                    umap_pred = umap_global_pred
+                    umap_gt = umap_global_gt
+                else:
+                    umap_pred = umap_gt = umap_global
+            if umap_pred is not None and umap_gt is not None:
+                pred_umap = umap_pred.transform(pred_flat).astype(np.float32)
+                gt_umap = umap_gt.transform(gt_flat).astype(np.float32)
             else:
                 pred_umap, gt_umap = pred_pca, gt_pca
 

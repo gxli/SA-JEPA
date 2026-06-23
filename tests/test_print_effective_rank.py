@@ -244,7 +244,7 @@ class PrintEffectiveRankTests(unittest.TestCase):
             summary = model.analyze_rank()
 
         self.assertEqual(summary["depth"], "2")
-        self.assertEqual(summary["dilations"], "[1,2]")
+        self.assertEqual(summary["dilations"], "[1,2] (13px)")
         self.assertEqual(summary["hardcap"], "9")
         self.assertEqual(summary["cdd_scales"], "4")
         self.assertEqual(summary["energy"], "   3.5000")

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import tempfile
 from typing import Optional
+
+_logger = logging.getLogger("sajepa")
 
 import numpy as np
 import torch
@@ -21,7 +24,7 @@ class ScaleAwareJEPA:
     """Scale-Aware Joint-Embedding Predictive Architecture for physical fields.
 
     Usage:
-        model = ScaleAwareJEPA(config="configs/mhd_turbulence.yaml")
+        model = ScaleAwareJEPA(config="configs/base_pyramid_scaleaware_convnext.yaml")
         model.fit(field, epochs=10)
         latent = model.extract(field)
         model.save_session("sessions/my_run")
@@ -69,7 +72,7 @@ class ScaleAwareJEPA:
             raise FileNotFoundError(
                 f"base_session has no model_last.pt: {base_session}"
             )
-        print(f"[sajepa] seeded {target_session} from {base_session} mode={mode}: {', '.join(copied)}")
+        _logger.info(f"seeded %s from %s mode=%s: %s", target_session, base_session, mode, ", ".join(copied))
 
     # ── training ────────────────────────────────────────────────
 
@@ -108,6 +111,8 @@ class ScaleAwareJEPA:
             new_dir = os.path.join(sessions_dir, config_name)
             self._seed_session_from_base(base_session, new_dir, mode=base_session_mode)
 
+        # NOTE: OOM-safe auto-scaling is not yet wired into train();
+        # use fit() for large models/fields that may OOM.
         session_dir = run_training(cfg, config_name=config_name, sessions_root=sessions_dir)
         self._config = cfg
         self._session_dir = os.path.abspath(session_dir)
@@ -177,8 +182,7 @@ class ScaleAwareJEPA:
         if not torch.cuda.is_available():
             train_cfg["num_workers"] = 0
 
-        print(f"[sajepa] batch={trainer.batch_size} accum={trainer.accumulation_steps}"
-              f" session={session_dir or '(temp)'}")
+        _logger.info(f"batch=%d accum=%d session=%s", trainer.batch_size, trainer.accumulation_steps, session_dir or "(temp)")
 
         old_cwd = os.getcwd()
         os.chdir(sessions_dir)
@@ -347,7 +351,7 @@ class ScaleAwareJEPA:
             _, _, V = torch.pca_lowrank(flat, q=min(2, C))
             results["pca"] = torch.matmul(flat, V[:, :2]).cpu().numpy()
         except Exception as e:
-            print(f"[sajepa] PCA fallback failed: {e}")
+            _logger.warning(f"PCA fallback failed: %s", e)
 
         # UMAP — best-effort
         if method.lower() == "umap":
@@ -361,7 +365,7 @@ class ScaleAwareJEPA:
                 emb = reducer.fit_transform(flat.to(self._get_device()))
                 results["umap"] = emb.cpu().numpy()
             except Exception as e:
-                print(f"[sajepa] UMAP unavailable ({type(e).__name__}), PCA only.")
+                _logger.warning(f"UMAP unavailable (%s), PCA only.", type(e).__name__)
 
         return results
 
@@ -421,7 +425,7 @@ class ScaleAwareJEPA:
         """Return effective-rank diagnostics for the current session."""
         if self._session_dir is None:
             raise RuntimeError("No session. Call fit() or load_session() first.")
-        from scripts.print_effective_rank import rank_summary
+        from scripts.print_session_summary import rank_summary
         rows = rank_summary([self._session_dir])
         if not rows:
             return {}
@@ -438,6 +442,63 @@ class ScaleAwareJEPA:
         return dict(zip(cols, rows[0]))
 
     # ── dashboard ───────────────────────────────────────────────
+
+    def save_interactive_umap(
+        self,
+        input_npy: str,
+        output_html: Optional[str] = None,
+        lo_pct: float = 1.0,
+        hi_pct: float = 99.0,
+    ) -> str:
+        """Build a self-contained click-to-similarity HTML from a UMAP XYZ .npy.
+
+        Args:
+            input_npy: path to a (3,H,W) or (H,W,3) UMAP embedding .npy file.
+            output_html: output .html path (default: input_npy with .html extension).
+            lo_pct: lower percentile for RGB scaling.
+            hi_pct: upper percentile for RGB scaling.
+
+        Returns:
+            path to the generated HTML file.
+        """
+        from scripts.session_umap_interactive import build_html
+        from pathlib import Path
+        in_path = Path(input_npy)
+        out_path = Path(output_html) if output_html else in_path.with_suffix(".html")
+        html_path = build_html(in_path, out_path, lo_pct, hi_pct)
+        return str(html_path)
+
+    def open_dashboard(self) -> str:
+        """Open the session dashboard in a browser.  Returns the file path."""
+        if self._session_dir is None:
+            raise RuntimeError("No session. Call fit() or load_session() first.")
+        import webbrowser
+        dash = os.path.join(self._session_dir, "dashboard.html")
+        if not os.path.exists(dash):
+            self.generate_dashboard()
+        if os.path.exists(dash):
+            webbrowser.open(f"file://{dash}")
+        return dash
+
+    def open_interactive_umap(self, branch: str = "predict") -> str:
+        """Open an interactive click-to-similarity UMAP in a browser.
+
+        *branch* can be ``"predict"``, ``"target"``, or ``"context"``.
+        Returns the path to the generated HTML file.
+        """
+        if self._session_dir is None:
+            raise RuntimeError("No session. Call fit() or load_session() first.")
+        import webbrowser
+        results = os.path.join(self._session_dir, "results")
+        npy = os.path.join(results, f"{branch}_umap_xyz.npy")
+        if not os.path.exists(npy):
+            npy = os.path.join(results, "predict_umap_xyz.npy")
+        if not os.path.exists(npy):
+            raise FileNotFoundError(f"No UMAP file found in {results}")
+        html = os.path.join(results, f"interactive_umap_{branch}.html")
+        self.save_interactive_umap(npy, html)
+        webbrowser.open(f"file://{html}")
+        return html
 
     def generate_dashboard(self, output_path: Optional[str] = None):
         """Generate interactive HTML dashboard from the current session.
@@ -473,8 +534,6 @@ class ScaleAwareJEPA:
             with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             is_inference_only = bool(cfg.get("_inference", {}).get("inference_only", False))
-            if not is_inference_only:
-                return
             results_dir = os.path.join(self._session_dir, "results")
             required = os.path.join(results_dir, "predict_umap_xyz.npy")
             if os.path.exists(required):
