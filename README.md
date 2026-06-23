@@ -44,10 +44,33 @@ intensity/molecular-gas fields, nighttime-light rasters, or any continuous
 physical distribution featuring diffuse filaments, ridges, and complex compact
 structures.
 
+### 🌌 Dense Latent Atlas Projections
+
+To verify that the scale-aware joint-embedding representations capture coherent
+physical structures without manual labels, the dense 32-channel latent
+coordinates are projected into a low-dimensional UMAP space. When back-mapped to
+physical coordinates, these spaces organize continuous fields by their local
+structural morphology.
+
+| MHD Turbulence | NGC 3627 |
+|:---:|:---:|
+| ![MHD](figures/mhd.png) | ![NGC 3627](figures/ngc.png) |
+| UMAP and PCA projections of the 32-channel latent atlas for a continuous MHD plasma simulation. Clusters trace filaments, shocks, and compact vortices. | UMAP and PCA projections for the molecular gas intensity field of NGC 3627. Latent neighborhoods map onto spiral structure and diffuse halo regions. |
+
+#### 🖥️ Interactive Dashboard — NGC 3627
+
+Click-to-similarity inspection of spiral arm and interarm regions. Selecting a
+latent neighborhood in the UMAP view back-maps to the corresponding physical
+structure in the galaxy field.
+
+| Spiral Arm | Interarm |
+|:---:|:---:|
+| ![spiral arm](figures/spiral_arm.png) | ![interarm](figures/interarm.png) |
+
 ## ⚡ Installation
 
 ```bash
-git clone <REPOSITORY_URL>
+git clone https://github.com/gxli/SA-JEPA.git
 cd sajepa
 pip install -e .
 ```
@@ -74,19 +97,19 @@ field = torch.from_numpy(np.load("path/to/your_field.npy"))
 
 # 2. Train a default scale-aware model
 model = ScaleAwareJEPA()
-model.fit(field, epochs=10, session_dir="sessions/my_run")
+model.fit(field, epochs=10, session_dir="outputs/my_run")
 
 # 3. Extract the dense latent atlas → shape (C_latent, H, W)
 latent = model.extract(field)
 
-# 4. Generate dashboards in the session directory
-model.generate_dashboard()                # → sessions/my_run/dashboard.html
-umap_html = model.open_interactive_umap() # → sessions/my_run/results/interactive_umap_predict.html
+# 4. Generate dashboards
+model.generate_dashboard()                # → outputs/my_run/dashboard.html
+umap_html = model.open_interactive_umap() # → outputs/my_run/results/interactive_umap_predict.html
 
 # 5. Save everything
-model.save_session("sessions/my_run")
+model.save_session("outputs/my_run")
 
-print(f"Dashboard:     sessions/my_run/dashboard.html")
+print(f"Dashboard:     outputs/my_run/dashboard.html")
 print(f"Interactive:   {umap_html}")
 ```
 
@@ -96,7 +119,7 @@ print(f"Interactive:   {umap_html}")
 from sajepa import ScaleAwareJEPA
 
 model = ScaleAwareJEPA(config="configs/base_pyramid_scaleaware_convnext.yaml")
-model.train(config_name="my_run", sessions_dir="sessions", dashboard=True)
+model.train(config_name="my_run", sessions_dir="outputs", dashboard=True)
 model.open_interactive_umap()
 model.save_session(model.session_dir)
 
@@ -107,11 +130,11 @@ print(f"Interactive:   {model.session_dir}/results/interactive_umap_predict.html
 ### ⌨️ Command Line
 
 ```bash
-sajepa-train --config configs/base_pyramid_scaleaware_convnext.yaml --sessions-dir sessions
-python scripts/session_to_dash.py --sessions-dir sessions --stage all
+sajepa-train --config configs/base_pyramid_scaleaware_convnext.yaml --sessions-dir outputs
+python scripts/session_to_dash.py --sessions-dir outputs --stage all
 ```
 
-Dashboards land in `sessions/base_pyramid_scaleaware_convnext/dashboard.html`. Run
+Dashboards land in `outputs/base_pyramid_scaleaware_convnext/dashboard.html`. Run
 `model.open_interactive_umap()` from Python to generate the interactive UMAP view.
 
 ### 📊 Dashboard Output
@@ -125,7 +148,7 @@ After any run, two self-contained HTML files land in the session directory:
 
 Reopen later:
 ```python
-model = ScaleAwareJEPA.load_session("sessions/my_run")
+model = ScaleAwareJEPA.load_session("outputs/my_run")
 model.open_dashboard()           # opens dashboard.html
 model.open_interactive_umap()    # opens interactive UMAP
 ```
@@ -136,15 +159,15 @@ model.open_interactive_umap()    # opens interactive UMAP
 
 ```python
 # Restore an existing saved model session
-model = ScaleAwareJEPA.load_session("sessions/my_run")
+model = ScaleAwareJEPA.load_session("outputs/my_run")
 latent = model.extract(field)
 
 # WEIGHTS-ONLY SEED: Warm-start on new data using prior weights
 model.fit(
     new_field,
     epochs=10,
-    session_dir="sessions/refine_new_data",
-    base_session="sessions/my_run",
+    session_dir="outputs/refine_new_data",
+    base_session="outputs/my_run",
     base_session_mode="weights",
 )
 
@@ -152,8 +175,8 @@ model.fit(
 model.fit(
     new_field,
     epochs=30,
-    session_dir="sessions/continue_old_run",
-    base_session="sessions/my_run",
+    session_dir="outputs/continue_old_run",
+    base_session="outputs/my_run",
     base_session_mode="resume",
 )
 ```
@@ -165,12 +188,12 @@ containing the following baseline artifacts:
 
 | File Path | Artifact Contents |
 |---|---|
-| `sessions/my_run/model_last.pt` | Latest saved system model weights file. |
-| `sessions/my_run/checkpoint_last.pt` | Optimization states for complete session training recovery. |
-| `sessions/my_run/metrics.csv` | Comprehensive training logging metrics (loss histories, LR schedules, rank properties). |
-| `sessions/my_run/dashboard.html` | Self-contained interactive Plotly diagnostic dashboard. |
-| `sessions/my_run/results/predict_latent_vectors_full.npy` | Dense computed coordinate latent atlas map array `(C, H, W)`. |
-| `sessions/my_run/results/predict_pca_xyz.npy` / `predict_umap_xyz.npy` | PCA and UMAP coordinate maps registered to physical field coordinates. |
+| `<outdir>/<session_name>/model_last.pt` | Latest saved system model weights file. |
+| `<outdir>/<session_name>/checkpoint_last.pt` | Optimization states for complete session training recovery. |
+| `<outdir>/<session_name>/metrics.csv` | Comprehensive training logging metrics (loss histories, LR schedules, rank properties). |
+| `<outdir>/<session_name>/dashboard.html` | Self-contained interactive Plotly diagnostic dashboard. |
+| `<outdir>/<session_name>/results/predict_latent_vectors_full.npy` | Dense computed coordinate latent atlas map array `(C, H, W)`. |
+| `<outdir>/<session_name>/results/predict_pca_xyz.npy` / `predict_umap_xyz.npy` | PCA and UMAP coordinate maps registered to physical field coordinates. |
 
 ## ⚙️ Hyperparameter Knobs
 
@@ -192,6 +215,22 @@ track these baseline starting targets:
 - `spread_regularizer`: configured as `std_hinge`, with a scaling `weight: 2`, mapping against `target: context` inside a `"pooled"` spatial_mode.
 - `symmetry_loss_weight`: `0.0` (off by default; set to `0.003` for weak four-view flip consistency).
 - `normalize_loss_l2`: `false` (preserves exact latent spatial amplitude calculations).
+
+**Large Fields & Crop Size**
+
+For fields larger than ~512² px, GPU memory becomes the limiting factor. Set
+`crop_size` in the config (or via `infer_npy` for inference-only runs):
+
+- `crop_size`: set under `data.crop_size` in YAML. Use `256` for most fields;
+  drop to `128` for >1024² px; raise to `512` if GPU headroom allows.
+- `crop_mode`: `"none"` (default, full field), `"center"` (single window), or
+  `"tile"` (sliding window, stitches results).
+- `crop_min_valid_fraction`: `0.5` — tiles with less valid data are skipped.
+
+For inference on an already-trained session, pass directly:
+```python
+model.infer_npy("large_field.npy", crop_size=256, crop_mode="tile")
+```
 
 **Modeling Dimensions**
 
