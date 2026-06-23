@@ -327,6 +327,21 @@ python -m src.inference_from_session \
 
 ## 📜 Citations & References
 
+### ScaleAware-JEPA
+
+```bibtex
+@article{li2026scaleaware,
+  author  = {Li, Guang-Xing},
+  title   = {ScaleAware-{JEPA}: Latent Representation for Discovery in
+             Multiscale Physical Fields},
+  journal = {arXiv preprint},
+  year    = {2026},
+  note    = {arXiv:XXXX.XXXXX}
+}
+```
+
+### Constrained Diffusion Decomposition
+
 If you apply this Multi-Scale Constrained Diffusion Decomposition engine
 within formal academic research pipelines, please attribute credit via the
 citation record provided below:
