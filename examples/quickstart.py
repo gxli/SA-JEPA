@@ -18,7 +18,7 @@ model = ScaleAwareJEPA(config={
               "spatial_mode": "pooled", "weight": 5.0, "target_std": 1.0}},
 })
 
-model.train(config_name="mhd_quickstart", sessions_dir=os.path.join(ROOT, "sessions"), dashboard=True)
+model.train(config_name="quickstart", sessions_dir=os.path.join(ROOT, "sessions"), dashboard=True)
 dashboard = os.path.join(model.session_dir, "dashboard.html")
 umap_npy = os.path.join(model.session_dir, "results", "predict_umap_xyz.npy")
 umap_html = os.path.join(model.session_dir, "results", "interactive_umap_predict.html")

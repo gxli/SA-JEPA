@@ -8,7 +8,7 @@ sys.path.insert(0, ROOT)
 from sajepa import ScaleAwareJEPA
 
 model = ScaleAwareJEPA(config=os.path.join(ROOT, "configs", "examples", "mhd_example.yaml"))
-model.train(config_name="mhd_example_config", sessions_dir=os.path.join(ROOT, "sessions"), dashboard=True)
+model.train(config_name="example_config_driven", sessions_dir=os.path.join(ROOT, "sessions"), dashboard=True)
 dashboard = os.path.join(model.session_dir, "dashboard.html")
 umap_npy = os.path.join(model.session_dir, "results", "predict_umap_xyz.npy")
 umap_html = os.path.join(model.session_dir, "results", "interactive_umap_predict.html")

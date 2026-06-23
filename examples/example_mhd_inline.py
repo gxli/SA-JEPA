@@ -41,7 +41,7 @@ config = {
 }
 
 model = ScaleAwareJEPA(config=config)
-model.train(config_name="mhd_inline_annotated",
+model.train(config_name="example_mhd_inline",
             sessions_dir=os.path.join(ROOT, "sessions"),
             dashboard=True)
 dashboard = os.path.join(model.session_dir, "dashboard.html")
