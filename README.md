@@ -55,13 +55,18 @@ structural morphology.
 | MHD Turbulence | NGC 3627 |
 |:---:|:---:|
 | ![MHD](figures/mhd.png) | ![NGC 3627](figures/ngc.png) |
-| UMAP and PCA projections of the 32-channel latent atlas for a continuous MHD plasma simulation. Clusters trace filaments, shocks, and compact vortices. | UMAP and PCA projections for the molecular gas intensity field of NGC 3627. Latent neighborhoods map onto spiral structure and diffuse halo regions. |
+| UMAP and PCA projections for a continuous MHD plasma simulation. | UMAP and PCA projections for the molecular gas intensity field of NGC 3627. Latent neighborhoods map onto spiral structure and diffuse halo regions. |
 
 #### 🖥️ Interactive Dashboard — NGC 3627
 
 Click-to-similarity inspection of spiral arm and interarm regions. Selecting a
 latent neighborhood in the UMAP view back-maps to the corresponding physical
 structure in the galaxy field.
+
+```python
+model.open_interactive_umap()                             # generates + opens in browser
+model.save_interactive_umap("predict_umap_xyz.npy", "out.html")  # save to file
+```
 
 | Spiral Arm | Interarm |
 |:---:|:---:|
