@@ -1,0 +1,24 @@
+# MHD example: ms=1.2, pooled, w=5, 10 epochs, no symmetry loss.
+# Run: sajepa-train --config configs/examples/mhd_example.yaml
+
+data:
+  data_root: data
+  npy_pattern: C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy
+  num_samples: 200
+  d4_augment: true
+
+model:
+  mode: pyramid
+  model_key: cdd_scaleaware_convnext
+  mask_size_scaling: 1.2
+
+train:
+  epochs: 10
+  symmetry_loss_weight: 0.0
+  spread_regularizer:
+    type: std_hinge
+    target: context
+    spatial_mode: pooled
+    weight: 5.0
+    target_std: 1.0
+    eps: 0.0001
