@@ -16,6 +16,7 @@ from src.train import load_config, run_training
 def parse_args():
     parser = argparse.ArgumentParser(description="Run one JEPA config")
     parser.add_argument("--config", type=str, required=True, help="Path to JSON config")
+    parser.add_argument("--name", type=str, default=None, help="Session name; defaults to config filename stem")
     parser.add_argument("--sessions-dir", type=str, default="sessions", help="Session output root")
     parser.add_argument(
         "--update-effective-rank",
@@ -34,7 +35,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
     config = load_config(args.config)
-    config_name = os.path.splitext(os.path.basename(args.config))[0]
+    config_name = args.name or os.path.splitext(os.path.basename(args.config))[0]
     if args.update_effective_rank:
         cfg = copy.deepcopy(config)
         cfg.setdefault("train", {})

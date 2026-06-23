@@ -108,9 +108,11 @@ print(f"Interactive:   {model.session_dir}/results/interactive_umap_predict.html
 
 ```bash
 sajepa-train --config configs/base_pyramid_scaleaware_convnext.yaml --sessions-dir sessions
+python scripts/session_to_dash.py --sessions-dir sessions --stage all
 ```
 
-Output lands in `sessions/my_run/` — open `sessions/my_run/dashboard.html`.
+Dashboards land in `sessions/base_pyramid_scaleaware_convnext/dashboard.html`. Run
+`model.open_interactive_umap()` from Python to generate the interactive UMAP view.
 
 ### 📊 Dashboard Output
 
@@ -164,11 +166,11 @@ containing the following baseline artifacts:
 | File Path | Artifact Contents |
 |---|---|
 | `sessions/my_run/model_last.pt` | Latest saved system model weights file. |
-| `sessions/my_run/resume_checkpoint.pt` | Optimization states for complete session training recovery. |
+| `sessions/my_run/checkpoint_last.pt` | Optimization states for complete session training recovery. |
 | `sessions/my_run/metrics.csv` | Comprehensive training logging metrics (loss histories, LR schedules, rank properties). |
-| `sessions/my_run/dashboard.html` | Self-contained interactive Plotly diagnostic presentation interface. |
-| `results/predict_latent_vectors_full.npy` | Dense computed coordinate latent atlas map array `(C, H, W)`. |
-| `results/predict_pca_xyz.npy` / `predict_umap_xyz.npy` | PCA and UMAP coordinate matrices mapped to physical field coordinates. |
+| `sessions/my_run/dashboard.html` | Self-contained interactive Plotly diagnostic dashboard. |
+| `sessions/my_run/results/predict_latent_vectors_full.npy` | Dense computed coordinate latent atlas map array `(C, H, W)`. |
+| `sessions/my_run/results/predict_pca_xyz.npy` / `predict_umap_xyz.npy` | PCA and UMAP coordinate maps registered to physical field coordinates. |
 
 ## ⚙️ Hyperparameter Knobs
 
@@ -187,8 +189,8 @@ track these baseline starting targets:
 **Loss Components**
 
 - `prediction_loss_weight`: `50` (primary JEPA latent prediction MSE multiplier).
-- `spread_regularizer`: configured as `std_hinge`, with a scaling `weight: 5`, mapping against `target: context` inside a `"pooled"` spatial_mode.
-- `symmetry_loss_weight`: `0.003` (provides weak four-view flip structural constraints across fields).
+- `spread_regularizer`: configured as `std_hinge`, with a scaling `weight: 2`, mapping against `target: context` inside a `"pooled"` spatial_mode.
+- `symmetry_loss_weight`: `0.0` (off by default; set to `0.003` for weak four-view flip consistency).
 - `normalize_loss_l2`: `false` (preserves exact latent spatial amplitude calculations).
 
 **Modeling Dimensions**
@@ -236,7 +238,7 @@ sajepa-train --config configs/base_pyramid_scaleaware_convnext.yaml --sessions-d
 python scripts/print_session_summary.py sessions/gen_*
 
 # Launch your structural interactive Plotly analytics dashboard
-python scripts/session_to_dash.py --session sessions/mhd_run_01
+python scripts/session_to_dash.py --sessions-dir sessions --stage all --export-dir results/dashboard
 
 # Execute a sliding-window tiled inference workflow on very large out-of-core fields
 python -m src.inference_from_session \
@@ -259,7 +261,7 @@ python -m src.inference_from_session \
 ├── examples/
 │   ├── quickstart.py                            # Basic programmatic entry validation script
 │   ├── example_mhd_inline.py                    # Annotated script using inline variables
-│   └── example_mhd_movie.py                     # Training routine generating latent space movies
+│   ├── example_config_driven.py                 # Config-override API training example
 ├── scripts/
 │   ├── train.py                                 # Core training terminal application interface
 │   ├── print_session_summary.py                 # Post-run evaluation summary calculator

@@ -4,10 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-sajepa-train --config configs/examples/mhd_example.yaml
+sajepa-train --config configs/examples/mhd_example.yaml --name example_cli
 
 echo ""
 echo "Done."
-echo "  session:          sessions/mhd_example"
-echo "  dashboard:        sessions/mhd_example/dashboard.html"
-echo "  interactive_umap: sessions/mhd_example/results/interactive_umap_predict.html"
+echo "  session:          sessions/example_cli"
+echo "  dashboard:        sessions/example_cli/dashboard.html"
+echo "  interactive_umap: sessions/example_cli/results/interactive_umap_predict.html"
