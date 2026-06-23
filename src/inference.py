@@ -544,11 +544,6 @@ def run_post_training_inference(
         _save_npz(os.path.join(session_dir, "cdd_channels_orig.npz"), inference_outputs["cdd_channels_orig"].numpy())
     if "cdd_channels_masked" in inference_outputs:
         _save_npz(os.path.join(session_dir, "cdd_channels_masked.npz"), inference_outputs["cdd_channels_masked"].numpy())
-        # Requested artifact: one example masked channel cube for quick inspection.
-        _save_npz(
-            os.path.join(session_dir, "example_masked_channel_cube.npz"),
-            inference_outputs["cdd_channels_masked"][0].numpy().astype(np.float32),
-        )
     if "dip_field_per_channel" in inference_outputs:
         _save_npz(
             os.path.join(session_dir, "dip_field_per_channel.npz"),

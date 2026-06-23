@@ -289,7 +289,7 @@ def test_manual_mask_box_sizes_ignore_extra_values():
     assert debug["cdd_box_sizes"][0].tolist() == [7.0, 11.0]
 
 
-def test_dashboard_reconstructs_pyramid_mask_cube_from_cdd_diff(tmp_path):
+def test_dashboard_reconstructs_pyramid_mask_stack_from_cdd_diff(tmp_path):
     session_dir = tmp_path / "session"
     session_dir.mkdir()
     cdd_orig = torch.ones((1, 3, 8, 8), dtype=torch.float32)
@@ -312,10 +312,10 @@ def test_dashboard_reconstructs_pyramid_mask_cube_from_cdd_diff(tmp_path):
 
     dash_path = compute_dash_data(str(session_dir), overwrite=True)
     with np.load(dash_path) as data:
-        cube = data["pyramid_mask_cube"]
+        stack = data["pyramid_mask_stack"]
 
-    assert cube.shape == (3, 8, 8)
-    assert int(np.count_nonzero(cube)) == 8
+    assert stack.shape == (3, 8, 8)
+    assert int(np.count_nonzero(stack)) == 8
 
 
 def test_dashboard_accepts_chw_embedding_artifacts(tmp_path):

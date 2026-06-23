@@ -46,7 +46,7 @@ DASH_DATA_REQUIRED = {
     "gt_pca_rgb_flat",
     "gt_umap_rgb",
     "gt_umap_rgb_flat",
-    "pyramid_mask_cube",
+    "pyramid_mask_stack",
 }
 
 SCALE_PROBE_KEYS = {
@@ -531,49 +531,48 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     else:
         visit_heatmap = np.zeros((h, w), dtype=np.float32)
 
-    # Load first-sample pyramid mask cube (S,H,W), save a canonical artifact in session dir.
-    mask_cube = None
+    # Dashboard-only pyramid mask stack (S,H,W), reconstructed from inference
+    # tensors/artifacts. This is not written as a standalone debug file.
+    pyramid_mask_stack = None
     for mask_name in ("dip_field_per_channel", "pyramid_mask_token"):
         mask_path = _prefer_npz(os.path.join(session_dir, f"{mask_name}.npy"))
         if os.path.exists(mask_path):
             arr = np.asarray(_load_array(mask_path), dtype=np.float32)
-            # Expected saved inference artifact shape: B,S,H,W
             if arr.ndim == 4 and arr.shape[0] > 0:
-                mask_cube = arr[0]
+                pyramid_mask_stack = arr[0]
                 break
-    if mask_cube is None:
+    if pyramid_mask_stack is None:
         tok = outputs.get("dip_field_per_channel", outputs.get("pyramid_mask_token"))
         if tok is not None:
             tok = _to_np(tok).astype(np.float32)
             if tok.ndim == 4 and tok.shape[0] > 0:
-                mask_cube = tok[0]
-    if mask_cube is None:
+                pyramid_mask_stack = tok[0]
+    if pyramid_mask_stack is None:
         cdd_o = outputs.get("cdd_channels_orig")
         cdd_m = outputs.get("cdd_channels_masked")
         if cdd_o is not None and cdd_m is not None:
             orig_arr = _to_np(cdd_o).astype(np.float32)
             masked_arr = _to_np(cdd_m).astype(np.float32)
             if orig_arr.ndim == 4 and masked_arr.shape == orig_arr.shape and orig_arr.shape[0] > 0:
-                mask_cube = (np.abs(orig_arr[0] - masked_arr[0]) > 1e-8).astype(np.float32)
-    if mask_cube is None:
+                pyramid_mask_stack = (np.abs(orig_arr[0] - masked_arr[0]) > 1e-8).astype(np.float32)
+    if pyramid_mask_stack is None:
         cdd_o_path = _prefer_npz(os.path.join(session_dir, "cdd_channels_orig.npy"))
         cdd_m_path = _prefer_npz(os.path.join(session_dir, "cdd_channels_masked.npy"))
         if os.path.exists(cdd_o_path) and os.path.exists(cdd_m_path):
             orig_arr = np.asarray(_load_array(cdd_o_path), dtype=np.float32)
             masked_arr = np.asarray(_load_array(cdd_m_path), dtype=np.float32)
             if orig_arr.ndim == 4 and masked_arr.shape == orig_arr.shape and orig_arr.shape[0] > 0:
-                mask_cube = (np.abs(orig_arr[0] - masked_arr[0]) > 1e-8).astype(np.float32)
-    if mask_cube is None:
+                pyramid_mask_stack = (np.abs(orig_arr[0] - masked_arr[0]) > 1e-8).astype(np.float32)
+    if pyramid_mask_stack is None:
         tok = outputs.get("mask_cube")
         if tok is not None:
             tok = _to_np(tok).astype(np.float32)
             if tok.ndim == 5 and tok.shape[0] > 0 and tok.shape[1] > 0:
-                mask_cube = tok[0, 0]
-    if mask_cube is None:
-        mask_cube = np.zeros((1, h, w), dtype=np.float32)
+                pyramid_mask_stack = tok[0, 0]
+    if pyramid_mask_stack is None:
+        pyramid_mask_stack = np.zeros((1, h, w), dtype=np.float32)
     else:
-        mask_cube = _canonicalize_cube_hw(mask_cube, (h, w))
-    np.save(os.path.join(session_dir, "example_pyramid_mask_cube.npy"), mask_cube.astype(np.float32, copy=False))
+        pyramid_mask_stack = _canonicalize_cube_hw(pyramid_mask_stack, (h, w))
 
     # Load precomputed PCA/UMAP artifacts saved by training-time pipeline.
     results_dir = os.path.join(session_dir, "results")
@@ -892,6 +891,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         energy_map=energy_map.astype(np.float32),
         visit_heatmap=visit_heatmap.astype(np.float32),
         visit_heatmap_kind=np.asarray(visit_heatmap_kind),
+        pyramid_mask_stack=pyramid_mask_stack.astype(np.float32),
         context_pca3d=bundles["context"]["pca3d"],
         context_umap3d=bundles["context"]["umap3d"],
         context_pca_rgb=bundles["context"]["pca_rgb"],
@@ -947,7 +947,6 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         rank_gt_top8=np.asarray([_rd("gt", "top8_energy")], dtype=np.float32),
         rank_match_ratio=np.asarray([rd_rank_match_ratio], dtype=np.float32),
         volume_match_ratio=np.asarray([rd_volume_match_ratio], dtype=np.float32),
-        pyramid_mask_cube=mask_cube.astype(np.float32),
         mask_sigma_names=np.array(mask_sigma_names, dtype=str),
         mask_sigma_sizes=np.asarray(mask_sigma_sizes, dtype=np.int32),
         mask_config_summary=np.array(mask_config_summary, dtype=str),
@@ -1855,15 +1854,14 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             },
         ]
     )
-    if model_mode in ("pyramid", "3d_slab") and "pyramid_mask_cube" in data.files:
+    if model_mode in ("pyramid", "3d_slab") and "pyramid_mask_stack" in data.files:
         cards.append(
             {
-                "title": "Pyramid Mask 3D (Sample-0)",
-                "fig": mask3d("Pyramid Mask 3D (Sample-0)", data["pyramid_mask_cube"]),
-                "group": "pyr-mask-3d",
+                "title": "Pyramid Mask Stack (Sample-0)",
+                "fig": mask3d("Pyramid Mask Stack (Sample-0)", data["pyramid_mask_stack"]),
+                "group": "pyr-mask-stack",
             }
         )
-
     rendered = []
     seen_groups: set[str] = set()
     for i, card in enumerate(cards):

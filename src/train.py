@@ -1967,13 +1967,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 ((batch_idx + 1) % diagnostic_interval == 0)
                 or ((batch_idx + 1) == len(dataloader))
             )
-            if is_main_process and "cdd_channels_masked" in outputs:
-                cube_path = os.path.join(session_dir, "example_masked_channel_cube.npy")
-                if not os.path.exists(cube_path):
-                    np.save(
-                        cube_path,
-                        outputs["cdd_channels_masked"][0].detach().cpu().numpy().astype(np.float32),
-                    )
             if should_log_diagnostics:
                 # Keep the hot path asynchronous: copy diagnostic tensors to host
                 # only at the configured sampling interval.
