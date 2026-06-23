@@ -77,10 +77,10 @@ and spread weight `5`.
 
 After any run, two self-contained HTML files land in the session directory:
 
-| File | Purpose |
+| Path | Purpose |
 |:---|:---|
-| `sessions/<name>/dashboard.html` | Plotly diagnostic dashboard (loss curves, latent projections, rank metrics) |
-| `sessions/<name>/results/interactive_umap_predict.html` | Click-to-similarity interactive UMAP browser |
+| `<outdir>/<session_name>/dashboard.html` | Plotly diagnostic dashboard (loss curves, latent projections, rank metrics) |
+| `<outdir>/<session_name>/results/interactive_umap_predict.html` | Click-to-similarity interactive UMAP browser |
 
 Reopen later:
 ```python
