@@ -18,19 +18,21 @@ joint-embedding predictions optimized for continuous structures:
   encoder receives these components alongside scale-aware masks, meaning
   the context available for prediction dynamically scales with the hidden
   target structure.
-- **JEPA Latent Prediction:** A n online encoder processes a masked field
+- **JEPA Latent Prediction:** An online encoder processes a masked field
   and predicts the latent representation produced by an Exponential Moving
   Average (EMA) target encoder from the corresponding unmasked field.
   Training matches latent representations at hidden target locations instead
   of reconstructing noisy pixels.
 - **Dense Latent Exploration:** Every pixel receives a distinct latent
   coordinate that maps back directly to the original field coordinate space.
+- **Modality Support:** 2D fields are fully supported and tested. 3D
+  volumetric mode (`3d_full_volume`, `3d_slab`) is under active development.
 
 ## 🎯 Application Scenarios
 
 `sajepa` is explicitly engineered for label-free representation learning of
-continuous 2D scalar fields where distinct objects, semantic boundaries, or
-segmentation rules are not known in advance.
+continuous 2D (and, under development, 3D) scalar fields where distinct
+objects, semantic boundaries, or segmentation rules are not known in advance.
 
 **Standard Discovery Workflow**
 

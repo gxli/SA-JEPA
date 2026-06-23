@@ -1103,10 +1103,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
     if input_type == "cube" and not is_3d_mode:
         raise ValueError(
-            "data.input_type='cube' requires model.mode='3d_slab'."
+            "data.input_type='cube' requires model.mode='3d_slab' or '3d_full_volume'."
         )
     if is_3d_mode and input_type != "cube":
-        raise ValueError("model.mode='3d_slab' requires data.input_type='cube'.")
+        raise ValueError("3D model modes require data.input_type='cube'.")
     image_batch_inference = (input_type == "image_batch")
 
     resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
@@ -1389,6 +1389,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"crop_depth={crop_depth_3d} encoder_rf_depth={encoder_rf_depth_3d} "
                 f"target_depth={'full' if is_3d_full_volume_mode else target_slab_depth_3d}"
             )
+        inference_crop_depth_3d = int(train_cfg.get("inference_crop_depth_3d", crop_depth_3d))
+        if inference_crop_depth_3d <= 0:
+            raise ValueError(f"train.inference_crop_depth_3d must be positive, got {inference_crop_depth_3d}")
         dataset = JEPA3DCropDataset(
             data_root=data_cfg.get("data_root", "data"),
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
@@ -1409,8 +1412,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
             num_samples=max(1, int(train_cfg.get("inference_num_samples", 8))),
             crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
-            crop_depth=crop_depth_3d,
-            slab_depth=crop_depth_3d,
+            crop_depth=inference_crop_depth_3d,
+            slab_depth=inference_crop_depth_3d,
             depth_axis=int(data_cfg.get("volume_depth_axis", data_cfg.get("cube_slice_axis", 0))),
             random_axis=False,
             normalize=bool(data_cfg.get("normalize", True)),
@@ -2204,7 +2207,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 config_name=config_name,
                 force_recompute_inference=force_recompute_inference,
             )
-            if cdd_cache:
+            if cdd_cache and bool(train_cfg.get("full_volume_inference_enabled", True)):
                 target_slab_depth_3d = max(
                     int(model_cfg.get("patch_size", 2)),
                     int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
