@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 import plotly.graph_objects as go
 import torch
+from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap
 
 
 DASHBOARD_VERSION = "production-diagnostics-v6-spread-table"
@@ -407,6 +408,32 @@ def _canonicalize_cube_hw(arr: np.ndarray, shape: tuple[int, int]) -> np.ndarray
     return np.where(np.isfinite(out), out, 0.0).astype(np.float32, copy=False)
 
 
+def _display_scalar_from_batched_tensor(x: Any) -> np.ndarray:
+    arr = _to_np(x).astype(np.float32)
+    if arr.ndim == 5:
+        # B,C,D,H,W. Dashboard displays a scalar field; multi-channel CDD
+        # inputs are reconstructed by summing channels before taking a slice.
+        arr = arr[0]
+        if arr.shape[0] > 1:
+            arr = arr.sum(axis=0)
+        else:
+            arr = arr[0]
+        return arr[arr.shape[0] // 2] if arr.ndim == 3 else arr
+    if arr.ndim == 4:
+        # B,C,H,W or B,D,H,W. Treat C as channels when there are multiple maps.
+        arr = arr[0]
+        if arr.ndim == 3 and arr.shape[0] > 1:
+            arr = arr.sum(axis=0)
+        elif arr.ndim == 3:
+            arr = arr[0]
+        return arr
+    if arr.ndim == 3:
+        return arr[arr.shape[0] // 2]
+    if arr.ndim == 2:
+        return arr
+    return np.zeros((1, 1), dtype=np.float32)
+
+
 def _rgb_from_xyz(
     xyz: np.ndarray,
     h: int,
@@ -436,7 +463,11 @@ def _rgb_from_xyz(
 def _xyz_from_feature_map(feat: np.ndarray) -> np.ndarray:
     """Fallback embedding: flatten CHW feature map to N x 3 via first channels."""
     arr = np.asarray(feat, dtype=np.float32)
-    if arr.ndim == 4:
+    if arr.ndim == 5:
+        # B,C,D,H,W -> C,H,W center slice. These are latent maps, not CDD.
+        arr = arr[0]
+        arr = arr[:, arr.shape[1] // 2]
+    elif arr.ndim == 4:
         arr = arr[0]
     if arr.ndim != 3:
         return np.zeros((0, 3), dtype=np.float32)
@@ -450,8 +481,84 @@ def _xyz_from_feature_map(feat: np.ndarray) -> np.ndarray:
         xyz = np.concatenate([flat, flat, flat], axis=1)
     else:
         xyz = np.zeros((h * w, 3), dtype=np.float32)
-    xyz = np.where(np.isfinite(xyz), xyz, 0.0).astype(np.float32)
-    return xyz
+    return xyz.astype(np.float32, copy=False)
+
+
+def _latent_vectors_from_feature_map(feat: np.ndarray) -> np.ndarray:
+    arr = np.asarray(feat, dtype=np.float32)
+    if arr.ndim == 5:
+        arr = arr[0]
+        arr = arr[:, arr.shape[1] // 2]
+    elif arr.ndim == 4:
+        arr = arr[0]
+    if arr.ndim != 3:
+        return np.zeros((0, 0), dtype=np.float32)
+    c, h, w = arr.shape
+    return np.transpose(arr, (1, 2, 0)).reshape(h * w, c).astype(np.float32, copy=False)
+
+
+def _apply_latent_border_nan(z: np.ndarray, h: int, w: int, border_px: int) -> np.ndarray:
+    b = int(max(0, min(int(border_px), h // 2, w // 2)))
+    arr = np.asarray(z, dtype=np.float32)
+    if b <= 0 or arr.ndim != 2 or arr.shape[0] != h * w:
+        return arr
+    out = arr.reshape(h, w, arr.shape[1]).copy()
+    out[:b, :, :] = np.nan
+    out[h - b :, :, :] = np.nan
+    out[:, :b, :] = np.nan
+    out[:, w - b :, :] = np.nan
+    return out.reshape(h * w, arr.shape[1])
+
+
+def _apply_xyz_border_nan(xyz: np.ndarray, h: int, w: int, border_px: int) -> np.ndarray:
+    b = int(max(0, min(int(border_px), h // 2, w // 2)))
+    arr = np.asarray(xyz, dtype=np.float32)
+    if b <= 0 or arr.shape != (h * w, 3):
+        return arr
+    out = arr.reshape(h, w, 3).copy()
+    out[:b, :, :] = np.nan
+    out[h - b :, :, :] = np.nan
+    out[:, :b, :] = np.nan
+    out[:, w - b :, :] = np.nan
+    return out.reshape(h * w, 3)
+
+
+def _encoder_fov_margin_from_config(session_dir: str) -> int:
+    cfg_path = os.path.join(session_dir, "config_used.json")
+    if not os.path.exists(cfg_path):
+        return 0
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return 0
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(model_cfg, dict):
+        return 0
+    depth = int(model_cfg.get("encoder_depth", 3))
+    kernel = int(model_cfg.get("encoder_kernel_size", 5))
+    mode = str(model_cfg.get("mode", "")).strip().lower()
+    encoder_type = str(model_cfg.get("encoder_type", "")).strip().lower()
+    if mode.startswith("3d") or "3d" in encoder_type:
+        rf = 1 + 2 * (3 - 1) + max(0, depth) * max(0, kernel - 1)
+        return max(0, rf)
+    dilations = model_cfg.get("convnext_layer_dilations")
+    if dilations is None:
+        dil_list = [1] * max(0, depth)
+    else:
+        try:
+            dil_list = [int(v) for v in dilations]
+        except TypeError:
+            dil_list = [1] * max(0, depth)
+        if len(dil_list) < depth and dil_list:
+            reps = (depth + len(dil_list) - 1) // len(dil_list)
+            dil_list = (dil_list * reps)[:depth]
+        else:
+            dil_list = dil_list[:depth]
+    rf = 1 + 2 + 2
+    for dilation in dil_list:
+        rf += max(0, kernel - 1) * max(1, int(dilation))
+    return max(0, rf)
 
 
 def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
@@ -487,11 +594,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     x_clean = outputs.get("x_clean")
     if x_clean is None:
         raise RuntimeError(f"{session_dir}: inference outputs missing x_clean")
-    orig = _to_np(x_clean)[0, 0].astype(np.float32)
+    ctx_raw = outputs.get("x_context", outputs.get("x_context_raw", x_clean))
+    orig = _display_scalar_from_batched_tensor(x_clean)
+    blurred = _display_scalar_from_batched_tensor(ctx_raw)
     h, w = orig.shape
-
-    context = outputs.get("x_context", outputs.get("x_context_raw", x_clean))
-    blurred = _to_np(context)[0, 0].astype(np.float32)
 
     # Always render target locations as center points (not square footprints).
     target_locations = outputs.get("target_locations")
@@ -505,7 +611,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         for ki in range(tloc.shape[1]):
             if not tvalid[bi, ki]:
                 continue
-            yy, xx = int(tloc[bi, ki, 0]), int(tloc[bi, ki, 1])
+            if tloc.shape[-1] >= 3:
+                yy, xx = int(tloc[bi, ki, -2]), int(tloc[bi, ki, -1])
+            else:
+                yy, xx = int(tloc[bi, ki, 0]), int(tloc[bi, ki, 1])
             if 0 <= yy < h and 0 <= xx < w:
                 target[yy, xx] = 1.0
 
@@ -599,6 +708,14 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     has_predict_branch = has_results_dir and _has_required_branch_artifacts(results_dir, "predict")
     has_target_branch = has_results_dir and _has_required_branch_artifacts(results_dir, "target")
     fallback_mode = not (has_predict_branch and has_target_branch)
+    inference_summary = {}
+    summary_path = os.path.join(session_dir, "jepa_energy_summary.json")
+    if os.path.exists(summary_path):
+        try:
+            with open(summary_path, "r", encoding="utf-8") as f:
+                inference_summary = json.load(f)
+        except Exception:
+            inference_summary = {}
     if has_results_dir:
         verbose_missing = _verbose_artifact_report(session_dir)
         for line in verbose_missing:
@@ -613,6 +730,14 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     if pred_map is None:
         raise RuntimeError(f"{session_dir}: inference outputs missing pred_map")
     h_lat, w_lat = int(pred_map.shape[-2]), int(pred_map.shape[-1])
+    if "inference_discard_margin" in inference_summary:
+        latent_border_px = int(max(0, inference_summary.get("inference_discard_margin") or 0))
+    elif "inference_encoder_receptive_field" in inference_summary:
+        latent_border_px = int(max(0, int(inference_summary.get("inference_encoder_receptive_field") or 0)))
+    else:
+        latent_border_px = _encoder_fov_margin_from_config(session_dir)
+    if latent_border_px > 0:
+        print(f"dashboard_latent_border_nan={session_dir} border_px={latent_border_px}")
 
     def _chw_or_n3_to_xyz(arr: np.ndarray, hh: int, ww: int, path: str) -> np.ndarray:
         xyz = np.asarray(arr, dtype=np.float32)
@@ -623,11 +748,14 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     f"expected (3,{hh},{ww})"
                 )
             return np.transpose(xyz, (1, 2, 0)).reshape(hh * ww, 3).astype(np.float32)
+        if xyz.ndim == 2 and xyz.shape[1:] == (3,):
+            # Accept any N×3 shape (volumetric artifacts may differ from hh*ww).
+            return xyz.astype(np.float32)
         if xyz.ndim == 2 and xyz.shape == (hh * ww, 3):
             return xyz.astype(np.float32)
         raise RuntimeError(
             f"{session_dir}: malformed embedding artifact {path} shape={xyz.shape}, "
-            f"expected (3,{hh},{ww}) or ({hh * ww},3)"
+            f"expected (3,{hh},{ww}) or (N,3)"
         )
 
     def _resolve_artifact_path(base_name: str, volumetric_name: str) -> str | None:
@@ -680,23 +808,78 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 return int(arr[0]), int(arr[1])
         return h_lat, w_lat
 
+    def _slice_latent_xyz(prefix_out: str) -> np.ndarray:
+        if prefix_out == "pred":
+            src_map = outputs.get("pred_map", outputs.get("context_map"))
+        elif prefix_out == "gt":
+            src_map = outputs.get("gt_map", outputs.get("pred_map"))
+        else:
+            src_map = outputs.get("context_map", outputs.get("pred_map"))
+        if src_map is None:
+            return np.zeros((h_lat * w_lat, 3), dtype=np.float32)
+        xyz = _xyz_from_feature_map(_to_np(src_map))
+        if xyz.shape[0] != h_lat * w_lat:
+            return np.zeros((h_lat * w_lat, 3), dtype=np.float32)
+        return _apply_xyz_border_nan(xyz, h_lat, w_lat, latent_border_px)
+
+    def _slice_latent_vectors(prefix_out: str) -> np.ndarray:
+        if prefix_out == "pred":
+            src_map = outputs.get("pred_map", outputs.get("context_map"))
+        elif prefix_out == "gt":
+            src_map = outputs.get("gt_map", outputs.get("pred_map"))
+        else:
+            src_map = outputs.get("context_map", outputs.get("pred_map"))
+        if src_map is None:
+            return np.zeros((0, 0), dtype=np.float32)
+        z = _latent_vectors_from_feature_map(_to_np(src_map))
+        if z.shape[0] != h_lat * w_lat:
+            return np.zeros((0, 0), dtype=np.float32)
+        return _apply_latent_border_nan(z, h_lat, w_lat, latent_border_px)
+
+    def _compute_slice_pca_umap(prefix_out: str) -> tuple[np.ndarray, np.ndarray]:
+        z = _slice_latent_vectors(prefix_out)
+        if z.ndim != 2 or z.shape[0] != h_lat * w_lat or z.shape[1] == 0:
+            empty = np.full((h_lat * w_lat, 3), np.nan, dtype=np.float32)
+            return empty, empty.copy()
+        valid = np.isfinite(z).all(axis=1)
+        pca = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
+        um = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
+        if int(np.count_nonzero(valid)) < 4:
+            return pca, um
+        z_valid = z[valid].astype(np.float32, copy=False)
+        pca_valid = _compute_pca_3d(z_valid).astype(np.float32, copy=False)
+        pca[valid] = pca_valid
+        try:
+            umap_valid = _compute_umap_nd(
+                _preprocess_latents_for_umap(z_valid),
+                n_components=3,
+                n_neighbors=15,
+                min_dist=0.05,
+                metric="cosine",
+                random_state=42,
+                init="spectral",
+                fit_max_tokens=65536,
+            ).astype(np.float32, copy=False)
+            diff = np.linalg.norm((umap_valid - pca_valid).reshape(-1))
+            base = np.linalg.norm(pca_valid.reshape(-1)) + 1e-12
+            if float(diff / base) < 1e-6:
+                print(
+                    f"dashboard_note={session_dir}: {prefix_out} UMAP backend fell back to PCA; "
+                    "leaving UMAP empty instead of duplicating PCA"
+                )
+            else:
+                um[valid] = umap_valid
+        except Exception as e:
+            print(
+                f"dashboard_note={session_dir}: {prefix_out} UMAP unavailable "
+                f"({type(e).__name__}: {e}); leaving UMAP empty"
+            )
+        return pca, um
+
     bundles = {}
     for prefix_saved, prefix_out in (("context", "context"), ("predict", "pred"), ("target", "gt")):
         if fallback_mode:
-            if prefix_out == "pred":
-                src_map = outputs.get("pred_map", outputs.get("context_map"))
-            elif prefix_out == "gt":
-                src_map = outputs.get("gt_map", outputs.get("pred_map"))
-            else:
-                src_map = outputs.get("context_map", outputs.get("pred_map"))
-            if src_map is None:
-                xyz = np.zeros((h_lat * w_lat, 3), dtype=np.float32)
-            else:
-                xyz = _xyz_from_feature_map(_to_np(src_map))
-                if xyz.shape[0] != h_lat * w_lat:
-                    xyz = np.zeros((h_lat * w_lat, 3), dtype=np.float32)
-            pca = xyz
-            um = xyz
+            pca, um = _compute_slice_pca_umap(prefix_out)
             hh, ww = h_lat, w_lat
             pca_rgb, pca_rgb_flat = _rgb_from_xyz(pca, hh, ww)
             um_rgb, um_rgb_flat = _rgb_from_xyz(um, hh, ww)
@@ -727,10 +910,30 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             else:
                 raise
         if pca.shape[0] != hh * ww or um.shape[0] != hh * ww:
-            raise RuntimeError(
-                f"{session_dir}: embedding length mismatch for {src_prefix} "
-                f"(shape={hh}x{ww}, pca_n={pca.shape[0]}, umap_n={um.shape[0]})"
+            # Scatter artifacts can be sampled/volumetric and therefore cannot
+            # be reshaped into the displayed slice. Use the actual slice latent
+            # map for image-grid panels instead of rendering black placeholders.
+            print(
+                f"dashboard_note={session_dir}: {prefix_out} embedding point count "
+                f"does not match slice grid pca={pca.shape[0]} umap={um.shape[0]} "
+                f"grid={hh * ww}; recomputing slice PCA/UMAP"
             )
+            pca, um = _compute_slice_pca_umap(prefix_out)
+            hh, ww = h_lat, w_lat
+        else:
+            pca = _apply_xyz_border_nan(pca, hh, ww, latent_border_px)
+            um = _apply_xyz_border_nan(um, hh, ww, latent_border_px)
+            valid_pair = np.isfinite(pca).all(axis=1) & np.isfinite(um).all(axis=1)
+            if int(np.count_nonzero(valid_pair)) > 0:
+                diff = np.linalg.norm((pca[valid_pair] - um[valid_pair]).reshape(-1))
+                base = np.linalg.norm(pca[valid_pair].reshape(-1)) + 1e-12
+                if float(diff / base) < 1e-6:
+                    print(
+                        f"dashboard_note={session_dir}: {prefix_out} UMAP artifact equals PCA; "
+                        "recomputing slice PCA/UMAP"
+                    )
+                    pca, um = _compute_slice_pca_umap(prefix_out)
+                    hh, ww = h_lat, w_lat
         pca_rgb, pca_rgb_flat = _rgb_from_xyz(pca, hh, ww)
         um_rgb, um_rgb_flat = _rgb_from_xyz(um, hh, ww)
         bundles[prefix_out] = {
@@ -1144,7 +1347,17 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
 
     def scatter3d(title: str, xyz: np.ndarray, rgb_flat: np.ndarray) -> tuple[go.Figure, int, int]:
         pts = np.asarray(xyz, dtype=np.float32)
+        if pts.ndim == 3 and pts.shape[0] == 3:
+            pts = np.transpose(pts, (1, 2, 0)).reshape(-1, 3)
+        elif pts.ndim == 3 and pts.shape[-1] == 3:
+            pts = pts.reshape(-1, 3)
+        elif pts.ndim == 4 and pts.shape[0] == 1 and pts.shape[1] == 3:
+            pts = np.transpose(pts[0], (1, 2, 0)).reshape(-1, 3)
+        elif pts.ndim == 4 and pts.shape[0] == 1 and pts.shape[-1] == 3:
+            pts = pts[0].reshape(-1, 3)
         rgb = np.asarray(rgb_flat)
+        if rgb.ndim == 3 and rgb.shape[-1] == 3:
+            rgb = rgb.reshape(-1, 3)
         source_n = int(pts.shape[0]) if pts.ndim == 2 and pts.shape[1] >= 3 else 0
         if source_n == 0:
             x, y, z = [], [], []
@@ -1157,6 +1370,35 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             pts = pts[:n]
             if rgb.ndim == 2:
                 rgb = rgb[:n]
+            finite = np.isfinite(pts[:, :3]).all(axis=1)
+            finite_pts = pts[finite]
+            finite_rgb = rgb[finite] if rgb.ndim == 2 else rgb
+            pts = pts[finite]
+            if rgb.ndim == 2:
+                rgb = rgb[finite]
+            if pts.shape[0] > 0:
+                lo = np.percentile(pts[:, :3], 1.0, axis=0)
+                hi = np.percentile(pts[:, :3], 99.0, axis=0)
+                valid_range = np.isfinite(lo) & np.isfinite(hi) & (hi > lo)
+                keep = np.ones((pts.shape[0],), dtype=bool)
+                for ax in range(3):
+                    if valid_range[ax]:
+                        keep &= (pts[:, ax] >= lo[ax]) & (pts[:, ax] <= hi[ax])
+                min_keep = max(16, min(256, int(0.001 * pts.shape[0])))
+                if int(np.count_nonzero(keep)) >= min_keep:
+                    pts = pts[keep]
+                    if rgb.ndim == 2:
+                        rgb = rgb[keep]
+            if pts.shape[0] == 0 and finite_pts.shape[0] > 0:
+                pts = finite_pts
+                if rgb.ndim == 2:
+                    rgb = finite_rgb
+            max_scatter_points = 50000
+            if pts.shape[0] > max_scatter_points:
+                sample_idx = np.linspace(0, pts.shape[0] - 1, max_scatter_points, dtype=np.int64)
+                pts = pts[sample_idx]
+                if rgb.ndim == 2:
+                    rgb = rgb[sample_idx]
             rendered_n = int(pts.shape[0])
             x, y, z = pts[:, 0], -pts[:, 1], pts[:, 2]
             if rgb.ndim == 2 and rgb.shape[1] >= 3:
@@ -1170,7 +1412,13 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                     y=y,
                     z=z,
                     mode="markers",
-                    marker=dict(size=2, opacity=0.82, color=colors, showscale=False),
+                    marker=dict(
+                        size=3,
+                        opacity=0.96,
+                        color=colors,
+                        showscale=False,
+                        line=dict(width=0),
+                    ),
                     showlegend=False,
                 )
             ]
@@ -2022,6 +2270,32 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return [0.0, 1.0];
     return [lo, hi];
   }}
+  function finitePercentileMask(x, y, z, loPct, hiPct) {{
+    const n = Math.min(x.length, y.length, z.length);
+    const xf = [], yf = [], zf = [];
+    const finite = new Array(n);
+    for (let i = 0; i < n; i++) {{
+      const xx = Number(x[i]), yy = Number(y[i]), zz = Number(z[i]);
+      const ok = Number.isFinite(xx) && Number.isFinite(yy) && Number.isFinite(zz);
+      finite[i] = ok;
+      if (ok) {{ xf.push(xx); yf.push(yy); zf.push(zz); }}
+    }}
+    const xr = percentileRange(xf, loPct, hiPct);
+    const yr = percentileRange(yf, loPct, hiPct);
+    const zr = percentileRange(zf, loPct, hiPct);
+    const mask = new Array(n);
+    for (let i = 0; i < n; i++) {{
+      const xx = Number(x[i]), yy = Number(y[i]), zz = Number(z[i]);
+      mask[i] = finite[i] && xx >= xr[0] && xx <= xr[1] && yy >= yr[0] && yy <= yr[1] && zz >= zr[0] && zz <= zr[1];
+    }}
+    let kept = 0;
+    for (let i = 0; i < n; i++) if (mask[i]) kept++;
+    const minKeep = Math.max(16, Math.min(256, Math.floor(0.001 * xf.length)));
+    if (kept < minKeep) {{
+      for (let i = 0; i < n; i++) mask[i] = finite[i];
+    }}
+    return {{ mask, xr, yr, zr }};
+  }}
   function map255(v, lo, hi, invertColor) {{
     const den = Math.max(1e-12, hi - lo);
     let y = clamp01((Number(v) - lo) / den);
@@ -2097,36 +2371,37 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         const bx = tr._jepaBaseX;
         const by = tr._jepaBaseY;
         const bz = tr._jepaBaseZCoord;
-        const x = invertX ? bx.map((v) => -v) : bx.slice();
-        const y = invertY ? by.map((v) => -v) : by.slice();
-        const z = invertZ ? bz.map((v) => -v) : bz.slice();
-        const xr = percentileRange(bx, 0.01, 0.99);
-        const yr = percentileRange(by, 0.01, 0.99);
-        const zr = percentileRange(bz, 0.01, 0.99);
+        const fx = invertX ? bx.map((v) => -v) : bx.slice();
+        const fy = invertY ? by.map((v) => -v) : by.slice();
+        const fz = invertZ ? bz.map((v) => -v) : bz.slice();
+        const filt = finitePercentileMask(fx, fy, fz, 0.01, 0.99);
         const lo = colorLow !== null ? colorLow : 0.0;
         const hi = colorHigh !== null ? colorHigh : 255.0;
         const n = Math.min(bx.length, by.length, bz.length);
-        const colors = new Array(n);
+        const x = [], y = [], z = [], colors = [];
+        const maxScatterPoints = 50000;
+        let keptTotal = 0;
+        for (let k = 0; k < n; k++) if (filt.mask[k]) keptTotal++;
+        const stride = keptTotal > maxScatterPoints ? Math.ceil(keptTotal / maxScatterPoints) : 1;
+        let keptSeen = 0;
         for (let k = 0; k < n; k++) {{
-          const r0 = normalizeChannel(bx[k], xr[0], xr[1], invertX) * 255.0;
-          const g0 = normalizeChannel(by[k], yr[0], yr[1], invertY) * 255.0;
-          const b0 = normalizeChannel(bz[k], zr[0], zr[1], invertZ) * 255.0;
-          colors[k] = `rgb(${{map255(r0, lo, hi, invertColor)}},${{map255(g0, lo, hi, invertColor)}},${{map255(b0, lo, hi, invertColor)}})`;
+          if (!filt.mask[k]) continue;
+          if ((keptSeen % stride) !== 0) {{ keptSeen++; continue; }}
+          keptSeen++;
+          x.push(fx[k]); y.push(fy[k]); z.push(fz[k]);
+          const r0 = normalizeChannel(fx[k], filt.xr[0], filt.xr[1], false) * 255.0;
+          const g0 = normalizeChannel(fy[k], filt.yr[0], filt.yr[1], false) * 255.0;
+          const b0 = normalizeChannel(fz[k], filt.zr[0], filt.zr[1], false) * 255.0;
+          colors.push(`rgb(${{map255(r0, lo, hi, invertColor)}},${{map255(g0, lo, hi, invertColor)}},${{map255(b0, lo, hi, invertColor)}})`);
         }}
         Plotly.restyle(gd, {{ x: [x], y: [y], z: [z], "marker.color": [colors] }}, [i]);
         const relayoutOpts = {{
           "scene.camera.projection.type": "orthographic",
           "scene.aspectmode": "cube",
         }};
-        if (xmin !== null) relayoutOpts["scene.xaxis.range"] = [xmin, xmax !== null ? xmax : xr[1]];
-        else if (xmax !== null) relayoutOpts["scene.xaxis.range"] = [xr[0], xmax];
-        else relayoutOpts["scene.xaxis.autorange"] = true;
-        if (ymin !== null) relayoutOpts["scene.yaxis.range"] = [ymin, ymax !== null ? ymax : yr[1]];
-        else if (ymax !== null) relayoutOpts["scene.yaxis.range"] = [yr[0], ymax];
-        else relayoutOpts["scene.yaxis.autorange"] = true;
-        if (zmin !== null) relayoutOpts["scene.zaxis.range"] = [zmin, zmax !== null ? zmax : zr[1]];
-        else if (zmax !== null) relayoutOpts["scene.zaxis.range"] = [zr[0], zmax];
-        else relayoutOpts["scene.zaxis.autorange"] = true;
+        relayoutOpts["scene.xaxis.range"] = [xmin !== null ? xmin : filt.xr[0], xmax !== null ? xmax : filt.xr[1]];
+        relayoutOpts["scene.yaxis.range"] = [ymin !== null ? ymin : filt.yr[0], ymax !== null ? ymax : filt.yr[1]];
+        relayoutOpts["scene.zaxis.range"] = [zmin !== null ? zmin : filt.zr[0], zmax !== null ? zmax : filt.zr[1]];
         Plotly.relayout(gd, relayoutOpts);
         Plotly.redraw(gd);
       }});
@@ -2482,10 +2757,16 @@ def main():
     processed = 0
     skipped = 0
     exported = 0
-    for name in sorted(os.listdir(args.sessions_dir)):
-        session_dir = os.path.join(args.sessions_dir, name)
-        if not os.path.isdir(session_dir):
-            continue
+    root_name = os.path.basename(os.path.abspath(args.sessions_dir))
+    if os.path.exists(os.path.join(args.sessions_dir, "inference_outputs.pt")):
+        session_items = [(root_name, args.sessions_dir)]
+    else:
+        session_items = [
+            (name, os.path.join(args.sessions_dir, name))
+            for name in sorted(os.listdir(args.sessions_dir))
+            if os.path.isdir(os.path.join(args.sessions_dir, name))
+        ]
+    for name, session_dir in session_items:
         print("=" * 72)
         print(f"dashboard_session_begin={session_dir}")
         dash_html_path = os.path.join(session_dir, "dashboard.html")
@@ -2503,7 +2784,7 @@ def main():
             print(f"skip_no_inference={session_dir}")
             skipped += 1
             continue
-        if args.stage in ("compute", "all", "plot"):
+        if args.stage == "plot":
             has_dash_npz = os.path.exists(os.path.join(session_dir, "dash_data.npz"))
             if (not has_dash_npz) and (not _has_min_dashboard_artifacts(session_dir)):
                 missing = _missing_dashboard_artifacts(session_dir)

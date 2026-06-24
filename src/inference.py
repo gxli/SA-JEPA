@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from src.losses import representation_dense_energy
+from src.models.masking import norm_per_sample_channel
 
 
 def _save_npz(path: str, arr: np.ndarray) -> None:
@@ -219,7 +220,170 @@ def _apply_nan_boundary_frame(x: torch.Tensor, border_px: int) -> torch.Tensor:
     return out
 
 
-def _first_full_resolution_batch(dataloader, max_diagnostic_size: int = 768):
+def _tile_starts_2d(length: int, window: int, overlap: int) -> list[int]:
+    window = max(1, min(int(window), int(length)))
+    overlap = min(max(0, int(overlap)), max(0, window - 1))
+    step = max(1, window - overlap)
+    starts = list(range(0, max(1, int(length) - window + 1), step))
+    tail = max(0, int(length) - window)
+    if not starts or starts[-1] != tail:
+        starts.append(tail)
+    return starts
+
+
+def _encoder_receptive_field_2d(model) -> int:
+    depth = int(getattr(model, "encoder_depth", 4))
+    kernel = int(getattr(model, "encoder_kernel_size", 7))
+    dilations = getattr(model, "convnext_layer_dilations", None)
+    if dilations is None:
+        dil_list = [1] * depth
+    else:
+        dil_list = [int(d) for d in dilations]
+        if len(dil_list) < depth:
+            reps = (depth + len(dil_list) - 1) // max(1, len(dil_list))
+            dil_list = (dil_list * reps)[:depth]
+        else:
+            dil_list = dil_list[:depth]
+    fov = 1 + 2 + 2
+    for dilation in dil_list:
+        fov += max(0, kernel - 1) * max(1, int(dilation))
+    return max(1, int(fov))
+
+
+def _dense_forward_2d_tile(model, x_tile: torch.Tensor, cdd_tile: torch.Tensor | None, log_floor: torch.Tensor):
+    post_log = bool(getattr(model, "post_log_transform", False))
+    x_enc = torch.log(torch.clamp(x_tile, min=0.0) + log_floor) if post_log else x_tile
+
+    encoder_type = str(getattr(model, "encoder_type", ""))
+    if encoder_type == "cdd_scaleaware_convnext":
+        if cdd_tile is None:
+            raise RuntimeError("cdd_scaleaware_convnext tiled inference requires CDD channels")
+        cdd_enc = torch.log(torch.clamp(cdd_tile, min=0.0) + log_floor) if post_log else cdd_tile
+        if bool(getattr(model, "scaleaware_norm_per_scale", False)):
+            cdd_enc = norm_per_sample_channel(cdd_enc)
+        zero = torch.zeros_like(cdd_enc)
+        context_map = model.context_encoder(cdd_enc, mask_tokens=zero)
+        with torch.no_grad():
+            gt_base = model.target_encoder(cdd_enc, mask_tokens=zero)
+    elif encoder_type in ("convnext_dense_pyramid", "escnn_c4_pyramid"):
+        if cdd_tile is None:
+            raise RuntimeError(f"{encoder_type} tiled inference requires CDD channels")
+        cdd_enc = torch.log(torch.clamp(cdd_tile, min=0.0) + log_floor) if post_log else cdd_tile
+        zero = torch.zeros_like(cdd_enc)
+        enc = torch.cat([cdd_enc, zero], dim=1)
+        context_map = model.context_encoder(enc)
+        with torch.no_grad():
+            gt_base = model.target_encoder(enc)
+    elif encoder_type == "convnext_dense_masktoken":
+        zero = torch.zeros_like(x_enc[:, :1])
+        enc = torch.cat([x_enc, zero], dim=1)
+        context_map = model.context_encoder(enc)
+        with torch.no_grad():
+            gt_base = model.target_encoder(enc)
+    else:
+        context_map = model.context_encoder(x_enc)
+        with torch.no_grad():
+            gt_base = model.target_encoder(x_enc)
+
+    context_proj = model.projector(context_map)
+    pred_map = model.predictor(context_proj)
+    with torch.no_grad():
+        gt_map = model.target_projector(gt_base)
+    energy = representation_dense_energy(pred_map, gt_map)
+    return {
+        "x_clean": x_enc,
+        "x_context": x_enc,
+        "context_map": context_map,
+        "pred_map": pred_map,
+        "gt_map": gt_map,
+        "energy_rel_sym": energy["energy_rel_sym"],
+        "energy_raw": energy["energy_raw"],
+        "energy_rel_gt": energy["energy_rel_gt"],
+        "energy_cosine": energy["energy_cosine"],
+    }
+
+
+def _run_tiled_dense_inference_2d(
+    *,
+    model,
+    x_raw: torch.Tensor,
+    cdd_raw: torch.Tensor | None,
+    tile_size: int,
+    tile_overlap: int | None,
+    config_name: str,
+) -> dict[str, torch.Tensor]:
+    device = next(model.parameters()).device
+    b, _, h, w = x_raw.shape
+    if b != 1:
+        raise RuntimeError("Tiled 2D dashboard inference currently expects batch size 1")
+    rf = _encoder_receptive_field_2d(model)
+    margin = min(rf, max(0, (int(tile_size) - 1) // 2))
+    overlap_eff = max(2 * margin, int(tile_overlap) if tile_overlap is not None else 0)
+    overlap_eff = min(max(0, overlap_eff), max(0, int(tile_size) - 1))
+    y_starts = _tile_starts_2d(h, tile_size, overlap_eff)
+    x_starts = _tile_starts_2d(w, tile_size, overlap_eff)
+    eps = max(1e-6, float(getattr(model, "log_eps", 1.0)))
+    if bool(getattr(model, "post_log_transform", False)):
+        base = torch.clamp(x_raw, min=0.0)
+        base_std = torch.std(base, dim=(-2, -1), keepdim=True)
+        log_floor = torch.clamp(base_std * float(getattr(model, "cdd_log_std_floor_mult", 0.05)), min=eps)
+    else:
+        log_floor = torch.ones((b, 1, 1, 1), dtype=x_raw.dtype, device=x_raw.device)
+
+    print(
+        f"[{config_name}] tiled 2D dense inference: tile={tile_size} "
+        f"y_tiles={len(y_starts)} x_tiles={len(x_starts)} encoder_rf={rf} "
+        f"discard_margin={margin} overlap={overlap_eff}"
+    )
+    sums: dict[str, torch.Tensor] = {}
+    weight = torch.zeros((b, 1, h, w), dtype=torch.float32)
+    for y0 in y_starts:
+        ye = min(y0 + int(tile_size), h)
+        valid_h = int(ye - y0)
+        wy0 = 0 if y0 == 0 else min(margin, valid_h)
+        wy1 = valid_h if ye == h else max(wy0, valid_h - min(margin, valid_h))
+        if wy1 <= wy0:
+            continue
+        for x0 in x_starts:
+            xe = min(x0 + int(tile_size), w)
+            valid_w = int(xe - x0)
+            wx0 = 0 if x0 == 0 else min(margin, valid_w)
+            wx1 = valid_w if xe == w else max(wx0, valid_w - min(margin, valid_w))
+            if wx1 <= wx0:
+                continue
+            x_tile = x_raw[:, :, y0:ye, x0:xe]
+            cdd_tile = None if cdd_raw is None else cdd_raw[:, :, y0:ye, x0:xe]
+            pad_h = max(0, int(tile_size) - int(x_tile.shape[-2]))
+            pad_w = max(0, int(tile_size) - int(x_tile.shape[-1]))
+            if pad_h or pad_w:
+                pad_mode = "reflect" if min(x_tile.shape[-2:]) > 1 else "replicate"
+                x_tile = F.pad(x_tile, (0, pad_w, 0, pad_h), mode=pad_mode)
+                if cdd_tile is not None:
+                    cdd_tile = F.pad(cdd_tile, (0, pad_w, 0, pad_h), mode=pad_mode)
+            tile_out = _dense_forward_2d_tile(
+                model,
+                x_tile.to(device, non_blocking=True),
+                None if cdd_tile is None else cdd_tile.to(device, non_blocking=True),
+                log_floor.to(device, non_blocking=True),
+            )
+            out_y0, out_y1 = y0 + wy0, y0 + wy1
+            out_x0, out_x1 = x0 + wx0, x0 + wx1
+            for key, value in tile_out.items():
+                value_cpu = value[:, :, :valid_h, :valid_w].detach().cpu()
+                if key not in sums:
+                    sums[key] = torch.zeros((b, int(value_cpu.shape[1]), h, w), dtype=torch.float32)
+                sums[key][:, :, out_y0:out_y1, out_x0:out_x1] += value_cpu[:, :, wy0:wy1, wx0:wx1]
+            weight[:, :, out_y0:out_y1, out_x0:out_x1] += 1.0
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    if not sums:
+        raise RuntimeError(f"[{config_name}] tiled 2D dense inference produced no tiles")
+    weight = weight.clamp_min(1.0)
+    return {key: value / weight for key, value in sums.items()}
+
+
+def _first_full_resolution_batch(dataloader, max_diagnostic_size: int | None = None):
     """Fetch a single batch for diagnostic visualization.
 
     Enforces a max size to prevent GPU OOM and 100MB+ HTML crashes
@@ -230,18 +394,20 @@ def _first_full_resolution_batch(dataloader, max_diagnostic_size: int = 768):
         return None
     old = {}
 
-    # Check original image size to see if we need to enforce a crop
+    # Native/full-frame inference is the default. A diagnostic crop is only
+    # applied when max_diagnostic_size is explicitly positive.
     needs_safety_crop = False
-    try:
-        sample_path = dataset.sample_index[0][0]
-        shape = dataset._probe_file_shape(sample_path)
-        if shape[-2] > max_diagnostic_size or shape[-1] > max_diagnostic_size:
-            needs_safety_crop = True
-    except Exception:
-        pass
+    if max_diagnostic_size is not None and int(max_diagnostic_size) > 0:
+        try:
+            sample_path = dataset.sample_index[0][0]
+            shape = dataset._probe_file_shape(sample_path)
+            if shape[-2] > int(max_diagnostic_size) or shape[-1] > int(max_diagnostic_size):
+                needs_safety_crop = True
+        except Exception:
+            pass
 
     target_crop_mode = "center" if needs_safety_crop else "none"
-    target_crop_size = max_diagnostic_size if needs_safety_crop else None
+    target_crop_size = int(max_diagnostic_size) if needs_safety_crop else None
 
     for name, value in (
         ("crop_mode", target_crop_mode),
@@ -282,7 +448,9 @@ def run_post_training_inference(
     training_d4_augment: bool = False,
     inference_tta_enabled: bool = False,
     inference_tta_mode: str = "flip4",
-    max_diagnostic_size: int = 768,
+    max_diagnostic_size: int | None = None,
+    tile_size: int | None = 512,
+    tile_overlap: int | None = None,
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
     if (not force_recompute_inference) and os.path.exists(inference_outputs_path):
@@ -337,6 +505,12 @@ def run_post_training_inference(
             cdd_raw = None
             x_raw = raw_batch if not isinstance(raw_batch, (tuple, list)) else raw_batch[0]
         x_raw = x_raw.to(next(model.parameters()).device)
+        use_tiled_2d = (
+            x_raw.dim() == 4
+            and tile_size is not None
+            and int(tile_size) > 0
+            and (int(x_raw.shape[-2]) > int(tile_size) or int(x_raw.shape[-1]) > int(tile_size))
+        )
         if bool(mask_inference):
             raise ValueError(
                 "Post-training lattice-sweep mask inference has been removed. "
@@ -356,63 +530,113 @@ def run_post_training_inference(
         tta_view_count = 1
         shift_sums: dict[str, torch.Tensor] = {}
         shift_counts: dict[str, int] = {}
-        for pi, shift in enumerate(shifts):
-            return_debug_next = pi == 0
-
-            def _forward_one_tta(xv: torch.Tensor, cdv: torch.Tensor | None) -> dict:
-                nonlocal return_debug_next
-                return_debug = return_debug_next
-                return_debug_next = False
-                return model(
-                    xv,
-                    return_debug=return_debug,
-                    enable_grid_jitter=False,
-                    enable_target_dithering=False,
-                    lattice_shift_override=shift,
-                    mask_inference=bool(mask_inference),
-                    cdd_orig=cdv,
-                )
-
-            if bool(inference_tta_enabled):
-                out_i, tta_view_count = _forward_tta_streaming_2d(
-                    x=x_raw,
-                    mode=inference_tta_mode,
-                    forward_one=_forward_one_tta,
-                    cdd=cdd_raw,
-                )
-            else:
-                out_i = _forward_one_tta(x_raw, cdd_raw)
-            for key in ("pred_map", "gt_map", "context_map"):
-                value = out_i.get(key)
-                if value is None:
-                    continue
-                if key not in shift_sums:
-                    shift_sums[key] = value
-                    shift_counts[key] = 1
-                else:
-                    shift_sums[key].add_(value)
-                    shift_counts[key] += 1
-            if invalid_region_skip:
-                _mask_invalid_targets_from_input(
-                    outputs=out_i,
-                    x_input=x_raw,
-                    patch_size=patch_size,
-                    invalid_values=invalid_region_values,
-                )
-            if outputs is None:
-                outputs = out_i
-                h, w = outputs["x_clean"].shape[-2:]
-                bsz = outputs["x_clean"].shape[0]
-                energy_sum = torch.zeros((bsz, 1, h, w), device=outputs["x_clean"].device, dtype=outputs["x_clean"].dtype)
-                count_map = torch.zeros_like(energy_sum)
-            e_tot_i, n_val_i = _accumulate_point_energy(
-                outputs=out_i,
-                energy_sum=energy_sum,
-                count_map=count_map,
-                image_size=(h, w),
+        if use_tiled_2d:
+            h, w = int(x_raw.shape[-2]), int(x_raw.shape[-1])
+            probe_h = min(int(tile_size), h)
+            probe_w = min(int(tile_size), w)
+            x_probe = x_raw[:, :, :probe_h, :probe_w]
+            cdd_probe = None if cdd_raw is None else cdd_raw[:, :, :probe_h, :probe_w]
+            outputs = model(
+                x_probe,
+                return_debug=True,
+                enable_grid_jitter=False,
+                enable_target_dithering=False,
+                lattice_shift_override=(0, 0),
+                mask_inference=False,
+                cdd_orig=cdd_probe,
             )
-            total_energy += float(e_tot_i)
-            total_valid += int(n_val_i)
+            tiled = _run_tiled_dense_inference_2d(
+                model=model,
+                x_raw=x_raw.detach().cpu(),
+                cdd_raw=None if cdd_raw is None else cdd_raw.detach().cpu(),
+                tile_size=int(tile_size),
+                tile_overlap=tile_overlap,
+                config_name=config_name,
+            )
+            for key in ("x_clean", "x_context", "context_map", "pred_map", "gt_map"):
+                outputs[key] = tiled[key].to(x_raw.device)
+            outputs["x_clean_raw"] = x_raw
+            outputs["x_context_raw"] = x_raw
+            for key in (
+                "network_context_in",
+                "network_target_in",
+                "target_mask_map",
+                "cdd_channels_orig",
+                "cdd_channels_masked",
+                "dip_field_per_channel",
+                "pyramid_mask_token",
+            ):
+                outputs.pop(key, None)
+            if cdd_raw is not None:
+                outputs["cdd_channels_orig"] = cdd_raw
+                outputs["cdd_channels_masked"] = cdd_raw
+                zero_cdd = torch.zeros_like(cdd_raw)
+                outputs["dip_field_per_channel"] = zero_cdd
+                outputs["pyramid_mask_token"] = zero_cdd
+            bsz = int(x_raw.shape[0])
+            energy_sum = tiled["energy_rel_sym"].to(x_raw.device, dtype=x_raw.dtype)
+            count_map = torch.ones_like(energy_sum)
+            total_energy = float(tiled["energy_rel_sym"].sum().item())
+            total_valid = int(max(1, tiled["energy_rel_sym"].numel()))
+            outputs["_tiled_dense_energy"] = {k: v.to(x_raw.device) for k, v in tiled.items() if k.startswith("energy_")}
+        else:
+            for pi, shift in enumerate(shifts):
+                return_debug_next = pi == 0
+
+                def _forward_one_tta(xv: torch.Tensor, cdv: torch.Tensor | None) -> dict:
+                    nonlocal return_debug_next
+                    return_debug = return_debug_next
+                    return_debug_next = False
+                    return model(
+                        xv,
+                        return_debug=return_debug,
+                        enable_grid_jitter=False,
+                        enable_target_dithering=False,
+                        lattice_shift_override=shift,
+                        mask_inference=bool(mask_inference),
+                        cdd_orig=cdv,
+                    )
+
+                if bool(inference_tta_enabled):
+                    out_i, tta_view_count = _forward_tta_streaming_2d(
+                        x=x_raw,
+                        mode=inference_tta_mode,
+                        forward_one=_forward_one_tta,
+                        cdd=cdd_raw,
+                    )
+                else:
+                    out_i = _forward_one_tta(x_raw, cdd_raw)
+                for key in ("pred_map", "gt_map", "context_map"):
+                    value = out_i.get(key)
+                    if value is None:
+                        continue
+                    if key not in shift_sums:
+                        shift_sums[key] = value
+                        shift_counts[key] = 1
+                    else:
+                        shift_sums[key].add_(value)
+                        shift_counts[key] += 1
+                if invalid_region_skip:
+                    _mask_invalid_targets_from_input(
+                        outputs=out_i,
+                        x_input=x_raw,
+                        patch_size=patch_size,
+                        invalid_values=invalid_region_values,
+                    )
+                if outputs is None:
+                    outputs = out_i
+                    h, w = outputs["x_clean"].shape[-2:]
+                    bsz = outputs["x_clean"].shape[0]
+                    energy_sum = torch.zeros((bsz, 1, h, w), device=outputs["x_clean"].device, dtype=outputs["x_clean"].dtype)
+                    count_map = torch.zeros_like(energy_sum)
+                e_tot_i, n_val_i = _accumulate_point_energy(
+                    outputs=out_i,
+                    energy_sum=energy_sum,
+                    count_map=count_map,
+                    image_size=(h, w),
+                )
+                total_energy += float(e_tot_i)
+                total_valid += int(n_val_i)
         assert outputs is not None and energy_sum is not None and count_map is not None
         # Average aligned maps across deterministic shifts to stabilize dashboard embeddings.
         if len(shifts) > 1:
@@ -460,11 +684,21 @@ def run_post_training_inference(
             inference_outputs[k] = outputs[k][:8].detach().cpu()
     energy_scalar = float(total_energy / max(1, total_valid))
     energy_scalar_norm = compute_jepa_energy_fn(outputs, normalize=True)
-    # Dense full-image energy from lattice prediction/target maps.
-    e_map_dense = compute_target_energy_map_fn(
-        outputs,
-        image_size=(int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])),
-    )
+    # Dense full-image energy from prediction/target maps. For tiled 2D
+    # inference, use the stitched energy maps computed tile-by-tile so the
+    # dashboard never falls back to a one-shot full-frame pass.
+    if "_tiled_dense_energy" in outputs:
+        e_map_dense = {
+            "energy_rel_sym": outputs["_tiled_dense_energy"]["energy_rel_sym"],
+            "energy_raw": outputs["_tiled_dense_energy"]["energy_raw"],
+            "energy_rel_gt": outputs["_tiled_dense_energy"]["energy_rel_gt"],
+            "energy_cosine": outputs["_tiled_dense_energy"]["energy_cosine"],
+        }
+    else:
+        e_map_dense = compute_target_energy_map_fn(
+            outputs,
+            image_size=(int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])),
+        )
     # Keep point-sampled target energy as a secondary diagnostic.
     e_map_points = energy_sum / count_map.clamp_min(1.0)
     inference_outputs["jepa_energy"] = torch.tensor(energy_scalar, dtype=torch.float32)
@@ -564,6 +798,8 @@ def run_post_training_inference(
     _save_npz(os.path.join(session_dir, "target_energy_cosine_map.npz"), inference_outputs["target_energy_cosine_map"].numpy())
     _save_npz(os.path.join(session_dir, "target_energy_point_map.npz"), inference_outputs["target_energy_point_map"].numpy())
     _save_npz(os.path.join(session_dir, "target_energy_count_map.npz"), inference_outputs["target_energy_count_map"].numpy())
+    encoder_rf = int(_encoder_receptive_field_2d(model))
+    discard_margin = int(max(0, encoder_rf))
     with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -574,6 +810,11 @@ def run_post_training_inference(
                 "inference_tta_enabled": bool(inference_tta_enabled),
                 "inference_tta_mode": str(inference_tta_mode),
                 "inference_tta_views": int(tta_view_count),
+                "inference_tiled_dense_2d": bool(use_tiled_2d),
+                "inference_tile_size": None if tile_size is None else int(tile_size),
+                "inference_tile_overlap": None if tile_overlap is None else int(tile_overlap),
+                "inference_encoder_receptive_field": int(encoder_rf),
+                "inference_discard_margin": int(discard_margin),
             },
             f,
             indent=2,
@@ -683,16 +924,199 @@ def run_post_training_inference_3d(
     session_dir: str,
     config_name: str,
     force_recompute_inference: bool,
+    cdd_cache: dict | None = None,
+    inference_depth: int | None = None,
+    slice_index: int | None = None,
+    spatial_tile_size: int | None = 64,
+    spatial_overlap: int | None = None,
+    inference_tta_enabled: bool = False,
+    inference_tta_mode: str = "flip4",
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
     if (not force_recompute_inference) and os.path.exists(inference_outputs_path):
-        return session_dir
+        summary_path = os.path.join(session_dir, "jepa_energy_summary.json")
+        if cdd_cache:
+            try:
+                with open(summary_path, "r", encoding="utf-8") as f:
+                    summary = json.load(f)
+                if bool(summary.get("inference_3d_full_xy_slice", False)):
+                    return session_dir
+            except Exception:
+                pass
+        else:
+            return session_dir
 
     model.eval()
     with torch.no_grad():
-        x = next(iter(dataloader))
-        x = x.to(next(model.parameters()).device)
-        outputs = model(x)
+        if cdd_cache:
+            (path, _), cdd_vol = next(iter(cdd_cache.items()))
+            cdd_np = np.asarray(cdd_vol, dtype=np.float32)
+            if cdd_np.ndim != 4:
+                raise ValueError(f"Expected cached CDD cube SxDxHxW, got {tuple(cdd_np.shape)} for {path}")
+            _, d, h, w = cdd_np.shape
+            min_depth = int(getattr(model, "required_input_depth", getattr(model, "encoder_receptive_field_depth", 1)))
+            slab_depth = int(min_depth)
+            z = int(d // 2 if slice_index is None else slice_index)
+            z = max(0, min(d - 1, z))
+            before = slab_depth // 2
+            after = slab_depth - before - 1
+            req0 = z - before
+            req1 = z + after + 1
+            src0 = max(0, req0)
+            src1 = min(d, req1)
+            pad_front = src0 - req0
+            pad_back = req1 - src1
+            vol_cpu = torch.from_numpy(cdd_np[:, src0:src1]).unsqueeze(0).float()
+            if pad_front or pad_back:
+                vol_cpu = F.pad(vol_cpu, (0, 0, 0, 0, pad_front, pad_back), mode="replicate")
+            device = next(model.parameters()).device
+            tile_size = max(1, int(spatial_tile_size or max(h, w)))
+            encoder_rf = int(getattr(model, "encoder_receptive_field_depth", 1) or 1)
+            margin = min(max(0, encoder_rf), max(0, (tile_size - 1) // 2))
+            overlap_eff = max(2 * margin, int(spatial_overlap) if spatial_overlap is not None else 0)
+            overlap_eff = min(max(0, overlap_eff), max(0, tile_size - 1))
+            y_starts = _tile_starts_2d(h, tile_size, overlap_eff)
+            x_starts = _tile_starts_2d(w, tile_size, overlap_eff)
+            print(
+                f"[{config_name}] 3D slice inference: source={path} "
+                f"slice={z}/{d} input_slab_depth={slab_depth} full_xy=({h}, {w}) "
+                f"spatial_tile={tile_size} y_tiles={len(y_starts)} x_tiles={len(x_starts)} "
+                f"encoder_rf={encoder_rf} discard_margin={margin} overlap={overlap_eff}"
+            )
+
+            log_floor_cpu = None
+            if bool(getattr(model, "post_log_transform", False)):
+                eps = max(1e-6, float(getattr(model, "log_eps", 1.0)))
+                base = torch.clamp(vol_cpu, min=0.0)
+                base_std = torch.std(base, dim=(-3, -2, -1), keepdim=True)
+                log_floor_cpu = torch.clamp(
+                    base_std * float(getattr(model, "cdd_log_std_floor_mult", 0.05)),
+                    min=eps,
+                )
+            center_idx = int(slab_depth // 2)
+            pred_sum = None
+            gt_sum = None
+            ctx_sum = None
+            tta_view_count = 1
+            if bool(inference_tta_enabled):
+                tta_view_count = sum(1 for _name, _x in _iter_tta_views_2d(torch.empty(1, 1, 1, 2, 2), inference_tta_mode))
+                print(
+                    f"[{config_name}] 3D slice inference TTA: enabled mode={inference_tta_mode} "
+                    f"views={tta_view_count}"
+                )
+            weight = torch.zeros((1, 1, 1, h, w), dtype=torch.float32)
+            for y0 in y_starts:
+                ye = min(y0 + tile_size, h)
+                valid_h = int(ye - y0)
+                wy0 = 0 if y0 == 0 else min(margin, valid_h)
+                wy1 = valid_h if ye == h else max(wy0, valid_h - min(margin, valid_h))
+                if wy1 <= wy0:
+                    continue
+                for x0 in x_starts:
+                    xe = min(x0 + tile_size, w)
+                    valid_w = int(xe - x0)
+                    wx0 = 0 if x0 == 0 else min(margin, valid_w)
+                    wx1 = valid_w if xe == w else max(wx0, valid_w - min(margin, valid_w))
+                    if wx1 <= wx0:
+                        continue
+                    tile_cpu = vol_cpu[:, :, :, y0:ye, x0:xe]
+                    pad_h = max(0, tile_size - int(tile_cpu.shape[-2]))
+                    pad_w = max(0, tile_size - int(tile_cpu.shape[-1]))
+                    if pad_h or pad_w:
+                        tile_cpu = F.pad(tile_cpu, (0, pad_w, 0, pad_h, 0, 0), mode="replicate")
+                    fields_cpu = model.make_fields(tile_cpu) if hasattr(model, "make_fields") else tile_cpu
+                    if log_floor_cpu is not None:
+                        fields_cpu = torch.log(torch.clamp(fields_cpu, min=0.0) + log_floor_cpu)
+                    fields = fields_cpu.to(device, non_blocking=True)
+                    ctx_acc = None
+                    gt_acc = None
+                    pred_acc = None
+                    view_iter = _iter_tta_views_2d(fields, inference_tta_mode) if bool(inference_tta_enabled) else (("id", fields),)
+                    actual_views = 0
+                    for view_name, fields_view in view_iter:
+                        zero_mask_tokens = torch.zeros_like(fields_view)
+                        context_view = model.context_encoder(fields_view, mask_tokens=zero_mask_tokens)
+                        gt_view = model.target_encoder(fields_view, mask_tokens=zero_mask_tokens)
+                        pred_view = model.predictor3d(context_view)
+                        context_view = _apply_tta_2d(view_name, context_view)
+                        gt_view = _apply_tta_2d(view_name, gt_view)
+                        pred_view = _apply_tta_2d(view_name, pred_view)
+                        if ctx_acc is None:
+                            ctx_acc = context_view
+                            gt_acc = gt_view
+                            pred_acc = pred_view
+                        else:
+                            ctx_acc = ctx_acc + context_view
+                            gt_acc = gt_acc + gt_view
+                            pred_acc = pred_acc + pred_view
+                        actual_views += 1
+                        if view_name != "id":
+                            del fields_view
+                        del zero_mask_tokens, context_view, gt_view, pred_view
+                    if actual_views <= 0 or ctx_acc is None or gt_acc is None or pred_acc is None:
+                        raise RuntimeError(f"[{config_name}] 3D TTA produced no views")
+                    inv_views = 1.0 / float(actual_views)
+                    context_map_full = ctx_acc * inv_views
+                    gt_map_full = gt_acc * inv_views
+                    pred_map_full = pred_acc * inv_views
+                    pred_tile = pred_map_full[:, :, center_idx : center_idx + 1, :valid_h, :valid_w].detach().cpu()
+                    gt_tile = gt_map_full[:, :, center_idx : center_idx + 1, :valid_h, :valid_w].detach().cpu()
+                    ctx_tile = context_map_full[:, :, center_idx : center_idx + 1, :valid_h, :valid_w].detach().cpu()
+                    del fields, ctx_acc, gt_acc, pred_acc, context_map_full, gt_map_full, pred_map_full
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    if pred_sum is None:
+                        pred_sum = torch.zeros((1, int(pred_tile.shape[1]), 1, h, w), dtype=torch.float32)
+                        gt_sum = torch.zeros((1, int(gt_tile.shape[1]), 1, h, w), dtype=torch.float32)
+                        ctx_sum = torch.zeros((1, int(ctx_tile.shape[1]), 1, h, w), dtype=torch.float32)
+                    out_y0, out_y1 = y0 + wy0, y0 + wy1
+                    out_x0, out_x1 = x0 + wx0, x0 + wx1
+                    pred_sum[:, :, :, out_y0:out_y1, out_x0:out_x1] += pred_tile[:, :, :, wy0:wy1, wx0:wx1]
+                    gt_sum[:, :, :, out_y0:out_y1, out_x0:out_x1] += gt_tile[:, :, :, wy0:wy1, wx0:wx1]
+                    ctx_sum[:, :, :, out_y0:out_y1, out_x0:out_x1] += ctx_tile[:, :, :, wy0:wy1, wx0:wx1]
+                    weight[:, :, :, out_y0:out_y1, out_x0:out_x1] += 1.0
+            if pred_sum is None or gt_sum is None or ctx_sum is None:
+                raise RuntimeError(f"[{config_name}] 3D slice tiled inference produced no tiles")
+            pred_map = pred_sum / weight.clamp_min(1.0)
+            gt_map = gt_sum / weight.clamp_min(1.0)
+            context_map = ctx_sum / weight.clamp_min(1.0)
+            x_clean = vol_cpu.sum(dim=1, keepdim=True)[:, :, center_idx : center_idx + 1]
+            x_context = x_clean
+            mask_cube = torch.zeros((1, 1, 1, h, w), dtype=x_clean.dtype)
+            target_locations = torch.tensor([[[0, h // 2, w // 2]]], dtype=torch.long)
+            target_valid = torch.ones((1, 1), dtype=torch.bool)
+            target_scales = torch.ones((1, 1), dtype=x_clean.dtype)
+            pred_patches = pred_map[:, :, :, h // 2 : h // 2 + 1, w // 2 : w // 2 + 1].unsqueeze(1)
+            gt_patches = gt_map[:, :, :, h // 2 : h // 2 + 1, w // 2 : w // 2 + 1].unsqueeze(1)
+            outputs = {
+                "pred_map": pred_map,
+                "gt_map": gt_map,
+                "context_map": context_map,
+                "x_clean": x_clean,
+                "x_context": x_context,
+                "mask_cube": mask_cube,
+                "target_locations": target_locations,
+                "target_valid": target_valid,
+                "target_scales": target_scales,
+                "pred_patches": pred_patches,
+                "gt_patches": gt_patches,
+                "selected_slab_start_index": torch.tensor([src0], dtype=torch.long),
+                "selected_slab_depth": torch.tensor([slab_depth], dtype=torch.long),
+                "_inference_3d_full_xy_slice": True,
+                "_inference_slice_index": z,
+                "_inference_input_slab_depth": slab_depth,
+                "_inference_spatial_tile_size": tile_size,
+                "_inference_spatial_overlap": overlap_eff,
+                "_inference_discard_margin": margin,
+                "_inference_tta_enabled": bool(inference_tta_enabled),
+                "_inference_tta_mode": str(inference_tta_mode),
+                "_inference_tta_views": int(tta_view_count),
+                "_inference_source_path": path,
+            }
+        else:
+            x = next(iter(dataloader))
+            x = x.to(next(model.parameters()).device)
+            outputs = model(x)
 
     pred_map = outputs["pred_map"][:1].detach().cpu()
     gt_map = outputs["gt_map"][:1].detach().cpu()
@@ -725,6 +1149,7 @@ def run_post_training_inference_3d(
     }
     inference_outputs["selected_slab_start_index"] = outputs["selected_slab_start_index"][:1].detach().cpu()
     inference_outputs["selected_slab_depth"] = outputs["selected_slab_depth"][:1].detach().cpu()
+    inference_outputs["inference_3d_full_xy_slice"] = bool(outputs.get("_inference_3d_full_xy_slice", False))
     torch.save(inference_outputs, inference_outputs_path)
 
     _save_npz(os.path.join(session_dir, "network_input_clean_3d.npz"), x_clean.numpy())
@@ -737,90 +1162,25 @@ def run_post_training_inference_3d(
     _save_npz(os.path.join(session_dir, "target_energy_raw_map_slab.npz"), slab_energy["energy_raw"].numpy())
     _save_npz(os.path.join(session_dir, "target_energy_rel_gt_map_slab.npz"), slab_energy["energy_rel_gt"].numpy())
     _save_npz(os.path.join(session_dir, "target_energy_cosine_map_slab.npz"), slab_energy["energy_cosine"].numpy())
+    with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "inference_3d_full_xy_slice": bool(outputs.get("_inference_3d_full_xy_slice", False)),
+                "inference_slice_index": outputs.get("_inference_slice_index"),
+                "inference_input_slab_depth": outputs.get("_inference_input_slab_depth"),
+                "inference_spatial_tile_size": outputs.get("_inference_spatial_tile_size"),
+                "inference_spatial_overlap": outputs.get("_inference_spatial_overlap"),
+                "inference_encoder_receptive_field": int(getattr(model, "encoder_receptive_field_depth", 1) or 1),
+                "inference_discard_margin": outputs.get("_inference_discard_margin"),
+                "inference_tta_enabled": bool(outputs.get("_inference_tta_enabled", False)),
+                "inference_tta_mode": outputs.get("_inference_tta_mode", "off"),
+                "inference_tta_views": int(outputs.get("_inference_tta_views", 1)),
+                "inference_source_path": outputs.get("_inference_source_path"),
+                "inference_output_shape": list(pred_map.shape),
+            },
+            f,
+            indent=2,
+        )
     print(f"[{config_name}] saved 3D inference artifacts")
     return session_dir
 
-
-def run_full_volume_inference_3d(
-    *,
-    model,
-    cdd_cache: dict,
-    session_dir: str,
-    config_name: str,
-    device: torch.device,
-    slab_depth: int = 8,
-    overlap: int = 4,
-    post_log_transform: bool = True,
-    log_eps: float = 1.0,
-    cdd_log_std_floor_mult: float = 0.05,
-) -> str:
-    """Run encoder on the full precomputed CDD volume and save context map.
-
-    Slides the encoder over the depth axis in overlapping slabs, stitches
-    results by averaging in the overlap region. Saves the full (C, D, H, W)
-    context_map_3d as .npz.
-    """
-    if not cdd_cache:
-        print(f"[{config_name}] full-volume inference: no CDD cache, skipping")
-        return session_dir
-
-    model.eval()
-    with torch.no_grad():
-        for (path, _), cdd_vol in cdd_cache.items():
-            # cdd_vol: (S, D, H, W) numpy float32
-            s, d, h, w = cdd_vol.shape
-            vol_t = torch.from_numpy(cdd_vol).unsqueeze(0).to(device)  # (1, S, D, H, W)
-
-            # Apply post_log_transform to match training input distribution
-            if post_log_transform:
-                eps_f = max(1e-6, float(log_eps))
-                vol_clamp = vol_t.clamp(min=0.0)
-                base_std = torch.std(vol_clamp, dim=(-3, -2, -1), keepdim=True)
-                log_floor = torch.clamp(base_std * float(cdd_log_std_floor_mult), min=eps_f)
-                vol_t = torch.log(vol_clamp + log_floor)
-
-            full_volume_training = bool(getattr(model, "full_volume_training", False))
-            target_depth = d if full_volume_training else max(1, min(int(getattr(model, "slab_depth", slab_depth)), slab_depth))
-            context_margin = 0 if full_volume_training else max(0, (slab_depth - target_depth) // 2)
-            target_overlap = min(max(0, int(overlap)), max(0, target_depth - 1))
-            step = max(1, target_depth - target_overlap)
-            starts = list(range(0, max(1, d - slab_depth + 1), step))
-            tail_start = max(0, d - slab_depth)
-            if not starts or starts[-1] != tail_start:
-                starts.append(tail_start)
-
-            ctx_sum = None
-            ctx_weight = torch.zeros((1, 1, d, 1, 1), device=device)
-
-            for z0 in starts:
-                ze = min(z0 + slab_depth, d)
-                slab = vol_t[:, :, z0:ze]  # (1, S, slab, H, W)
-                valid_depth = int(ze - z0)
-                if slab.shape[2] < slab_depth:
-                    pad_needed = slab_depth - slab.shape[2]
-                    pad_mode = "reflect" if slab.shape[2] > 1 else "replicate"
-                    slab = F.pad(slab, (0, 0, 0, 0, 0, pad_needed), mode=pad_mode)
-
-                mask_tokens = torch.zeros_like(slab)
-                ctx = model.context_encoder(slab, mask_tokens=mask_tokens)[:, :, :valid_depth]
-                if ctx_sum is None:
-                    ctx_sum = torch.zeros((1, int(ctx.shape[1]), d, int(ctx.shape[3]), int(ctx.shape[4])), device=device)
-                write_rel0 = 0 if z0 == 0 else min(context_margin, valid_depth)
-                write_rel1 = valid_depth if ze == d else max(write_rel0, min(valid_depth, slab_depth - context_margin))
-                if write_rel1 <= write_rel0:
-                    continue
-                out_z0 = z0 + write_rel0
-                out_z1 = z0 + write_rel1
-                ctx_sum[:, :, out_z0:out_z1] += ctx[:, :, write_rel0:write_rel1]
-                ctx_weight[:, :, out_z0:out_z1] += 1.0
-
-            if ctx_sum is None:
-                raise RuntimeError(f"[{config_name}] full-volume inference produced no slabs for {path}")
-            ctx_avg = ctx_sum / ctx_weight.clamp_min(1.0)
-
-            name = os.path.basename(path).replace('.npy', '')
-            out_path = os.path.join(session_dir, f"{name}_context_map_3d.npz")
-            _save_npz(out_path, ctx_avg.squeeze(0).cpu().numpy())
-            print(f"[{config_name}] full-volume context map saved: {out_path}")
-
-    return session_dir

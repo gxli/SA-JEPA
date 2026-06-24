@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import glob
 import hashlib
 import json
 import logging
@@ -27,7 +28,7 @@ from src.diagnostics import (
     compute_error_by_scale,
     rank_dashboard,
 )
-from src.inference import run_post_training_inference, run_post_training_inference_3d, run_full_volume_inference_3d
+from src.inference import run_post_training_inference, run_post_training_inference_3d
 from src.losses import (
     compute_jepa_energy,
     compute_output_spread_regularizer_loss,
@@ -568,6 +569,7 @@ class _MaskingCollator:
         self.mask_box_size_range = model.mask_box_size_range
         self.random_mask_box_per_target = bool(getattr(model, "random_mask_box_per_target", False))
         self.manual_mask_box_sizes = model.manual_mask_box_sizes
+        self.encoder_border_margin = int(model.encoder_receptive_field()) if hasattr(model, "encoder_receptive_field") else 0
         self.context_kwargs = {
             "sigmas": model.sigmas,
             "mask_fraction": model.mask_fraction,
@@ -620,12 +622,21 @@ class _MaskingCollator:
             cdd_orig_in = None
             x_clean = _collate_pad_spatial(batch)
         mask_scale, mask_box_size = self._sample_mask_params()
+        invalid_pixel_mask = ~torch.isfinite(x_clean)
+        border = int(max(0, min(self.encoder_border_margin, int(x_clean.shape[-2]) // 2, int(x_clean.shape[-1]) // 2)))
+        if border > 0:
+            invalid_pixel_mask = invalid_pixel_mask.clone()
+            invalid_pixel_mask[:, :, :border, :] = True
+            invalid_pixel_mask[:, :, int(x_clean.shape[-2]) - border :, :] = True
+            invalid_pixel_mask[:, :, :, :border] = True
+            invalid_pixel_mask[:, :, :, int(x_clean.shape[-1]) - border :] = True
         context_data = prepare_context_batch(
             x_clean=x_clean,
             mask_scale=mask_scale,
             mask_box_size=mask_box_size,
             mask_box_size_range=self.mask_box_size_range,
             cdd_orig_in=cdd_orig_in,
+            invalid_pixel_mask_in=invalid_pixel_mask,
             **self.context_kwargs,
         )
         x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
@@ -644,6 +655,15 @@ def _prepare_context_from_model(
         or enc_type in MASK_MAP_ENCODER_TYPES
     )
     mask_scale, mask_box_size = model.sample_mask_params(device=x_clean.device)
+    invalid_pixel_mask = ~torch.isfinite(x_clean)
+    border_margin = int(model.encoder_receptive_field()) if hasattr(model, "encoder_receptive_field") else 0
+    border = int(max(0, min(border_margin, int(x_clean.shape[-2]) // 2, int(x_clean.shape[-1]) // 2)))
+    if border > 0:
+        invalid_pixel_mask = invalid_pixel_mask.clone()
+        invalid_pixel_mask[:, :, :border, :] = True
+        invalid_pixel_mask[:, :, int(x_clean.shape[-2]) - border :, :] = True
+        invalid_pixel_mask[:, :, :, :border] = True
+        invalid_pixel_mask[:, :, :, int(x_clean.shape[-1]) - border :] = True
     return prepare_context_batch(
         x_clean=x_clean,
         sigmas=model.sigmas,
@@ -676,6 +696,7 @@ def _prepare_context_from_model(
         mask_box_hardcap=getattr(model, "mask_box_hardcap", None),
         cdd_use_gpu=(x_clean.device.type == "cuda"),
         use_cdd=bool(enc_type in CDD_CUBE_ENCODER_TYPES),
+        invalid_pixel_mask_in=invalid_pixel_mask,
     )
 
 
@@ -860,34 +881,7 @@ def resolve_encoder_type_default(model_cfg: dict) -> str:
 
 def _is_3d_jepa_mode(mode: str) -> bool:
     mode_norm = str(mode).strip().lower().replace(" ", "_")
-    return mode_norm in {"3d_slab", "3d_full_volume"}
-
-
-def _is_3d_full_volume_mode(mode: str) -> bool:
-    return str(mode).strip().lower().replace(" ", "_") == "3d_full_volume"
-
-
-def _infer_full_volume_depth_3d(data_cfg: dict, cdd_cache: dict | None) -> int:
-    if cdd_cache:
-        depths = [int(np.asarray(v).shape[1]) for v in cdd_cache.values() if np.asarray(v).ndim == 4]
-        if depths:
-            return max(depths)
-
-    import glob as _glob
-
-    data_root = data_cfg.get("data_root", "data")
-    npy_pattern = data_cfg.get("npy_pattern", "*.npy")
-    paths = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
-    if not paths:
-        raise FileNotFoundError(f"No .npy files found in {data_root}/{npy_pattern}")
-    axis = int(data_cfg.get("volume_depth_axis", data_cfg.get("cube_slice_axis", 0))) % 3
-    depths = []
-    for path in paths:
-        shape = tuple(_safe_load_npy(path, mmap_mode="r").shape)
-        if len(shape) != 3:
-            raise ValueError(f"3D full-volume mode expects cube arrays, got shape={shape} in {path}")
-        depths.append(int(shape[axis]))
-    return max(depths)
+    return mode_norm == "3d_slab"
 
 
 def _resolve_3d_crop_depth(
@@ -896,15 +890,12 @@ def _resolve_3d_crop_depth(
     model_cfg: dict,
     cdd_cache: dict | None,
     default_depth: int,
-    full_volume_mode: bool,
 ) -> int:
     value = data_cfg.get("volume_crop_depth", data_cfg.get("crop_depth_3d", None))
     if isinstance(value, str) and value.strip().lower() == "full":
-        return _infer_full_volume_depth_3d(data_cfg, cdd_cache)
+        raise ValueError("3D crop_depth='full' is no longer supported; use an integer slice depth.")
     if value is not None:
         return int(value)
-    if full_volume_mode:
-        return _infer_full_volume_depth_3d(data_cfg, cdd_cache)
     return int(default_depth)
 
 
@@ -1047,10 +1038,10 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
 
 def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.device) -> PyramidGridJEPA3D:
     mode = str(model_cfg.get("mode", "")).strip().lower().replace(" ", "_")
-    if mode not in {"3d_slab", "3d_full_volume"}:
+    if mode != "3d_slab":
         raise ValueError(
             f"Unsupported 3D JEPA mode={model_cfg.get('mode')}. "
-            "Use model.mode='3d_slab' or model.mode='3d_full_volume'."
+            "Use model.mode='3d_slab'."
         )
     if "volumetric_mode" in model_cfg:
         raise ValueError("model.volumetric_mode was removed; use model.mode='3d_slab'.")
@@ -1105,7 +1096,6 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         norm_per_scale=bool(model_cfg.get("scaleaware_norm_per_scale", True)),
         adapter_norm=bool(model_cfg.get("scaleaware_adapter_norm", True)),
         final_norm=bool(model_cfg.get("scaleaware_final_norm", True)),
-        full_volume_training=(mode == "3d_full_volume"),
     ).to(device)
 
 
@@ -1239,7 +1229,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     if is_main_process:
         log_info(f"[{config_name}] global_seed={seed} rank_seed={rank_seed}")
     is_3d_mode = _is_3d_jepa_mode(model_cfg.get("mode", "image"))
-    is_3d_full_volume_mode = _is_3d_full_volume_mode(model_cfg.get("mode", "image"))
 
     # Optional WandB logging (config-controlled, main process only)
     _use_wandb = False
@@ -1280,7 +1269,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
     if input_type == "cube" and not is_3d_mode:
         raise ValueError(
-            "data.input_type='cube' requires model.mode='3d_slab' or '3d_full_volume'."
+            "data.input_type='cube' requires model.mode='3d_slab'."
         )
     if is_3d_mode and input_type != "cube":
         raise ValueError("3D model modes require data.input_type='cube'.")
@@ -1470,6 +1459,41 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         os.path.exists(inference_outputs_path)
         and os.path.getsize(inference_outputs_path) > 0
     )
+    inference_summary_path = os.path.join(session_dir, "jepa_energy_summary.json")
+    inference_summary = {}
+    if os.path.exists(inference_summary_path):
+        try:
+            with open(inference_summary_path, "r", encoding="utf-8") as f:
+                inference_summary = json.load(f)
+        except Exception:
+            inference_summary = {}
+    data_profile_path = os.path.join(session_dir, "data_profile.json")
+    requires_tiled_2d_inference = False
+    tile_size_for_skip = train_cfg.get("inference_tile_size", train_cfg.get("full_volume_spatial_tile_size", 512))
+    try:
+        tile_size_for_skip = int(tile_size_for_skip)
+    except (TypeError, ValueError):
+        tile_size_for_skip = 0
+    if not is_3d_mode and tile_size_for_skip > 0 and os.path.exists(data_profile_path):
+        try:
+            with open(data_profile_path, "r", encoding="utf-8") as f:
+                profile = json.load(f)
+            first_shape = (profile.get("files") or [{}])[0].get("shape") or []
+            if len(first_shape) >= 2:
+                requires_tiled_2d_inference = (
+                    int(first_shape[-2]) > tile_size_for_skip
+                    or int(first_shape[-1]) > tile_size_for_skip
+                )
+        except Exception:
+            requires_tiled_2d_inference = False
+    has_tiled_2d_inference = bool(inference_summary.get("inference_tiled_dense_2d", False))
+    requires_3d_full_xy_slice = is_3d_mode
+    has_3d_full_xy_slice = bool(inference_summary.get("inference_3d_full_xy_slice", False))
+    has_required_inference = has_inference_outputs and (
+        has_tiled_2d_inference if requires_tiled_2d_inference else True
+    ) and (
+        has_3d_full_xy_slice if requires_3d_full_xy_slice else True
+    )
     if 0 < observed_epoch < start_epoch:
         log_info(
             f"[{config_name}] checkpoint epoch {start_epoch} exceeds observed completed epoch "
@@ -1479,21 +1503,28 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     if (
         start_epoch >= epochs
         and observed_epoch >= epochs
-        and has_inference_outputs
+        and has_required_inference
         and not force_recompute_inference
         and not compute_effective_rank
         and not rerun_completed
     ):
         log_info(
             f"[{config_name}] checkpoint epoch {start_epoch} and observed epoch {observed_epoch} "
-            f"already >= configured epochs {epochs}, inference_outputs.pt present; "
+            f"already >= configured epochs {epochs}, required inference artifacts present; "
             "skipping completed session before CDD/dataloader setup "
             "(set train.rerun_completed=true to force rerun)."
         )
         return session_dir
-    if start_epoch >= epochs and observed_epoch >= epochs and not has_inference_outputs:
+    if start_epoch >= epochs and observed_epoch >= epochs and not has_required_inference:
+        missing = (
+            "full-XY 3D slice inference"
+            if requires_3d_full_xy_slice and has_inference_outputs
+            else "tiled 2D inference"
+            if requires_tiled_2d_inference and has_inference_outputs
+            else "inference_outputs.pt"
+        )
         log_info(
-            f"[{config_name}] training complete but inference_outputs.pt missing; "
+            f"[{config_name}] training complete but {missing} missing; "
             "continuing to dataloader/inference setup."
         )
 
@@ -1588,9 +1619,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             model_cfg=model_cfg,
             cdd_cache=cdd_cache,
             default_depth=auto_crop_depth_3d,
-            full_volume_mode=is_3d_full_volume_mode,
         )
-        min_crop_depth_3d = target_slab_depth_3d if is_3d_full_volume_mode else auto_crop_depth_3d
+        min_crop_depth_3d = auto_crop_depth_3d
         if crop_depth_3d < min_crop_depth_3d:
             raise ValueError(
                 "3D crop depth is too small: "
@@ -1602,7 +1632,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 f"[{config_name}] {model_without_ddp.mode} geometry: spatial_crop="
                 f"{int(data_cfg.get('volume_crop_size', data_cfg.get('crop_size_3d', 64)))} "
                 f"crop_depth={crop_depth_3d} encoder_rf_depth={encoder_rf_depth_3d} "
-                f"target_depth={'full' if is_3d_full_volume_mode else target_slab_depth_3d}"
+                f"target_depth={target_slab_depth_3d}"
             )
         inference_crop_depth_3d = int(train_cfg.get("inference_crop_depth_3d", crop_depth_3d))
         if inference_crop_depth_3d <= 0:
@@ -2418,23 +2448,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 session_dir=session_dir,
                 config_name=config_name,
                 force_recompute_inference=force_recompute_inference,
+                cdd_cache=cdd_cache,
+                inference_depth=inference_crop_depth_3d,
+                slice_index=train_cfg.get("inference_slice_index_3d"),
+                spatial_tile_size=train_cfg.get("inference_spatial_tile_size_3d", data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
+                spatial_overlap=train_cfg.get("inference_spatial_overlap_3d"),
+                inference_tta_enabled=inference_tta_enabled,
+                inference_tta_mode=inference_tta_mode,
             )
-            if cdd_cache and bool(train_cfg.get("full_volume_inference_enabled", True)):
-                target_slab_depth_3d = max(
-                    int(model_cfg.get("patch_size", 2)),
-                    int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
-                )
-                run_full_volume_inference_3d(
-                    model=model_without_ddp,
-                    cdd_cache=cdd_cache,
-                    session_dir=session_dir,
-                    config_name=config_name,
-                    device=device,
-                    slab_depth=int(crop_depth_3d if is_3d_full_volume_mode else getattr(model_without_ddp, "required_input_depth", target_slab_depth_3d)),
-                    post_log_transform=bool(model_cfg.get("post_log_transform", True)),
-                    log_eps=float(model_cfg.get("log_eps", 1.0)),
-                    cdd_log_std_floor_mult=float(model_cfg.get("cdd_log_std_floor_mult", 0.05)),
-                )
         else:
             session_dir = run_post_training_inference(
                 model=model_without_ddp,
@@ -2453,7 +2474,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 training_d4_augment=bool(data_cfg.get("d4_augment", False)),
                 inference_tta_enabled=inference_tta_enabled,
                 inference_tta_mode=inference_tta_mode,
-                max_diagnostic_size=int(train_cfg.get("max_diagnostic_size", 768)),
+                max_diagnostic_size=train_cfg.get("inference_max_diagnostic_size"),
+                tile_size=train_cfg.get("inference_tile_size", train_cfg.get("full_volume_spatial_tile_size", 512)),
+                tile_overlap=train_cfg.get("inference_tile_overlap"),
             )
     # Save NPY artifacts (PCA/UMAP/latent embeddings) required by session_to_dash.py.
     # No PNG, HTML, or dashboard rendering is performed here.

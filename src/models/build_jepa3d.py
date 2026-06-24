@@ -55,7 +55,6 @@ class PyramidGridJEPA3D(nn.Module):
         norm_per_scale: bool = True,
         adapter_norm: bool = True,
         final_norm: bool = True,
-        full_volume_training: bool = False,
     ):
         super().__init__()
         self.num_scales = int(num_scales)
@@ -69,19 +68,14 @@ class PyramidGridJEPA3D(nn.Module):
         self.cdd_log_std_floor_mult = float(cdd_log_std_floor_mult)
         self.mask_box_size = int(mask_box_size)
         self.num_mask_boxes = int(num_mask_boxes)
-        self.mode = "3d_full_volume" if bool(full_volume_training) else "3d_slab"
-        self.full_volume_training = bool(full_volume_training)
+        self.mode = "3d_slab"
         self.slab_depth = max(self.patch_size, int(slab_depth))
         self.encoder_receptive_field_depth = int(
             encoder_receptive_field_depth
             if encoder_receptive_field_depth is not None
             else compute_3d_encoder_receptive_field_depth(encoder_depth, encoder_kernel_size)
         )
-        self.required_input_depth = int(
-            self.slab_depth
-            if self.full_volume_training
-            else self.encoder_receptive_field_depth + self.slab_depth - 1
-        )
+        self.required_input_depth = int(self.encoder_receptive_field_depth + self.slab_depth - 1)
         self.use_symmetric_feature_loss = bool(use_symmetric_feature_loss)
         self.use_film = bool(use_film)
         self.use_per_scale_adapters = bool(use_per_scale_adapters)
@@ -177,9 +171,6 @@ class PyramidGridJEPA3D(nn.Module):
         return mask
 
     def _center_slab_start_index(self, batch_size: int, depth: int, device) -> tuple[torch.Tensor, int]:
-        if self.full_volume_training:
-            starts = torch.zeros((batch_size,), dtype=torch.long, device=device)
-            return starts, int(depth)
         slab_depth = max(1, min(int(self.slab_depth), int(depth)))
         start = max(0, (int(depth) - slab_depth) // 2)
         starts = torch.full((batch_size,), start, dtype=torch.long, device=device)
@@ -234,6 +225,12 @@ class PyramidGridJEPA3D(nn.Module):
                 f"got {d}, required at least {self.required_input_depth} "
                 f"(encoder_rf={self.encoder_receptive_field_depth}, target_slab_depth={self.slab_depth})"
             )
+        if d > int(self.required_input_depth):
+            input_start = max(0, (int(d) - int(self.required_input_depth)) // 2)
+            input_end = input_start + int(self.required_input_depth)
+            fields = fields[:, :, input_start:input_end]
+            x_clean = x_clean[:, :, input_start:input_end]
+            d = int(fields.shape[2])
 
         slab_starts, slab_depth = self._center_slab_start_index(batch_size=b, depth=d, device=x_clean.device)
 
@@ -256,16 +253,7 @@ class PyramidGridJEPA3D(nn.Module):
             base_ctx = torch.clamp(fields_context, min=0.0)
             fields_context = torch.log(base_ctx + log_floor)
 
-        if self.use_symmetric_feature_loss:
-            context_map_3d, symmetric_var = symmetric_forward_3d(
-                self.context_encoder,
-                fields_context,
-                mask_tokens=mask_tokens,
-                return_var=True,
-            )
-        else:
-            context_map_3d = self.context_encoder(fields_context, mask_tokens=mask_tokens)
-            symmetric_var = None
+        return_full_3d_maps = bool(kwargs.get("return_full_3d_maps", False))
         with torch.no_grad():
             zero_mask_tokens = torch.zeros_like(fields)
             if self.use_symmetric_feature_loss:
@@ -278,9 +266,26 @@ class PyramidGridJEPA3D(nn.Module):
             else:
                 gt_map_3d = self.target_encoder(fields, mask_tokens=zero_mask_tokens)
                 target_symmetric_var = None
+            gt_map = self._gather_slabs(gt_map_3d, slab_starts, slab_depth)
+            gt_map_full = gt_map_3d if return_full_3d_maps else None
+            if not return_full_3d_maps:
+                del gt_map_3d
+            del zero_mask_tokens
 
+        if self.use_symmetric_feature_loss:
+            context_map_3d, symmetric_var = symmetric_forward_3d(
+                self.context_encoder,
+                fields_context,
+                mask_tokens=mask_tokens,
+                return_var=True,
+            )
+        else:
+            context_map_3d = self.context_encoder(fields_context, mask_tokens=mask_tokens)
+            symmetric_var = None
         context_map = self._gather_slabs(context_map_3d, slab_starts, slab_depth)
-        gt_map = self._gather_slabs(gt_map_3d, slab_starts, slab_depth)
+        context_map_full = context_map_3d if return_full_3d_maps else None
+        if not return_full_3d_maps:
+            del context_map_3d
         pred_map = self.predictor3d(context_map)
         _, _, dz, hy, wx = pred_map.shape
         target_budget = _fractional_spatial_target_budget(
@@ -302,6 +307,8 @@ class PyramidGridJEPA3D(nn.Module):
             num_targets=num_targets,
             patch_size=self.patch_size,
             device=x_clean.device,
+            spatial_border_margin=int(self.encoder_receptive_field_depth),
+            depth_border_margin=0,
         )
         pred_patches = extract_location_cubes(pred_map, target_locations, self.patch_size)
         gt_patches = extract_location_cubes(gt_map, target_locations, self.patch_size)
@@ -315,10 +322,8 @@ class PyramidGridJEPA3D(nn.Module):
             "target_valid": target_valid,
             "target_scales": torch.ones((b, num_targets), device=x_clean.device, dtype=x_clean.dtype),
             "context_map": context_map,
-            "context_map_3d": context_map_3d,
             "pred_map": pred_map,
             "gt_map": gt_map,
-            "gt_map_3d": gt_map_3d,
             "x_clean": self._gather_slabs(x_clean, slab_starts, slab_depth),
             "x_clean_full": x_clean,
             "x_context": self._gather_slabs(fields_context, slab_starts, slab_depth),
@@ -331,6 +336,9 @@ class PyramidGridJEPA3D(nn.Module):
             "mask_footprint_px": torch.tensor(float(self.mask_box_size), device=x_clean.device, dtype=x_clean.dtype),
             "mask_scale_factor": torch.tensor(1.0, device=x_clean.device, dtype=x_clean.dtype),
         }
+        if return_full_3d_maps:
+            out["context_map_3d"] = context_map_full
+            out["gt_map_3d"] = gt_map_full
         if symmetric_var is not None:
             out["symmetric_var"] = symmetric_var
         if target_symmetric_var is not None:

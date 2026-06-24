@@ -224,7 +224,7 @@ class PrintEffectiveRankTests(unittest.TestCase):
                 json.dumps(
                     {
                         "model": {
-                            "mode": "3d_full_volume",
+                            "mode": "3d_slab",
                             "mask_size_scaling": 1.2,
                             "mask_size": 5,
                             "encoder_depth": 2,

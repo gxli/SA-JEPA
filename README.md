@@ -122,10 +122,19 @@ print(f"Interactive:   {umap_html}")
 
 ### ⚙️ Config-driven
 
+> **⚠️ Always inherit from the base config.** The base config provides 75
+> essential defaults (model architecture, CDD pipeline, optimizer, target
+> sampling). Without it, training silently collapses — wrong encoder size,
+> broken spread loss, empty UMAP config. Every custom YAML must start with:
+> ```yaml
+> base_config: path/to/base_pyramid_scaleaware_convnext.yaml
+> ```
+> The examples in `configs/examples/` and `configs/local_configs/` all do this.
+
 ```python
 from sajepa import ScaleAwareJEPA
 
-model = ScaleAwareJEPA(config="configs/base_pyramid_scaleaware_convnext.yaml")
+model = ScaleAwareJEPA(config="configs/examples/mhd_example.yaml")
 model.train(config_name="my_run", sessions_dir="outputs", dashboard=True)
 model.open_interactive_umap()
 model.save_session(model.session_dir)

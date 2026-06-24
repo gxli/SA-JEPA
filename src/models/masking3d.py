@@ -11,17 +11,24 @@ def sample_target_locations_3d(
     num_targets: int,
     patch_size: int,
     device,
+    spatial_border_margin: int = 0,
+    depth_border_margin: int = 0,
 ):
     half = patch_size // 2
-    lo_z = half
-    hi_z = depth - (patch_size - half)
-    lo_y = half
-    hi_y = height - (patch_size - half)
-    lo_x = half
-    hi_x = width - (patch_size - half)
+    lo_z = max(half, int(depth_border_margin))
+    hi_z = min(depth - (patch_size - half), depth - 1 - int(depth_border_margin))
+    lo_y = max(half, int(spatial_border_margin))
+    hi_y = min(height - (patch_size - half), height - 1 - int(spatial_border_margin))
+    lo_x = max(half, int(spatial_border_margin))
+    hi_x = min(width - (patch_size - half), width - 1 - int(spatial_border_margin))
 
     if hi_z < lo_z or hi_y < lo_y or hi_x < lo_x:
-        raise ValueError("Patch too large for volume")
+        raise ValueError(
+            "Patch plus encoder border too large for volume "
+            f"depth_range=({lo_z},{hi_z}) y_range=({lo_y},{hi_y}) x_range=({lo_x},{hi_x}) "
+            f"shape=({depth},{height},{width}) patch_size={patch_size} "
+            f"spatial_border_margin={spatial_border_margin} depth_border_margin={depth_border_margin}"
+        )
 
     z = torch.randint(lo_z, hi_z + 1, (batch_size, num_targets), device=device)
     y = torch.randint(lo_y, hi_y + 1, (batch_size, num_targets), device=device)

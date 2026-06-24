@@ -12,7 +12,7 @@ from src.utils.npy import _safe_load_npy, normalize01
 class JEPA3DCropDataset(Dataset):
     """3D dataset that consumes precomputed CDD cache entries.
 
-    Each cache entry is (S, D, H, W) — S CDD scale channels over a full volume.
+    Each cache entry is (S, D, H, W) — S CDD scale channels over a cube.
     The dataset randomly selects a slice axis (X/Y/Z), rotates the CDD data so
     that axis becomes the depth dimension, then extracts a context crop of size
     (S, crop_depth, crop_size, crop_size).

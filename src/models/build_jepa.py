@@ -337,6 +337,37 @@ class PyramidGridJEPA(nn.Module):
             return int(round((lo + hi) / 2.0)), (lo, hi)
         return int(round(float(value))), None
 
+    def encoder_receptive_field(self) -> int:
+        depth = int(self.encoder_depth)
+        dilations = self.convnext_layer_dilations
+        if dilations is None:
+            dil_list = [1] * max(0, depth)
+        else:
+            dil_list = [int(d) for d in dilations]
+            if len(dil_list) < depth and dil_list:
+                reps = (depth + len(dil_list) - 1) // len(dil_list)
+                dil_list = (dil_list * reps)[:depth]
+            else:
+                dil_list = dil_list[:depth]
+        rf = 1 + 2 + 2
+        for dilation in dil_list:
+            rf += max(0, int(self.encoder_kernel_size) - 1) * max(1, int(dilation))
+        return max(1, int(rf))
+
+    def _apply_encoder_border_invalid_mask(self, invalid_pixel_mask: torch.Tensor) -> torch.Tensor:
+        if invalid_pixel_mask.dim() != 4:
+            return invalid_pixel_mask
+        _, _, h, w = invalid_pixel_mask.shape
+        border = int(max(0, min(self.encoder_receptive_field(), h // 2, w // 2)))
+        if border <= 0:
+            return invalid_pixel_mask
+        out = invalid_pixel_mask.clone()
+        out[:, :, :border, :] = True
+        out[:, :, h - border :, :] = True
+        out[:, :, :, :border] = True
+        out[:, :, :, w - border :] = True
+        return out
+
     def sample_mask_params(self, device=None) -> tuple[float, int]:
         """Return effective mask scale and box size for this masking call."""
         rand_device = device if device is not None else torch.device("cpu")
@@ -415,6 +446,7 @@ class PyramidGridJEPA(nn.Module):
             invalid_pixel_mask = ~torch.isfinite(x_clean)
             if invalid_pixel_mask.any():
                 x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
+            invalid_pixel_mask = self._apply_encoder_border_invalid_mask(invalid_pixel_mask)
 
             debug_encoder_types = CDD_DEBUG_ENCODER_TYPES | MASK_MAP_ENCODER_TYPES
             need_debug_tensors = bool(

@@ -583,6 +583,7 @@ def make_pyramid_grid_context(
     cdd_use_gpu: bool = False,
     cdd_orig_in: Optional[torch.Tensor] = None,
     use_cdd: bool = True,
+    invalid_pixel_mask_in: Optional[torch.Tensor] = None,
 ):
     """
     x_clean: B x 1 x H x W
@@ -1074,6 +1075,8 @@ def make_pyramid_grid_context(
                     continue
                 if iy + patch_half_hi > h or ix + patch_half_hi > w:
                     continue
+                if sample_invalid_mask is not None and bool(sample_invalid_mask[iy, ix]):
+                    continue
                 if bool(target_invalid_region_skip) or sampled_mode:
                     if not _target_patch_has_valid_input(
                         arr=arr,
@@ -1218,6 +1221,7 @@ def prepare_context_batch(
     cdd_use_gpu: bool = False,
     cdd_orig_in: Optional[torch.Tensor] = None,
     use_cdd: bool = True,
+    invalid_pixel_mask_in: Optional[torch.Tensor] = None,
 ):
     """Prepare context tensors from a clean batch.
 
@@ -1226,6 +1230,11 @@ def prepare_context_batch(
     or the main process (no CUDA requirement).
     """
     invalid_pixel_mask = ~torch.isfinite(x_clean)
+    if invalid_pixel_mask_in is not None:
+        invalid_pixel_mask = invalid_pixel_mask | invalid_pixel_mask_in.to(
+            device=invalid_pixel_mask.device,
+            dtype=torch.bool,
+        )
     if invalid_pixel_mask.any():
         x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
 

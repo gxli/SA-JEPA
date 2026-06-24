@@ -51,6 +51,43 @@ def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
     return os.path.basename(out_html)
 
 
+def _encoder_fov_border_from_config(session_dir: str) -> int:
+    cfg_path = os.path.join(session_dir, "config_used.json")
+    if not os.path.exists(cfg_path):
+        return 0
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return 0
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(model_cfg, dict):
+        return 0
+    depth = int(model_cfg.get("encoder_depth", 3))
+    kernel = int(model_cfg.get("encoder_kernel_size", 5))
+    mode = str(model_cfg.get("mode", "")).strip().lower()
+    encoder_type = str(model_cfg.get("encoder_type", "")).strip().lower()
+    if mode.startswith("3d") or "3d" in encoder_type:
+        return max(0, 1 + 2 * (3 - 1) + max(0, depth) * max(0, kernel - 1))
+    dilations = model_cfg.get("convnext_layer_dilations")
+    if dilations is None:
+        dil_list = [1] * max(0, depth)
+    else:
+        try:
+            dil_list = [int(v) for v in dilations]
+        except TypeError:
+            dil_list = [1] * max(0, depth)
+        if len(dil_list) < depth and dil_list:
+            reps = (depth + len(dil_list) - 1) // len(dil_list)
+            dil_list = (dil_list * reps)[:depth]
+        else:
+            dil_list = dil_list[:depth]
+    rf = 1 + 2 + 2
+    for dilation in dil_list:
+        rf += max(0, kernel - 1) * max(1, int(dilation))
+    return max(0, rf)
+
+
 def _compute_pca_2d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     fit_x = x
@@ -449,6 +486,14 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     h_lat = int(pred_map.shape[-2])
     w_lat = int(pred_map.shape[-1])
     valid_mask_2d = _build_input_validity_mask(x_clean_raw, h_lat, w_lat)  # [H_lat, W_lat] bool
+    border_px = int(max(0, min(_encoder_fov_border_from_config(session_dir), h_lat // 2, w_lat // 2)))
+    if border_px > 0:
+        valid_mask_2d = valid_mask_2d.copy()
+        valid_mask_2d[:border_px, :] = False
+        valid_mask_2d[h_lat - border_px :, :] = False
+        valid_mask_2d[:, :border_px] = False
+        valid_mask_2d[:, w_lat - border_px :] = False
+        print(f"[dashboard] latent PCA/UMAP border mask: border_px={border_px}")
     valid_mask_flat = valid_mask_2d.reshape(-1)  # [H_lat * W_lat]
 
     # Render sampled target locations for first sample.
@@ -484,7 +529,15 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         # Use sample-0 dense latent map (H*W tokens) for branch-specific plotly 2D color + 3D scatter.
         h_map = int(fmap.shape[-2])
         w_map = int(fmap.shape[-1])
-        latent_map = fmap[0].detach().cpu().numpy().astype(np.float32)
+        latent_t = fmap[0]
+        if latent_t.dim() == 4:
+            # C,D,H,W -> C,H,W center slice for 3D slab inference dashboards.
+            latent_t = latent_t[:, latent_t.shape[1] // 2]
+        latent_map = latent_t.detach().cpu().numpy().astype(np.float32)
+        if latent_map.ndim != 3:
+            raise RuntimeError(
+                f"{branch_name} latent map must be CxHxW after slicing, got shape={latent_map.shape}"
+            )
         z = np.transpose(latent_map, (1, 2, 0)).reshape(-1, fmap.shape[1]).astype(np.float32)
 
         # Filter invalid-region latents from PCA/UMAP, keep NaN sentinels.
