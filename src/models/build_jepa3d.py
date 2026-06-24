@@ -218,6 +218,7 @@ class PyramidGridJEPA3D(nn.Module):
                     return_scales=False,
                     verbose=False,
                     use_gpu=False,
+                    gaussian_backend="cuda",
                 )
                 ch = np.clip(np.stack(channels_arr, axis=0), 0.0, None).astype(np.float32)
                 decomposed.append(torch.from_numpy(ch).to(x_clean.device))

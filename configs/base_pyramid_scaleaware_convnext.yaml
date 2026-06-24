@@ -1,6 +1,7 @@
 data:
   data_root: data
   npy_pattern: C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy
+  input_type: image
   num_samples: 200
   log_eps: 1.0e-06
   cdd_mode: log

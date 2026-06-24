@@ -26,7 +26,7 @@ joint-embedding predictions optimized for continuous structures:
 - **Dense Latent Exploration:** Every pixel receives a distinct latent
   coordinate that maps back directly to the original field coordinate space.
 - **Modality Support:** 2D fields are fully supported and tested. 3D
-  volumetric mode (`3d_full_volume`, `3d_slab`) is under active development.
+  volumetric mode (`3d_slab`) is under active development.
 
 ## 🎯 Application Scenarios
 

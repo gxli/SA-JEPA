@@ -119,13 +119,7 @@ class JEPADataset(Dataset):
         return path.endswith(".fits")
 
     def _build_sample_index(self):
-        # Also scan for .fits files
-        fits_pattern = self.pattern.replace(".npy", ".fits") if self.pattern.endswith(".npy") else os.path.join(os.path.dirname(self.pattern), "*.fits")
-        self.fits_files = sorted(glob.glob(fits_pattern)) if fits is not None else []
-        if self.fits_files:
-            print(f"[dataset] Found {len(self.fits_files)} .fits file(s)")
-
-        all_files = list(self.npy_files) + list(self.h5_files) + list(self.fits_files)
+        all_files = list(self.npy_files) + list(self.h5_files)
         index = []
         for path in all_files:
             shape = self._probe_file_shape(path)
@@ -269,7 +263,7 @@ class JEPADataset(Dataset):
     def _crop_slices(self, h: int, w: int) -> tuple[slice, slice] | None:
         if self.crop_mode == "none" or self.crop_size is None:
             return None
-        crop_h, crop_w = self.crop_size
+        crop_h, crop_w = self._coerce_crop_size(self.crop_size)
         if crop_h > h or crop_w > w:
             raise ValueError(f"crop_size={self.crop_size} exceeds image shape={(h, w)}")
         if self.crop_mode == "center":

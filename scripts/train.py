@@ -13,6 +13,17 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 from src.train import load_config, run_training
 
 
+def _assert_local_imports() -> None:
+    expected_root = os.path.realpath(os.environ.get("SAJEPA_LOCAL_ROOT", _project_root))
+    actual_train = os.path.realpath(sys.modules["src.train"].__file__)
+    if not actual_train.startswith(expected_root + os.sep):
+        raise RuntimeError(
+            "Refusing to run non-local sajepa code. "
+            f"Expected src.train under {expected_root!r}, got {actual_train!r}. "
+            "Run with PYTHONPATH=$PWD python scripts/train.py, not the installed sajepa entrypoint."
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run one JEPA config")
     parser.add_argument("--config", type=str, required=True, help="Path to JSON config")
@@ -33,6 +44,7 @@ def parse_args():
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _assert_local_imports()
     args = parse_args()
     config = load_config(args.config)
     config_name = args.name or os.path.splitext(os.path.basename(args.config))[0]

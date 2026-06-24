@@ -326,6 +326,7 @@ def _precompute_cdd_cache(
     model_cfg: dict,
     device: torch.device,
     config_name: str,
+    session_dir: str = "",
     cache_replicas: int = 1,
 ) -> dict:
     """Pre-compute a bounded CDD decomposition cache on GPU, store in CPU RAM."""
@@ -343,6 +344,9 @@ def _precompute_cdd_cache(
     cdd_sm_mode = str(model_cfg.get("cdd_sm_mode", data_cfg.get("cdd_sm_mode", "reflect")))
     cdd_append_last_residual = bool(model_cfg.get("cdd_append_last_residual", True))
     cdd_pre_log_transform = bool(model_cfg.get("cdd_pre_log_transform", False))
+    cdd_gaussian_backend = str(
+        model_cfg.get("cdd_gaussian_backend", data_cfg.get("cdd_gaussian_backend", "cuda"))
+    )
     sigmas = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
     cdd_num_channels = int(model_cfg.get("cdd_num_channels", len(sigmas)))
     cdd_request_num_channels = model_cfg.get("cdd_request_num_channels", None)
@@ -355,13 +359,10 @@ def _precompute_cdd_cache(
         log_info(f"[{config_name}] CDD precompute: no files found for pattern, skipping")
         return {}
     disk_cache_enabled = bool(data_cfg.get("cdd_disk_cache", True))
-    cdd_cache_mode = str(data_cfg.get("cdd_cache_mode", "session")).lower()
     if "cdd_cache_dir" in data_cfg:
         disk_cache_dir = str(data_cfg["cdd_cache_dir"])
-    elif cdd_cache_mode == "data":
-        disk_cache_dir = os.path.join(data_root, "cdd_cache")
     else:
-        disk_cache_dir = os.path.join("sessions", "cdd_cache")
+        disk_cache_dir = os.path.join(session_dir, "cdd_cache")
     cdd_meta = {
         "version": 2,
         "cdd_mode": cdd_mode,
@@ -369,8 +370,11 @@ def _precompute_cdd_cache(
         "cdd_sm_mode": cdd_sm_mode,
         "cdd_append_last_residual": cdd_append_last_residual,
         "cdd_pre_log_transform": cdd_pre_log_transform,
+        "cdd_gaussian_backend": cdd_gaussian_backend,
         "log_eps": float(model_cfg.get("log_eps", 1.0)),
         "cdd_log_std_floor_mult": float(model_cfg.get("cdd_log_std_floor_mult", 0.05)),
+        "cdd_min_scale": float(min(float(s) for s in sigmas)),
+        "cdd_max_scale": float(max(float(s) for s in sigmas)),
         "sigmas": [float(s) for s in sigmas],
         "cdd_num_channels": cdd_num_channels,
         "cdd_request_num_channels": None if cdd_request_num_channels is None else int(cdd_request_num_channels),
@@ -459,22 +463,25 @@ def _precompute_cdd_cache(
             arr = np.log(arr_clamp + log_floor).astype(np.float32)
         cdd_kwargs = dict(
             max_scale=max(float(s) for s in sigmas),
+            min_scale=min(float(s) for s in sigmas),
             mode=cdd_mode,
             constrained=cdd_constrained,
             sm_mode=cdd_sm_mode,
-            return_scales=False,
+            return_scales=True,
             verbose=False,
             use_gpu=(device.type == "cuda"),
+            gaussian_backend=cdd_gaussian_backend,
         )
         if cdd_request_num_channels is not None:
             cdd_kwargs["num_channels"] = int(cdd_request_num_channels)
-        cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(arr, **cdd_kwargs)
+        cdd_channels_arr, cdd_residual, cdd_scales_used = cdd.constrained_diffusion_decomposition(arr, **cdd_kwargs)
         actual_cdd_channels = int(len(cdd_channels_arr))
         if actual_cdd_channels < cdd_num_channels:
             raise RuntimeError(
                 f"[{config_name}] CDD returned too few result bands for {path}: "
                 f"requested_keep={cdd_num_channels}, returned_bands={actual_cdd_channels}, "
-                f"residual_channel={int(cdd_append_last_residual)}, input_shape={tuple(arr.shape)}. "
+                f"residual_channel={int(cdd_append_last_residual)}, "
+                f"scales_used={np.asarray(cdd_scales_used).tolist()}, input_shape={tuple(arr.shape)}. "
                 "The vanilla CDD contract is results + residual; the model can ignore extra results, "
                 "but it cannot invent missing configured result channels."
             )
@@ -488,12 +495,12 @@ def _precompute_cdd_cache(
                 f"got {cdd_orig.shape}"
             )
         if cdd_append_last_residual:
-            cdd_residual = np.asarray(cdd_residual, dtype=np.float32)
-            if cdd_residual.shape != arr.shape:
-                raise ValueError(
-                    f"CDD residual for {path} must match input shape {arr.shape}, got {cdd_residual.shape}"
-                )
-            cdd_orig[-1] = cdd_orig[-1] + np.clip(cdd_residual, a_min=0.0, a_max=None).astype(np.float32)
+            # Recompute residual from kept channels so sum(kept) == original.
+            # The raw CDD residual accounts for all returned bands (including
+            # dropped ones); recomputing guarantees exact reconstruction.
+            kept_sum = np.sum(cdd_orig, axis=0, dtype=np.float32)
+            recomputed_residual = (arr - kept_sum).astype(np.float32)
+            cdd_orig[-1] = cdd_orig[-1] + np.clip(recomputed_residual, a_min=0.0, a_max=None)
         cached_channels = int(cdd_orig.shape[0])
         request_arg = "auto" if cdd_request_num_channels is None else str(int(cdd_request_num_channels))
         ignored_channels = max(0, actual_cdd_channels - cdd_num_channels)
@@ -502,7 +509,7 @@ def _precompute_cdd_cache(
             f"returned_bands={actual_cdd_channels} ignored_bands={ignored_channels} "
             f"residual_added_to_last={int(cdd_append_last_residual)} "
             f"cached_channels={cached_channels} model_expected={model_num_scales} "
-            f"input_shape={tuple(arr.shape)}"
+            f"scales_used={np.asarray(cdd_scales_used).tolist()} input_shape={tuple(arr.shape)}"
         )
         if cached_channels != model_num_scales:
             raise RuntimeError(
@@ -797,6 +804,39 @@ def make_session_dir(root: str, config_name: str) -> str:
     path = os.path.join(root, config_name)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _observed_completed_epoch(session_dir: str) -> int:
+    """Best-effort completed epoch from durable training logs."""
+    epoch_summary_path = os.path.join(session_dir, "epoch_summary.csv")
+    best_epoch = 0
+    if os.path.exists(epoch_summary_path):
+        try:
+            with open(epoch_summary_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        best_epoch = max(best_epoch, int(float(row.get("epoch", 0) or 0)))
+                    except (TypeError, ValueError):
+                        continue
+        except OSError:
+            pass
+    if best_epoch > 0:
+        return best_epoch
+
+    metrics_path = os.path.join(session_dir, "metrics.csv")
+    if os.path.exists(metrics_path):
+        try:
+            with open(metrics_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        best_epoch = max(best_epoch, int(float(row.get("epoch", 0) or 0)))
+                    except (TypeError, ValueError):
+                        continue
+        except OSError:
+            pass
+    return best_epoch
 
 
 def resolve_pipeline_config(data_cfg: dict, model_cfg: dict) -> bool:
@@ -1420,6 +1460,43 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             if not resume_model_ignored:
                 log_info(f"resume_model={model_ckpt_path}")
 
+    epochs = int(train_cfg.get("epochs", 20))
+    force_recompute_inference = bool(train_cfg.get("force_recompute_inference", False))
+    compute_effective_rank = bool(train_cfg.get("compute_effective_rank", False))
+    rerun_completed = bool(train_cfg.get("rerun_completed", False))
+    observed_epoch = _observed_completed_epoch(session_dir)
+    inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
+    has_inference_outputs = (
+        os.path.exists(inference_outputs_path)
+        and os.path.getsize(inference_outputs_path) > 0
+    )
+    if 0 < observed_epoch < start_epoch:
+        log_info(
+            f"[{config_name}] checkpoint epoch {start_epoch} exceeds observed completed epoch "
+            f"{observed_epoch}; resuming from observed logs instead."
+        )
+        start_epoch = observed_epoch
+    if (
+        start_epoch >= epochs
+        and observed_epoch >= epochs
+        and has_inference_outputs
+        and not force_recompute_inference
+        and not compute_effective_rank
+        and not rerun_completed
+    ):
+        log_info(
+            f"[{config_name}] checkpoint epoch {start_epoch} and observed epoch {observed_epoch} "
+            f"already >= configured epochs {epochs}, inference_outputs.pt present; "
+            "skipping completed session before CDD/dataloader setup "
+            "(set train.rerun_completed=true to force rerun)."
+        )
+        return session_dir
+    if start_epoch >= epochs and observed_epoch >= epochs and not has_inference_outputs:
+        log_info(
+            f"[{config_name}] training complete but inference_outputs.pt missing; "
+            "continuing to dataloader/inference setup."
+        )
+
     scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
     def _param_max(value_key: str, default: float) -> float:
         values = model_cfg.get(value_key, default)
@@ -1490,6 +1567,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         model_cfg=model_cfg,
         device=device,
         config_name=config_name,
+        session_dir=session_dir,
         cache_replicas=cdd_cache_replicas,
     ) if uses_cdd_channels else None
     if is_main_process:
@@ -1748,17 +1826,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             except Exception as e:
                 log_error("scaler_state_incompatible", e)
 
-    epochs = train_cfg.get("epochs", 20)
     log_interval = train_cfg.get("log_interval", 10)
     log_flush_interval = max(1, int(log_interval))
     diagnostic_interval = max(1, int(train_cfg.get("diagnostic_interval", log_flush_interval)))
-    force_recompute_inference = bool(train_cfg.get("force_recompute_inference", False))
     inference_mask_passes = int(train_cfg.get("inference_mask_passes", 1))
     mask_inference = bool(train_cfg.get("mask_inference", False))
     viz_crop_border = bool(train_cfg.get("viz_crop_border", False))
     viz_crop_border_px = train_cfg.get("viz_crop_border_px")
     umap_cfg = dict(train_cfg.get("umap", {}))
-    compute_effective_rank = bool(train_cfg.get("compute_effective_rank", False))
     inference_visit_batches = int(train_cfg.get("inference_visit_batches", 32))
     inference_tta_enabled = bool(train_cfg.get("inference_tta_enabled", False))
     inference_tta_mode = str(train_cfg.get("inference_tta_mode", "flip4"))

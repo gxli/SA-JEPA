@@ -326,14 +326,33 @@ def _load_scale_probe_dash_data(session_dir: str) -> dict[str, np.ndarray]:
 
 
 def _has_required_branch_artifacts(results_dir: str, branch: str) -> bool:
-    has_shape = os.path.exists(os.path.join(results_dir, f"{branch}_spatial_shape.npy"))
-    has_pca = os.path.exists(os.path.join(results_dir, f"{branch}_pca_xyz.npy"))
-    has_umap_map = os.path.exists(os.path.join(results_dir, f"{branch}_umap_xyz.npy"))
+    candidates = [
+        (f"{branch}_spatial_shape.npy", None),
+        (f"{branch}_pca_xyz.npy", f"volumetric_pca_xyz.npy"),
+        (f"{branch}_umap_xyz.npy", f"volumetric_umap_xyz.npy"),
+    ]
+    has_shape = False
+    has_pca = False
+    has_umap = False
+    for name, fallback in candidates:
+        if os.path.exists(os.path.join(results_dir, name)):
+            if "spatial_shape" in name:
+                has_shape = True
+            elif "pca" in name:
+                has_pca = True
+            elif "umap" in name:
+                has_umap = True
+        elif fallback and os.path.exists(os.path.join(results_dir, fallback)):
+            if "pca" in fallback:
+                has_pca = True
+            elif "umap" in fallback:
+                has_umap = True
     has_umap_legacy = all(
         os.path.exists(os.path.join(results_dir, f"{branch}_umap_{axis}.npy"))
         for axis in ("x", "y", "z")
     )
-    return has_shape and has_pca and (has_umap_map or has_umap_legacy)
+    # 3D volumetric sessions use volumetric_* naming; spatial_shape is optional.
+    return has_pca and (has_umap or has_umap_legacy)
 
 
 def _has_min_dashboard_artifacts(session_dir: str) -> bool:
@@ -611,17 +630,27 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             f"expected (3,{hh},{ww}) or ({hh * ww},3)"
         )
 
+    def _resolve_artifact_path(base_name: str, volumetric_name: str) -> str | None:
+        path = os.path.join(results_dir, base_name)
+        if os.path.exists(path):
+            return path
+        vpath = os.path.join(results_dir, volumetric_name)
+        if os.path.exists(vpath):
+            return vpath
+        return None
+
     def _load_xyz_triplet(prefix: str, kind: str, hh: int, ww: int) -> np.ndarray:
         if kind == "pca":
-            path = os.path.join(results_dir, f"{prefix}_pca_xyz.npy")
-            if not os.path.exists(path):
+            path = _resolve_artifact_path(f"{prefix}_pca_xyz.npy", "volumetric_pca_xyz.npy")
+            if not path:
                 raise RuntimeError(
-                    f"{session_dir}: missing required artifact {path}\n"
-                    f"hint: run training/inference export that writes results/{prefix}_pca_xyz.npy"
+                    f"{session_dir}: missing required PCA artifact "
+                    f"(results/{prefix}_pca_xyz.npy or results/volumetric_pca_xyz.npy)\n"
+                    "hint: run training/inference to generate PCA artifacts"
                 )
             return _chw_or_n3_to_xyz(np.load(path), hh, ww, path)
-        xyz_path = os.path.join(results_dir, f"{prefix}_umap_xyz.npy")
-        if os.path.exists(xyz_path):
+        xyz_path = _resolve_artifact_path(f"{prefix}_umap_xyz.npy", "volumetric_umap_xyz.npy")
+        if xyz_path:
             return _chw_or_n3_to_xyz(np.load(xyz_path), hh, ww, xyz_path)
         ux = os.path.join(results_dir, f"{prefix}_umap_x.npy")
         uy = os.path.join(results_dir, f"{prefix}_umap_y.npy")
