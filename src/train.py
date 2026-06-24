@@ -569,7 +569,7 @@ class _MaskingCollator:
         self.mask_box_size_range = model.mask_box_size_range
         self.random_mask_box_per_target = bool(getattr(model, "random_mask_box_per_target", False))
         self.manual_mask_box_sizes = model.manual_mask_box_sizes
-        self.encoder_border_margin = int(model.encoder_receptive_field()) if hasattr(model, "encoder_receptive_field") else 0
+        self.encoder_border_margin = int(model.encoder_receptive_field()) // 2 if hasattr(model, "encoder_receptive_field") else 0
         self.context_kwargs = {
             "sigmas": model.sigmas,
             "mask_fraction": model.mask_fraction,
@@ -656,7 +656,7 @@ def _prepare_context_from_model(
     )
     mask_scale, mask_box_size = model.sample_mask_params(device=x_clean.device)
     invalid_pixel_mask = ~torch.isfinite(x_clean)
-    border_margin = int(model.encoder_receptive_field()) if hasattr(model, "encoder_receptive_field") else 0
+    border_margin = int(model.encoder_receptive_field()) // 2 if hasattr(model, "encoder_receptive_field") else 0
     border = int(max(0, min(border_margin, int(x_clean.shape[-2]) // 2, int(x_clean.shape[-1]) // 2)))
     if border > 0:
         invalid_pixel_mask = invalid_pixel_mask.clone()

@@ -358,7 +358,7 @@ class PyramidGridJEPA(nn.Module):
         if invalid_pixel_mask.dim() != 4:
             return invalid_pixel_mask
         _, _, h, w = invalid_pixel_mask.shape
-        border = int(max(0, min(self.encoder_receptive_field(), h // 2, w // 2)))
+        border = int(max(0, min(self.encoder_receptive_field() // 2, h // 2, w // 2)))
         if border <= 0:
             return invalid_pixel_mask
         out = invalid_pixel_mask.clone()

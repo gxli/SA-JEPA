@@ -317,7 +317,7 @@ def _run_tiled_dense_inference_2d(
     if b != 1:
         raise RuntimeError("Tiled 2D dashboard inference currently expects batch size 1")
     rf = _encoder_receptive_field_2d(model)
-    margin = min(rf, max(0, (int(tile_size) - 1) // 2))
+    margin = min(rf // 2, max(0, (int(tile_size) - 1) // 2))
     overlap_eff = max(2 * margin, int(tile_overlap) if tile_overlap is not None else 0)
     overlap_eff = min(max(0, overlap_eff), max(0, int(tile_size) - 1))
     y_starts = _tile_starts_2d(h, tile_size, overlap_eff)
@@ -799,7 +799,7 @@ def run_post_training_inference(
     _save_npz(os.path.join(session_dir, "target_energy_point_map.npz"), inference_outputs["target_energy_point_map"].numpy())
     _save_npz(os.path.join(session_dir, "target_energy_count_map.npz"), inference_outputs["target_energy_count_map"].numpy())
     encoder_rf = int(_encoder_receptive_field_2d(model))
-    discard_margin = int(max(0, encoder_rf))
+    discard_margin = int(max(0, encoder_rf // 2))
     with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
