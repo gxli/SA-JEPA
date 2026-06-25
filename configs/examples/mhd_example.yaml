@@ -11,6 +11,8 @@ model:
   mode: pyramid
   model_key: cdd_scaleaware_convnext
   mask_size_scaling: 1.2
+  sigmas: [2, 4, 8, 16, 32]
+  mask_box_hardcap: 48
 
 train:
   epochs: 10

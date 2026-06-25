@@ -17,9 +17,9 @@ config = {
     },
     "model": {
         "mask_size_scaling": 1.2,
-        # "sigmas": [2, 4, 8, 16],
+        "sigmas": [2, 4, 8, 16, 32],
+        "mask_box_hardcap": 48,
         # "convnext_layer_dilations": [1,1,2,4],
-        # "mask_box_hardcap": 48,
         "normalize_loss_l2": False,
         # "use_symmetric_feature_loss": False,
     },

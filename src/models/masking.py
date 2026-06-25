@@ -577,6 +577,7 @@ def make_pyramid_grid_context(
     target_invalid_region_skip: bool = True,
     target_invalid_region_values=(0.0, "nan"),
     invalid_pixel_mask: Optional[torch.Tensor] = None,
+    target_mask: Optional[torch.Tensor] = None,
     target_sampling_mode: str = "random",
     priority_top_percent: float = 5.0,
     priority_n_target: int | str = 20,
@@ -1233,6 +1234,7 @@ def prepare_context_batch(
     cdd_orig_in: Optional[torch.Tensor] = None,
     use_cdd: bool = True,
     invalid_pixel_mask_in: Optional[torch.Tensor] = None,
+    target_mask: Optional[torch.Tensor] = None,
 ):
     """Prepare context tensors from a clean batch.
 
@@ -1246,6 +1248,11 @@ def prepare_context_batch(
             device=invalid_pixel_mask.device,
             dtype=torch.bool,
         )
+    if target_mask is not None:
+        # Invert user target_mask: 1 = valid target, 0 = skip.
+        target_exclude = ~target_mask.to(device=invalid_pixel_mask.device, dtype=torch.bool)
+        if target_exclude.shape[-2:] == invalid_pixel_mask.shape[-2:]:
+            invalid_pixel_mask = invalid_pixel_mask | target_exclude
     if invalid_pixel_mask.any():
         x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
 

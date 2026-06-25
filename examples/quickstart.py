@@ -12,7 +12,7 @@ DATA = os.path.join(ROOT, "data", "C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.
 model = ScaleAwareJEPA(config={
     "data": {"data_root": os.path.dirname(DATA), "npy_pattern": os.path.basename(DATA),
              "num_samples": 200, "d4_augment": True},
-    "model": {"mask_size_scaling": 1.2},
+    "model": {"mask_size_scaling": 1.2, "sigmas": [2, 4, 8, 16, 32], "mask_box_hardcap": 48},
     "train": {"epochs": 10, "symmetry_loss_weight": 0.0,
               "spread_regularizer": {"type": "std_hinge", "target": "context",
               "spatial_mode": "pooled", "weight": 5.0, "target_std": 1.0}},

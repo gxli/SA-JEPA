@@ -580,6 +580,7 @@ class _MaskingCollator:
         model: PyramidGridJEPA,
         return_debug: bool = False,
         require_precomputed_cdd: bool = False,
+        target_mask: Optional[torch.Tensor] = None,
     ):
         enc_type = str(getattr(model, "encoder_type", "")).lower()
         self.use_cdd = bool(enc_type in CDD_CUBE_ENCODER_TYPES)
@@ -596,6 +597,8 @@ class _MaskingCollator:
         self.random_mask_box_per_target = bool(getattr(model, "random_mask_box_per_target", False))
         self.manual_mask_box_sizes = model.manual_mask_box_sizes
         self.encoder_border_margin = int(model.encoder_receptive_field()) // 2 if hasattr(model, "encoder_receptive_field") else 0
+        self.target_mask = target_mask
+        self.target_threshold = target_threshold
         self.context_kwargs = {
             "sigmas": model.sigmas,
             "mask_fraction": model.mask_fraction,
@@ -656,6 +659,11 @@ class _MaskingCollator:
             invalid_pixel_mask[:, :, int(x_clean.shape[-2]) - border :, :] = True
             invalid_pixel_mask[:, :, :, :border] = True
             invalid_pixel_mask[:, :, :, int(x_clean.shape[-1]) - border :] = True
+        batch_target_mask = self.target_mask
+        if self.target_threshold is not None and batch_target_mask is None:
+            # Auto-generate from raw data: pixels > threshold are valid targets
+            raw = x_clean[:, 0] if x_clean.dim() == 4 else x_clean
+            batch_target_mask = (raw > self.target_threshold).to(torch.bool)
         context_data = prepare_context_batch(
             x_clean=x_clean,
             mask_scale=mask_scale,
@@ -663,6 +671,7 @@ class _MaskingCollator:
             mask_box_size_range=self.mask_box_size_range,
             cdd_orig_in=cdd_orig_in,
             invalid_pixel_mask_in=invalid_pixel_mask,
+            target_mask=batch_target_mask,
             **self.context_kwargs,
         )
         x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1808,10 +1817,22 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     train_sampler = DistributedSampler(train_dataset) if is_ddp else None
     val_sampler = None
 
+    target_mask = None
+    target_threshold = data_cfg.get("target_threshold")
+    if target_threshold is not None:
+        target_threshold = float(target_threshold)
+    if data_cfg.get("target_mask"):
+        import numpy as np
+        mask_path = os.path.join(data_cfg.get("data_root", "data"), data_cfg["target_mask"])
+        if os.path.exists(mask_path):
+            target_mask = torch.from_numpy(np.load(mask_path).astype(np.float32))
+            log_info(f"[{config_name}] target_mask loaded: {mask_path} shape={tuple(target_mask.shape)}")
+
     masking_collate = None if is_3d_mode else _MaskingCollator(
         model,
         return_debug=bool(train_cfg.get("debug_masking_tensors", False)),
         require_precomputed_cdd=bool(cdd_cache),
+        target_mask=target_mask,
     )
     if is_main_process and (not is_3d_mode) and str(getattr(model, "encoder_type", "")).lower() in CDD_CUBE_ENCODER_TYPES:
         log_info(

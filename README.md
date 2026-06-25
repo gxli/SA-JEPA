@@ -138,14 +138,9 @@ print(f"Interactive:   {umap_html}")
 
 ### ⚙️ Config-driven
 
-> **⚠️ Always inherit from the base config.** The base config provides 75
-> essential defaults (model architecture, CDD pipeline, optimizer, target
-> sampling). Without it, training silently collapses — wrong encoder size,
-> broken spread loss, empty UMAP config. Every custom YAML must start with:
-> ```yaml
-> base_config: path/to/base_pyramid_scaleaware_convnext.yaml
-> ```
-> The examples in `configs/examples/` and `configs/local_configs/` all do this.
+> 📘 Every config path (API, CLI, and YAML) automatically inherits from the
+> base config. You only need to specify the keys you want to override. See
+> [Configuration Knobs Dictionary](configs/README.md) for the full default set.
 
 ```python
 from sajepa import ScaleAwareJEPA
@@ -229,8 +224,12 @@ containing the following baseline artifacts:
 
 ## ⚙️ Hyperparameter Knobs
 
-The configurations sitting underneath your default `ScaleAwareJEPA()` pipeline
-track these baseline starting targets:
+All configs inherit from `base_pyramid_scaleaware_convnext.yaml` (loaded
+automatically by every entry point — API, CLI, and config-driven paths).
+The exhaustive breakdown of all 75+ parameters is in
+[**Configuration Knobs Dictionary**](configs/README.md).
+
+### Baseline Production Targets:
 
 **Training Settings**
 
