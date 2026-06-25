@@ -11,20 +11,22 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
 import plotly.graph_objects as go
 import torch
-from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap
+from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap, _target_region_mask_from_outputs
 
 
-DASHBOARD_VERSION = "production-diagnostics-v6-spread-table"
+DASHBOARD_VERSION = "production-diagnostics-v11-border-nan-fit-finite"
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.join(ROOT_DIR, "scripts")
 
 DASH_DATA_REQUIRED = {
     "dashboard_version",
+    "rgb_render_source",
     "orig",
     "target",
     "target_loc_heatmap",
@@ -95,6 +97,7 @@ def _read_config_file(path: str, seen: set[str] | None = None) -> dict[str, Any]
         else:
             cfg = json.load(f)
     if not isinstance(cfg, dict):
+        seen.remove(abs_path)
         return {}
     base_ref = cfg.pop("base_config", None)
     if base_ref is not None:
@@ -493,11 +496,34 @@ def _rgb_from_xyz(
     clipped = np.clip((xyz - lo) / den, 0.0, 1.0)
     if not bright_top:
         clipped = 1.0 - clipped
-    # NaN sentinels → black (no-data marker)
-    clipped[~fin] = 0.0
+    clipped[~fin] = 1.0
     rgb_flat = np.clip(np.round(clipped * 255.0), 0, 255).astype(np.uint8)
     rgb = rgb_flat.reshape(h, w, 3)
     return rgb, rgb_flat
+
+
+def _fill_invalid_rgb_from_nearest(rgb: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Fill invalid display pixels from nearest valid row/column, preserving shape."""
+    out = np.asarray(rgb, dtype=np.uint8).copy()
+    mask = np.asarray(valid, dtype=bool)
+    if out.ndim != 3 or out.shape[:2] != mask.shape or not mask.any() or mask.all():
+        return out
+    yy, xx = np.nonzero(mask)
+    y0, y1 = int(yy.min()), int(yy.max())
+    x0, x1 = int(xx.min()), int(xx.max())
+    bad_y, bad_x = np.nonzero(~mask)
+    if bad_y.size == 0:
+        return out
+    src_y = np.clip(bad_y, y0, y1)
+    src_x = np.clip(bad_x, x0, x1)
+    fallback = out[src_y, src_x]
+    still_bad = ~mask[src_y, src_x]
+    if np.any(still_bad):
+        # Rare non-rectangular holes: use the median valid colour rather than
+        # turning missing display pixels into a fake black structure.
+        fallback[still_bad] = np.median(out[mask], axis=0).astype(np.uint8)
+    out[bad_y, bad_x] = fallback
+    return out
 
 
 def _xyz_from_feature_map(feat: np.ndarray) -> np.ndarray:
@@ -548,6 +574,44 @@ def _apply_latent_border_nan(z: np.ndarray, h: int, w: int, border_px: int) -> n
     out[:, :b, :] = np.nan
     out[:, w - b :, :] = np.nan
     return out.reshape(h * w, arr.shape[1])
+
+
+def _expected_full_frame_hw(session_dir: str) -> tuple[int, int] | None:
+    profile_path = os.path.join(session_dir, "data_profile.json")
+    if not os.path.exists(profile_path):
+        return None
+    try:
+        with open(profile_path, "r", encoding="utf-8") as f:
+            profile = json.load(f)
+        files = profile.get("files", []) if isinstance(profile, dict) else []
+        if not files:
+            return None
+        shape = files[0].get("shape")
+        if not isinstance(shape, list) or len(shape) < 2:
+            return None
+        return int(shape[-2]), int(shape[-1])
+    except Exception:
+        return None
+
+
+def _assert_not_stale_cropped_inference(session_dir: str, observed_hw: tuple[int, int]) -> None:
+    cfg, _cfg_path = _load_session_config(session_dir)
+    train_cfg = cfg.get("train", {}) if isinstance(cfg, dict) else {}
+    max_diag = train_cfg.get("inference_max_diagnostic_size") if isinstance(train_cfg, dict) else None
+    try:
+        full_frame_requested = max_diag is None or int(max_diag) <= 0
+    except (TypeError, ValueError):
+        full_frame_requested = str(max_diag).strip().lower() in ("", "none", "false", "full")
+    if not full_frame_requested:
+        return
+    expected_hw = _expected_full_frame_hw(session_dir)
+    if expected_hw is None or tuple(observed_hw) == tuple(expected_hw):
+        return
+    raise RuntimeError(
+        f"{session_dir}: stale/cropped inference_outputs.pt has image shape {tuple(observed_hw)} "
+        f"but config requests full-frame inference and data_profile shape is {tuple(expected_hw)}. "
+        "Delete inference_outputs.pt and dash_data.npz, then rerun with --recompute-inference."
+    )
 
 
 def _apply_xyz_border_nan(xyz: np.ndarray, h: int, w: int, border_px: int) -> np.ndarray:
@@ -660,6 +724,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     orig = _display_scalar_from_batched_tensor(x_clean)
     blurred = _display_scalar_from_batched_tensor(ctx_raw)
     h, w = orig.shape
+    _assert_not_stale_cropped_inference(session_dir, (h, w))
 
     # Always render target locations as center points (not square footprints).
     target_locations = outputs.get("target_locations")
@@ -720,6 +785,23 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             visit_heatmap = np.zeros((h, w), dtype=np.float32)
     else:
         visit_heatmap = np.zeros((h, w), dtype=np.float32)
+
+    # Apply target-region mask to image-resolution heatmaps so non-masked
+    # regions appear as NaN (transparent) in the dashboard.
+    if "target_mask_map" in outputs:
+        mask_img = _target_region_mask_from_outputs(outputs, h, w)
+        if mask_img is not None and mask_img.any():
+            print(f"dashboard_mask_heatmap_filter={session_dir} "
+                  f"masked_pixels={int(mask_img.sum())}/{int(mask_img.size)} "
+                  f"({100.0*mask_img.sum()/max(1,mask_img.size):.1f}%)")
+            energy_map = energy_map.copy()
+            energy_map[~mask_img] = np.nan
+            target_loc_heatmap = target_loc_heatmap.copy()
+            target_loc_heatmap[~mask_img] = np.nan
+            visit_heatmap = visit_heatmap.copy()
+            visit_heatmap[~mask_img] = np.nan
+        else:
+            print(f"dashboard_mask_heatmap_filter={session_dir} empty_or_none")
 
     # Dashboard-only pyramid mask stack (S,H,W), reconstructed from inference
     # tensors/artifacts. This is not written as a standalone debug file.
@@ -792,6 +874,19 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     if pred_map is None:
         raise RuntimeError(f"{session_dir}: inference outputs missing pred_map")
     h_lat, w_lat = int(pred_map.shape[-2]), int(pred_map.shape[-1])
+
+    target_region_mask_lat = None
+    mask_inference_flag = bool(outputs.get("mask_inference", False))
+    if "target_mask_map" in outputs:
+        target_region_mask_lat_raw = _target_region_mask_from_outputs(outputs, h_lat, w_lat)
+        target_region_mask_lat = target_region_mask_lat_raw.reshape(-1).copy()
+        if target_region_mask_lat is not None:
+            n_mask = int(target_region_mask_lat.sum())
+            n_total = int(target_region_mask_lat.size)
+            print(f"dashboard_mask_filter={session_dir} "
+                  f"mask_inference={mask_inference_flag} "
+                  f"masked_tokens={n_mask}/{n_total} "
+                  f"({100.0*n_mask/max(1,n_total):.1f}%)")
     config_border = _latent_margin_from_config(session_dir)
     if config_border is not None:
         latent_border_px = int(max(0, config_border))
@@ -800,7 +895,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     else:
         latent_border_px = 0
     if latent_border_px > 0:
-        print(f"dashboard_latent_border_nan={session_dir} border_px={latent_border_px}")
+        print(f"dashboard_latent_border_filter={session_dir} border_px={latent_border_px} visual_border=off")
 
     def _chw_or_n3_to_xyz(arr: np.ndarray, hh: int, ww: int, path: str) -> np.ndarray:
         xyz = np.asarray(arr, dtype=np.float32)
@@ -883,7 +978,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         xyz = _xyz_from_feature_map(_to_np(src_map))
         if xyz.shape[0] != h_lat * w_lat:
             return np.zeros((h_lat * w_lat, 3), dtype=np.float32)
-        return _apply_xyz_border_nan(xyz, h_lat, w_lat, latent_border_px)
+        return xyz
 
     def _slice_latent_vectors(prefix_out: str) -> np.ndarray:
         if prefix_out == "pred":
@@ -897,13 +992,15 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         z = _latent_vectors_from_feature_map(_to_np(src_map))
         if z.shape[0] != h_lat * w_lat:
             return np.zeros((0, 0), dtype=np.float32)
-        return _apply_latent_border_nan(z, h_lat, w_lat, latent_border_px)
+        return z
 
     def _compute_slice_pca_umap(prefix_out: str) -> tuple[np.ndarray, np.ndarray]:
         z = _slice_latent_vectors(prefix_out)
         if z.ndim != 2 or z.shape[0] != h_lat * w_lat or z.shape[1] == 0:
             empty = np.full((h_lat * w_lat, 3), np.nan, dtype=np.float32)
             return empty, empty.copy()
+        if latent_border_px > 0:
+            z = _apply_latent_border_nan(z, h_lat, w_lat, latent_border_px)
         valid = np.isfinite(z).all(axis=1)
         pca = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
         um = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
@@ -945,20 +1042,19 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
     bundles = {}
     for prefix_saved, prefix_out in (("context", "context"), ("predict", "pred"), ("target", "gt")):
-        if fallback_mode:
-            pca, um = _compute_slice_pca_umap(prefix_out)
-            hh, ww = h_lat, w_lat
-            pca_rgb, pca_rgb_flat = _rgb_from_xyz(pca, hh, ww)
-            um_rgb, um_rgb_flat = _rgb_from_xyz(um, hh, ww)
-            bundles[prefix_out] = {
-                "pca3d": pca,
-                "umap3d": um,
-                "pca_rgb": pca_rgb,
-                "pca_rgb_flat": pca_rgb_flat,
-                "umap_rgb": um_rgb,
-                "umap_rgb_flat": um_rgb_flat,
-            }
-            continue
+        pca, um = _compute_slice_pca_umap(prefix_out)
+        hh, ww = h_lat, w_lat
+        pca_rgb, pca_rgb_flat = _rgb_from_xyz(pca, hh, ww)
+        um_rgb, um_rgb_flat = _rgb_from_xyz(um, hh, ww)
+        bundles[prefix_out] = {
+            "pca3d": pca,
+            "umap3d": um,
+            "pca_rgb": pca_rgb,
+            "pca_rgb_flat": pca_rgb_flat,
+            "umap_rgb": um_rgb,
+            "umap_rgb_flat": um_rgb_flat,
+        }
+        continue
         src_prefix = prefix_saved
         try:
             hh, ww = _load_hw(src_prefix)
@@ -988,15 +1084,13 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             pca, um = _compute_slice_pca_umap(prefix_out)
             hh, ww = h_lat, w_lat
         else:
-            if latent_border_px <= 0 and (not np.isfinite(pca).all() or not np.isfinite(um).all()):
+            if not np.isfinite(pca).all() or not np.isfinite(um).all():
                 print(
                     f"dashboard_note={session_dir}: {prefix_out} embedding artifact has NaN pixels "
-                    "while inference_discard_margin=0; recomputing slice PCA/UMAP"
+                    "from an older masked/bordered export; recomputing slice PCA/UMAP"
                 )
                 pca, um = _compute_slice_pca_umap(prefix_out)
                 hh, ww = h_lat, w_lat
-            pca = _apply_xyz_border_nan(pca, hh, ww, latent_border_px)
-            um = _apply_xyz_border_nan(um, hh, ww, latent_border_px)
             valid_pair = np.isfinite(pca).all(axis=1) & np.isfinite(um).all(axis=1)
             if int(np.count_nonzero(valid_pair)) > 0:
                 diff = np.linalg.norm((pca[valid_pair] - um[valid_pair]).reshape(-1))
@@ -1191,6 +1285,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
     dash_payload = dict(
         dashboard_version=np.asarray(DASHBOARD_VERSION),
+        rgb_render_source=np.asarray("latent_border_nan_fit_finite_rgb_invalid_white"),
         orig=orig,
         blurred=blurred,
         target=target.astype(np.float32),
@@ -2265,6 +2360,15 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     ms_summary = data.get("mask_config_summary", np.array([], dtype=str))
     er_y = data.get("effective_rank_y", np.array([], dtype=np.float32))
     latest_er = float(er_y[-1]) if len(er_y) > 0 and np.isfinite(er_y[-1]) else None
+    dash_data_version = str(np.asarray(data.get("dashboard_version", np.asarray("missing"))).reshape(-1)[0])
+    rgb_render_source = str(np.asarray(data.get("rgb_render_source", np.asarray("missing"))).reshape(-1)[0])
+    generated_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    build_banner_html = (
+        f'<span class="build-chip strong">html={html_lib.escape(DASHBOARD_VERSION)}</span>'
+        f'<span class="build-chip">dash_data={html_lib.escape(dash_data_version)}</span>'
+        f'<span class="build-chip">rgb={html_lib.escape(rgb_render_source)}</span>'
+        f'<span class="build-chip">generated={html_lib.escape(generated_utc)}</span>'
+    )
 
     summary_parts = []
     for s in ms_summary:
@@ -2285,6 +2389,9 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     .topbar {{ margin: 0 0 12px 2px; }}
     h1 {{ margin: 0; font-size: 24px; font-weight: 650; color: #0d1527; }}
     .version {{ color: #596275; font-size: 13px; font-weight: 600; margin-left: 8px; }}
+    .build-banner {{ margin: 8px 0 10px 0; padding: 10px 12px; background: #fff7d6; border: 2px solid #f0b429; border-radius: 8px; color: #1f2937; font-size: 14px; font-weight: 650; }}
+    .build-chip {{ display: inline-block; margin-right: 14px; }}
+    .build-chip.strong {{ color: #9a3412; font-weight: 800; }}
     .mask-summary {{ margin: 0 0 18px 2px; padding: 14px 18px; background: #fff; border: 1px solid #d9deea; border-radius: 8px; font-size: 15px; line-height: 1.8; }}
     .mask-summary .val {{ color: #3a4055; margin-right: 20px; }}
     .mask-summary .erank {{ display: inline-block; margin-left: 8px; padding: 4px 14px; background: #1a1a2e; color: #fde725; border-radius: 6px; font-weight: 700; font-size: 17px; }}
@@ -2306,6 +2413,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
 <body>
   <div class="topbar">
     <h1>JEPA Session Dashboard: {os.path.basename(session_dir)} <span class="version">{DASHBOARD_VERSION}</span></h1>
+    <div class="build-banner">{build_banner_html}</div>
   </div>
   <div class="mask-summary">{mask_summary_html}</div>
   <div class="grid">{''.join(rendered)}</div>

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from src.losses import representation_dense_energy
-from src.models.masking import norm_per_sample_channel
+from src.models.masking import extract_location_patches, norm_per_sample_channel, prepare_context_batch
 
 
 def _save_npz(path: str, arr: np.ndarray) -> None:
@@ -318,6 +318,90 @@ def _dense_forward_2d_tile(model, x_tile: torch.Tensor, cdd_tile: torch.Tensor |
     }
 
 
+def _prepare_full_mask_debug_2d(
+    *,
+    model,
+    x_raw_cpu: torch.Tensor,
+    cdd_raw_cpu: torch.Tensor | None,
+    lattice_shift_override: tuple[int, int] = (0, 0),
+) -> dict[str, torch.Tensor]:
+    """Build full-frame mask/debug tensors without using them as encoder input."""
+    mask_scale, mask_box_size = model.sample_mask_params(device=x_raw_cpu.device)
+    invalid_pixel_mask = ~torch.isfinite(x_raw_cpu)
+    border_margin = int(model.encoder_receptive_field()) // 2 if hasattr(model, "encoder_receptive_field") else 0
+    border = int(max(0, min(border_margin, int(x_raw_cpu.shape[-2]) // 2, int(x_raw_cpu.shape[-1]) // 2)))
+    if border > 0:
+        invalid_pixel_mask = invalid_pixel_mask.clone()
+        invalid_pixel_mask[:, :, :border, :] = True
+        invalid_pixel_mask[:, :, int(x_raw_cpu.shape[-2]) - border :, :] = True
+        invalid_pixel_mask[:, :, :, :border] = True
+        invalid_pixel_mask[:, :, :, int(x_raw_cpu.shape[-1]) - border :] = True
+    context_data = prepare_context_batch(
+        x_clean=x_raw_cpu,
+        sigmas=model.sigmas,
+        mask_fraction=model.mask_fraction,
+        mask_scale=float(mask_scale),
+        spacing_scale=model.spacing_scale,
+        global_shift=model.global_shift,
+        align_scales=model.align_scales,
+        mask_box_size=int(mask_box_size),
+        mask_box_size_range=model.mask_box_size_range,
+        random_mask_box_per_target=getattr(model, "random_mask_box_per_target", False),
+        manual_mask_box_sizes=model.manual_mask_box_sizes,
+        cdd_mode=model.cdd_mode,
+        cdd_constrained=model.cdd_constrained,
+        cdd_sm_mode=model.cdd_sm_mode,
+        cdd_append_last_residual=model.cdd_append_last_residual,
+        cdd_pre_log_transform=model.cdd_pre_log_transform,
+        patch_size=model.patch_size,
+        return_debug=True,
+        enable_grid_jitter=False,
+        enable_target_dithering=False,
+        lattice_shift_override=lattice_shift_override,
+        target_invalid_region_skip=model.target_invalid_region_skip,
+        target_invalid_region_values=model.target_invalid_region_values,
+        target_sampling_mode=model.target_sampling_mode,
+        priority_top_percent=model.priority_top_percent,
+        priority_n_target=model.priority_n_target,
+        priority_min_targets_per_map=model.priority_min_targets_per_map,
+        priority_dithering_pixels=model.priority_dithering_pixels,
+        priority_candidate_oversample=model.priority_candidate_oversample,
+        target_nonoverlap=getattr(model, "target_nonoverlap", False),
+        target_allow_partial_overlap=getattr(model, "target_allow_partial_overlap", 0.0),
+        mask_box_hardcap=getattr(model, "mask_box_hardcap", None),
+        cdd_use_gpu=False,
+        cdd_orig_in=cdd_raw_cpu,
+        use_cdd=cdd_raw_cpu is not None,
+        invalid_pixel_mask_in=invalid_pixel_mask,
+    )
+    debug = context_data[4] if len(context_data) > 4 else {}
+    out = {
+        "target_locations": context_data[1],
+        "target_scales": context_data[2],
+        "target_valid": context_data[3],
+    }
+    if "mask_map" in debug:
+        out["target_mask_map"] = debug["mask_map"].unsqueeze(1)
+    for src, dst in (
+        ("cdd_channels_orig", "cdd_channels_orig"),
+        ("cdd_channels_masked", "cdd_channels_masked"),
+        ("dip_field_per_channel", "dip_field_per_channel"),
+    ):
+        if src in debug:
+            out[dst] = debug[src]
+    if "dip_field_per_channel" in out:
+        out["pyramid_mask_token"] = out["dip_field_per_channel"]
+    for key in (
+        "priority_good_candidates",
+        "priority_nonzero_mean",
+        "priority_auto_base_targets",
+        "priority_effective_targets",
+    ):
+        if key in debug:
+            out[key] = debug[key]
+    return out
+
+
 def _run_tiled_dense_inference_2d(
     *,
     model,
@@ -398,35 +482,20 @@ def _run_tiled_dense_inference_2d(
     return {key: value / weight for key, value in sums.items()}
 
 
-def _first_full_resolution_batch(dataloader, max_diagnostic_size: int | None = None):
+def _first_full_resolution_batch(dataloader):
     """Fetch a single batch for diagnostic visualization.
 
-    Enforces a max size to prevent GPU OOM and 100MB+ HTML crashes
-    on very large images (e.g. 2000×2000+).
+    Always returns the native sample. Post-training diagnostics must preserve
+    field of view; memory control belongs to tiled inference, not cropping.
     """
     dataset = getattr(dataloader, "dataset", None)
     if dataset is None or not hasattr(dataset, "__getitem__"):
         return None
     old = {}
 
-    # Native/full-frame inference is the default. A diagnostic crop is only
-    # applied when max_diagnostic_size is explicitly positive.
-    needs_safety_crop = False
-    if max_diagnostic_size is not None and int(max_diagnostic_size) > 0:
-        try:
-            sample_path = dataset.sample_index[0][0]
-            shape = dataset._probe_file_shape(sample_path)
-            if shape[-2] > int(max_diagnostic_size) or shape[-1] > int(max_diagnostic_size):
-                needs_safety_crop = True
-        except Exception:
-            pass
-
-    target_crop_mode = "center" if needs_safety_crop else "none"
-    target_crop_size = int(max_diagnostic_size) if needs_safety_crop else None
-
     for name, value in (
-        ("crop_mode", target_crop_mode),
-        ("crop_size", target_crop_size),
+        ("crop_mode", "none"),
+        ("crop_size", None),
         ("d4_augment", False),
         ("crop_min_valid_fraction", 0.0),
     ):
@@ -509,7 +578,17 @@ def run_post_training_inference(
     model.eval()
     with torch.no_grad():
         print(f"[{config_name}] post_training_inference loading sample batch")
-        raw_batch = _first_full_resolution_batch(dataloader, max_diagnostic_size=max_diagnostic_size)
+        if max_diagnostic_size is not None:
+            try:
+                if int(max_diagnostic_size) > 0:
+                    print(
+                        f"[{config_name}] post_training_inference ignoring "
+                        f"inference_max_diagnostic_size={int(max_diagnostic_size)} "
+                        "because post-training inference always preserves full image shape"
+                    )
+            except (TypeError, ValueError):
+                pass
+        raw_batch = _first_full_resolution_batch(dataloader)
         if raw_batch is None:
             raw_batch = next(iter(dataloader))
         else:
@@ -525,14 +604,12 @@ def run_post_training_inference(
             x_raw.dim() == 4
             and tile_size is not None
             and int(tile_size) > 0
-            and (int(x_raw.shape[-2]) > int(tile_size) or int(x_raw.shape[-1]) > int(tile_size))
         )
         if bool(mask_inference) and use_tiled_2d:
-            raise ValueError(
-                "Masked post-training dashboard inference is not supported with "
-                "tiled dense inference. Set train.inference_max_diagnostic_size "
-                "so the dashboard sample fits in one forward pass, or run with "
-                "train.mask_inference=false for dense full-frame diagnostics."
+            print(
+                f"[{config_name}] tiled dense inference with mask diagnostics: "
+                "encoder runs clean full-frame tiles; mask/debug tensors are "
+                "computed full-frame and applied downstream"
             )
         shifts = [(0, 0)]
         print(f"[{config_name}] post_training_inference model forward deterministic_shifts=1")
@@ -562,6 +639,14 @@ def run_post_training_inference(
                 mask_inference=False,
                 cdd_orig=cdd_probe,
             )
+            mask_debug_full = {}
+            if bool(mask_inference):
+                mask_debug_full = _prepare_full_mask_debug_2d(
+                    model=model,
+                    x_raw_cpu=x_raw.detach().cpu(),
+                    cdd_raw_cpu=None if cdd_raw is None else cdd_raw.detach().cpu(),
+                    lattice_shift_override=(0, 0),
+                )
             tiled = _run_tiled_dense_inference_2d(
                 model=model,
                 x_raw=x_raw.detach().cpu(),
@@ -584,12 +669,24 @@ def run_post_training_inference(
                 "pyramid_mask_token",
             ):
                 outputs.pop(key, None)
+            for key, value in mask_debug_full.items():
+                outputs[key] = value.to(x_raw.device) if torch.is_tensor(value) else value
+            outputs["pred_patches"] = extract_location_patches(
+                outputs["pred_map"],
+                outputs["target_locations"],
+                patch_size=int(getattr(model, "patch_size", 1)),
+            )
+            outputs["gt_patches"] = extract_location_patches(
+                outputs["gt_map"],
+                outputs["target_locations"],
+                patch_size=int(getattr(model, "patch_size", 1)),
+            )
             if cdd_raw is not None:
-                outputs["cdd_channels_orig"] = cdd_raw
-                outputs["cdd_channels_masked"] = cdd_raw
+                outputs.setdefault("cdd_channels_orig", cdd_raw)
+                outputs.setdefault("cdd_channels_masked", cdd_raw)
                 zero_cdd = torch.zeros_like(cdd_raw)
-                outputs["dip_field_per_channel"] = zero_cdd
-                outputs["pyramid_mask_token"] = zero_cdd
+                outputs.setdefault("dip_field_per_channel", zero_cdd)
+                outputs.setdefault("pyramid_mask_token", zero_cdd)
             bsz = int(x_raw.shape[0])
             energy_sum = tiled["energy_rel_sym"].to(x_raw.device, dtype=x_raw.dtype)
             count_map = torch.ones_like(energy_sum)
@@ -664,6 +761,8 @@ def run_post_training_inference(
         "inference_scope": "dashboard_sample_batch",
         "mask_inference": bool(mask_inference),
         "patch_size": int(getattr(model, "patch_size", 1)),
+        "inference_input_shape": tuple(int(v) for v in outputs["x_clean"].shape[-2:]),
+        "inference_pred_shape": tuple(int(v) for v in outputs["pred_map"].shape[-2:]),
         "inference_num_dataloader_batches_seen": 1,
         "inference_num_dataloader_batches_available": dataloader_len if dataloader_len is not None else -1,
         "x_clean_raw": outputs.get("x_clean_raw", outputs["x_clean"])[:8].detach().cpu(),
@@ -836,6 +935,8 @@ def run_post_training_inference(
                 "inference_tiled_dense_2d": bool(use_tiled_2d),
                 "inference_tile_size": None if tile_size is None else int(tile_size),
                 "inference_tile_overlap": None if tile_overlap is None else int(tile_overlap),
+                "inference_input_shape": list(inference_outputs["inference_input_shape"]),
+                "inference_pred_shape": list(inference_outputs["inference_pred_shape"]),
                 "inference_encoder_receptive_field": int(encoder_rf),
                 "inference_dense_output_receptive_field": int(dense_output_rf),
                 "inference_discard_margin": int(discard_margin),

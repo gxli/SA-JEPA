@@ -304,6 +304,58 @@ def _write_cdd_cache_profile(*, cdd_cache: dict | None, session_dir: str, config
         f.write("\n")
 
 
+def _expected_hw_from_data_profile(session_dir: str) -> tuple[int, int] | None:
+    profile_path = os.path.join(session_dir, "data_profile.json")
+    if not os.path.exists(profile_path):
+        return None
+    try:
+        with open(profile_path, "r", encoding="utf-8") as f:
+            profile = json.load(f)
+        files = profile.get("files", []) if isinstance(profile, dict) else []
+        if not files:
+            return None
+        shape = files[0].get("shape")
+        if not isinstance(shape, list) or len(shape) < 2:
+            return None
+        return int(shape[-2]), int(shape[-1])
+    except Exception:
+        return None
+
+
+def _full_frame_inference_shape_mismatch(
+    *,
+    session_dir: str,
+    train_cfg: dict,
+    inference_outputs_path: str,
+) -> str | None:
+    if not os.path.exists(inference_outputs_path) or os.path.getsize(inference_outputs_path) <= 0:
+        return None
+    max_diag = train_cfg.get("inference_max_diagnostic_size")
+    try:
+        full_frame_requested = max_diag is None or int(max_diag) <= 0
+    except (TypeError, ValueError):
+        full_frame_requested = str(max_diag).strip().lower() in ("", "none", "false", "full")
+    if not full_frame_requested:
+        return None
+    expected_hw = _expected_hw_from_data_profile(session_dir)
+    if expected_hw is None:
+        return None
+    try:
+        outputs = torch.load(inference_outputs_path, map_location="cpu")
+        x_clean = outputs.get("x_clean") if isinstance(outputs, dict) else None
+        if x_clean is None or not hasattr(x_clean, "shape") or len(x_clean.shape) < 2:
+            return None
+        observed_hw = (int(x_clean.shape[-2]), int(x_clean.shape[-1]))
+    except Exception as e:
+        return f"could not read existing inference_outputs.pt ({type(e).__name__}: {e})"
+    if observed_hw == expected_hw:
+        return None
+    return (
+        f"existing inference_outputs.pt shape={observed_hw} but current config requests "
+        f"full-frame shape={expected_hw}"
+    )
+
+
 def _cdd_disk_cache_paths(*, cache_dir: str, path: str, meta: dict) -> tuple[str, str]:
     abs_path = os.path.abspath(path)
     stat = os.stat(abs_path)
@@ -1547,6 +1599,21 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     has_tiled_2d_inference = bool(inference_summary.get("inference_tiled_dense_2d", False))
     requires_3d_full_xy_slice = is_3d_mode
     has_3d_full_xy_slice = bool(inference_summary.get("inference_3d_full_xy_slice", False))
+    stale_full_frame_reason = None
+    if not is_3d_mode and has_inference_outputs:
+        stale_full_frame_reason = _full_frame_inference_shape_mismatch(
+            session_dir=session_dir,
+            train_cfg=train_cfg,
+            inference_outputs_path=inference_outputs_path,
+        )
+        if stale_full_frame_reason is not None:
+            log_info(
+                f"[{config_name}] stale inference ignored: {stale_full_frame_reason}; "
+                "forcing post-training inference recompute."
+            )
+            has_inference_outputs = False
+            has_tiled_2d_inference = False
+            force_recompute_inference = True
     has_required_inference = has_inference_outputs and (
         has_tiled_2d_inference if requires_tiled_2d_inference else True
     ) and (

@@ -625,10 +625,10 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         valid_mask_2d[:, :border_px] = False
         valid_mask_2d[:, w_lat - border_px :] = False
         print(f"[dashboard] latent PCA/UMAP border mask: border_px={border_px}")
-    if bool(outputs.get("mask_inference", False)):
+    if bool(outputs.get("mask_inference", False)) or "target_mask_map" in outputs:
         target_region_mask = _target_region_mask_from_outputs(outputs, h_lat, w_lat)
         valid_mask_2d = valid_mask_2d & target_region_mask
-        print(f"[dashboard] latent PCA/UMAP masked-region filter: valid_pixels={int(valid_mask_2d.sum())}")
+        print(f"[dashboard] latent PCA/UMAP masked-region filter: valid_pixels={int(valid_mask_2d.sum())} mask_inference={bool(outputs.get('mask_inference', False))}")
     valid_mask_flat = valid_mask_2d.reshape(-1)  # [H_lat * W_lat]
 
     # Render sampled target locations for first sample.
