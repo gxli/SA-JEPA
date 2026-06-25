@@ -149,11 +149,13 @@ def _encoder_fov_border_from_config(session_dir: str) -> int:
 
 def _latent_border_from_summary_or_config(session_dir: str) -> int:
     cfg = _load_session_config(session_dir)
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
     train_cfg = cfg.get("train", {}) if isinstance(cfg, dict) else {}
-    if isinstance(train_cfg, dict) and "inference_discard_margin" in train_cfg:
+    source_cfg = model_cfg if isinstance(model_cfg, dict) and "viz_crop_border" in model_cfg else train_cfg
+    if isinstance(source_cfg, dict) and bool(source_cfg.get("viz_crop_border", False)):
         try:
-            value = train_cfg.get("inference_discard_margin")
-            if str(value).strip().lower() == "auto":
+            value = source_cfg.get("viz_crop_border_px", source_cfg.get("inference_discard_margin", "auto"))
+            if value is None or str(value).strip().lower() == "auto":
                 return _encoder_fov_border_from_config(session_dir)
             return int(max(0, value or 0))
         except (TypeError, ValueError):

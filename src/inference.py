@@ -265,6 +265,13 @@ def _dense_output_receptive_field_2d(model) -> int:
     return max(1, int(rf))
 
 
+def _visual_border_half_fov(model) -> int:
+    rf = int(getattr(model, "encoder_receptive_field_depth", 0) or 0)
+    if rf <= 0:
+        rf = int(_encoder_receptive_field_2d(model))
+    return max(0, rf // 2)
+
+
 def _dense_forward_2d_tile(model, x_tile: torch.Tensor, cdd_tile: torch.Tensor | None, log_floor: torch.Tensor):
     post_log = bool(getattr(model, "post_log_transform", False))
     x_enc = torch.log(torch.clamp(x_tile, min=0.0) + log_floor) if post_log else x_tile
@@ -829,8 +836,8 @@ def run_post_training_inference(
     inference_outputs["target_energy_count_map"] = count_map[:8].detach().cpu()
 
     if bool(viz_crop_border):
-        if viz_crop_border_px is None:
-            auto_border = int(max(getattr(model, "sigmas", (16.0,))))
+        if viz_crop_border_px is None or str(viz_crop_border_px).strip().lower() == "auto":
+            auto_border = int(_visual_border_half_fov(model))
         else:
             auto_border = int(max(0, viz_crop_border_px))
         inference_outputs["target_energy_map"] = _apply_nan_boundary_frame(

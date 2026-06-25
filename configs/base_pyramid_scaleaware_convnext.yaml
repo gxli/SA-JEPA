@@ -62,6 +62,7 @@ model:
   priority_min_targets_per_map: 10
   priority_dithering_pixels: 6
   priority_candidate_oversample: 0
+  viz_crop_border: false
 train:
   batch_size: 4
   lr: 0.0001
@@ -84,7 +85,6 @@ train:
   inference_tta_enabled: false
   inference_tta_mode: flip4
   compute_effective_rank: true
-  viz_crop_border: false
   umap:
     metric: euclidean
     standardize: true

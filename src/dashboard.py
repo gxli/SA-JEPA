@@ -20,13 +20,16 @@ import torch
 from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap, _target_region_mask_from_outputs
 
 
-DASHBOARD_VERSION = "production-diagnostics-v11-border-nan-fit-finite"
+DASHBOARD_VERSION = "production-diagnostics-v15-full-frame-gray-border"
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.join(ROOT_DIR, "scripts")
 
 DASH_DATA_REQUIRED = {
     "dashboard_version",
     "rgb_render_source",
+    "viz_crop_border",
+    "latent_border_px",
+    "dashboard_config_source",
     "orig",
     "target",
     "target_loc_heatmap",
@@ -496,7 +499,7 @@ def _rgb_from_xyz(
     clipped = np.clip((xyz - lo) / den, 0.0, 1.0)
     if not bright_top:
         clipped = 1.0 - clipped
-    clipped[~fin] = 1.0
+    clipped[~fin] = 0.90
     rgb_flat = np.clip(np.round(clipped * 255.0), 0, 255).astype(np.uint8)
     rgb = rgb_flat.reshape(h, w, 3)
     return rgb, rgb_flat
@@ -627,20 +630,54 @@ def _apply_xyz_border_nan(xyz: np.ndarray, h: int, w: int, border_px: int) -> np
     return out.reshape(h * w, 3)
 
 
-def _latent_margin_from_config(session_dir: str) -> int | None:
+def _apply_image_border_nan(arr: np.ndarray, border_px: int) -> np.ndarray:
+    img = np.asarray(arr, dtype=np.float32)
+    if img.ndim != 2:
+        return img
+    h, w = img.shape
+    b = int(max(0, min(int(border_px), h // 2, w // 2)))
+    if b <= 0:
+        return img
+    out = img.copy()
+    out[:b, :] = np.nan
+    out[h - b :, :] = np.nan
+    out[:, :b] = np.nan
+    out[:, w - b :] = np.nan
+    return out
+
+
+def _summary_discard_margin(session_dir: str) -> int:
+    summary_path = os.path.join(session_dir, "jepa_energy_summary.json")
+    if not os.path.exists(summary_path):
+        return 0
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+        return int(max(0, summary.get("inference_discard_margin") or 0))
+    except Exception:
+        return 0
+
+
+def _viz_crop_border_from_config(session_dir: str) -> tuple[bool, int, str | None]:
     cfg, cfg_path = _load_session_config(session_dir)
+    summary_margin = _summary_discard_margin(session_dir)
     if not cfg_path:
-        return None
+        return summary_margin > 0, summary_margin, None
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
     train_cfg = cfg.get("train", {}) if isinstance(cfg, dict) else {}
-    if isinstance(train_cfg, dict) and "inference_discard_margin" in train_cfg:
-        try:
-            value = train_cfg.get("inference_discard_margin")
-            if str(value).strip().lower() == "auto":
-                return _encoder_fov_border_from_config_dict(cfg)
-            return int(max(0, value or 0))
-        except (TypeError, ValueError):
-            return 0
-    return None
+    source_cfg = model_cfg if isinstance(model_cfg, dict) and "viz_crop_border" in model_cfg else train_cfg
+    if not isinstance(source_cfg, dict):
+        return summary_margin > 0, summary_margin, cfg_path
+    enabled = bool(source_cfg.get("viz_crop_border", False))
+    if not enabled:
+        return summary_margin > 0, summary_margin, cfg_path
+    value = source_cfg.get("viz_crop_border_px", source_cfg.get("inference_discard_margin", "auto"))
+    try:
+        if value is None or str(value).strip().lower() == "auto":
+            return True, max(summary_margin, _encoder_fov_border_from_config_dict(cfg)), cfg_path
+        return True, max(summary_margin, int(max(0, value or 0))), cfg_path
+    except (TypeError, ValueError):
+        return summary_margin > 0, summary_margin, cfg_path
 
 
 def _encoder_fov_border_from_config_dict(cfg: dict) -> int:
@@ -887,15 +924,13 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                   f"mask_inference={mask_inference_flag} "
                   f"masked_tokens={n_mask}/{n_total} "
                   f"({100.0*n_mask/max(1,n_total):.1f}%)")
-    config_border = _latent_margin_from_config(session_dir)
-    if config_border is not None:
-        latent_border_px = int(max(0, config_border))
-    elif "inference_discard_margin" in inference_summary:
-        latent_border_px = int(max(0, inference_summary.get("inference_discard_margin") or 0))
-    else:
-        latent_border_px = 0
+    viz_crop_border, latent_border_px, dashboard_config_source = _viz_crop_border_from_config(session_dir)
     if latent_border_px > 0:
-        print(f"dashboard_latent_border_filter={session_dir} border_px={latent_border_px} visual_border=off")
+        print(f"dashboard_latent_border_filter={session_dir} border_px={latent_border_px} mode=nan_fit_finite")
+    if viz_crop_border and latent_border_px > 0:
+        energy_map = _apply_image_border_nan(energy_map, latent_border_px)
+        target_loc_heatmap = _apply_image_border_nan(target_loc_heatmap, latent_border_px)
+        visit_heatmap = _apply_image_border_nan(visit_heatmap, latent_border_px)
 
     def _chw_or_n3_to_xyz(arr: np.ndarray, hh: int, ww: int, path: str) -> np.ndarray:
         xyz = np.asarray(arr, dtype=np.float32)
@@ -999,7 +1034,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         if z.ndim != 2 or z.shape[0] != h_lat * w_lat or z.shape[1] == 0:
             empty = np.full((h_lat * w_lat, 3), np.nan, dtype=np.float32)
             return empty, empty.copy()
-        if latent_border_px > 0:
+        if viz_crop_border and latent_border_px > 0:
             z = _apply_latent_border_nan(z, h_lat, w_lat, latent_border_px)
         valid = np.isfinite(z).all(axis=1)
         pca = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
@@ -1285,7 +1320,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
     dash_payload = dict(
         dashboard_version=np.asarray(DASHBOARD_VERSION),
-        rgb_render_source=np.asarray("latent_border_nan_fit_finite_rgb_invalid_white"),
+        rgb_render_source=np.asarray("summary_or_model_border_nan_fit_finite_rgb_invalid_gray"),
+        viz_crop_border=np.asarray(bool(viz_crop_border)),
+        latent_border_px=np.asarray(latent_border_px, dtype=np.int32),
+        dashboard_config_source=np.asarray(dashboard_config_source or "none"),
         orig=orig,
         blurred=blurred,
         target=target.astype(np.float32),
@@ -1397,15 +1435,15 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             raw = vals.astype(np.float32, copy=False)
             finite = raw[np.isfinite(raw)]
             if finite.size == 0:
-                gray = np.zeros(raw.shape, dtype=np.uint8)
-                alpha = np.zeros(raw.shape, dtype=np.uint8)
+                gray = np.full(raw.shape, 230, dtype=np.uint8)
             else:
                 lo = float(np.min(finite))
                 hi = float(np.max(finite))
                 if hi <= lo + 1e-12:
                     hi = lo + 1.0
                 gray = np.clip(np.round((np.nan_to_num(raw, nan=lo) - lo) / (hi - lo) * 255.0), 0, 255).astype(np.uint8)
-                alpha = np.where(np.isfinite(raw), 255, 0).astype(np.uint8)
+                gray[~np.isfinite(raw)] = 230
+            alpha = np.full(raw.shape, 255, dtype=np.uint8)
             out = np.dstack([gray, gray, gray, alpha])
         else:
             out = np.zeros((1, 1, 4), dtype=np.uint8)
@@ -1504,14 +1542,26 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 )
             ]
         )
-        fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=36, b=8), height=330)
+        fig.update_layout(
+            template="plotly_white",
+            title={"text": title, "x": 0.02},
+            margin=dict(l=8, r=8, t=36, b=8),
+            height=330,
+            plot_bgcolor="#e6e8ef",
+        )
         _apply_image_axes(fig, vals.shape[-2:])
         return fig
 
     def img(title: str, rgb: np.ndarray) -> go.Figure:
         vals = np.asarray(rgb)
         fig = go.Figure([go.Image(z=vals)])
-        fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=36, b=8), height=330)
+        fig.update_layout(
+            template="plotly_white",
+            title={"text": title, "x": 0.02},
+            margin=dict(l=8, r=8, t=36, b=8),
+            height=330,
+            plot_bgcolor="#e6e8ef",
+        )
         _apply_image_axes(fig, vals.shape[:2])
         return fig
 
@@ -2362,11 +2412,23 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     latest_er = float(er_y[-1]) if len(er_y) > 0 and np.isfinite(er_y[-1]) else None
     dash_data_version = str(np.asarray(data.get("dashboard_version", np.asarray("missing"))).reshape(-1)[0])
     rgb_render_source = str(np.asarray(data.get("rgb_render_source", np.asarray("missing"))).reshape(-1)[0])
+    viz_crop_border = str(np.asarray(data.get("viz_crop_border", np.asarray("missing"))).reshape(-1)[0])
+    latent_border_px = str(np.asarray(data.get("latent_border_px", np.asarray("missing"))).reshape(-1)[0])
+    dashboard_config_source = str(np.asarray(data.get("dashboard_config_source", np.asarray("missing"))).reshape(-1)[0])
+    dashboard_config_label = dashboard_config_source
+    if dashboard_config_source not in ("missing", "none"):
+        try:
+            dashboard_config_label = os.path.relpath(dashboard_config_source, ROOT_DIR)
+        except ValueError:
+            dashboard_config_label = dashboard_config_source
     generated_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     build_banner_html = (
         f'<span class="build-chip strong">html={html_lib.escape(DASHBOARD_VERSION)}</span>'
         f'<span class="build-chip">dash_data={html_lib.escape(dash_data_version)}</span>'
+        f'<span class="build-chip">viz_crop_border={html_lib.escape(viz_crop_border)}</span>'
+        f'<span class="build-chip">latent_border_px={html_lib.escape(latent_border_px)}</span>'
         f'<span class="build-chip">rgb={html_lib.escape(rgb_render_source)}</span>'
+        f'<span class="build-chip">config_loaded={html_lib.escape(dashboard_config_label)}</span>'
         f'<span class="build-chip">generated={html_lib.escape(generated_utc)}</span>'
     )
 
