@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from .encoders3d import ScaleAwareConvNeXt3DEncoder, ScaleFiLMConvNeXt3DEncoder
 from .masking import _fractional_spatial_target_budget
-from .masking3d import extract_location_cubes, sample_target_locations_3d
+from .masking3d import extract_location_cubes
 from .predictor3d import FullResPredictor3D
 from .symmetry import symmetric_forward_3d
 from src.losses import l2_normalize_patches
@@ -32,7 +32,7 @@ class PyramidGridJEPA3D(nn.Module):
         num_scales: int = 1,
         encoder_type: str = "cdd_scaleaware_convnext3d",
         patch_size=2,
-        num_targets=32,
+        num_targets: int | str = "auto",
         encoder_depth=3,
         encoder_kernel_size=5,
         encoder_stride=1,
@@ -49,6 +49,9 @@ class PyramidGridJEPA3D(nn.Module):
         use_film: bool = True,
         use_per_scale_adapters: bool = False,
         priority_candidate_oversample: float = 3.0,
+        priority_min_targets_per_map: int = 0,
+        target_nonoverlap: bool = True,
+        target_allow_partial_overlap: float = 0.0,
         encoder_receptive_field_depth: int | None = None,
         use_grn: bool = True,
         stem_norm: bool = True,
@@ -60,7 +63,7 @@ class PyramidGridJEPA3D(nn.Module):
         self.num_scales = int(num_scales)
         self.encoder_type = str(encoder_type).lower()
         self.patch_size = int(patch_size)
-        self.num_targets = int(num_targets)
+        self.num_targets = num_targets
         self.ema_momentum = float(ema_momentum)
         self.normalize_loss_l2 = bool(normalize_loss_l2)
         self.post_log_transform = bool(post_log_transform)
@@ -80,6 +83,9 @@ class PyramidGridJEPA3D(nn.Module):
         self.use_film = bool(use_film)
         self.use_per_scale_adapters = bool(use_per_scale_adapters)
         self.priority_candidate_oversample = float(priority_candidate_oversample)
+        self.priority_min_targets_per_map = int(priority_min_targets_per_map)
+        self.target_nonoverlap = bool(target_nonoverlap)
+        self.target_allow_partial_overlap = float(target_allow_partial_overlap)
 
         if self.use_film or self.use_per_scale_adapters:
             self.context_encoder = ScaleFiLMConvNeXt3DEncoder(
@@ -136,7 +142,7 @@ class PyramidGridJEPA3D(nn.Module):
         focus_slab_start_idx: torch.Tensor,
     ):
         box = max(1, int(self.mask_box_size))
-        n_box = max(1, int(self.num_mask_boxes))
+        n_box = max(1, int(self.num_mask_boxes), int(self._target_budget(height=height, width=width, device=device)))
         mask = torch.zeros((batch_size, 1, depth, height, width), device=device)
         z_lim = max(1, depth - box + 1)
         y_lim = max(1, height - box + 1)
@@ -169,6 +175,92 @@ class PyramidGridJEPA3D(nn.Module):
                 mask_cpu[b, 0, zz : zz + box, yy : yy + box, xx : xx + box] = 1.0
         mask.copy_(torch.from_numpy(mask_cpu).to(device=mask.device))
         return mask
+
+    def _target_budget(self, height: int, width: int, device) -> int:
+        raw = self.num_targets
+        if isinstance(raw, str) and raw.strip().lower() == "auto":
+            budget_oversample = float(self.priority_candidate_oversample)
+            if budget_oversample <= 0.0:
+                budget_oversample = 1.0
+            return int(
+                _fractional_spatial_target_budget(
+                    height=int(height),
+                    width=int(width),
+                    box_size=max(1, int(self.mask_box_size)),
+                    oversample=budget_oversample,
+                    device=device,
+                    minimum=int(self.priority_min_targets_per_map),
+                    overlap_fraction=float(self.target_allow_partial_overlap),
+                )
+                or 0
+            )
+        return max(0, int(round(float(raw))))
+
+    def _sample_targets_from_masked_slab(
+        self,
+        mask_slab: torch.Tensor,
+        num_targets: int,
+        patch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if mask_slab.dim() != 5:
+            raise ValueError(f"Expected mask_slab Bx1xDxHxW, got {tuple(mask_slab.shape)}")
+        b, _, d, h, w = mask_slab.shape
+        device = mask_slab.device
+        p = int(patch_size)
+        half = p // 2
+        lo_z = half
+        hi_z = d - (p - half)
+        lo_y = half
+        hi_y = h - (p - half)
+        lo_x = half
+        hi_x = w - (p - half)
+        target_budget = max(1, int(num_targets))
+        loc_out = torch.zeros((b, target_budget, 3), dtype=torch.long, device=device)
+        valid_out = torch.zeros((b, target_budget), dtype=torch.bool, device=device)
+        if hi_z < lo_z or hi_y < lo_y or hi_x < lo_x:
+            return loc_out, valid_out
+
+        exclusion = max(1, int(self.mask_box_size))
+        allow_partial = float(self.target_allow_partial_overlap)
+        for bi in range(b):
+            candidates = torch.nonzero(mask_slab[bi, 0] > 0, as_tuple=False)
+            if candidates.numel() == 0:
+                continue
+            inside = (
+                (candidates[:, 0] >= lo_z)
+                & (candidates[:, 0] <= hi_z)
+                & (candidates[:, 1] >= lo_y)
+                & (candidates[:, 1] <= hi_y)
+                & (candidates[:, 2] >= lo_x)
+                & (candidates[:, 2] <= hi_x)
+            )
+            candidates = candidates[inside]
+            if candidates.numel() == 0:
+                continue
+            perm = torch.randperm(candidates.shape[0], device=device)
+            candidates = candidates[perm]
+            selected = []
+            for cand in candidates:
+                if len(selected) >= target_budget:
+                    break
+                if bool(self.target_nonoverlap) and selected:
+                    yy = int(cand[1].item())
+                    xx = int(cand[2].item())
+                    ok = True
+                    min_sep = max(0.0, float(exclusion) * (1.0 - allow_partial))
+                    for prev in selected:
+                        if max(abs(yy - int(prev[1])), abs(xx - int(prev[2]))) < min_sep:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                selected.append(cand)
+            if selected:
+                stacked = torch.stack(selected, dim=0)
+                n = min(target_budget, stacked.shape[0])
+                loc_out[bi, :n] = stacked[:n]
+                valid_out[bi, :n] = True
+        return loc_out, valid_out
 
     def _center_slab_start_index(self, batch_size: int, depth: int, device) -> tuple[torch.Tensor, int]:
         slab_depth = max(1, min(int(self.slab_depth), int(depth)))
@@ -288,27 +380,12 @@ class PyramidGridJEPA3D(nn.Module):
             del context_map_3d
         pred_map = self.predictor3d(context_map)
         _, _, dz, hy, wx = pred_map.shape
-        target_budget = _fractional_spatial_target_budget(
-            height=hy,
-            width=wx,
-            box_size=max(1, int(self.mask_box_size)),
-            oversample=self.priority_candidate_oversample,
-            device=x_clean.device,
-            minimum=1,
-        )
-        num_targets = max(1, int(self.num_targets))
-        if target_budget is not None:
-            num_targets = max(1, min(num_targets, int(target_budget)))
-        target_locations, target_valid = sample_target_locations_3d(
-            batch_size=b,
-            depth=dz,
-            height=hy,
-            width=wx,
+        num_targets = max(1, self._target_budget(height=hy, width=wx, device=x_clean.device))
+        mask_slab = self._gather_slabs(box_mask, slab_starts, slab_depth)
+        target_locations, target_valid = self._sample_targets_from_masked_slab(
+            mask_slab=mask_slab,
             num_targets=num_targets,
             patch_size=self.patch_size,
-            device=x_clean.device,
-            spatial_border_margin=int(self.encoder_receptive_field_depth),
-            depth_border_margin=0,
         )
         pred_patches = extract_location_cubes(pred_map, target_locations, self.patch_size)
         gt_patches = extract_location_cubes(gt_map, target_locations, self.patch_size)

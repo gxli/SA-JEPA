@@ -26,7 +26,8 @@ joint-embedding predictions optimized for continuous structures:
 - **Dense Latent Exploration:** Every pixel receives a distinct latent
   coordinate that maps back directly to the original field coordinate space.
 - **Modality Support:** 2D fields are fully supported and tested. 3D
-  volumetric mode (`3d_slab`) is under active development.
+  volumetric training (`3d_slab`) is under active development; full-volume
+  inference-only mode is also available.
 
 ## 🎯 Application Scenarios
 
@@ -228,7 +229,7 @@ track these baseline starting targets:
 **Loss Components**
 
 - `prediction_loss_weight`: `50` (primary JEPA latent prediction MSE multiplier).
-- `spread_regularizer`: configured as `std_hinge`, with a scaling `weight: 2`, mapping against `target: context` inside a `"pooled"` spatial_mode.
+- `spread_regularizer`: configured as `std_hinge`, with a scaling `weight: 2` (recommend `5` for production; see `configs/examples/mhd_example.yaml`), mapping against `target: context` inside a `"pooled"` spatial_mode.
 - `symmetry_loss_weight`: `0.0` (off by default; set to `0.003` for weak four-view flip consistency).
 - `normalize_loss_l2`: `false` (preserves exact latent spatial amplitude calculations).
 
@@ -262,10 +263,12 @@ model.infer_npy("large_field.npy", crop_size=256, crop_mode="tile")
   The full encoder adds a 3×3 adapter and 3×3 stem (≈ +4 px additional);
   with GRN enabled the strict dependency is global across the feature map.
 
-OOM-safe auto-scaling (`fit()` only): on CUDA OOM, `fit()` halves
-the batch size and increases gradient accumulation to preserve the
-target effective batch.  The `train()` method and CLI do not yet
-support this.
+> **Experimental:** OOM-safe auto-scaling (`fit()` only) attempts to recover
+> from CUDA OOM by halving the batch size and increasing gradient
+> accumulation.  This is not guaranteed to work.  The reliable fix for OOM
+> is to reduce `crop_size` (see Large Fields section above) or lower
+> `batch_size` directly.  The `train()` method and CLI do not support
+> auto-scaling.
 
 ## 💻 API Reference
 
@@ -275,7 +278,7 @@ support this.
 | `model.fit(field, epochs, ...)` | self | Executes training pipelines over a designated 2D physical target array. |
 | `model.train(configs=None, ...)` | self | Orchestrates structured, YAML config-driven baseline training scenarios. |
 | `model.extract(field)` | `(C, H, W)` | Generates the dense, pixel-registered coordinate latent array. |
-| `model.project(field, method="umap")` | dict | Computes high-performance PCA and torchdr-native GPU-accelerated UMAP matrices. |
+| `model.project(field, method="umap")` | dict | Computes PCA and GPU-accelerated UMAP (cuML) projection matrices. |
 | `model.infer_npy(path, **kwargs)` | string | Runs direct automated forward passes on a target `.npy` layout file path. |
 | `model.analyze_rank()` | dict | Evaluates structural properties (effective manifold rank, dead channel screens). |
 | `model.save_session(path)` | — | Serializes all weight structures, evaluation dumps, and config configurations. |
@@ -317,10 +320,12 @@ python -m src.inference_from_session \
 │   ├── quickstart.py                            # Basic programmatic entry validation script
 │   ├── example_mhd_inline.py                    # Annotated script using inline variables
 │   ├── example_config_driven.py                 # Config-override API training example
+│   └── example_cli.sh                           # Shell example for CLI-driven runs
 ├── scripts/
 │   ├── train.py                                 # Core training terminal application interface
 │   ├── print_session_summary.py                 # Post-run evaluation summary calculator
 │   ├── session_to_dash.py                       # Exporter script managing Plotly layouts
+│   ├── session_to_movie.py                      # Converts saved movie frames into latent-space movies
 │   └── session_to_plots.py                      # Exports static publication-ready vector figures
 ├── src/
 │   ├── api.py                                   # Main developer ScaleAwareJEPA interface endpoint

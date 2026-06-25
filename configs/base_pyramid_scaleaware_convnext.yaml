@@ -84,7 +84,7 @@ train:
   inference_tta_enabled: false
   inference_tta_mode: flip4
   compute_effective_rank: true
-  viz_crop_border: true
+  viz_crop_border: false
   umap:
     metric: euclidean
     standardize: true

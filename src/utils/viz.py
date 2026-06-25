@@ -88,6 +88,19 @@ def _encoder_fov_border_from_config(session_dir: str) -> int:
     return max(0, rf)
 
 
+def _latent_border_from_summary_or_config(session_dir: str) -> int:
+    summary_path = os.path.join(session_dir, "jepa_energy_summary.json")
+    if os.path.exists(summary_path):
+        try:
+            with open(summary_path, "r", encoding="utf-8") as f:
+                summary = json.load(f)
+            if "inference_discard_margin" in summary:
+                return int(max(0, summary.get("inference_discard_margin") or 0))
+        except Exception:
+            pass
+    return _encoder_fov_border_from_config(session_dir)
+
+
 def _compute_pca_2d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     fit_x = x
@@ -486,7 +499,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     h_lat = int(pred_map.shape[-2])
     w_lat = int(pred_map.shape[-1])
     valid_mask_2d = _build_input_validity_mask(x_clean_raw, h_lat, w_lat)  # [H_lat, W_lat] bool
-    border_px = int(max(0, min(_encoder_fov_border_from_config(session_dir), h_lat // 2, w_lat // 2)))
+    border_px = int(max(0, min(_latent_border_from_summary_or_config(session_dir), h_lat // 2, w_lat // 2)))
     if border_px > 0:
         valid_mask_2d = valid_mask_2d.copy()
         valid_mask_2d[:border_px, :] = False

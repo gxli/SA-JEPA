@@ -41,7 +41,7 @@ from src.losses import (
 )
 from src.models.build_jepa import CDD_CUBE_ENCODER_TYPES, CDD_DEBUG_ENCODER_TYPES, MASK_MAP_ENCODER_TYPES, PyramidGridJEPA
 from src.models.build_jepa3d import PyramidGridJEPA3D, compute_3d_encoder_receptive_field_depth
-from src.models.masking import prepare_context_batch
+from src.models.masking import _max_effective_mask_box_size, prepare_context_batch
 from src.utils import log_error, set_error_log_path
 from src.utils.npy import _safe_load_npy
 from src.utils.viz import save_inference_dashboard, save_volumetric_umap_embeddings
@@ -91,6 +91,32 @@ def _format_progress_line(
     if optim_state:
         parts.append(_format_metric_dict(optim_state))
     return " | ".join(part for part in parts if part)
+
+
+def _format_target_z_counts(
+    target_locations: torch.Tensor,
+    target_valid: torch.Tensor,
+    depth: int | None = None,
+) -> str:
+    if target_locations.dim() < 3 or int(target_locations.shape[-1]) < 3:
+        return ""
+    if target_valid.dim() < 2:
+        return ""
+    with torch.no_grad():
+        loc = target_locations.detach()
+        valid = target_valid.detach().bool()
+        if loc.shape[:2] != valid.shape[:2]:
+            return ""
+        z = loc[..., 0].long()
+        max_depth = int(depth) if depth is not None and int(depth) > 0 else int(z[valid].max().item() + 1) if bool(valid.any().item()) else 0
+        if max_depth <= 0:
+            return ""
+        counts = []
+        denom = max(1, int(valid.shape[0]))
+        for zi in range(max_depth):
+            n = float(((z == zi) & valid).sum().item()) / float(denom)
+            counts.append(f"{zi}:{n:.1f}")
+    return ",".join(counts)
 
 
 def _format_active_loss_terms(
@@ -787,12 +813,21 @@ def load_config(path: str) -> dict:
                 cfg = json.load(f)
 
         base_ref = cfg.pop("base_config", None)
-        if base_ref is None:
-            merged = cfg
-        else:
+        if base_ref is not None:
+            # Explicit base_config: load and merge
             base_path = base_ref
             if not os.path.isabs(base_path):
                 base_path = os.path.join(os.path.dirname(abs_path), base_path)
+            base_cfg = _load_with_base(base_path, seen)
+            merged = _deep_merge(base_cfg, cfg)
+        elif abs_path.endswith("base_pyramid_scaleaware_convnext.yaml"):
+            # Loading the base config itself — no merge needed
+            merged = cfg
+        else:
+            # No base_config: auto-merge with project base for safety.
+            # Without this, 75+ essential keys silently vanish.
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            base_path = os.path.join(project_root, "configs", "base_pyramid_scaleaware_convnext.yaml")
             base_cfg = _load_with_base(base_path, seen)
             merged = _deep_merge(base_cfg, cfg)
         seen.remove(abs_path)
@@ -1066,13 +1101,22 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         encoder_depth=encoder_depth,
         encoder_kernel_size=encoder_kernel_size,
     )
+    patch_size = int(model_cfg.get("patch_size", 2))
+    mask_box_size_3d = _max_effective_mask_box_size(
+        sigmas=sigmas,
+        mask_scale=float(model_cfg.get("mask_size_scaling", 1.0)),
+        mask_box_size=int(model_cfg.get("mask_size", 0)),
+        inner_target_size=patch_size,
+        hardcap=model_cfg.get("mask_box_hardcap"),
+        manual_mask_box_sizes=model_cfg.get("mask_size_manual"),
+    )
     return PyramidGridJEPA3D(
         latent_channels=int(model_cfg.get("latent_channels", 16)),
         scale_channels=int(model_cfg.get("scale_channels", model_cfg.get("encoder_width", 8))),
         num_scales=int(num_scales),
         encoder_type=enc_type,
-        patch_size=int(model_cfg.get("patch_size", 2)),
-        num_targets=int(model_cfg.get("num_targets", 32)),
+        patch_size=patch_size,
+        num_targets=model_cfg.get("num_targets", "auto"),
         encoder_depth=encoder_depth,
         encoder_kernel_size=encoder_kernel_size,
         encoder_stride=int(model_cfg.get("encoder_stride", 1)),
@@ -1082,14 +1126,17 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         log_eps=float(model_cfg.get("log_eps", 1e-6)),
         cdd_log_std_floor_mult=float(model_cfg.get("cdd_log_std_floor_mult", 0.05)),
         fusion=fusion,
-        mask_box_size=int(model_cfg.get("mask_size", 8)),
+        mask_box_size=int(mask_box_size_3d),
         num_mask_boxes=int(model_cfg.get("num_mask_boxes", 8)),
-        slab_depth=int(model_cfg.get("slab_depth", max(1, int(model_cfg.get("patch_size", 2))))),
+        slab_depth=int(model_cfg.get("slab_depth", max(1, patch_size))),
         use_symmetric_feature_loss=bool(model_cfg.get("use_symmetric_feature_loss", False))
         and float(train_cfg.get("symmetry_loss_weight", 0.0)) > 0.0,
         use_film=bool(model_cfg.get("use_film", True)),
         use_per_scale_adapters=bool(model_cfg.get("use_per_scale_adapters", False)),
         priority_candidate_oversample=float(model_cfg.get("priority_candidate_oversample", 3.0)),
+        priority_min_targets_per_map=int(model_cfg.get("priority_min_targets_per_map", 0)),
+        target_nonoverlap=bool(model_cfg.get("target_nonoverlap", True)),
+        target_allow_partial_overlap=float(model_cfg.get("target_allow_partial_overlap", 0.0)),
         encoder_receptive_field_depth=encoder_rf_depth,
         use_grn=bool(model_cfg.get("use_grn", True)),
         stem_norm=bool(model_cfg.get("scaleaware_stem_norm", True)),
@@ -2040,6 +2087,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         epoch_spread = 0.0
         epoch_symmetric = 0.0
         epoch_valid_frac = 0.0
+        epoch_targets_per_image = 0.0
+        epoch_target_slots_per_image = 0.0
         epoch_embed_spread_mean = 0.0
         epoch_context_manifold_size = 0.0
         epoch_batches = 0
@@ -2150,9 +2199,17 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             )
             raw_mse_val, norm_err_val = compute_raw_mse_and_norm_err(outputs)
             energy_val = compute_jepa_energy(outputs)
-            valid_frac = float(outputs["target_valid"].float().mean().item())
+            target_valid_f = outputs["target_valid"].float()
+            valid_frac = float(target_valid_f.mean().item())
             ctx_stats = embedding_spread_stats(z_ctx, target_std=embed_spread_target)
-            targets_per_image = float(outputs["target_valid"].float().sum(dim=1).mean().item())
+            active_targets_by_sample = target_valid_f.sum(dim=1)
+            targets_per_image = float(active_targets_by_sample.mean().item())
+            target_slots_per_image = int(outputs["target_valid"].shape[1]) if outputs["target_valid"].dim() >= 2 else 0
+            target_z_counts = _format_target_z_counts(
+                outputs["target_locations"],
+                outputs["target_valid"],
+                depth=int(outputs["pred_map"].shape[-3]) if outputs["pred_map"].dim() == 5 else None,
+            )
             footprint_values = outputs.get("target_box_sizes")
             if footprint_values is not None and footprint_values.numel() > 0:
                 footprint_valid = outputs.get("target_valid")
@@ -2271,8 +2328,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             batch_diag = {
                 "ctx_std": f"{ctx_stats['embed_spread_mean']:.3f}",
                 "ctx_effrank": f"{ctx_stats['context_manifold_size']:.2f}",
+                "active_tgt": f"{targets_per_image:.1f}/{target_slots_per_image}",
                 "valid": f"{valid_frac:.3f}",
             }
+            if target_z_counts:
+                batch_diag["z_tgt"] = target_z_counts
             batch_optim = {
                 "lr": f"{current_lr:.1e}",
             }
@@ -2300,6 +2360,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         "metrics/embed_spread": ctx_stats["embed_spread_mean"],
                         "metrics/dead_channels": ctx_stats["dead_channel_count"],
                         "metrics/targets_per_image": targets_per_image,
+                        "metrics/target_slots_per_image": target_slots_per_image,
                         "metrics/mask_footprint_mean_px": mask_footprint_mean_px,
                         "epoch": epoch + 1,
                     },
@@ -2313,6 +2374,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_spread += float(loss_spread.item())
             epoch_symmetric += float(loss_symmetry.item())
             epoch_valid_frac += float(valid_frac)
+            epoch_targets_per_image += float(targets_per_image)
+            epoch_target_slots_per_image += float(target_slots_per_image)
             epoch_embed_spread_mean += ctx_stats["embed_spread_mean"]
             epoch_context_manifold_size += ctx_stats["context_manifold_size"]
             epoch_batches += 1
@@ -2361,6 +2424,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_diag = {
                 "ctx_std": _fmt_metric(epoch_embed_spread_mean / epoch_batches),
                 "ctx_effrank": _fmt_metric(epoch_context_manifold_size / epoch_batches),
+                "active_tgt": f"{epoch_targets_per_image / epoch_batches:.1f}/{epoch_target_slots_per_image / epoch_batches:.1f}",
                 "valid": _fmt_metric(epoch_valid_frac / epoch_batches),
             }
             tqdm.write(
@@ -2477,12 +2541,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 max_diagnostic_size=train_cfg.get("inference_max_diagnostic_size"),
                 tile_size=train_cfg.get("inference_tile_size", train_cfg.get("full_volume_spatial_tile_size", 512)),
                 tile_overlap=train_cfg.get("inference_tile_overlap"),
+                inference_discard_margin=train_cfg.get("inference_discard_margin"),
             )
     # Save NPY artifacts (PCA/UMAP/latent embeddings) required by session_to_dash.py.
     # No PNG, HTML, or dashboard rendering is performed here.
     inf_path = os.path.join(session_dir, "inference_outputs.pt")
     post_training_artifacts = bool(train_cfg.get("post_training_artifacts", True))
-    if is_main_process and (not is_3d_mode) and os.path.exists(inf_path) and post_training_artifacts:
+    artifacts_exist = os.path.exists(os.path.join(session_dir, "rank_diagnostics.json")) and any(
+        os.path.getsize(p) > 0 for p in glob.glob(os.path.join(session_dir, "results", "*_pca_*.npy"))
+    ) if os.path.isdir(os.path.join(session_dir, "results")) else False
+    if artifacts_exist:
+        log_info(f"[{config_name}] post-training artifacts already exist; skip PCA/UMAP/rank generation")
+    if is_main_process and (not is_3d_mode) and os.path.exists(inf_path) and post_training_artifacts and not artifacts_exist:
         try:
             outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
             artifacts_dir = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)

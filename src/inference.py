@@ -451,6 +451,7 @@ def run_post_training_inference(
     max_diagnostic_size: int | None = None,
     tile_size: int | None = 512,
     tile_overlap: int | None = None,
+    inference_discard_margin: int | None = None,
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
     if (not force_recompute_inference) and os.path.exists(inference_outputs_path):
@@ -799,7 +800,10 @@ def run_post_training_inference(
     _save_npz(os.path.join(session_dir, "target_energy_point_map.npz"), inference_outputs["target_energy_point_map"].numpy())
     _save_npz(os.path.join(session_dir, "target_energy_count_map.npz"), inference_outputs["target_energy_count_map"].numpy())
     encoder_rf = int(_encoder_receptive_field_2d(model))
-    discard_margin = int(max(0, encoder_rf // 2))
+    if inference_discard_margin is not None:
+        discard_margin = int(max(0, int(inference_discard_margin)))
+    else:
+        discard_margin = int(max(0, encoder_rf // 2))
     with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -972,7 +976,7 @@ def run_post_training_inference_3d(
             device = next(model.parameters()).device
             tile_size = max(1, int(spatial_tile_size or max(h, w)))
             encoder_rf = int(getattr(model, "encoder_receptive_field_depth", 1) or 1)
-            margin = min(max(0, encoder_rf), max(0, (tile_size - 1) // 2))
+            margin = min(max(0, encoder_rf // 2), max(0, (tile_size - 1) // 2))
             overlap_eff = max(2 * margin, int(spatial_overlap) if spatial_overlap is not None else 0)
             overlap_eff = min(max(0, overlap_eff), max(0, tile_size - 1))
             y_starts = _tile_starts_2d(h, tile_size, overlap_eff)
@@ -1083,9 +1087,15 @@ def run_post_training_inference_3d(
             x_clean = vol_cpu.sum(dim=1, keepdim=True)[:, :, center_idx : center_idx + 1]
             x_context = x_clean
             mask_cube = torch.zeros((1, 1, 1, h, w), dtype=x_clean.dtype)
-            target_locations = torch.tensor([[[0, h // 2, w // 2]]], dtype=torch.long)
-            target_valid = torch.ones((1, 1), dtype=torch.bool)
-            target_scales = torch.ones((1, 1), dtype=x_clean.dtype)
+            yy, xx = torch.meshgrid(
+                torch.arange(h, dtype=torch.long),
+                torch.arange(w, dtype=torch.long),
+                indexing="ij",
+            )
+            zz = torch.zeros_like(yy)
+            target_locations = torch.stack([zz, yy, xx], dim=-1).reshape(1, h * w, 3)
+            target_valid = torch.ones((1, h * w), dtype=torch.bool)
+            target_scales = torch.ones((1, h * w), dtype=x_clean.dtype)
             pred_patches = pred_map[:, :, :, h // 2 : h // 2 + 1, w // 2 : w // 2 + 1].unsqueeze(1)
             gt_patches = gt_map[:, :, :, h // 2 : h // 2 + 1, w // 2 : w // 2 + 1].unsqueeze(1)
             outputs = {
@@ -1183,4 +1193,3 @@ def run_post_training_inference_3d(
         )
     print(f"[{config_name}] saved 3D inference artifacts")
     return session_dir
-

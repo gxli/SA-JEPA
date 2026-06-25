@@ -541,7 +541,7 @@ def _encoder_fov_margin_from_config(session_dir: str) -> int:
     encoder_type = str(model_cfg.get("encoder_type", "")).strip().lower()
     if mode.startswith("3d") or "3d" in encoder_type:
         rf = 1 + 2 * (3 - 1) + max(0, depth) * max(0, kernel - 1)
-        return max(0, rf)
+        return max(0, rf // 2)
     dilations = model_cfg.get("convnext_layer_dilations")
     if dilations is None:
         dil_list = [1] * max(0, depth)
@@ -558,7 +558,7 @@ def _encoder_fov_margin_from_config(session_dir: str) -> int:
     rf = 1 + 2 + 2
     for dilation in dil_list:
         rf += max(0, kernel - 1) * max(1, int(dilation))
-    return max(0, rf)
+    return max(0, rf // 2)
 
 
 def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
@@ -733,7 +733,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     if "inference_discard_margin" in inference_summary:
         latent_border_px = int(max(0, inference_summary.get("inference_discard_margin") or 0))
     elif "inference_encoder_receptive_field" in inference_summary:
-        latent_border_px = int(max(0, int(inference_summary.get("inference_encoder_receptive_field") or 0)))
+        latent_border_px = int(max(0, int(inference_summary.get("inference_encoder_receptive_field") or 0) // 2))
     else:
         latent_border_px = _encoder_fov_margin_from_config(session_dir)
     if latent_border_px > 0:
@@ -848,6 +848,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             return pca, um
         z_valid = z[valid].astype(np.float32, copy=False)
         pca_valid = _compute_pca_3d(z_valid).astype(np.float32, copy=False)
+        if pca_valid.ndim == 2 and pca_valid.shape[1] < 3:
+            pca_pad = np.full((pca_valid.shape[0], 3), np.nan, dtype=np.float32)
+            pca_pad[:, : pca_valid.shape[1]] = pca_valid
+            pca_valid = pca_pad
         pca[valid] = pca_valid
         try:
             umap_valid = _compute_umap_nd(
@@ -921,6 +925,13 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             pca, um = _compute_slice_pca_umap(prefix_out)
             hh, ww = h_lat, w_lat
         else:
+            if latent_border_px <= 0 and (not np.isfinite(pca).all() or not np.isfinite(um).all()):
+                print(
+                    f"dashboard_note={session_dir}: {prefix_out} embedding artifact has NaN pixels "
+                    "while inference_discard_margin=0; recomputing slice PCA/UMAP"
+                )
+                pca, um = _compute_slice_pca_umap(prefix_out)
+                hh, ww = h_lat, w_lat
             pca = _apply_xyz_border_nan(pca, hh, ww, latent_border_px)
             um = _apply_xyz_border_nan(um, hh, ww, latent_border_px)
             valid_pair = np.isfinite(pca).all(axis=1) & np.isfinite(um).all(axis=1)

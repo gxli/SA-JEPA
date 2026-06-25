@@ -26,6 +26,19 @@ def test_fractional_spatial_target_budget_matches_area_ratio_for_integer_case():
     assert budget == 48
 
 
+def test_fractional_spatial_target_budget_scales_with_allowed_overlap():
+    budget = _fractional_spatial_target_budget(
+        height=64,
+        width=64,
+        box_size=16,
+        oversample=3.0,
+        device=torch.device("cpu"),
+        overlap_fraction=0.5,
+    )
+
+    assert budget == 96
+
+
 def test_priority_catalogue_is_sorted_by_ratio_descending():
     cdd = np.ones((3, 5, 5), dtype=np.float32)
     cdd[2] = 20.0

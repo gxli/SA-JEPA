@@ -206,13 +206,19 @@ def _fractional_spatial_target_budget(
     oversample: float,
     device: torch.device,
     minimum: int = 0,
+    overlap_fraction: float = 0.0,
 ) -> int | None:
-    """Budget candidates as f * image_area / box_area with stochastic rounding."""
+    """Budget candidates as f / (1-overlap) * image_area / box_area.
+
+    This is an initial seed/slot budget. Later rejection/non-overlap logic is
+    still responsible for deciding how many targets are actually active.
+    """
     f = float(oversample)
     if f <= 0.0:
         return None
+    overlap = min(max(float(overlap_fraction), 0.0), 0.95)
     box = max(1, int(box_size))
-    desired = f * float(max(1, int(height)) * max(1, int(width))) / float(box * box)
+    desired = (f / max(1e-6, 1.0 - overlap)) * float(max(1, int(height)) * max(1, int(width))) / float(box * box)
     base = int(math.floor(desired))
     frac = float(desired - base)
     extra = int(torch.rand(1, device=device).item() < frac)
@@ -853,6 +859,7 @@ def make_pyramid_grid_context(
                             oversample=float(priority_candidate_oversample),
                             device=x_clean.device,
                             minimum=int(priority_min_targets_per_map),
+                            overlap_fraction=float(target_allow_partial_overlap),
                         )
                         if prescreen_count is not None and len(priority_catalogue) > prescreen_count:
                             perm = torch.randperm(len(priority_catalogue), device=x_clean.device)[:prescreen_count]
@@ -865,13 +872,17 @@ def make_pyramid_grid_context(
                     # target count should not depend on rank density artifacts.
                     nonzero_mean = 1.0
                     budget_box = int(round(float(np.mean(candidate_boxes)))) if candidate_boxes else int(max_box)
+                    budget_oversample = float(priority_candidate_oversample)
+                    if budget_oversample <= 0.0:
+                        budget_oversample = 1.0
                     auto_base = _fractional_spatial_target_budget(
                         height=h,
                         width=w,
                         box_size=budget_box,
-                        oversample=1.0,
+                        oversample=budget_oversample,
                         device=x_clean.device,
                         minimum=0,
+                        overlap_fraction=float(target_allow_partial_overlap),
                     ) or 0
 
                     priority_n_raw = priority_n_target
