@@ -208,12 +208,16 @@ class PyramidGridJEPA3D(nn.Module):
         device = mask_slab.device
         p = int(patch_size)
         half = p // 2
+        # mask_slab is already the gathered target slab after the encoder has
+        # seen its required depth context. Do not apply the full input-depth RF
+        # margin to this small target slab, or depth-3 targets become impossible.
+        spatial_fov_half = max(half, self.encoder_receptive_field_depth // 2)
         lo_z = half
         hi_z = d - (p - half)
-        lo_y = half
-        hi_y = h - (p - half)
-        lo_x = half
-        hi_x = w - (p - half)
+        lo_y = spatial_fov_half
+        hi_y = h - spatial_fov_half
+        lo_x = spatial_fov_half
+        hi_x = w - spatial_fov_half
         target_budget = max(1, int(num_targets))
         loc_out = torch.zeros((b, target_budget, 3), dtype=torch.long, device=device)
         valid_out = torch.zeros((b, target_budget), dtype=torch.bool, device=device)

@@ -98,7 +98,17 @@ def _latent_border_from_summary_or_config(session_dir: str) -> int:
                 return int(max(0, summary.get("inference_discard_margin") or 0))
         except Exception:
             pass
-    return _encoder_fov_border_from_config(session_dir)
+    cfg_path = os.path.join(session_dir, "config_used.json")
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            train_cfg = cfg.get("train", {}) if isinstance(cfg, dict) else {}
+            if isinstance(train_cfg, dict) and "inference_discard_margin" in train_cfg:
+                return int(max(0, train_cfg.get("inference_discard_margin") or 0))
+        except Exception:
+            pass
+    return 0
 
 
 def _compute_pca_2d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> np.ndarray:
@@ -462,6 +472,55 @@ def _filtered_embedding(
     return result
 
 
+def _target_region_mask_from_outputs(outputs: dict, target_h: int, target_w: int) -> np.ndarray:
+    """Return valid target/mask positions at latent-map resolution for sample 0."""
+    target_mask = outputs.get("target_mask_map")
+    if target_mask is not None:
+        tm = torch.as_tensor(target_mask)
+        if tm.dim() == 3:
+            tm = tm.unsqueeze(1)
+        if tm.dim() == 4 and tm.shape[0] > 0:
+            tm0 = tm[0:1, 0:1].float()
+            if int(tm0.shape[-2]) != int(target_h) or int(tm0.shape[-1]) != int(target_w):
+                tm0 = F.interpolate(tm0, size=(target_h, target_w), mode="nearest")
+            return (tm0[0, 0] > 0.5).detach().cpu().numpy().astype(bool)
+
+    mask = np.zeros((target_h, target_w), dtype=bool)
+    target_locations = outputs.get("target_locations")
+    if target_locations is None:
+        return mask
+    tloc = torch.as_tensor(target_locations)
+    if tloc.dim() != 3 or tloc.shape[0] < 1:
+        return mask
+    target_valid = outputs.get("target_valid")
+    if target_valid is None:
+        tvalid = torch.ones(tloc.shape[:2], dtype=torch.bool)
+    else:
+        tvalid = torch.as_tensor(target_valid).bool()
+    x_ref = outputs.get("x_clean_raw", outputs.get("x_clean"))
+    if x_ref is not None and torch.as_tensor(x_ref).dim() >= 4:
+        h_in = max(1, int(torch.as_tensor(x_ref).shape[-2]))
+        w_in = max(1, int(torch.as_tensor(x_ref).shape[-1]))
+    else:
+        h_in = int(target_h)
+        w_in = int(target_w)
+    scale_y = float(target_h) / float(h_in)
+    scale_x = float(target_w) / float(w_in)
+    patch_size = int(max(1, outputs.get("patch_size", 1)))
+    rad_y = max(0, int(np.ceil(0.5 * patch_size * scale_y)))
+    rad_x = max(0, int(np.ceil(0.5 * patch_size * scale_x)))
+    for i in range(int(tloc.shape[1])):
+        if i >= int(tvalid.shape[1]) or not bool(tvalid[0, i].item()):
+            continue
+        cy = int(round(float(tloc[0, i, 0].item()) * scale_y))
+        cx = int(round(float(tloc[0, i, 1].item()) * scale_x))
+        y0, y1 = max(0, cy - rad_y), min(target_h, cy + rad_y + 1)
+        x0, x1 = max(0, cx - rad_x), min(target_w, cx + rad_x + 1)
+        if y0 < y1 and x0 < x1:
+            mask[y0:y1, x0:x1] = True
+    return mask
+
+
 def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | None = None) -> str:
     umap_cfg = dict(umap_cfg or {})
     fit_max_tokens = int(umap_cfg.get("fit_max_tokens", 65536))
@@ -507,6 +566,10 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         valid_mask_2d[:, :border_px] = False
         valid_mask_2d[:, w_lat - border_px :] = False
         print(f"[dashboard] latent PCA/UMAP border mask: border_px={border_px}")
+    if bool(outputs.get("mask_inference", False)):
+        target_region_mask = _target_region_mask_from_outputs(outputs, h_lat, w_lat)
+        valid_mask_2d = valid_mask_2d & target_region_mask
+        print(f"[dashboard] latent PCA/UMAP masked-region filter: valid_pixels={int(valid_mask_2d.sum())}")
     valid_mask_flat = valid_mask_2d.reshape(-1)  # [H_lat * W_lat]
 
     # Render sampled target locations for first sample.

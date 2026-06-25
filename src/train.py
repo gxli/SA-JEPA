@@ -581,6 +581,7 @@ class _MaskingCollator:
         return_debug: bool = False,
         require_precomputed_cdd: bool = False,
         target_mask: Optional[torch.Tensor] = None,
+        target_threshold: Optional[float] = None,
     ):
         enc_type = str(getattr(model, "encoder_type", "")).lower()
         self.use_cdd = bool(enc_type in CDD_CUBE_ENCODER_TYPES)
@@ -1822,7 +1823,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     if target_threshold is not None:
         target_threshold = float(target_threshold)
     if data_cfg.get("target_mask"):
-        import numpy as np
         mask_path = os.path.join(data_cfg.get("data_root", "data"), data_cfg["target_mask"])
         if os.path.exists(mask_path):
             target_mask = torch.from_numpy(np.load(mask_path).astype(np.float32))
@@ -1833,6 +1833,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         return_debug=bool(train_cfg.get("debug_masking_tensors", False)),
         require_precomputed_cdd=bool(cdd_cache),
         target_mask=target_mask,
+        target_threshold=target_threshold,
     )
     if is_main_process and (not is_3d_mode) and str(getattr(model, "encoder_type", "")).lower() in CDD_CUBE_ENCODER_TYPES:
         log_info(
@@ -2571,9 +2572,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     artifacts_exist = os.path.exists(os.path.join(session_dir, "rank_diagnostics.json")) and any(
         os.path.getsize(p) > 0 for p in glob.glob(os.path.join(session_dir, "results", "*_pca_*.npy"))
     ) if os.path.isdir(os.path.join(session_dir, "results")) else False
-    if artifacts_exist:
+    if artifacts_exist and not force_recompute_inference:
         log_info(f"[{config_name}] post-training artifacts already exist; skip PCA/UMAP/rank generation")
-    if is_main_process and (not is_3d_mode) and os.path.exists(inf_path) and post_training_artifacts and not artifacts_exist:
+    if (
+        is_main_process
+        and (not is_3d_mode)
+        and os.path.exists(inf_path)
+        and post_training_artifacts
+        and (force_recompute_inference or not artifacts_exist)
+    ):
         try:
             outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
             artifacts_dir = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)

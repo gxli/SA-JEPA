@@ -250,6 +250,21 @@ def _encoder_receptive_field_2d(model) -> int:
     return max(1, int(fov))
 
 
+def _dense_output_receptive_field_2d(model) -> int:
+    rf = int(_encoder_receptive_field_2d(model))
+    predictor = getattr(model, "predictor", None)
+    if bool(getattr(model, "predictor_spatial_conv", False)) and predictor is not None:
+        pred_kernel = 3
+        try:
+            for module in predictor.modules():
+                if isinstance(module, torch.nn.Conv2d) and module.kernel_size[0] > 1:
+                    pred_kernel = max(pred_kernel, int(module.kernel_size[0]))
+        except Exception:
+            pred_kernel = 3
+        rf += max(0, int(pred_kernel) - 1)
+    return max(1, int(rf))
+
+
 def _dense_forward_2d_tile(model, x_tile: torch.Tensor, cdd_tile: torch.Tensor | None, log_floor: torch.Tensor):
     post_log = bool(getattr(model, "post_log_transform", False))
     x_enc = torch.log(torch.clamp(x_tile, min=0.0) + log_floor) if post_log else x_tile
@@ -316,7 +331,7 @@ def _run_tiled_dense_inference_2d(
     b, _, h, w = x_raw.shape
     if b != 1:
         raise RuntimeError("Tiled 2D dashboard inference currently expects batch size 1")
-    rf = _encoder_receptive_field_2d(model)
+    rf = _dense_output_receptive_field_2d(model)
     margin = min(rf // 2, max(0, (int(tile_size) - 1) // 2))
     overlap_eff = max(2 * margin, int(tile_overlap) if tile_overlap is not None else 0)
     overlap_eff = min(max(0, overlap_eff), max(0, int(tile_size) - 1))
@@ -332,7 +347,7 @@ def _run_tiled_dense_inference_2d(
 
     print(
         f"[{config_name}] tiled 2D dense inference: tile={tile_size} "
-        f"y_tiles={len(y_starts)} x_tiles={len(x_starts)} encoder_rf={rf} "
+        f"y_tiles={len(y_starts)} x_tiles={len(x_starts)} dense_output_rf={rf} "
         f"discard_margin={margin} overlap={overlap_eff}"
     )
     sums: dict[str, torch.Tensor] = {}
@@ -512,11 +527,12 @@ def run_post_training_inference(
             and int(tile_size) > 0
             and (int(x_raw.shape[-2]) > int(tile_size) or int(x_raw.shape[-1]) > int(tile_size))
         )
-        if bool(mask_inference):
+        if bool(mask_inference) and use_tiled_2d:
             raise ValueError(
-                "Post-training lattice-sweep mask inference has been removed. "
-                "Run post-training inference with mask_inference=false and use "
-                "the dense prediction/target maps for energy diagnostics."
+                "Masked post-training dashboard inference is not supported with "
+                "tiled dense inference. Set train.inference_max_diagnostic_size "
+                "so the dashboard sample fits in one forward pass, or run with "
+                "train.mask_inference=false for dense full-frame diagnostics."
             )
         shifts = [(0, 0)]
         print(f"[{config_name}] post_training_inference model forward deterministic_shifts=1")
@@ -646,6 +662,8 @@ def run_post_training_inference(
 
     inference_outputs = {
         "inference_scope": "dashboard_sample_batch",
+        "mask_inference": bool(mask_inference),
+        "patch_size": int(getattr(model, "patch_size", 1)),
         "inference_num_dataloader_batches_seen": 1,
         "inference_num_dataloader_batches_available": dataloader_len if dataloader_len is not None else -1,
         "x_clean_raw": outputs.get("x_clean_raw", outputs["x_clean"])[:8].detach().cpu(),
@@ -800,10 +818,11 @@ def run_post_training_inference(
     _save_npz(os.path.join(session_dir, "target_energy_point_map.npz"), inference_outputs["target_energy_point_map"].numpy())
     _save_npz(os.path.join(session_dir, "target_energy_count_map.npz"), inference_outputs["target_energy_count_map"].numpy())
     encoder_rf = int(_encoder_receptive_field_2d(model))
+    dense_output_rf = int(_dense_output_receptive_field_2d(model))
     if inference_discard_margin is not None:
         discard_margin = int(max(0, int(inference_discard_margin)))
     else:
-        discard_margin = int(max(0, encoder_rf // 2))
+        discard_margin = int(max(0, dense_output_rf // 2))
     with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -818,6 +837,7 @@ def run_post_training_inference(
                 "inference_tile_size": None if tile_size is None else int(tile_size),
                 "inference_tile_overlap": None if tile_overlap is None else int(tile_overlap),
                 "inference_encoder_receptive_field": int(encoder_rf),
+                "inference_dense_output_receptive_field": int(dense_output_rf),
                 "inference_discard_margin": int(discard_margin),
             },
             f,

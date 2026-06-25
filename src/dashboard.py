@@ -523,7 +523,7 @@ def _apply_xyz_border_nan(xyz: np.ndarray, h: int, w: int, border_px: int) -> np
     return out.reshape(h * w, 3)
 
 
-def _encoder_fov_margin_from_config(session_dir: str) -> int:
+def _explicit_latent_margin_from_config(session_dir: str) -> int:
     cfg_path = os.path.join(session_dir, "config_used.json")
     if not os.path.exists(cfg_path):
         return 0
@@ -532,33 +532,13 @@ def _encoder_fov_margin_from_config(session_dir: str) -> int:
             cfg = json.load(f)
     except Exception:
         return 0
-    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-    if not isinstance(model_cfg, dict):
-        return 0
-    depth = int(model_cfg.get("encoder_depth", 3))
-    kernel = int(model_cfg.get("encoder_kernel_size", 5))
-    mode = str(model_cfg.get("mode", "")).strip().lower()
-    encoder_type = str(model_cfg.get("encoder_type", "")).strip().lower()
-    if mode.startswith("3d") or "3d" in encoder_type:
-        rf = 1 + 2 * (3 - 1) + max(0, depth) * max(0, kernel - 1)
-        return max(0, rf // 2)
-    dilations = model_cfg.get("convnext_layer_dilations")
-    if dilations is None:
-        dil_list = [1] * max(0, depth)
-    else:
+    train_cfg = cfg.get("train", {}) if isinstance(cfg, dict) else {}
+    if isinstance(train_cfg, dict) and "inference_discard_margin" in train_cfg:
         try:
-            dil_list = [int(v) for v in dilations]
-        except TypeError:
-            dil_list = [1] * max(0, depth)
-        if len(dil_list) < depth and dil_list:
-            reps = (depth + len(dil_list) - 1) // len(dil_list)
-            dil_list = (dil_list * reps)[:depth]
-        else:
-            dil_list = dil_list[:depth]
-    rf = 1 + 2 + 2
-    for dilation in dil_list:
-        rf += max(0, kernel - 1) * max(1, int(dilation))
-    return max(0, rf // 2)
+            return int(max(0, train_cfg.get("inference_discard_margin") or 0))
+        except (TypeError, ValueError):
+            return 0
+    return 0
 
 
 def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
@@ -732,10 +712,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     h_lat, w_lat = int(pred_map.shape[-2]), int(pred_map.shape[-1])
     if "inference_discard_margin" in inference_summary:
         latent_border_px = int(max(0, inference_summary.get("inference_discard_margin") or 0))
-    elif "inference_encoder_receptive_field" in inference_summary:
-        latent_border_px = int(max(0, int(inference_summary.get("inference_encoder_receptive_field") or 0) // 2))
     else:
-        latent_border_px = _encoder_fov_margin_from_config(session_dir)
+        latent_border_px = _explicit_latent_margin_from_config(session_dir)
     if latent_border_px > 0:
         print(f"dashboard_latent_border_nan={session_dir} border_px={latent_border_px}")
 
