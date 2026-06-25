@@ -4,6 +4,29 @@ import torch
 import torch.nn as nn
 
 
+def _depth_window_ranges(full_depth: int, out_start: int, out_depth: int, radii: list[int]) -> list[tuple[int, int]]:
+    out_lo = int(out_start)
+    out_hi = int(out_start) + int(out_depth) - 1
+    ranges: list[tuple[int, int]] = []
+    remaining = sum(int(r) for r in radii)
+    for radius in radii:
+        remaining -= int(radius)
+        lo = max(0, out_lo - remaining)
+        hi = min(int(full_depth) - 1, out_hi + remaining)
+        ranges.append((lo, hi))
+    return ranges
+
+
+def _crop_depth_global(x: torch.Tensor, current_offset: int, lo: int, hi: int) -> tuple[torch.Tensor, int]:
+    local_lo = max(0, int(lo) - int(current_offset))
+    local_hi = min(int(x.shape[-3]) - 1, int(hi) - int(current_offset))
+    if local_hi < local_lo:
+        raise RuntimeError(
+            f"Invalid depth crop lo={lo} hi={hi} offset={current_offset} tensor_depth={x.shape[-3]}"
+        )
+    return x[..., local_lo : local_hi + 1, :, :], int(lo)
+
+
 # ---------------------------------------------------------------------------
 # Norm layers
 # ---------------------------------------------------------------------------
@@ -79,6 +102,19 @@ class ConvNeXtBlock3D(nn.Module):
         y = y.permute(0, 4, 1, 2, 3)      # B,C,D,H,W
         y = self.pw2(y)
         return x + y
+
+    def forward_depth_window(self, x: torch.Tensor, current_offset: int, out_lo: int, out_hi: int):
+        y = self.dw(x)
+        y, next_offset = _crop_depth_global(y, current_offset, out_lo, out_hi)
+        residual, _ = _crop_depth_global(x, current_offset, out_lo, out_hi)
+        y = self.norm(y)
+        y = self.pw1(y)
+        y = self.act(y)
+        y = y.permute(0, 2, 3, 4, 1)
+        y = self.grn(y)
+        y = y.permute(0, 4, 1, 2, 3)
+        y = self.pw2(y)
+        return residual + y, next_offset
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +195,7 @@ class ScaleAwareConvNeXt3DEncoder(nn.Module):
         for _ in range(int(depth)):
             blocks.append(ConvNeXtBlock3D(out_channels, kernel_size=int(kernel_size), use_grn=use_grn))
         self.blocks = nn.Sequential(*blocks)
+        self._depth_radii = [1, 1] + [int(kernel_size) // 2 for _ in range(int(depth))]
 
         # Final norm
         self.final_norm = LayerNorm3d(out_channels) if final_norm else nn.Identity()
@@ -189,6 +226,45 @@ class ScaleAwareConvNeXt3DEncoder(nn.Module):
 
         x = self.proj(x)
         x = self.blocks(x)
+        x = self.final_norm(x)
+        return x
+
+    def forward_depth_window(self, fields, mask_tokens=None, out_start: int = 0, out_depth: int | None = None):
+        if mask_tokens is None:
+            mask_tokens = torch.zeros_like(fields)
+
+        b, s, d, h, w = fields.shape
+        if s != self.num_scales:
+            raise ValueError(f"Expected {self.num_scales} scales, got {s}")
+        out_depth = int(out_depth if out_depth is not None else d)
+        ranges = _depth_window_ranges(d, int(out_start), out_depth, self._depth_radii)
+        range_i = 0
+        offset = 0
+
+        x = torch.stack([fields, mask_tokens], dim=2).reshape(b * s, 2, d, h, w)
+        for layer in self.scale_stem:
+            x = layer(x)
+            if isinstance(layer, nn.Conv3d) and int(layer.kernel_size[0]) > 1:
+                lo, hi = ranges[range_i]
+                x, offset = _crop_depth_global(x, offset, lo, hi)
+                range_i += 1
+        cs = x.shape[1]
+        cur_d = x.shape[-3]
+        x = x.reshape(b, s, cs, cur_d, h, w)
+
+        if self.norm_per_scale:
+            x = self.per_scale_norm(x.reshape(b * s, cs, cur_d, h, w)).reshape(b, s, cs, cur_d, h, w)
+
+        if self.fusion == "gate":
+            x = self.fuse(x)
+        else:
+            x = x.reshape(b, s * cs, cur_d, h, w)
+
+        x = self.proj(x)
+        for block in self.blocks:
+            lo, hi = ranges[range_i]
+            x, offset = block.forward_depth_window(x, offset, lo, hi)
+            range_i += 1
         x = self.final_norm(x)
         return x
 
@@ -230,6 +306,14 @@ class SharedScaleConvNeXtStage3d(nn.Module):
         y = self.block(y)
         y = y.reshape(B, S, C, D, H, W)
         return y
+
+    def forward_depth_window(self, x: torch.Tensor, current_offset: int, out_lo: int, out_hi: int):
+        B, S, C, D, H, W = x.shape
+        x = self.film(x)
+        y = x.reshape(B * S, C, D, H, W)
+        y, next_offset = self.block.forward_depth_window(y, current_offset, out_lo, out_hi)
+        y = y.reshape(B, S, C, y.shape[-3], H, W)
+        return y, next_offset
 
 
 class PerScaleAdapter3d(nn.Module):
@@ -326,6 +410,8 @@ class ScaleFiLMConvNeXt3DEncoder(nn.Module):
                     PerScaleAdapter3d(self.num_scales, scale_channels, use_norm=adapter_norm)
                 )
 
+        self._depth_radii = [1, 1] + [int(kernel_size) // 2 for _ in range(int(depth))]
+
         # Fusion
         if self.fusion == "gate":
             self.fuse = ScaleGateMixer3D(scale_channels, self.num_scales)
@@ -372,6 +458,49 @@ class ScaleFiLMConvNeXt3DEncoder(nn.Module):
             x = x.reshape(b, s * cs, d, h, w)
 
         # Head + final norm
+        x = self.head(x)
+        x = self.final_norm(x)
+        return x
+
+    def forward_depth_window(self, fields, mask_tokens=None, out_start: int = 0, out_depth: int | None = None):
+        if mask_tokens is None:
+            mask_tokens = torch.zeros_like(fields)
+
+        b, s, d, h, w = fields.shape
+        if s != self.num_scales:
+            raise ValueError(f"Expected {self.num_scales} scales, got {s}")
+        out_depth = int(out_depth if out_depth is not None else d)
+        ranges = _depth_window_ranges(d, int(out_start), out_depth, self._depth_radii)
+        range_i = 0
+        offset = 0
+
+        x = torch.stack([fields, mask_tokens], dim=2).reshape(b * s, 2, d, h, w)
+        for layer in self.scale_stem:
+            x = layer(x)
+            if isinstance(layer, nn.Conv3d) and int(layer.kernel_size[0]) > 1:
+                lo, hi = ranges[range_i]
+                x, offset = _crop_depth_global(x, offset, lo, hi)
+                range_i += 1
+        cs = x.shape[1]
+        cur_d = x.shape[-3]
+        x = x.reshape(b, s, cs, cur_d, h, w)
+
+        if self.norm_per_scale:
+            x = self.per_scale_norm(x.reshape(b * s, cs, cur_d, h, w)).reshape(b, s, cs, cur_d, h, w)
+
+        for blk in self.blocks:
+            if isinstance(blk, SharedScaleConvNeXtStage3d):
+                lo, hi = ranges[range_i]
+                x, offset = blk.forward_depth_window(x, offset, lo, hi)
+                range_i += 1
+            else:
+                x = blk(x)
+
+        if self.fusion == "gate":
+            x = self.fuse(x)
+        else:
+            x = x.reshape(b, s * cs, x.shape[-3], h, w)
+
         x = self.head(x)
         x = self.final_norm(x)
         return x

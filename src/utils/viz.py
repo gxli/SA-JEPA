@@ -16,6 +16,69 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAX_PCA_FIT_TOKENS = 65536
 
 
+def _deep_merge_dict(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge_dict(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _read_config_file(path: str, seen: set[str] | None = None) -> dict:
+    seen = set() if seen is None else seen
+    abs_path = os.path.abspath(path)
+    if abs_path in seen:
+        raise ValueError(f"Cyclic base_config reference detected: {abs_path}")
+    seen.add(abs_path)
+    with open(abs_path, "r", encoding="utf-8") as f:
+        if abs_path.endswith((".yaml", ".yml")):
+            import yaml as _yaml
+
+            cfg = _yaml.safe_load(f) or {}
+        else:
+            cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        seen.remove(abs_path)
+        return {}
+    base_ref = cfg.pop("base_config", None)
+    if base_ref is not None:
+        base_path = base_ref if os.path.isabs(base_ref) else os.path.join(os.path.dirname(abs_path), base_ref)
+        cfg = _deep_merge_dict(_read_config_file(base_path, seen), cfg)
+    seen.remove(abs_path)
+    return cfg
+
+
+def _session_config_candidates(session_dir: str) -> list[str]:
+    name = os.path.basename(os.path.abspath(session_dir))
+    env_cfg_dir = os.environ.get("SESSION_DASH_CONFIG_DIR", "").strip()
+    candidates: list[str] = []
+    if env_cfg_dir:
+        for ext in (".yaml", ".yml", ".json"):
+            candidates.append(os.path.join(env_cfg_dir, "local_configs", f"{name}{ext}"))
+            candidates.append(os.path.join(env_cfg_dir, f"{name}{ext}"))
+    candidates.extend([
+        os.path.join(ROOT_DIR, "configs", "local_configs", f"{name}.yaml"),
+        os.path.join(ROOT_DIR, "configs", "local_configs", f"{name}.yml"),
+        os.path.join(ROOT_DIR, "configs", "local_configs", f"{name}.json"),
+        os.path.join(session_dir, "resolved_config.json"),
+        os.path.join(session_dir, "config_used.json"),
+    ])
+    return [os.path.abspath(path) for path in candidates]
+
+
+def _load_session_config(session_dir: str) -> dict:
+    for path in _session_config_candidates(session_dir):
+        if not os.path.exists(path):
+            continue
+        try:
+            return _read_config_file(path)
+        except Exception:
+            continue
+    return {}
+
+
 def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
     cfg_path = os.path.join(session_dir, "config_used.json")
     if not os.path.exists(cfg_path):
@@ -52,13 +115,8 @@ def _generate_masking_diagnostic_for_dashboard(session_dir: str) -> str | None:
 
 
 def _encoder_fov_border_from_config(session_dir: str) -> int:
-    cfg_path = os.path.join(session_dir, "config_used.json")
-    if not os.path.exists(cfg_path):
-        return 0
-    try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    except Exception:
+    cfg = _load_session_config(session_dir)
+    if not cfg:
         return 0
     model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
     if not isinstance(model_cfg, dict):
@@ -68,7 +126,8 @@ def _encoder_fov_border_from_config(session_dir: str) -> int:
     mode = str(model_cfg.get("mode", "")).strip().lower()
     encoder_type = str(model_cfg.get("encoder_type", "")).strip().lower()
     if mode.startswith("3d") or "3d" in encoder_type:
-        return max(0, 1 + 2 * (3 - 1) + max(0, depth) * max(0, kernel - 1))
+        rf = 1 + 2 * (3 - 1) + max(0, depth) * max(0, kernel - 1)
+        return max(0, rf // 2)
     dilations = model_cfg.get("convnext_layer_dilations")
     if dilations is None:
         dil_list = [1] * max(0, depth)
@@ -85,10 +144,20 @@ def _encoder_fov_border_from_config(session_dir: str) -> int:
     rf = 1 + 2 + 2
     for dilation in dil_list:
         rf += max(0, kernel - 1) * max(1, int(dilation))
-    return max(0, rf)
+    return max(0, rf // 2)
 
 
 def _latent_border_from_summary_or_config(session_dir: str) -> int:
+    cfg = _load_session_config(session_dir)
+    train_cfg = cfg.get("train", {}) if isinstance(cfg, dict) else {}
+    if isinstance(train_cfg, dict) and "inference_discard_margin" in train_cfg:
+        try:
+            value = train_cfg.get("inference_discard_margin")
+            if str(value).strip().lower() == "auto":
+                return _encoder_fov_border_from_config(session_dir)
+            return int(max(0, value or 0))
+        except (TypeError, ValueError):
+            return 0
     summary_path = os.path.join(session_dir, "jepa_energy_summary.json")
     if os.path.exists(summary_path):
         try:
@@ -96,16 +165,6 @@ def _latent_border_from_summary_or_config(session_dir: str) -> int:
                 summary = json.load(f)
             if "inference_discard_margin" in summary:
                 return int(max(0, summary.get("inference_discard_margin") or 0))
-        except Exception:
-            pass
-    cfg_path = os.path.join(session_dir, "config_used.json")
-    if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            train_cfg = cfg.get("train", {}) if isinstance(cfg, dict) else {}
-            if isinstance(train_cfg, dict) and "inference_discard_margin" in train_cfg:
-                return int(max(0, train_cfg.get("inference_discard_margin") or 0))
         except Exception:
             pass
     return 0

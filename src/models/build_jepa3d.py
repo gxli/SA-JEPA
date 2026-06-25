@@ -6,6 +6,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .encoders3d import ScaleAwareConvNeXt3DEncoder, ScaleFiLMConvNeXt3DEncoder
 from .masking import _fractional_spatial_target_budget
@@ -58,6 +59,7 @@ class PyramidGridJEPA3D(nn.Module):
         norm_per_scale: bool = True,
         adapter_norm: bool = True,
         final_norm: bool = True,
+        activation_checkpointing: bool = True,
     ):
         super().__init__()
         self.num_scales = int(num_scales)
@@ -86,6 +88,7 @@ class PyramidGridJEPA3D(nn.Module):
         self.priority_min_targets_per_map = int(priority_min_targets_per_map)
         self.target_nonoverlap = bool(target_nonoverlap)
         self.target_allow_partial_overlap = float(target_allow_partial_overlap)
+        self.activation_checkpointing = bool(activation_checkpointing)
 
         if self.use_film or self.use_per_scale_adapters:
             self.context_encoder = ScaleFiLMConvNeXt3DEncoder(
@@ -128,6 +131,62 @@ class PyramidGridJEPA3D(nn.Module):
             channels=int(latent_channels),
             hidden=max(2 * int(latent_channels), 32),
         )
+
+    def _context_encoder_forward(self, fields: torch.Tensor, mask_tokens: torch.Tensor) -> torch.Tensor:
+        if self.activation_checkpointing and self.training and torch.is_grad_enabled():
+            return checkpoint(
+                lambda f, m: self.context_encoder(f, mask_tokens=m),
+                fields,
+                mask_tokens,
+                use_reentrant=False,
+            )
+        return self.context_encoder(fields, mask_tokens=mask_tokens)
+
+    def _context_encoder_depth_window(
+        self,
+        fields: torch.Tensor,
+        mask_tokens: torch.Tensor,
+        out_start: int,
+        out_depth: int,
+    ) -> torch.Tensor:
+        if hasattr(self.context_encoder, "forward_depth_window"):
+            if self.activation_checkpointing and self.training and torch.is_grad_enabled():
+                return checkpoint(
+                    lambda f, m: self.context_encoder.forward_depth_window(
+                        f,
+                        mask_tokens=m,
+                        out_start=int(out_start),
+                        out_depth=int(out_depth),
+                    ),
+                    fields,
+                    mask_tokens,
+                    use_reentrant=False,
+                )
+            return self.context_encoder.forward_depth_window(
+                fields,
+                mask_tokens=mask_tokens,
+                out_start=int(out_start),
+                out_depth=int(out_depth),
+            )
+        return self._gather_slabs(self._context_encoder_forward(fields, mask_tokens), torch.tensor([out_start], device=fields.device), out_depth)
+
+    def _target_encoder_depth_window(
+        self,
+        fields: torch.Tensor,
+        mask_tokens: torch.Tensor,
+        out_start: int,
+        out_depth: int,
+    ) -> torch.Tensor:
+        if hasattr(self.target_encoder, "forward_depth_window"):
+            return self.target_encoder.forward_depth_window(
+                fields,
+                mask_tokens=mask_tokens,
+                out_start=int(out_start),
+                out_depth=int(out_depth),
+            )
+        full = self.target_encoder(fields, mask_tokens=mask_tokens)
+        starts = torch.full((fields.shape[0],), int(out_start), dtype=torch.long, device=fields.device)
+        return self._gather_slabs(full, starts, out_depth)
     def make_fields(self, x):
         # The input channel is the single direct 3D field axis consumed by the encoder.
         return x
@@ -329,6 +388,7 @@ class PyramidGridJEPA3D(nn.Module):
             d = int(fields.shape[2])
 
         slab_starts, slab_depth = self._center_slab_start_index(batch_size=b, depth=d, device=x_clean.device)
+        slab_start = int(slab_starts[0].item())
 
         box_mask = self._make_random_box_mask3d(
             b,
@@ -359,13 +419,24 @@ class PyramidGridJEPA3D(nn.Module):
                     mask_tokens=zero_mask_tokens,
                     return_var=True,
                 )
+                gt_map = self._gather_slabs(gt_map_3d, slab_starts, slab_depth)
+                gt_map_full = gt_map_3d if return_full_3d_maps else None
+                if not return_full_3d_maps:
+                    del gt_map_3d
             else:
-                gt_map_3d = self.target_encoder(fields, mask_tokens=zero_mask_tokens)
+                if return_full_3d_maps:
+                    gt_map_3d = self.target_encoder(fields, mask_tokens=zero_mask_tokens)
+                    gt_map = self._gather_slabs(gt_map_3d, slab_starts, slab_depth)
+                    gt_map_full = gt_map_3d
+                else:
+                    gt_map = self._target_encoder_depth_window(
+                        fields,
+                        zero_mask_tokens,
+                        out_start=slab_start,
+                        out_depth=slab_depth,
+                    )
+                    gt_map_full = None
                 target_symmetric_var = None
-            gt_map = self._gather_slabs(gt_map_3d, slab_starts, slab_depth)
-            gt_map_full = gt_map_3d if return_full_3d_maps else None
-            if not return_full_3d_maps:
-                del gt_map_3d
             del zero_mask_tokens
 
         if self.use_symmetric_feature_loss:
@@ -375,13 +446,24 @@ class PyramidGridJEPA3D(nn.Module):
                 mask_tokens=mask_tokens,
                 return_var=True,
             )
+            context_map = self._gather_slabs(context_map_3d, slab_starts, slab_depth)
+            context_map_full = context_map_3d if return_full_3d_maps else None
+            if not return_full_3d_maps:
+                del context_map_3d
         else:
-            context_map_3d = self.context_encoder(fields_context, mask_tokens=mask_tokens)
+            if return_full_3d_maps:
+                context_map_3d = self._context_encoder_forward(fields_context, mask_tokens)
+                context_map = self._gather_slabs(context_map_3d, slab_starts, slab_depth)
+                context_map_full = context_map_3d
+            else:
+                context_map = self._context_encoder_depth_window(
+                    fields_context,
+                    mask_tokens,
+                    out_start=slab_start,
+                    out_depth=slab_depth,
+                )
+                context_map_full = None
             symmetric_var = None
-        context_map = self._gather_slabs(context_map_3d, slab_starts, slab_depth)
-        context_map_full = context_map_3d if return_full_3d_maps else None
-        if not return_full_3d_maps:
-            del context_map_3d
         pred_map = self.predictor3d(context_map)
         _, _, dz, hy, wx = pred_map.shape
         num_targets = max(1, self._target_budget(height=hy, width=wx, device=x_clean.device))

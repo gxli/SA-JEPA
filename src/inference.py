@@ -819,10 +819,10 @@ def run_post_training_inference(
     _save_npz(os.path.join(session_dir, "target_energy_count_map.npz"), inference_outputs["target_energy_count_map"].numpy())
     encoder_rf = int(_encoder_receptive_field_2d(model))
     dense_output_rf = int(_dense_output_receptive_field_2d(model))
-    if inference_discard_margin is not None:
-        discard_margin = int(max(0, int(inference_discard_margin)))
-    else:
+    if inference_discard_margin is None or str(inference_discard_margin).strip().lower() == "auto":
         discard_margin = int(max(0, dense_output_rf // 2))
+    else:
+        discard_margin = int(max(0, int(inference_discard_margin)))
     with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -872,8 +872,27 @@ def run_post_training_inference(
     canonical_visit_counts = np.zeros((visit_h, visit_w), dtype=np.float32)
     canonical_rows = []
     max_visit_batches = int(inference_visit_batches)
-    if max_visit_batches < 0:
-        max_visit_batches = 0
+    if max_visit_batches <= 0:
+        _save_npz(os.path.join(session_dir, "visited_target_frequency.npz"), canonical_visit_counts)
+        _save_npz(os.path.join(session_dir, "visited_target_frequency_canonical.npz"), canonical_visit_counts)
+        np.save(os.path.join(session_dir, "target_visit_rows.npy"), np.zeros((0, 6), dtype=np.float32))
+        with open(
+            os.path.join(session_dir, "visited_target_locations_canonical.csv"),
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as f:
+            csv.writer(f).writerow(["batch", "sample", "target", "y", "x", "scale"])
+        print(f"[{config_name}] target_visit_heatmap skipped inference_visit_batches={max_visit_batches}")
+        _save_npz(os.path.join(session_dir, "pred_map.npz"), inference_outputs["pred_map"].numpy())
+        _save_npz(os.path.join(session_dir, "gt_map.npz"), inference_outputs["gt_map"].numpy())
+        pred_norm = inference_outputs["pred_map"].norm(dim=1).numpy()
+        gt_norm = inference_outputs["gt_map"].norm(dim=1).numpy()
+        err_norm = (inference_outputs["pred_map"] - inference_outputs["gt_map"]).norm(dim=1).numpy()
+        _save_npz(os.path.join(session_dir, "pred_norm.npz"), pred_norm)
+        _save_npz(os.path.join(session_dir, "gt_norm.npz"), gt_norm)
+        _save_npz(os.path.join(session_dir, "err_norm.npz"), err_norm)
+        return session_dir
     dev = next(model.parameters()).device
     with torch.no_grad():
         for ib, batch in enumerate(dataloader):

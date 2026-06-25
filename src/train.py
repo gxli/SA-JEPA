@@ -1153,6 +1153,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         norm_per_scale=bool(model_cfg.get("scaleaware_norm_per_scale", True)),
         adapter_norm=bool(model_cfg.get("scaleaware_adapter_norm", True)),
         final_norm=bool(model_cfg.get("scaleaware_final_norm", True)),
+        activation_checkpointing=bool(model_cfg.get("activation_checkpointing", True)),
     ).to(device)
 
 

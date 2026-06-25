@@ -24,6 +24,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.join(ROOT_DIR, "scripts")
 
 DASH_DATA_REQUIRED = {
+    "dashboard_version",
     "orig",
     "target",
     "target_loc_heatmap",
@@ -61,17 +62,57 @@ SCALE_PROBE_KEYS = {
 def _session_config_candidates(session_dir: str) -> list[str]:
     name = os.path.basename(os.path.abspath(session_dir))
     env_cfg_dir = os.environ.get("SESSION_DASH_CONFIG_DIR", "").strip()
-    candidates = [
+    candidates = []
+    if env_cfg_dir:
+        for ext in (".yaml", ".yml", ".json"):
+            candidates.append(os.path.join(env_cfg_dir, "local_configs", f"{name}{ext}"))
+            candidates.append(os.path.join(env_cfg_dir, f"{name}{ext}"))
+    candidates.extend([
+        os.path.join(ROOT_DIR, "configs", "local_configs", f"{name}.yaml"),
+        os.path.join(ROOT_DIR, "configs", "local_configs", f"{name}.yml"),
+        os.path.join(ROOT_DIR, "configs", "local_configs", f"{name}.json"),
         os.path.join(session_dir, "resolved_config.json"),
         os.path.join(session_dir, "config_used.json"),
-    ]
-    if env_cfg_dir:
-        candidates.append(os.path.join(env_cfg_dir, f"{name}.json"))
+    ])
     candidates.extend([
         os.path.join(ROOT_DIR, "configs", "experiments", f"{name}.json"),
         os.path.join(ROOT_DIR, "configs", f"{name}.json"),
     ])
     return [os.path.abspath(path) for path in candidates]
+
+
+def _read_config_file(path: str, seen: set[str] | None = None) -> dict[str, Any]:
+    seen = set() if seen is None else seen
+    abs_path = os.path.abspath(path)
+    if abs_path in seen:
+        raise ValueError(f"Cyclic base_config reference detected: {abs_path}")
+    seen.add(abs_path)
+    with open(abs_path, "r", encoding="utf-8") as f:
+        if abs_path.endswith((".yaml", ".yml")):
+            import yaml as _yaml
+
+            cfg = _yaml.safe_load(f) or {}
+        else:
+            cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        return {}
+    base_ref = cfg.pop("base_config", None)
+    if base_ref is not None:
+        base_path = base_ref if os.path.isabs(base_ref) else os.path.join(os.path.dirname(abs_path), base_ref)
+        base_cfg = _read_config_file(base_path, seen)
+        cfg = _deep_merge_dict(base_cfg, cfg)
+    seen.remove(abs_path)
+    return cfg
+
+
+def _deep_merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge_dict(out[key], value)
+        else:
+            out[key] = value
+    return out
 
 
 def _find_session_config(session_dir: str) -> str | None:
@@ -86,8 +127,7 @@ def _find_readable_session_config(session_dir: str) -> tuple[dict[str, Any], str
         if not os.path.exists(path):
             continue
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
+            cfg = _read_config_file(path)
             if isinstance(cfg, dict):
                 return cfg, path
             print(f"dashboard_config_read_failed={path} reason=not_object")
@@ -523,22 +563,50 @@ def _apply_xyz_border_nan(xyz: np.ndarray, h: int, w: int, border_px: int) -> np
     return out.reshape(h * w, 3)
 
 
-def _explicit_latent_margin_from_config(session_dir: str) -> int:
-    cfg_path = os.path.join(session_dir, "config_used.json")
-    if not os.path.exists(cfg_path):
-        return 0
-    try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    except Exception:
-        return 0
+def _latent_margin_from_config(session_dir: str) -> int | None:
+    cfg, cfg_path = _load_session_config(session_dir)
+    if not cfg_path:
+        return None
     train_cfg = cfg.get("train", {}) if isinstance(cfg, dict) else {}
     if isinstance(train_cfg, dict) and "inference_discard_margin" in train_cfg:
         try:
-            return int(max(0, train_cfg.get("inference_discard_margin") or 0))
+            value = train_cfg.get("inference_discard_margin")
+            if str(value).strip().lower() == "auto":
+                return _encoder_fov_border_from_config_dict(cfg)
+            return int(max(0, value or 0))
         except (TypeError, ValueError):
             return 0
-    return 0
+    return None
+
+
+def _encoder_fov_border_from_config_dict(cfg: dict) -> int:
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(model_cfg, dict):
+        return 0
+    depth = int(model_cfg.get("encoder_depth", 3))
+    kernel = int(model_cfg.get("encoder_kernel_size", 5))
+    mode = str(model_cfg.get("mode", "")).strip().lower()
+    encoder_type = str(model_cfg.get("encoder_type", "")).strip().lower()
+    if mode.startswith("3d") or "3d" in encoder_type:
+        rf = 1 + 2 * (3 - 1) + max(0, depth) * max(0, kernel - 1)
+        return max(0, rf // 2)
+    dilations = model_cfg.get("convnext_layer_dilations")
+    if dilations is None:
+        dil_list = [1] * max(0, depth)
+    else:
+        try:
+            dil_list = [int(v) for v in dilations]
+        except TypeError:
+            dil_list = [1] * max(0, depth)
+        if len(dil_list) < depth and dil_list:
+            reps = (depth + len(dil_list) - 1) // len(dil_list)
+            dil_list = (dil_list * reps)[:depth]
+        else:
+            dil_list = dil_list[:depth]
+    rf = 1 + 2 + 2
+    for dilation in dil_list:
+        rf += max(0, kernel - 1) * max(1, int(dilation))
+    return max(0, rf // 2)
 
 
 def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
@@ -550,13 +618,27 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             scale_pt, _ = _find_scale_probe_artifacts(session_dir)
             if scale_pt is not None:
                 missing.extend(sorted(SCALE_PROBE_KEYS.difference(existing.files)))
+            if "dashboard_version" in existing.files:
+                version_arr = np.asarray(existing["dashboard_version"]).reshape(-1)
+                version_str = str(version_arr[0]) if version_arr.size else ""
+                if version_str != DASHBOARD_VERSION:
+                    missing.append("dashboard_version")
             existing.close()
             npz_mtime = os.path.getmtime(out_npz)
             stale_inputs = []
-            for dep_name in ("metrics.csv", "loss_weights.json", "rank_diagnostics.json"):
+            for dep_name in (
+                "inference_outputs.pt",
+                "jepa_energy_summary.json",
+                "metrics.csv",
+                "loss_weights.json",
+                "rank_diagnostics.json",
+            ):
                 dep_path = os.path.join(session_dir, dep_name)
                 if os.path.exists(dep_path) and os.path.getmtime(dep_path) > npz_mtime:
                     stale_inputs.append(dep_name)
+            cfg_path = _find_readable_session_config_path(session_dir)
+            if cfg_path and os.path.exists(cfg_path) and os.path.getmtime(cfg_path) > npz_mtime:
+                stale_inputs.append(os.path.basename(cfg_path))
             if stale_inputs:
                 print(f"dash_data_stale_recompute={out_npz} newer={','.join(stale_inputs)}")
                 missing.extend(stale_inputs)
@@ -710,10 +792,13 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     if pred_map is None:
         raise RuntimeError(f"{session_dir}: inference outputs missing pred_map")
     h_lat, w_lat = int(pred_map.shape[-2]), int(pred_map.shape[-1])
-    if "inference_discard_margin" in inference_summary:
+    config_border = _latent_margin_from_config(session_dir)
+    if config_border is not None:
+        latent_border_px = int(max(0, config_border))
+    elif "inference_discard_margin" in inference_summary:
         latent_border_px = int(max(0, inference_summary.get("inference_discard_margin") or 0))
     else:
-        latent_border_px = _explicit_latent_margin_from_config(session_dir)
+        latent_border_px = 0
     if latent_border_px > 0:
         print(f"dashboard_latent_border_nan={session_dir} border_px={latent_border_px}")
 
@@ -1105,6 +1190,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     scale_probe_data = _load_scale_probe_dash_data(session_dir)
 
     dash_payload = dict(
+        dashboard_version=np.asarray(DASHBOARD_VERSION),
         orig=orig,
         blurred=blurred,
         target=target.astype(np.float32),
