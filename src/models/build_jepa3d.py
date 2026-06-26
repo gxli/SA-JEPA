@@ -60,6 +60,10 @@ class PyramidGridJEPA3D(nn.Module):
         adapter_norm: bool = True,
         final_norm: bool = True,
         activation_checkpointing: bool = True,
+        target_invalid_region_skip: bool = True,
+        target_invalid_region_values=(0.0, "nan"),
+        encoder_border_margin_xy: int = 0,
+        mask_box_hardcap: int | None = None,
     ):
         super().__init__()
         self.num_scales = int(num_scales)
@@ -74,6 +78,10 @@ class PyramidGridJEPA3D(nn.Module):
         self.mask_box_size = int(mask_box_size)
         self.num_mask_boxes = int(num_mask_boxes)
         self.mode = "3d_slab"
+        self.target_invalid_region_skip = bool(target_invalid_region_skip)
+        self.target_invalid_region_values = tuple(target_invalid_region_values)
+        self.encoder_border_margin_xy = int(max(0, encoder_border_margin_xy))
+        self.mask_box_hardcap = mask_box_hardcap
         self.slab_depth = max(self.patch_size, int(slab_depth))
         self.encoder_receptive_field_depth = int(
             encoder_receptive_field_depth
@@ -258,6 +266,7 @@ class PyramidGridJEPA3D(nn.Module):
     def _sample_targets_from_masked_slab(
         self,
         mask_slab: torch.Tensor,
+        target_mask_slab: torch.Tensor,
         num_targets: int,
         patch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -286,7 +295,9 @@ class PyramidGridJEPA3D(nn.Module):
         exclusion = max(1, int(self.mask_box_size))
         allow_partial = float(self.target_allow_partial_overlap)
         for bi in range(b):
-            candidates = torch.nonzero(mask_slab[bi, 0] > 0, as_tuple=False)
+            # Use target_mask_slab for candidate selection: only pixels
+            # that are inside both the box mask AND the valid-region mask.
+            candidates = torch.nonzero(target_mask_slab[bi, 0], as_tuple=False)
             if candidates.numel() == 0:
                 continue
             inside = (
@@ -409,6 +420,20 @@ class PyramidGridJEPA3D(nn.Module):
             base_ctx = torch.clamp(fields_context, min=0.0)
             fields_context = torch.log(base_ctx + log_floor)
 
+        # Build combined valid-region mask for target rejection.
+        # Valid targets must be inside a box_mask region AND outside
+        # invalid-pixel regions (NaN/Inf/zero + encoder FOV XY border).
+        target_mask_map = box_mask.bool()  # B,1,D,H,W
+        if self.target_invalid_region_skip:
+            invalid_pixel_mask = ~torch.isfinite(fields)
+            border_xy = self.encoder_border_margin_xy
+            if border_xy > 0:
+                invalid_pixel_mask[:, :, :, :border_xy, :] = True
+                invalid_pixel_mask[:, :, :, h - border_xy:, :] = True
+                invalid_pixel_mask[:, :, :, :, :border_xy] = True
+                invalid_pixel_mask[:, :, :, :, w - border_xy:] = True
+            target_mask_map = target_mask_map & ~invalid_pixel_mask[:, :1]
+
         return_full_3d_maps = bool(kwargs.get("return_full_3d_maps", False))
         with torch.no_grad():
             zero_mask_tokens = torch.zeros_like(fields)
@@ -468,8 +493,10 @@ class PyramidGridJEPA3D(nn.Module):
         _, _, dz, hy, wx = pred_map.shape
         num_targets = max(1, self._target_budget(height=hy, width=wx, device=x_clean.device))
         mask_slab = self._gather_slabs(box_mask, slab_starts, slab_depth)
+        target_mask_slab = self._gather_slabs(target_mask_map.float(), slab_starts, slab_depth).bool()
         target_locations, target_valid = self._sample_targets_from_masked_slab(
             mask_slab=mask_slab,
+            target_mask_slab=target_mask_slab,
             num_targets=num_targets,
             patch_size=self.patch_size,
         )
@@ -492,6 +519,7 @@ class PyramidGridJEPA3D(nn.Module):
             "x_context": self._gather_slabs(fields_context, slab_starts, slab_depth),
             "x_context_full": fields_context,
             "mask_cube": box_mask,
+            "target_mask_map": self._gather_slabs(target_mask_map.float(), slab_starts, slab_depth),
             "selected_slab_start_index": slab_starts,
             "selected_slab_depth": torch.full((b,), int(slab_depth), device=x_clean.device, dtype=torch.long),
             "encoder_receptive_field_depth": torch.full((b,), int(self.encoder_receptive_field_depth), device=x_clean.device, dtype=torch.long),

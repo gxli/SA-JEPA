@@ -193,6 +193,53 @@ def _compute_pca_2d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> 
         return (x_t @ v[:, :2]).cpu().numpy().astype(np.float32)
 
 
+def _robust_pca(z_flat: np.ndarray, mask_flat: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> np.ndarray:
+    """Strip NaN/Inf from input + mask, run PCA, never crash."""
+    combined = mask_flat.copy() & np.isfinite(z_flat).all(axis=-1)
+    if not combined.any():
+        return np.full((z_flat.shape[0], 3), np.nan, dtype=np.float32)
+    emb = _compute_pca_3d(z_flat[combined], fit_max_tokens=fit_max_tokens).astype(np.float32)
+    out = np.full((z_flat.shape[0], emb.shape[1]), np.nan, dtype=np.float32)
+    out[combined] = emb
+    return out
+
+
+def _robust_umap(
+    z_flat: np.ndarray,
+    mask_flat: np.ndarray,
+    l2_normalize: bool = False,
+    standardize: bool = False,
+    n_neighbors: int = 50,
+    min_dist: float = 0.2,
+    metric: str = "euclidean",
+    random_state: int = 42,
+    init: str = "auto",
+    fit_max_tokens: int = MAX_PCA_FIT_TOKENS,
+) -> np.ndarray:
+    """Strip NaN/Inf from input + mask, run UMAP, never crash."""
+    combined = mask_flat.copy() & np.isfinite(z_flat).all(axis=-1)
+    if not combined.any():
+        return np.full((z_flat.shape[0], 3), np.nan, dtype=np.float32)
+    z_clean = _preprocess_latents_for_umap(
+        z_flat[combined],
+        l2_normalize=l2_normalize,
+        standardize=standardize,
+    )
+    emb = _compute_umap_nd(
+        z_clean,
+        n_components=3,
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        metric=metric,
+        random_state=random_state,
+        init=init,
+        fit_max_tokens=fit_max_tokens,
+    ).astype(np.float32)
+    out = np.full((z_flat.shape[0], emb.shape[1]), np.nan, dtype=np.float32)
+    out[combined] = emb
+    return out
+
+
 def _compute_pca_3d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     if x.shape[0] > fit_max_tokens:
@@ -214,8 +261,11 @@ def _compute_pca_3d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> 
         try:
             _, _, vt = np.linalg.svd(fit_centered.astype(np.float64), full_matrices=False)
         except np.linalg.LinAlgError:
-            fit_jitter = fit_centered.astype(np.float64) + np.eye(fit_centered.shape[0], fit_centered.shape[1]) * 1e-5
-            _, _, vt = np.linalg.svd(fit_jitter, full_matrices=False)
+            try:
+                fit_jitter = fit_centered.astype(np.float64) + np.eye(fit_centered.shape[0], fit_centered.shape[1]) * 1e-5
+                _, _, vt = np.linalg.svd(fit_jitter, full_matrices=False)
+            except np.linalg.LinAlgError:
+                raise
         comps = vt[:3].T.astype(np.float32)
         return ((x - mean) @ comps).astype(np.float32)
 
@@ -312,9 +362,7 @@ def _compute_umap_nd(
     except Exception as e:
         print(f"[warning] umap-learn failed: {type(e).__name__}: {e}")
 
-    if n_components == 3:
-        return _compute_pca_3d(x, fit_max_tokens=fit_max_tokens)
-    return _compute_pca_2d(x, fit_max_tokens=fit_max_tokens)
+    raise RuntimeError(f"UMAP({n_components}D) failed: all backends exhausted")
 
 
 def _save_latent_overview_html(session_dir: str, pca_points: np.ndarray, umap_points: np.ndarray, h: int, w: int) -> str:
@@ -510,6 +558,27 @@ def _build_input_validity_mask(x_clean_raw: torch.Tensor, target_h: int, target_
     return mask
 
 
+def _target_allowed_validity_mask(outputs: dict, target_h: int, target_w: int) -> np.ndarray | None:
+    """Return the user-provided valid-target region at latent resolution."""
+    target_allowed = outputs.get("target_allowed_mask_map")
+    if target_allowed is None:
+        return None
+    tm = torch.as_tensor(target_allowed)
+    if tm.dim() == 2:
+        tm = tm.unsqueeze(0).unsqueeze(0)
+    elif tm.dim() == 3:
+        tm = tm.unsqueeze(1)
+    elif tm.dim() == 5:
+        # B,C,D,H,W: use the center depth plane for 2D dashboard embeddings.
+        tm = tm[:, :, tm.shape[2] // 2]
+    if tm.dim() != 4 or tm.shape[0] < 1:
+        return None
+    tm0 = tm[0:1, 0:1].float()
+    if int(tm0.shape[-2]) != int(target_h) or int(tm0.shape[-1]) != int(target_w):
+        tm0 = F.interpolate(tm0, size=(target_h, target_w), mode="nearest")
+    return (tm0[0, 0] > 0.5).detach().cpu().numpy().astype(bool)
+
+
 def _filtered_embedding(
     latents_flat: np.ndarray,
     mask_flat: np.ndarray,
@@ -523,14 +592,31 @@ def _filtered_embedding(
     if not mask_flat.any():
         # No valid positions → all-NaN placeholder; guess D=3
         return np.full((n_total, 3), np.nan, dtype=np.float32)
-    if mask_flat.all():
-        return compute_fn(latents_flat)
     latents_valid = latents_flat[mask_flat]
-    emb_valid = compute_fn(latents_valid)
+    # Drop rows where the model produced NaN/Inf latents.
+    finite_rows = np.isfinite(latents_valid).all(axis=-1)
+    if not finite_rows.any():
+        return np.full((n_total, 3), np.nan, dtype=np.float32)
+    if finite_rows.all():
+        emb_valid = compute_fn(latents_valid)
+    else:
+        emb_finite = compute_fn(latents_valid[finite_rows])
+        emb_valid = np.full((latents_valid.shape[0], emb_finite.shape[1]), np.nan, dtype=np.float32)
+        emb_valid[finite_rows] = emb_finite
     n_emb = emb_valid.shape[1]
     result = np.full((n_total, n_emb), np.nan, dtype=np.float32)
     result[mask_flat] = emb_valid
     return result
+
+
+def _target_location_yx(tloc: "torch.Tensor") -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Return (loc_y, loc_x) from target_locations tensor (B,K,2) or (B,K,3)."""
+    tloc = torch.as_tensor(tloc)
+    if tloc.dim() == 3 and tloc.shape[-1] >= 2:
+        if tloc.shape[-1] >= 3:
+            return tloc[..., -2].long(), tloc[..., -1].long()
+        return tloc[..., 0].long(), tloc[..., 1].long()
+    raise ValueError(f"Expected target_locations shape (B,K,2) or (B,K,3), got {tuple(tloc.shape)}")
 
 
 def _target_region_mask_from_outputs(outputs: dict, target_h: int, target_w: int) -> np.ndarray:
@@ -570,11 +656,12 @@ def _target_region_mask_from_outputs(outputs: dict, target_h: int, target_w: int
     patch_size = int(max(1, outputs.get("patch_size", 1)))
     rad_y = max(0, int(np.ceil(0.5 * patch_size * scale_y)))
     rad_x = max(0, int(np.ceil(0.5 * patch_size * scale_x)))
+    loc_y, loc_x = _target_location_yx(tloc)
     for i in range(int(tloc.shape[1])):
         if i >= int(tvalid.shape[1]) or not bool(tvalid[0, i].item()):
             continue
-        cy = int(round(float(tloc[0, i, 0].item()) * scale_y))
-        cx = int(round(float(tloc[0, i, 1].item()) * scale_x))
+        cy = int(round(float(loc_y[0, i].item()) * scale_y))
+        cx = int(round(float(loc_x[0, i].item()) * scale_x))
         y0, y1 = max(0, cy - rad_y), min(target_h, cy + rad_y + 1)
         x0, x1 = max(0, cx - rad_x), min(target_w, cx + rad_x + 1)
         if y0 < y1 and x0 < x1:
@@ -627,17 +714,21 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         valid_mask_2d[:, :border_px] = False
         valid_mask_2d[:, w_lat - border_px :] = False
         print(f"[dashboard] latent PCA/UMAP border mask: border_px={border_px}")
-    if bool(outputs.get("mask_inference", False)) or "target_mask_map" in outputs:
-        target_region_mask = _target_region_mask_from_outputs(outputs, h_lat, w_lat)
-        valid_mask_2d = valid_mask_2d & target_region_mask
-        print(f"[dashboard] latent PCA/UMAP masked-region filter: valid_pixels={int(valid_mask_2d.sum())} mask_inference={bool(outputs.get('mask_inference', False))}")
+    target_allowed_mask = _target_allowed_validity_mask(outputs, h_lat, w_lat)
+    if target_allowed_mask is not None:
+        valid_mask_2d = valid_mask_2d & target_allowed_mask
+        print(
+            "[dashboard] latent PCA/UMAP target-allowed mask: "
+            f"valid_pixels={int(valid_mask_2d.sum())}/{int(valid_mask_2d.size)}"
+        )
     valid_mask_flat = valid_mask_2d.reshape(-1)  # [H_lat * W_lat]
 
     # Render sampled target locations for first sample.
     target_vis = np.zeros_like(orig, dtype=np.float32)
+    loc_y, loc_x = _target_location_yx(target_locations)
     for i in range(target_locations.shape[1]):
-        cy = int(target_locations[0, i, 0].item())
-        cx = int(target_locations[0, i, 1].item())
+        cy = int(loc_y[0, i].item())
+        cx = int(loc_x[0, i].item())
         if 0 <= cy < target_vis.shape[0] and 0 <= cx < target_vis.shape[1]:
             target_vis[cy, cx] = 1.0
 
@@ -676,51 +767,15 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
                 f"{branch_name} latent map must be CxHxW after slicing, got shape={latent_map.shape}"
             )
         z = np.transpose(latent_map, (1, 2, 0)).reshape(-1, fmap.shape[1]).astype(np.float32)
-
-        # Filter invalid-region latents from PCA/UMAP, keep NaN sentinels.
-        pca3 = _filtered_embedding(
+        pca3 = _robust_pca(z, valid_mask_flat, fit_max_tokens=fit_max_tokens)
+        umap3 = _robust_umap(
             z, valid_mask_flat,
-            lambda arr: _compute_pca_3d(arr, fit_max_tokens=fit_max_tokens),
-        ).astype(np.float32)
-
-        if valid_mask_flat.all():
-            z_umap = _preprocess_latents_for_umap(
-                z,
-                l2_normalize=umap_l2_normalize,
-                standardize=umap_standardize,
-            )
-            umap3 = _compute_umap_nd(
-                z_umap,
-                n_components=3,
-                n_neighbors=umap_n_neighbors,
-                min_dist=umap_min_dist,
-                metric=umap_metric,
-                random_state=umap_random_state,
-                init=umap_init,
-                fit_max_tokens=fit_max_tokens,
-            ).astype(np.float32)
-        else:
-            z_valid = z[valid_mask_flat]
-            if z_valid.shape[0] == 0:
-                umap3 = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
-            else:
-                z_umap_valid = _preprocess_latents_for_umap(
-                    z_valid,
-                    l2_normalize=umap_l2_normalize,
-                    standardize=umap_standardize,
-                )
-                umap3_valid = _compute_umap_nd(
-                    z_umap_valid,
-                    n_components=3,
-                    n_neighbors=umap_n_neighbors,
-                    min_dist=umap_min_dist,
-                    metric=umap_metric,
-                    random_state=umap_random_state,
-                    init=umap_init,
-                    fit_max_tokens=fit_max_tokens,
-                ).astype(np.float32)
-                umap3 = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
-                umap3[valid_mask_flat] = umap3_valid
+            l2_normalize=umap_l2_normalize,
+            standardize=umap_standardize,
+            n_neighbors=umap_n_neighbors, min_dist=umap_min_dist,
+            metric=umap_metric, random_state=umap_random_state,
+            init=umap_init, fit_max_tokens=fit_max_tokens,
+        )
 
         expected_n = h_map * w_map
         if pca3.shape != (expected_n, 3):
@@ -757,8 +812,24 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     return results_dir
 
 
+def _build_volume_validity_mask(x_clean_raw: torch.Tensor, target_d: int, target_h: int, target_w: int) -> np.ndarray:
+    """Build a bool validity mask at latent volume resolution from the raw input."""
+    if x_clean_raw is None:
+        return np.ones((target_d, target_h, target_w), dtype=bool)
+    x = torch.as_tensor(x_clean_raw)
+    if x.dim() == 4:
+        valid_2d = _build_input_validity_mask(x, target_h, target_w)
+        return np.broadcast_to(valid_2d[None, :, :], (target_d, target_h, target_w)).copy()
+    if x.dim() != 5:
+        return np.ones((target_d, target_h, target_w), dtype=bool)
+    inp = x[0:1, 0:1]
+    valid = ((inp.abs() > 1e-12) & torch.isfinite(inp)).float()
+    pooled = F.interpolate(valid, size=(target_d, target_h, target_w), mode="nearest")
+    return (pooled[0, 0] > 0.5).detach().cpu().numpy().astype(bool)
+
+
 def save_volumetric_umap_embeddings(session_dir: str, outputs: dict, umap_cfg: dict | None = None) -> str:
-    """Train UMAP on a random fraction of volumetric latent voxels and save artifacts."""
+    """Train UMAP on valid volumetric latent voxels and save artifacts."""
     umap_cfg = dict(umap_cfg or {})
     umap_n_neighbors = int(umap_cfg.get("n_neighbors", 15))
     umap_min_dist = float(umap_cfg.get("min_dist", 0.05))
@@ -767,9 +838,8 @@ def save_volumetric_umap_embeddings(session_dir: str, outputs: dict, umap_cfg: d
     umap_init = str(umap_cfg.get("init", "spectral")).lower()
     umap_l2_normalize = bool(umap_cfg.get("l2_normalize", False))
     umap_standardize = bool(umap_cfg.get("standardize", False))
-    sample_fraction = float(umap_cfg.get("volumetric_sample_fraction", 0.05))
-    sample_fraction = min(max(sample_fraction, 0.0), 1.0)
-    max_points = int(max(128, umap_cfg.get("volumetric_max_points", 50000)))
+    max_points_raw = umap_cfg.get("volumetric_max_points", 100000)
+    max_points = None if max_points_raw is None else int(max(128, max_points_raw))
     sample_seed = int(umap_cfg.get("volumetric_sample_seed", umap_random_state))
 
     fmap = outputs.get("context_map")
@@ -778,13 +848,25 @@ def save_volumetric_umap_embeddings(session_dir: str, outputs: dict, umap_cfg: d
     if fmap.dim() != 5:
         raise ValueError(f"Expected 3D map B,C,D,H,W, got shape={tuple(fmap.shape)}")
 
+    d_map, h_map, w_map = int(fmap.shape[-3]), int(fmap.shape[-2]), int(fmap.shape[-1])
     z = fmap[0].detach().cpu().permute(1, 2, 3, 0).reshape(-1, fmap.shape[1]).numpy().astype(np.float32)
-    n_total = int(z.shape[0])
+    input_ref = outputs.get("x_clean_raw", outputs.get("x_clean"))
+    input_valid = _build_volume_validity_mask(input_ref, d_map, h_map, w_map).reshape(-1)
+    finite_valid = np.isfinite(z).all(axis=1)
+    valid = input_valid & finite_valid
+    valid_indices = np.flatnonzero(valid).astype(np.int64)
+    if valid_indices.size < 4:
+        raise RuntimeError(f"volumetric UMAP: fewer than 4 valid latent voxels ({valid_indices.size})")
+    n_valid = int(valid_indices.size)
     rng = np.random.default_rng(sample_seed)
-    n_pick = int(round(n_total * sample_fraction)) if sample_fraction < 1.0 else n_total
-    n_pick = max(128, min(n_total, n_pick, max_points))
-    idx = rng.choice(n_total, size=n_pick, replace=False)
-    z_sub = z[idx]
+    if max_points is not None and n_valid > max_points:
+        selected_indices = rng.choice(valid_indices, size=int(max_points), replace=False)
+        selection = "absolute_cap"
+    else:
+        selected_indices = valid_indices
+        selection = "full_valid_inference_extent"
+    selected_indices = np.sort(selected_indices.astype(np.int64, copy=False))
+    z_sub = z[selected_indices]
 
     z_sub_umap = _preprocess_latents_for_umap(
         z_sub,
@@ -804,17 +886,19 @@ def save_volumetric_umap_embeddings(session_dir: str, outputs: dict, umap_cfg: d
 
     results_dir = os.path.join(session_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
-    np.save(os.path.join(results_dir, "volumetric_umap_indices.npy"), idx.astype(np.int64))
+    np.save(os.path.join(results_dir, "volumetric_umap_indices.npy"), selected_indices.astype(np.int64))
     np.save(os.path.join(results_dir, "volumetric_umap_latents.npy"), z_sub.astype(np.float32))
     np.save(os.path.join(results_dir, "volumetric_umap_xyz.npy"), umap3)
     np.save(os.path.join(results_dir, "volumetric_pca_xyz.npy"), pca3)
 
     meta = {
-        "n_total_voxels": n_total,
-        "n_sampled": int(n_pick),
-        "sample_fraction": float(sample_fraction),
-        "max_points": int(max_points),
+        "n_total_voxels": int(z.shape[0]),
+        "n_finite_voxels": int(np.count_nonzero(finite_valid)),
+        "n_valid_voxels": n_valid,
+        "n_selected": int(selected_indices.size),
+        "max_points": None if max_points is None else int(max_points),
         "sample_seed": int(sample_seed),
+        "selection": selection,
     }
     meta_path = os.path.join(session_dir, "volumetric_umap_meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:

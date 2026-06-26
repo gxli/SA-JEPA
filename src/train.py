@@ -44,7 +44,7 @@ from src.models.build_jepa3d import PyramidGridJEPA3D, compute_3d_encoder_recept
 from src.models.masking import _max_effective_mask_box_size, prepare_context_batch
 from src.utils import log_error, set_error_log_path
 from src.utils.npy import _safe_load_npy
-from src.utils.viz import save_inference_dashboard, save_volumetric_umap_embeddings
+from src.utils.viz import _target_location_yx, save_inference_dashboard, save_volumetric_umap_embeddings
 
 LOGGER = logging.getLogger(__name__)
 warnings.filterwarnings(
@@ -280,25 +280,29 @@ def _write_data_profile(*, data_cfg: dict, session_dir: str, config_name: str) -
 def _write_cdd_cache_profile(*, cdd_cache: dict | None, session_dir: str, config_name: str) -> None:
     entries = []
     for (path, slice_idx), value in sorted((cdd_cache or {}).items()):
-        arr = np.asarray(value)
-        finite = np.isfinite(arr)
-        item = {
-            "path": path,
-            "slice_idx": slice_idx,
-            "shape": [int(v) for v in arr.shape],
-            "finite_count": int(finite.sum()),
-            "nan_count": int(np.isnan(arr).sum()),
-            "zero_count": int(np.count_nonzero(arr == 0.0)),
-            "zero_fraction": float(np.mean(arr == 0.0)) if arr.size > 0 else 0.0,
-            "positive_count": int(np.count_nonzero(arr > 0.0)),
-            "min": float(arr[finite].min()) if finite.any() else None,
-            "max": float(arr[finite].max()) if finite.any() else None,
-        }
-        entries.append(item)
-        log_info(
-            f"[{config_name}] CDD cache profile: path={path} shape={tuple(item['shape'])} "
-            f"nan={item['nan_count']} zero_fraction={item['zero_fraction']:.4f} max={item['max']}"
-        )
+        variants = ("untransformed", "transformed") if isinstance(value, dict) else (None,)
+        for variant in variants:
+            arr = np.asarray(value[variant] if variant else value)
+            finite = np.isfinite(arr)
+            item = {
+                "path": path,
+                "slice_idx": slice_idx,
+                "variant": variant,
+                "shape": [int(v) for v in arr.shape],
+                "finite_count": int(finite.sum()),
+                "nan_count": int(np.isnan(arr).sum()),
+                "zero_count": int(np.count_nonzero(arr == 0.0)),
+                "zero_fraction": float(np.mean(arr == 0.0)) if arr.size > 0 else 0.0,
+                "positive_count": int(np.count_nonzero(arr > 0.0)),
+                "min": float(arr[finite].min()) if finite.any() else None,
+                "max": float(arr[finite].max()) if finite.any() else None,
+            }
+            entries.append(item)
+            variant_tag = f" variant={variant}" if variant else ""
+            log_info(
+                f"[{config_name}] CDD cache profile: path={path}{variant_tag} shape={tuple(item['shape'])} "
+                f"nan={item['nan_count']} zero_fraction={item['zero_fraction']:.4f} max={item['max']}"
+            )
     with open(os.path.join(session_dir, "cdd_cache_profile.json"), "w", encoding="utf-8") as f:
         json.dump({"entries": entries}, f, indent=2)
         f.write("\n")
@@ -368,12 +372,12 @@ def _cdd_disk_cache_paths(*, cache_dir: str, path: str, meta: dict) -> tuple[str
     key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode("utf-8")).hexdigest()[:24]
     stem = os.path.splitext(os.path.basename(path))[0]
     return (
-        os.path.join(cache_dir, f"{stem}_{key}.npy"),
+        os.path.join(cache_dir, f"{stem}_{key}.npz"),
         os.path.join(cache_dir, f"{stem}_{key}.json"),
     )
 
 
-def _load_cdd_disk_cache(data_path: str, meta_path: str, expected_meta: dict) -> np.ndarray | None:
+def _load_cdd_disk_cache(data_path: str, meta_path: str, expected_meta: dict) -> dict | None:
     if not (os.path.exists(data_path) and os.path.exists(meta_path)):
         return None
     try:
@@ -381,21 +385,31 @@ def _load_cdd_disk_cache(data_path: str, meta_path: str, expected_meta: dict) ->
             got_meta = json.load(f)
         if got_meta != expected_meta:
             return None
-        return _safe_load_npy(data_path, mmap_mode=None).astype(np.float32, copy=False)
+        loaded = np.load(data_path)
+        if "untransformed" not in loaded or "transformed" not in loaded:
+            return None
+        return {
+            "untransformed": loaded["untransformed"].astype(np.float32, copy=False),
+            "transformed": loaded["transformed"].astype(np.float32, copy=False),
+        }
     except Exception as e:
         log_info(f"CDD disk cache ignored: {type(e).__name__}: {e}")
         return None
 
 
-def _save_cdd_disk_cache(data_path: str, meta_path: str, value: np.ndarray, meta: dict) -> None:
+def _save_cdd_disk_cache(data_path: str, meta_path: str, value: dict, meta: dict) -> None:
     os.makedirs(os.path.dirname(data_path), exist_ok=True)
     tmp_data = f"{data_path}.tmp"
     tmp_meta = f"{meta_path}.tmp"
-    np.save(tmp_data, value.astype(np.float32, copy=False))
+    np.savez_compressed(
+        tmp_data,
+        untransformed=value["untransformed"].astype(np.float32, copy=False),
+        transformed=value["transformed"].astype(np.float32, copy=False),
+    )
     with open(tmp_meta, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, sort_keys=True)
         f.write("\n")
-    os.replace(f"{tmp_data}.npy", data_path)
+    os.replace(f"{tmp_data}.npz", data_path)
     os.replace(tmp_meta, meta_path)
 
 
@@ -475,7 +489,8 @@ def _precompute_cdd_cache(
             sample_shape = _safe_load_npy(sample_path, mmap_mode="r").shape
         n_channels = int(model_num_scales)
         est_bytes_per = int(n_channels) * int(np.prod(sample_shape)) * np.dtype(np.float32).itemsize
-        est_process_gb = (est_bytes_per * len(npy_files)) / float(1024 ** 3)
+        # 2× for untransformed + transformed variants
+        est_process_gb = (2 * est_bytes_per * len(npy_files)) / float(1024 ** 3)
         est_node_gb = est_process_gb * max(1, int(cache_replicas))
         if est_node_gb > max_gb:
             raise RuntimeError(
@@ -502,17 +517,20 @@ def _precompute_cdd_cache(
             )
             cached = _load_cdd_disk_cache(disk_data_path, disk_meta_path, cdd_meta)
             if cached is not None:
-                if cached.shape[0] != model_num_scales:
-                    raise RuntimeError(
-                        f"[{config_name}] CDD disk cache channel mismatch for {path}: "
-                        f"cached_channels={cached.shape[0]}, model_expected={model_num_scales}, "
-                        f"cache_file={disk_data_path}"
-                    )
+                for variant in ("untransformed", "transformed"):
+                    if cached[variant].shape[0] != model_num_scales:
+                        raise RuntimeError(
+                            f"[{config_name}] CDD disk cache channel mismatch for {path} "
+                            f"variant={variant}: cached_channels={cached[variant].shape[0]}, "
+                            f"model_expected={model_num_scales}, "
+                            f"cache_file={disk_data_path}"
+                        )
                 cache[(path, None)] = cached
                 disk_hits += 1
                 log_info(
                     f"[{config_name}] CDD disk cache hit: path={path} cache={disk_data_path} "
-                    f"shape={tuple(cached.shape)}"
+                    f"untransformed_shape={tuple(cached['untransformed'].shape)} "
+                    f"transformed_shape={tuple(cached['transformed'].shape)}"
                 )
                 continue
         log_info(f"[{config_name}] CDD GPU compute: path={path}")
@@ -530,16 +548,8 @@ def _precompute_cdd_cache(
             arr = np.zeros_like(arr, dtype=np.float32)
         if arr.ndim not in (2, 3):
             raise ValueError(f"Unexpected ndim={arr.ndim} for {path}")
-        # Preserve volumetric context: decompose a cube once, then let the
-        # dataset choose a 2D slice from every cached CDD channel together.
-        if cdd_pre_log_transform:
-            log_eps_val = float(model_cfg.get("log_eps", 1.0))
-            log_floor_mult = float(model_cfg.get("cdd_log_std_floor_mult", 0.05))
-            eps_f = max(1e-6, log_eps_val)
-            arr_clamp = np.clip(arr, 0.0, None)
-            arr_std = float(np.std(arr_clamp))
-            log_floor = max(eps_f, arr_std * log_floor_mult)
-            arr = np.log(arr_clamp + log_floor).astype(np.float32)
+
+        # Shared CDD kwargs (untransformed and transformed share scales/config).
         cdd_kwargs = dict(
             max_scale=max(float(s) for s in sigmas),
             min_scale=min(float(s) for s in sigmas),
@@ -553,55 +563,74 @@ def _precompute_cdd_cache(
         )
         if cdd_request_num_channels is not None:
             cdd_kwargs["num_channels"] = int(cdd_request_num_channels)
-        cdd_channels_arr, cdd_residual, cdd_scales_used = cdd.constrained_diffusion_decomposition(arr, **cdd_kwargs)
-        actual_cdd_channels = int(len(cdd_channels_arr))
-        if actual_cdd_channels < cdd_num_channels:
-            raise RuntimeError(
-                f"[{config_name}] CDD returned too few result bands for {path}: "
-                f"requested_keep={cdd_num_channels}, returned_bands={actual_cdd_channels}, "
-                f"residual_channel={int(cdd_append_last_residual)}, "
-                f"scales_used={np.asarray(cdd_scales_used).tolist()}, input_shape={tuple(arr.shape)}. "
-                "The vanilla CDD contract is results + residual; the model can ignore extra results, "
-                "but it cannot invent missing configured result channels."
+
+        def _compute_cdd_variant(input_arr: np.ndarray, label: str) -> np.ndarray:
+            """Run CDD on *input_arr* and return (S, *spatial) channels."""
+            channels_arr, residual, scales_used = cdd.constrained_diffusion_decomposition(
+                input_arr, **cdd_kwargs,
             )
-        selected_cdd_channels = list(cdd_channels_arr[:cdd_num_channels])
-        # CDD always introduces one leading scale axis:
-        # image (H,W) -> (S,H,W), cube (D,H,W) -> (S,D,H,W).
-        cdd_orig = np.clip(np.stack(selected_cdd_channels, axis=0).astype(np.float32), a_min=0.0, a_max=None)
-        if cdd_orig.ndim != arr.ndim + 1 or cdd_orig.shape[1:] != arr.shape:
-            raise ValueError(
-                f"CDD output for {path} must have one leading scale axis over input shape {arr.shape}, "
-                f"got {cdd_orig.shape}"
+            actual_ch = int(len(channels_arr))
+            if actual_ch < cdd_num_channels:
+                raise RuntimeError(
+                    f"[{config_name}] CDD returned too few result bands for {path} "
+                    f"variant={label}: "
+                    f"requested_keep={cdd_num_channels}, returned_bands={actual_ch}, "
+                    f"residual_channel={int(cdd_append_last_residual)}, "
+                    f"scales_used={np.asarray(scales_used).tolist()}, input_shape={tuple(input_arr.shape)}. "
+                    "The vanilla CDD contract is results + residual; the model can ignore extra results, "
+                    "but it cannot invent missing configured result channels."
+                )
+            selected = list(channels_arr[:cdd_num_channels])
+            result = np.clip(np.stack(selected, axis=0).astype(np.float32), a_min=0.0, a_max=None)
+            if result.ndim != input_arr.ndim + 1 or result.shape[1:] != input_arr.shape:
+                raise ValueError(
+                    f"CDD output for {path} variant={label} must have one leading scale axis "
+                    f"over input shape {input_arr.shape}, got {result.shape}"
+                )
+            if cdd_append_last_residual:
+                kept_sum = np.sum(result, axis=0, dtype=np.float32)
+                recomputed_residual = (input_arr - kept_sum).astype(np.float32)
+                result[-1] = result[-1] + np.clip(recomputed_residual, a_min=0.0, a_max=None)
+            cached_ch = int(result.shape[0])
+            ignored_ch = max(0, actual_ch - cdd_num_channels)
+            log_info(
+                f"[{config_name}] CDD channels variant={label}: "
+                f"request_arg={'auto' if cdd_request_num_channels is None else str(int(cdd_request_num_channels))} "
+                f"keep_results={cdd_num_channels} returned_bands={actual_ch} ignored_bands={ignored_ch} "
+                f"residual_added_to_last={int(cdd_append_last_residual)} "
+                f"cached_channels={cached_ch} model_expected={model_num_scales} "
+                f"scales_used={np.asarray(scales_used).tolist()} input_shape={tuple(input_arr.shape)}"
             )
-        if cdd_append_last_residual:
-            # Recompute residual from kept channels so sum(kept) == original.
-            # The raw CDD residual accounts for all returned bands (including
-            # dropped ones); recomputing guarantees exact reconstruction.
-            kept_sum = np.sum(cdd_orig, axis=0, dtype=np.float32)
-            recomputed_residual = (arr - kept_sum).astype(np.float32)
-            cdd_orig[-1] = cdd_orig[-1] + np.clip(recomputed_residual, a_min=0.0, a_max=None)
-        cached_channels = int(cdd_orig.shape[0])
-        request_arg = "auto" if cdd_request_num_channels is None else str(int(cdd_request_num_channels))
-        ignored_channels = max(0, actual_cdd_channels - cdd_num_channels)
-        log_info(
-            f"[{config_name}] CDD channels: request_arg={request_arg} keep_results={cdd_num_channels} "
-            f"returned_bands={actual_cdd_channels} ignored_bands={ignored_channels} "
-            f"residual_added_to_last={int(cdd_append_last_residual)} "
-            f"cached_channels={cached_channels} model_expected={model_num_scales} "
-            f"scales_used={np.asarray(cdd_scales_used).tolist()} input_shape={tuple(arr.shape)}"
-        )
-        if cached_channels != model_num_scales:
-            raise RuntimeError(
-                f"[{config_name}] CDD/model scale mismatch for {path}: "
-                f"request_arg={request_arg}, keep_results={cdd_num_channels}, "
-                f"returned_bands={actual_cdd_channels}, ignored_bands={ignored_channels}, "
-                f"residual_added_to_last={int(cdd_append_last_residual)}, cached_channels={cached_channels}, "
-                f"model_expected={model_num_scales}. CDD results and residual must align with "
-                "the encoder input channel count."
-            )
-        cache[(path, None)] = cdd_orig.astype(np.float32, copy=False)
+            if cached_ch != model_num_scales:
+                raise RuntimeError(
+                    f"[{config_name}] CDD/model scale mismatch for {path} variant={label}: "
+                    f"keep_results={cdd_num_channels}, returned_bands={actual_ch}, "
+                    f"residual_added_to_last={int(cdd_append_last_residual)}, "
+                    f"cached_channels={cached_ch}, model_expected={model_num_scales}. "
+                    "CDD results and residual must align with the encoder input channel count."
+                )
+            return result
+
+        # ---- untransformed variant (CDD on raw normalized data) ----
+        cdd_untransformed = _compute_cdd_variant(arr.copy(), "untransformed")
+
+        # ---- transformed variant (CDD on log-transformed data) ----
+        log_eps_val = float(model_cfg.get("log_eps", 1.0))
+        log_floor_mult = float(model_cfg.get("cdd_log_std_floor_mult", 0.05))
+        eps_f = max(1e-6, log_eps_val)
+        arr_clamp = np.clip(arr, 0.0, None)
+        arr_std = float(np.std(arr_clamp))
+        log_floor = max(eps_f, arr_std * log_floor_mult)
+        arr_log = np.log(arr_clamp + log_floor).astype(np.float32)
+        cdd_transformed = _compute_cdd_variant(arr_log, "transformed")
+
+        cache_entry = {
+            "untransformed": cdd_untransformed.astype(np.float32, copy=False),
+            "transformed": cdd_transformed.astype(np.float32, copy=False),
+        }
+        cache[(path, None)] = cache_entry
         if disk_cache_enabled and disk_data_path is not None and disk_meta_path is not None:
-            _save_cdd_disk_cache(disk_data_path, disk_meta_path, cdd_orig, cdd_meta)
+            _save_cdd_disk_cache(disk_data_path, disk_meta_path, cache_entry, cdd_meta)
             disk_writes += 1
             log_info(f"[{config_name}] CDD disk cache saved: {disk_data_path}")
     # Free GPU memory used by CDD.
@@ -624,6 +653,75 @@ def _move_to_device(value, device: torch.device):
     if isinstance(value, dict):
         return {k: _move_to_device(v, device) for k, v in value.items()}
     return value
+
+
+def _target_mask_from_data_threshold(data_cfg: dict, threshold: float, config_name: str) -> torch.Tensor | None:
+    """Build a full-frame valid-target mask from the configured input array."""
+    pattern = os.path.join(data_cfg.get("data_root", "data"), data_cfg.get("npy_pattern", "*.npy"))
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        log_info(f"[{config_name}] target_threshold mask skipped: no files for {pattern}")
+        return None
+    try:
+        arr = np.asarray(_safe_load_npy(paths[0]), dtype=np.float32)
+    except Exception as exc:
+        log_info(f"[{config_name}] target_threshold mask skipped: failed to load {paths[0]} ({type(exc).__name__}: {exc})")
+        return None
+    valid = np.isfinite(arr) & (arr > float(threshold))
+    if valid.ndim > 2:
+        valid = np.any(valid, axis=tuple(range(valid.ndim - 2)))
+    if valid.ndim != 2:
+        log_info(f"[{config_name}] target_threshold mask skipped: unsupported shape {tuple(arr.shape)}")
+        return None
+    frac = float(np.mean(valid.astype(np.float32)))
+    mask = torch.from_numpy(valid.astype(np.float32))
+    log_info(
+        f"[{config_name}] target_threshold mask materialized: "
+        f"path={paths[0]} threshold={threshold:g} shape={tuple(mask.shape)} fraction={frac:.4f}"
+    )
+    return mask
+
+
+def _clear_stale_dashboard_artifacts(session_dir: str) -> None:
+    """Remove derived plot/embedding artifacts before forced re-inference."""
+    for name in (
+        "dash_data.npz",
+        "dashboard.html",
+        "dashboard_with_masking_demo.html",
+        "volumetric_umap_meta.json",
+        "rank_diagnostics.json",
+        "effective_rank.json",
+        "effective_rank.txt",
+    ):
+        path = os.path.join(session_dir, name)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    results_dir = os.path.join(session_dir, "results")
+    if not os.path.isdir(results_dir):
+        return
+    for name in os.listdir(results_dir):
+        if (
+            name.endswith("_latent_vectors_full.npy")
+            or name.endswith("_pca_xyz.npy")
+            or name.endswith("_umap_xyz.npy")
+            or name.endswith("_spatial_shape.npy")
+            or name in {
+                "latent_vectors_full.npy",
+                "pca_xyz.npy",
+                "umap_xyz.npy",
+                "volumetric_umap_indices.npy",
+                "volumetric_umap_latents.npy",
+                "volumetric_umap_xyz.npy",
+                "volumetric_pca_xyz.npy",
+            }
+        ):
+            try:
+                os.remove(os.path.join(results_dir, name))
+            except OSError:
+                pass
 
 
 class _MaskingCollator:
@@ -717,6 +815,18 @@ class _MaskingCollator:
             # Auto-generate from raw data: pixels > threshold are valid targets
             raw = x_clean[:, 0] if x_clean.dim() == 4 else x_clean
             batch_target_mask = (raw > self.target_threshold).to(torch.bool)
+        if batch_target_mask is not None:
+            tgt_h, tgt_w = int(x_clean.shape[-2]), int(x_clean.shape[-1])
+            if batch_target_mask.dim() == 2:
+                batch_target_mask = batch_target_mask.unsqueeze(0).unsqueeze(0)
+            elif batch_target_mask.dim() == 3:
+                batch_target_mask = batch_target_mask.unsqueeze(1)
+            if batch_target_mask.shape[-2:] != (tgt_h, tgt_w):
+                batch_target_mask = F.interpolate(
+                    batch_target_mask.float(),
+                    size=(tgt_h, tgt_w),
+                    mode="nearest",
+                ).bool()
         context_data = prepare_context_batch(
             x_clean=x_clean,
             mask_scale=mask_scale,
@@ -1206,6 +1316,10 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         adapter_norm=bool(model_cfg.get("scaleaware_adapter_norm", True)),
         final_norm=bool(model_cfg.get("scaleaware_final_norm", True)),
         activation_checkpointing=bool(model_cfg.get("activation_checkpointing", True)),
+        target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", True)),
+        target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", (0.0, "nan"))),
+        encoder_border_margin_xy=int(max(0, encoder_rf_depth // 2)),
+        mask_box_hardcap=model_cfg.get("mask_box_hardcap"),
     ).to(device)
 
 
@@ -1774,6 +1888,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             normalize=bool(data_cfg.get("normalize", True)),
             crop_strategy=str(data_cfg.get("crop_strategy", "random")),
             cdd_cache=cdd_cache,
+            cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
         )
         val_dataset = None
         train_dataset = dataset
@@ -1789,6 +1904,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             normalize=bool(data_cfg.get("normalize", True)),
             crop_strategy="center",
             cdd_cache=cdd_cache,
+            cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
         )
         train_idx = []
         val_idx = []
@@ -1811,6 +1927,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             input_type=input_type,
             image_batch_selected_indices=image_batch_selected_indices,
             cdd_cache=cdd_cache,
+            cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
         )
         val_fraction = float(train_cfg.get("val_fraction", 0.1))
         val_fraction = min(max(val_fraction, 0.0), 0.95)
@@ -1844,6 +1961,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 input_type=input_type,
                 image_batch_selected_indices=image_batch_selected_indices,
                 cdd_cache=cdd_cache,
+                cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
             )
             val_dataset.sample_index = val_idx
     log_info(
@@ -1895,6 +2013,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         if os.path.exists(mask_path):
             target_mask = torch.from_numpy(np.load(mask_path).astype(np.float32))
             log_info(f"[{config_name}] target_mask loaded: {mask_path} shape={tuple(target_mask.shape)}")
+    if target_mask is None and target_threshold is not None:
+        target_mask = _target_mask_from_data_threshold(data_cfg, target_threshold, config_name)
 
     masking_collate = None if is_3d_mode else _MaskingCollator(
         model,
@@ -1949,6 +2069,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             image_batch_inference=image_batch_inference,
             image_batch_selected_indices=image_batch_selected_indices,
             cdd_cache=cdd_cache,
+            cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
         )
         inference_dataset.sample_index = list(train_idx)
         inference_dataset.num_samples = train_dataset.num_samples
@@ -1998,10 +2119,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     diagnostic_interval = max(1, int(train_cfg.get("diagnostic_interval", log_flush_interval)))
     inference_mask_passes = int(train_cfg.get("inference_mask_passes", 1))
     mask_inference = bool(train_cfg.get("mask_inference", False))
-    viz_crop_border = bool(model_cfg.get("viz_crop_border", train_cfg.get("viz_crop_border", False)))
-    viz_crop_border_px = model_cfg.get("viz_crop_border_px", train_cfg.get("viz_crop_border_px"))
+    inference_mask_border = model_cfg.get("inference_mask_border", train_cfg.get("inference_mask_border", True))
     umap_cfg = dict(train_cfg.get("umap", {}))
-    inference_visit_batches = int(train_cfg.get("inference_visit_batches", 32))
     inference_tta_enabled = bool(train_cfg.get("inference_tta_enabled", False))
     inference_tta_mode = str(train_cfg.get("inference_tta_mode", "flip4"))
     log_info(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
@@ -2378,13 +2497,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     hh, ww = int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])
                     visit_counts = np.zeros((hh, ww), dtype=np.float32)
                 ndim_loc = int(tloc.shape[-1])
+                loc_y, loc_x = _target_location_yx(tloc)
                 for bi in range(tloc.shape[0]):
                     for ki in range(tloc.shape[1]):
                         if not bool(tvalid[bi, ki]):
                             continue
-                        yy = int(tloc[bi, ki, 0])
-                        xx = int(tloc[bi, ki, 1])
-                        zz = int(tloc[bi, ki, 2]) if ndim_loc >= 3 else 0
+                        yy = int(loc_y[bi, ki])
+                        xx = int(loc_x[bi, ki])
+                        zz = int(tloc[bi, ki, 0]) if ndim_loc >= 3 else 0
                         if (visit_counts is not None) and ndim_loc == 2 and 0 <= yy < visit_counts.shape[0] and 0 <= xx < visit_counts.shape[1]:
                             visit_counts[yy, xx] += 1.0
                         visited_rows.append(
@@ -2595,6 +2715,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         os.replace(tmp_final, os.path.join(session_dir, "model_last.pt"))
 
     if is_main_process:
+        if force_recompute_inference:
+            _clear_stale_dashboard_artifacts(session_dir)
+            log_info(f"[{config_name}] stale dashboard/embedding artifacts cleared before re-inference")
         if is_3d_mode:
             session_dir = run_post_training_inference_3d(
                 model=model_without_ddp,
@@ -2609,6 +2732,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 spatial_overlap=train_cfg.get("inference_spatial_overlap_3d"),
                 inference_tta_enabled=inference_tta_enabled,
                 inference_tta_mode=inference_tta_mode,
+                inference_mask_border=inference_mask_border,
             )
         else:
             session_dir = run_post_training_inference(
@@ -2620,12 +2744,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 force_recompute_inference=force_recompute_inference,
                 inference_mask_passes=inference_mask_passes,
                 mask_inference=mask_inference,
-                viz_crop_border=viz_crop_border,
-                viz_crop_border_px=viz_crop_border_px,
+                target_mask=target_mask,
+                inference_mask_border=inference_mask_border,
                 compute_jepa_energy_fn=compute_jepa_energy,
                 compute_target_energy_map_fn=compute_target_energy_map,
-                inference_visit_batches=inference_visit_batches,
-                training_d4_augment=bool(data_cfg.get("d4_augment", False)),
+
                 inference_tta_enabled=inference_tta_enabled,
                 inference_tta_mode=inference_tta_mode,
                 max_diagnostic_size=train_cfg.get("inference_max_diagnostic_size"),

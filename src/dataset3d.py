@@ -34,6 +34,7 @@ class JEPA3DCropDataset(Dataset):
         normalize: bool = True,
         crop_strategy: str = "random",
         cdd_cache: dict | None = None,
+        cdd_use_log: bool = False,
     ):
         import glob
         self.npy_files = sorted(glob.glob(os.path.join(data_root, npy_pattern)))
@@ -51,6 +52,7 @@ class JEPA3DCropDataset(Dataset):
         if self.crop_strategy not in ("random", "center", "mixed"):
             raise ValueError("crop_strategy must be one of: random, center, mixed")
         self.cdd_cache = cdd_cache
+        self.cdd_use_log = bool(cdd_use_log)
 
     def __len__(self):
         return self.num_samples
@@ -128,7 +130,10 @@ class JEPA3DCropDataset(Dataset):
         path = self.npy_files[idx % len(self.npy_files)]
         key = (path, None)
         if key in self.cdd_cache:
-            return self.cdd_cache[key].copy()  # (S, D, H, W)
+            cache_val = self.cdd_cache[key]
+            if isinstance(cache_val, dict):
+                return cache_val["transformed" if self.cdd_use_log else "untransformed"].copy()
+            return cache_val.copy()  # (S, D, H, W) legacy format
         # Fallback
         return self._get_raw_volume(idx)
 

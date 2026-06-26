@@ -20,8 +20,8 @@ all configs — see [load_config doc](../README.md#-warning-always-inherit-from-
 | `data.cube_slice_strategy` | `center` | How 2D slices are extracted from 3D cubes. |
 | `data.cube_slice_axis` | `0` | Depth axis for cube slicing. |
 | `data.cube_slice_index` | `0` | Fixed slice index when strategy is `fixed`. |
-| `data.target_mask` | — | Optional `.npy` binary mask: 1 = valid target pixel, 0 = skip. |
-| `data.target_threshold` | — | Auto-generate target mask from raw data: pixels above threshold are valid targets (e.g. `1e-4`). |
+| `data.target_mask` | — | Optional precomputed `.npy` binary valid-target map. Values `>0` mean targets may be sampled there; `0` means skip. Resized with nearest-neighbor if needed. Takes precedence over `data.target_threshold`. |
+| `data.target_threshold` | — | Auto-generate a valid-target map from raw data when `data.target_mask` is absent: pixels above threshold are valid targets (e.g. `1e-4`). |
 
 ## 2. CDD (Constrained Diffusion Decomposition)
 
@@ -57,6 +57,18 @@ all configs — see [load_config doc](../README.md#-warning-always-inherit-from-
 | `model.priority_dithering_pixels` | `6` | Jitter radius (px) for priority-selected targets. |
 | `model.priority_candidate_oversample` | `0` | Oversampling factor for candidate pool. |
 | `model.global_shift` | `false` | Global lattice shift for target grid. |
+
+**Target-region masks vs sampled mask boxes**
+
+`data.target_mask` is a precomputed *valid target region* map. Use it for
+domain masks such as Perseus: targets are sampled only where the mask is
+positive. This is different from `target_mask_map` / `mask_map` artifacts saved
+during inference, which are sampled JEPA mask footprints (the boxes removed from
+the context input). Those box maps are diagnostics and must not be used as the
+valid-target map.
+
+If both `data.target_mask` and `data.target_threshold` are set, the precomputed
+mask wins and the threshold fallback is ignored.
 
 ## 4. ConvNeXt Backbone Architecture
 
@@ -148,3 +160,9 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.umap.l2_normalize` | `false` | L2-normalize latent features before UMAP. |
 | `train.umap.n_neighbors` | `50` | UMAP neighborhood size. |
 | `train.umap.min_dist` | `0.2` | UMAP minimum embedding distance. |
+| `train.umap.volumetric_max_points` | `100000` | Absolute cap for 3D volumetric UMAP points from the inferred slice/slab/volume extent. There is no fraction-sampling knob; all valid inferred voxels are used until this cap is reached. |
+
+Embedding artifacts reject invalid inputs before PCA/UMAP. Rows outside the
+input-valid mask, rows in discarded borders, and non-finite latent rows are
+written as `NaN` in saved PCA/UMAP coordinate maps. Dashboard code should render
+those saved NaNs; it should not repair colorful borders after the fact.

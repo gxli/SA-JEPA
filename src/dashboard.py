@@ -20,15 +20,14 @@ import torch
 from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap, _target_region_mask_from_outputs
 
 
-DASHBOARD_VERSION = "production-diagnostics-v15-full-frame-gray-border"
+DASHBOARD_VERSION = "production-diagnostics-v18-render-only-artifacts"
+DASHBOARD_COMPUTE_UMAP = os.environ.get("DASHBOARD_COMPUTE_UMAP", "").strip().lower() in {"1", "true", "yes", "on"}
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.join(ROOT_DIR, "scripts")
 
 DASH_DATA_REQUIRED = {
     "dashboard_version",
     "rgb_render_source",
-    "viz_crop_border",
-    "latent_border_px",
     "dashboard_config_source",
     "orig",
     "target",
@@ -373,10 +372,12 @@ def _load_scale_probe_dash_data(session_dir: str) -> dict[str, np.ndarray]:
 
 
 def _has_required_branch_artifacts(results_dir: str, branch: str) -> bool:
+    generic_pca = "pca_xyz.npy" if branch == "predict" else None
+    generic_umap = "umap_xyz.npy" if branch == "predict" else None
     candidates = [
         (f"{branch}_spatial_shape.npy", None),
-        (f"{branch}_pca_xyz.npy", f"volumetric_pca_xyz.npy"),
-        (f"{branch}_umap_xyz.npy", f"volumetric_umap_xyz.npy"),
+        (f"{branch}_pca_xyz.npy", generic_pca or f"volumetric_pca_xyz.npy"),
+        (f"{branch}_umap_xyz.npy", generic_umap or f"volumetric_umap_xyz.npy"),
     ]
     has_shape = False
     has_pca = False
@@ -499,9 +500,11 @@ def _rgb_from_xyz(
     clipped = np.clip((xyz - lo) / den, 0.0, 1.0)
     if not bright_top:
         clipped = 1.0 - clipped
-    clipped[~fin] = 0.90
+    clipped[~fin] = 0.0
     rgb_flat = np.clip(np.round(clipped * 255.0), 0, 255).astype(np.uint8)
-    rgb = rgb_flat.reshape(h, w, 3)
+    alpha = fin.astype(np.uint8) * 255
+    rgb_flat = np.column_stack([rgb_flat, alpha])
+    rgb = rgb_flat.reshape(h, w, 4)
     return rgb, rgb_flat
 
 
@@ -515,6 +518,13 @@ def _fill_invalid_rgb_from_nearest(rgb: np.ndarray, valid: np.ndarray) -> np.nda
     y0, y1 = int(yy.min()), int(yy.max())
     x0, x1 = int(xx.min()), int(xx.max())
     bad_y, bad_x = np.nonzero(~mask)
+    if bad_y.size == 0:
+        return out
+    # Only fill interior holes (within the valid bounding box).
+    # Border NaN pixels stay unfilled → render as gray, keeping FOV border visible.
+    inside = (bad_y >= y0) & (bad_y <= y1) & (bad_x >= x0) & (bad_x <= x1)
+    bad_y = bad_y[inside]
+    bad_x = bad_x[inside]
     if bad_y.size == 0:
         return out
     src_y = np.clip(bad_y, y0, y1)
@@ -823,23 +833,6 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     else:
         visit_heatmap = np.zeros((h, w), dtype=np.float32)
 
-    # Apply target-region mask to image-resolution heatmaps so non-masked
-    # regions appear as NaN (transparent) in the dashboard.
-    if "target_mask_map" in outputs:
-        mask_img = _target_region_mask_from_outputs(outputs, h, w)
-        if mask_img is not None and mask_img.any():
-            print(f"dashboard_mask_heatmap_filter={session_dir} "
-                  f"masked_pixels={int(mask_img.sum())}/{int(mask_img.size)} "
-                  f"({100.0*mask_img.sum()/max(1,mask_img.size):.1f}%)")
-            energy_map = energy_map.copy()
-            energy_map[~mask_img] = np.nan
-            target_loc_heatmap = target_loc_heatmap.copy()
-            target_loc_heatmap[~mask_img] = np.nan
-            visit_heatmap = visit_heatmap.copy()
-            visit_heatmap[~mask_img] = np.nan
-        else:
-            print(f"dashboard_mask_heatmap_filter={session_dir} empty_or_none")
-
     # Dashboard-only pyramid mask stack (S,H,W), reconstructed from inference
     # tensors/artifacts. This is not written as a standalone debug file.
     pyramid_mask_stack = None
@@ -912,25 +905,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         raise RuntimeError(f"{session_dir}: inference outputs missing pred_map")
     h_lat, w_lat = int(pred_map.shape[-2]), int(pred_map.shape[-1])
 
-    target_region_mask_lat = None
-    mask_inference_flag = bool(outputs.get("mask_inference", False))
-    if "target_mask_map" in outputs:
-        target_region_mask_lat_raw = _target_region_mask_from_outputs(outputs, h_lat, w_lat)
-        target_region_mask_lat = target_region_mask_lat_raw.reshape(-1).copy()
-        if target_region_mask_lat is not None:
-            n_mask = int(target_region_mask_lat.sum())
-            n_total = int(target_region_mask_lat.size)
-            print(f"dashboard_mask_filter={session_dir} "
-                  f"mask_inference={mask_inference_flag} "
-                  f"masked_tokens={n_mask}/{n_total} "
-                  f"({100.0*n_mask/max(1,n_total):.1f}%)")
-    viz_crop_border, latent_border_px, dashboard_config_source = _viz_crop_border_from_config(session_dir)
-    if latent_border_px > 0:
-        print(f"dashboard_latent_border_filter={session_dir} border_px={latent_border_px} mode=nan_fit_finite")
-    if viz_crop_border and latent_border_px > 0:
-        energy_map = _apply_image_border_nan(energy_map, latent_border_px)
-        target_loc_heatmap = _apply_image_border_nan(target_loc_heatmap, latent_border_px)
-        visit_heatmap = _apply_image_border_nan(visit_heatmap, latent_border_px)
+    dashboard_config_source = _find_readable_session_config_path(session_dir)
 
     def _chw_or_n3_to_xyz(arr: np.ndarray, hh: int, ww: int, path: str) -> np.ndarray:
         xyz = np.asarray(arr, dtype=np.float32)
@@ -951,10 +926,14 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             f"expected (3,{hh},{ww}) or (N,3)"
         )
 
-    def _resolve_artifact_path(base_name: str, volumetric_name: str) -> str | None:
+    def _resolve_artifact_path(base_name: str, volumetric_name: str, generic_name: str | None = None) -> str | None:
         path = os.path.join(results_dir, base_name)
         if os.path.exists(path):
             return path
+        if generic_name:
+            gpath = os.path.join(results_dir, generic_name)
+            if os.path.exists(gpath):
+                return gpath
         vpath = os.path.join(results_dir, volumetric_name)
         if os.path.exists(vpath):
             return vpath
@@ -962,7 +941,11 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
     def _load_xyz_triplet(prefix: str, kind: str, hh: int, ww: int) -> np.ndarray:
         if kind == "pca":
-            path = _resolve_artifact_path(f"{prefix}_pca_xyz.npy", "volumetric_pca_xyz.npy")
+            path = _resolve_artifact_path(
+                f"{prefix}_pca_xyz.npy",
+                "volumetric_pca_xyz.npy",
+                "pca_xyz.npy" if prefix == "predict" else None,
+            )
             if not path:
                 raise RuntimeError(
                     f"{session_dir}: missing required PCA artifact "
@@ -970,7 +953,11 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     "hint: run training/inference to generate PCA artifacts"
                 )
             return _chw_or_n3_to_xyz(np.load(path), hh, ww, path)
-        xyz_path = _resolve_artifact_path(f"{prefix}_umap_xyz.npy", "volumetric_umap_xyz.npy")
+        xyz_path = _resolve_artifact_path(
+            f"{prefix}_umap_xyz.npy",
+            "volumetric_umap_xyz.npy",
+            "umap_xyz.npy" if prefix == "predict" else None,
+        )
         if xyz_path:
             return _chw_or_n3_to_xyz(np.load(xyz_path), hh, ww, xyz_path)
         ux = os.path.join(results_dir, f"{prefix}_umap_x.npy")
@@ -1034,8 +1021,6 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         if z.ndim != 2 or z.shape[0] != h_lat * w_lat or z.shape[1] == 0:
             empty = np.full((h_lat * w_lat, 3), np.nan, dtype=np.float32)
             return empty, empty.copy()
-        if viz_crop_border and latent_border_px > 0:
-            z = _apply_latent_border_nan(z, h_lat, w_lat, latent_border_px)
         valid = np.isfinite(z).all(axis=1)
         pca = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
         um = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
@@ -1048,7 +1033,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             pca_pad[:, : pca_valid.shape[1]] = pca_valid
             pca_valid = pca_pad
         pca[valid] = pca_valid
-        try:
+        if DASHBOARD_COMPUTE_UMAP:
             umap_valid = _compute_umap_nd(
                 _preprocess_latents_for_umap(z_valid),
                 n_components=3,
@@ -1059,37 +1044,11 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 init="spectral",
                 fit_max_tokens=65536,
             ).astype(np.float32, copy=False)
-            diff = np.linalg.norm((umap_valid - pca_valid).reshape(-1))
-            base = np.linalg.norm(pca_valid.reshape(-1)) + 1e-12
-            if float(diff / base) < 1e-6:
-                print(
-                    f"dashboard_note={session_dir}: {prefix_out} UMAP backend fell back to PCA; "
-                    "leaving UMAP empty instead of duplicating PCA"
-                )
-            else:
-                um[valid] = umap_valid
-        except Exception as e:
-            print(
-                f"dashboard_note={session_dir}: {prefix_out} UMAP unavailable "
-                f"({type(e).__name__}: {e}); leaving UMAP empty"
-            )
+            um[valid] = umap_valid
         return pca, um
 
     bundles = {}
     for prefix_saved, prefix_out in (("context", "context"), ("predict", "pred"), ("target", "gt")):
-        pca, um = _compute_slice_pca_umap(prefix_out)
-        hh, ww = h_lat, w_lat
-        pca_rgb, pca_rgb_flat = _rgb_from_xyz(pca, hh, ww)
-        um_rgb, um_rgb_flat = _rgb_from_xyz(um, hh, ww)
-        bundles[prefix_out] = {
-            "pca3d": pca,
-            "umap3d": um,
-            "pca_rgb": pca_rgb,
-            "pca_rgb_flat": pca_rgb_flat,
-            "umap_rgb": um_rgb,
-            "umap_rgb_flat": um_rgb_flat,
-        }
-        continue
         src_prefix = prefix_saved
         try:
             hh, ww = _load_hw(src_prefix)
@@ -1098,15 +1057,21 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         except Exception:
             if prefix_saved == "context":
                 src_prefix = "predict"
-                hh, ww = _load_hw(src_prefix)
-                pca = _load_xyz_triplet(src_prefix, "pca", hh, ww)
-                um = _load_xyz_triplet(src_prefix, "umap", hh, ww)
-                print(
-                    f"dashboard_note={session_dir}: missing context embeddings; "
-                    "using predict embeddings for context panels"
-                )
+                try:
+                    hh, ww = _load_hw(src_prefix)
+                    pca = _load_xyz_triplet(src_prefix, "pca", hh, ww)
+                    um = _load_xyz_triplet(src_prefix, "umap", hh, ww)
+                except Exception:
+                    pca, um = _compute_slice_pca_umap(prefix_out)
+                    hh, ww = h_lat, w_lat
+                else:
+                    print(
+                        f"dashboard_note={session_dir}: missing context embeddings; "
+                        "using predict embeddings for context panels"
+                    )
             else:
-                raise
+                pca, um = _compute_slice_pca_umap(prefix_out)
+                hh, ww = h_lat, w_lat
         if pca.shape[0] != hh * ww or um.shape[0] != hh * ww:
             # Scatter artifacts can be sampled/volumetric and therefore cannot
             # be reshaped into the displayed slice. Use the actual slice latent
@@ -1114,29 +1079,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             print(
                 f"dashboard_note={session_dir}: {prefix_out} embedding point count "
                 f"does not match slice grid pca={pca.shape[0]} umap={um.shape[0]} "
-                f"grid={hh * ww}; recomputing slice PCA/UMAP"
+                f"grid={hh * ww}; using slice PCA fallback and blank UMAP grid"
             )
             pca, um = _compute_slice_pca_umap(prefix_out)
             hh, ww = h_lat, w_lat
-        else:
-            if not np.isfinite(pca).all() or not np.isfinite(um).all():
-                print(
-                    f"dashboard_note={session_dir}: {prefix_out} embedding artifact has NaN pixels "
-                    "from an older masked/bordered export; recomputing slice PCA/UMAP"
-                )
-                pca, um = _compute_slice_pca_umap(prefix_out)
-                hh, ww = h_lat, w_lat
-            valid_pair = np.isfinite(pca).all(axis=1) & np.isfinite(um).all(axis=1)
-            if int(np.count_nonzero(valid_pair)) > 0:
-                diff = np.linalg.norm((pca[valid_pair] - um[valid_pair]).reshape(-1))
-                base = np.linalg.norm(pca[valid_pair].reshape(-1)) + 1e-12
-                if float(diff / base) < 1e-6:
-                    print(
-                        f"dashboard_note={session_dir}: {prefix_out} UMAP artifact equals PCA; "
-                        "recomputing slice PCA/UMAP"
-                    )
-                    pca, um = _compute_slice_pca_umap(prefix_out)
-                    hh, ww = h_lat, w_lat
         pca_rgb, pca_rgb_flat = _rgb_from_xyz(pca, hh, ww)
         um_rgb, um_rgb_flat = _rgb_from_xyz(um, hh, ww)
         bundles[prefix_out] = {
@@ -1156,50 +1102,62 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     embed_spread_mean, embed_spread_min, embed_under_spread_frac, dead_channel_count = [], [], [], []
     targets_per_image, mask_footprint_mean_px, mask_scale_factor = [], [], []
     if os.path.exists(metrics_path):
+        def _row_float(row: dict[str, str], *keys: str) -> float:
+            for key in keys:
+                value = row.get(key)
+                if value is None or value == "":
+                    continue
+                try:
+                    return float(value)
+                except Exception:
+                    continue
+            return float("nan")
+
         with open(metrics_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                try:
-                    ep = float(row.get("epoch", "nan"))
-                    ba = float(row.get("batch", row.get("step", "nan")))
-                    gs = float(row.get("global_step", "nan"))
-                    tl = float(row.get("loss_total", row.get("total_loss", row.get("loss", "nan"))))
-                    jl = float(row.get("loss_prediction", row.get("loss_jepa", row.get("jepa_loss", row.get("loss_mse", "nan")))))
-                    sl = float(row.get("loss_spread", row.get("loss_sigreg", "nan")))
-                    syml = float(row.get("loss_symmetry", row.get("loss_symmetric", "nan")))
-                    wj = float(row.get("weighted_prediction", row.get("weighted_jepa", row.get("weighted_mse", "nan"))))
-                    ws = float(row.get("weighted_spread", row.get("weighted_sigreg", "nan")))
-                    wsym = float(row.get("weighted_symmetry", row.get("weighted_symmetric", "nan")))
-                    esm = float(row.get("embed_spread_mean", row.get("ctx_std_mean", "nan")))
-                    esmin = float(row.get("embed_spread_min", row.get("ctx_std_min", "nan")))
-                    euf = float(row.get("embed_under_spread_frac", "nan"))
-                    dcc = float(row.get("dead_channel_count", "nan"))
-                    tpi = float(row.get("targets_per_image", "nan"))
-                    mfpx = float(row.get("mask_footprint_mean_px", "nan"))
-                    msf = float(row.get("mask_scale_factor", "nan"))
-                except Exception:
-                    continue
+                ep = _row_float(row, "epoch")
+                ba = _row_float(row, "batch", "step")
+                gs = _row_float(row, "global_step")
+                tl = _row_float(row, "loss_total", "total_loss", "train_loss", "loss")
+                jl = _row_float(row, "loss_prediction", "loss_jepa", "jepa_loss", "loss_mse")
+                sl = _row_float(row, "loss_spread", "loss_sigreg")
+                syml = _row_float(row, "loss_symmetry", "loss_symmetric")
+                wj = _row_float(row, "weighted_prediction", "weighted_jepa", "weighted_mse")
+                ws = _row_float(row, "weighted_spread", "weighted_sigreg")
+                wsym = _row_float(row, "weighted_symmetry", "weighted_symmetric")
+                esm = _row_float(row, "embed_spread_mean", "ctx_std_mean")
+                esmin = _row_float(row, "embed_spread_min", "ctx_std_min")
+                euf = _row_float(row, "embed_under_spread_frac")
+                dcc = _row_float(row, "dead_channel_count")
+                tpi = _row_float(row, "targets_per_image")
+                mfpx = _row_float(row, "mask_footprint_mean_px")
+                msf = _row_float(row, "mask_scale_factor")
                 if np.isfinite(gs):
                     loss_x.append(gs)
                 elif np.isfinite(ep) and np.isfinite(ba):
                     loss_x.append(ep + 0.001 * ba)
+                elif np.isfinite(ep):
+                    loss_x.append(ep)
                 else:
                     continue
-                if np.isfinite(tl) and np.isfinite(jl):
-                    loss_total.append(tl)
-                    loss_prediction.append(jl)
-                    loss_spread.append(sl if np.isfinite(sl) else np.nan)
-                    loss_symmetry.append(syml if np.isfinite(syml) else np.nan)
-                    weighted_prediction.append(wj if np.isfinite(wj) else np.nan)
-                    weighted_spread.append(ws if np.isfinite(ws) else np.nan)
-                    weighted_symmetry.append(wsym if np.isfinite(wsym) else np.nan)
-                    embed_spread_mean.append(esm if np.isfinite(esm) else np.nan)
-                    embed_spread_min.append(esmin if np.isfinite(esmin) else np.nan)
-                    embed_under_spread_frac.append(euf if np.isfinite(euf) else np.nan)
-                    dead_channel_count.append(dcc if np.isfinite(dcc) else np.nan)
-                    targets_per_image.append(tpi if np.isfinite(tpi) else np.nan)
-                    mask_footprint_mean_px.append(mfpx if np.isfinite(mfpx) else np.nan)
-                    mask_scale_factor.append(msf if np.isfinite(msf) else np.nan)
+                if not (np.isfinite(tl) or np.isfinite(jl) or np.isfinite(sl) or np.isfinite(syml)):
+                    loss_x.pop()
+                    continue
+                loss_total.append(tl if np.isfinite(tl) else np.nan)
+                loss_prediction.append(jl if np.isfinite(jl) else np.nan)
+                loss_spread.append(sl if np.isfinite(sl) else np.nan)
+                loss_symmetry.append(syml if np.isfinite(syml) else np.nan)
+                weighted_prediction.append(wj if np.isfinite(wj) else np.nan)
+                weighted_spread.append(ws if np.isfinite(ws) else np.nan)
+                weighted_symmetry.append(wsym if np.isfinite(wsym) else np.nan)
+                embed_spread_mean.append(esm if np.isfinite(esm) else np.nan)
+                embed_spread_min.append(esmin if np.isfinite(esmin) else np.nan)
+                embed_under_spread_frac.append(euf if np.isfinite(euf) else np.nan)
+                dead_channel_count.append(dcc if np.isfinite(dcc) else np.nan)
+                targets_per_image.append(tpi if np.isfinite(tpi) else np.nan)
+                mask_footprint_mean_px.append(mfpx if np.isfinite(mfpx) else np.nan)
+                mask_scale_factor.append(msf if np.isfinite(msf) else np.nan)
     effective_rank_x, effective_rank_y = [], []
     run_results_path = os.path.join(session_dir, "run_results.csv")
     if os.path.exists(run_results_path):
@@ -1320,9 +1278,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
     dash_payload = dict(
         dashboard_version=np.asarray(DASHBOARD_VERSION),
-        rgb_render_source=np.asarray("summary_or_model_border_nan_fit_finite_rgb_invalid_gray"),
-        viz_crop_border=np.asarray(bool(viz_crop_border)),
-        latent_border_px=np.asarray(latent_border_px, dtype=np.int32),
+        rgb_render_source=np.asarray("inference-fov-nan"),
         dashboard_config_source=np.asarray(dashboard_config_source or "none"),
         orig=orig,
         blurred=blurred,
@@ -2412,8 +2368,6 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     latest_er = float(er_y[-1]) if len(er_y) > 0 and np.isfinite(er_y[-1]) else None
     dash_data_version = str(np.asarray(data.get("dashboard_version", np.asarray("missing"))).reshape(-1)[0])
     rgb_render_source = str(np.asarray(data.get("rgb_render_source", np.asarray("missing"))).reshape(-1)[0])
-    viz_crop_border = str(np.asarray(data.get("viz_crop_border", np.asarray("missing"))).reshape(-1)[0])
-    latent_border_px = str(np.asarray(data.get("latent_border_px", np.asarray("missing"))).reshape(-1)[0])
     dashboard_config_source = str(np.asarray(data.get("dashboard_config_source", np.asarray("missing"))).reshape(-1)[0])
     dashboard_config_label = dashboard_config_source
     if dashboard_config_source not in ("missing", "none"):
@@ -2425,8 +2379,6 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     build_banner_html = (
         f'<span class="build-chip strong">html={html_lib.escape(DASHBOARD_VERSION)}</span>'
         f'<span class="build-chip">dash_data={html_lib.escape(dash_data_version)}</span>'
-        f'<span class="build-chip">viz_crop_border={html_lib.escape(viz_crop_border)}</span>'
-        f'<span class="build-chip">latent_border_px={html_lib.escape(latent_border_px)}</span>'
         f'<span class="build-chip">rgb={html_lib.escape(rgb_render_source)}</span>'
         f'<span class="build-chip">config_loaded={html_lib.escape(dashboard_config_label)}</span>'
         f'<span class="build-chip">generated={html_lib.escape(generated_utc)}</span>'

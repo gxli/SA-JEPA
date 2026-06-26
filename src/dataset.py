@@ -35,6 +35,7 @@ class JEPADataset(Dataset):
         image_batch_selected_indices: dict | None = None,
         cdd_cache: dict | None = None,
         crop_min_valid_fraction: float = 0.0,
+        cdd_use_log: bool = False,
     ):
         self.input_type = str(input_type).lower()
         allowed_input_types = {"image", "cube", "image_batch"}
@@ -63,6 +64,7 @@ class JEPADataset(Dataset):
             raise ValueError("crop_size is required when crop_mode is not 'none'")
         self.d4_augment = bool(d4_augment)
         self.cdd_cache = cdd_cache or None
+        self.cdd_use_log = bool(cdd_use_log)
         self.crop_min_valid_fraction = float(crop_min_valid_fraction) if crop_min_valid_fraction is not None else 0.0
 
         pattern = os.path.join(data_root, npy_pattern)
@@ -312,13 +314,17 @@ class JEPADataset(Dataset):
 
         if self.cdd_cache is not None:
             path, forced_slice_idx = key
-            # New caches retain full cubes at (path, None). Fall back to an
-            # exact key so existing 2D/per-slice caches remain usable.
-            cdd_np = self.cdd_cache.get((path, None))
-            if cdd_np is None:
-                cdd_np = self.cdd_cache.get(key)
-            if cdd_np is None:
+            # New caches store a dict {"untransformed": ..., "transformed": ...}.
+            # Pick the right variant based on whether the model expects log-space CDD.
+            cache_val = self.cdd_cache.get((path, None))
+            if cache_val is None:
+                cache_val = self.cdd_cache.get(key)
+            if cache_val is None:
                 raise KeyError(f"CDD cache miss for key={key}")
+            if isinstance(cache_val, dict):
+                cdd_np = cache_val["transformed" if self.cdd_use_log else "untransformed"]
+            else:
+                cdd_np = cache_val
             cdd_np = self._extract_2d_from_cdd(np.asarray(cdd_np), forced_slice_idx=forced_slice_idx)
             # cdd_np is now (S, H, W) float32
             cdd_orig = torch.from_numpy(cdd_np.astype(np.float32))

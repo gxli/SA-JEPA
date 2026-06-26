@@ -11,6 +11,10 @@ import torch.nn.functional as F
 from src.losses import representation_dense_energy
 from src.models.masking import extract_location_patches, norm_per_sample_channel, prepare_context_batch
 
+# Bump this on every inference-affecting change so session logs show which code ran.
+INFERENCE_VERSION = "v2-border-nan-3d-fix-2025"
+from src.utils.viz import _target_location_yx
+
 
 def _save_npz(path: str, arr: np.ndarray) -> None:
     """Save a single array as compressed .npz (zip archive, key='arr').
@@ -147,8 +151,9 @@ def _mask_invalid_targets_from_input(
                 numeric_specs.append(float(spec))
             except (TypeError, ValueError):
                 continue
-    loc_y = loc[..., 0].long()
-    loc_x = loc[..., 1].long()
+    loc_y, loc_x = _target_location_yx(loc)
+    loc_y = loc_y.long()
+    loc_x = loc_x.long()
     y0 = loc_y - half_lo
     x0 = loc_x - half_lo
     y1 = loc_y + half_hi
@@ -201,6 +206,35 @@ def _accumulate_point_energy(
     energy_sum.view(-1).scatter_add_(0, flat_idx.reshape(-1), values.reshape(-1))
     count_map.view(-1).scatter_add_(0, flat_idx.reshape(-1), torch.ones_like(values, dtype=count_map.dtype).reshape(-1))
     return float(values.sum().item()), int(values.numel())
+
+
+def _target_center_map(
+    target_locations: torch.Tensor,
+    target_valid: torch.Tensor,
+    image_size: tuple[int, int],
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    tloc = torch.as_tensor(target_locations)
+    tvalid = torch.as_tensor(target_valid).bool()
+    bsz, _, _ = tloc.shape
+    h, w = int(image_size[0]), int(image_size[1])
+    tmap = torch.zeros((bsz, 1, h, w), dtype=dtype)
+    loc_y, loc_x = _target_location_yx(tloc)
+    for bi in range(bsz):
+        for ki in range(tloc.shape[1]):
+            if not bool(tvalid[bi, ki].item()):
+                continue
+            cy = int(loc_y[bi, ki].item())
+            cx = int(loc_x[bi, ki].item())
+            if 0 <= cy < h and 0 <= cx < w:
+                # 3x3 cross so targets are visible when downscaled.
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        yy, xx = cy + dy, cx + dx
+                        if 0 <= yy < h and 0 <= xx < w:
+                            tmap[bi, 0, yy, xx] = 1.0
+    return tmap
 
 
 def _apply_nan_boundary_frame(x: torch.Tensor, border_px: int) -> torch.Tensor:
@@ -272,7 +306,14 @@ def _visual_border_half_fov(model) -> int:
     return max(0, rf // 2)
 
 
-def _dense_forward_2d_tile(model, x_tile: torch.Tensor, cdd_tile: torch.Tensor | None, log_floor: torch.Tensor):
+def _dense_forward_2d_tile(
+    model,
+    x_tile: torch.Tensor,
+    cdd_tile: torch.Tensor | None,
+    log_floor: torch.Tensor,
+    *,
+    cdd_preencoded: bool = False,
+):
     post_log = bool(getattr(model, "post_log_transform", False))
     x_enc = torch.log(torch.clamp(x_tile, min=0.0) + log_floor) if post_log else x_tile
 
@@ -280,8 +321,8 @@ def _dense_forward_2d_tile(model, x_tile: torch.Tensor, cdd_tile: torch.Tensor |
     if encoder_type == "cdd_scaleaware_convnext":
         if cdd_tile is None:
             raise RuntimeError("cdd_scaleaware_convnext tiled inference requires CDD channels")
-        cdd_enc = torch.log(torch.clamp(cdd_tile, min=0.0) + log_floor) if post_log else cdd_tile
-        if bool(getattr(model, "scaleaware_norm_per_scale", False)):
+        cdd_enc = cdd_tile if cdd_preencoded else (torch.log(torch.clamp(cdd_tile, min=0.0) + log_floor) if post_log else cdd_tile)
+        if (not cdd_preencoded) and bool(getattr(model, "scaleaware_norm_per_scale", False)):
             cdd_enc = norm_per_sample_channel(cdd_enc)
         zero = torch.zeros_like(cdd_enc)
         context_map = model.context_encoder(cdd_enc, mask_tokens=zero)
@@ -331,9 +372,25 @@ def _prepare_full_mask_debug_2d(
     x_raw_cpu: torch.Tensor,
     cdd_raw_cpu: torch.Tensor | None,
     lattice_shift_override: tuple[int, int] = (0, 0),
+    target_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build full-frame mask/debug tensors without using them as encoder input."""
     mask_scale, mask_box_size = model.sample_mask_params(device=x_raw_cpu.device)
+    # Resize target_mask to match the full-frame image if shapes differ.
+    if target_mask is not None:
+        tgt_h, tgt_w = int(x_raw_cpu.shape[-2]), int(x_raw_cpu.shape[-1])
+        if target_mask.dim() == 2:
+            target_mask = target_mask.unsqueeze(0).unsqueeze(0)
+        elif target_mask.dim() == 3:
+            target_mask = target_mask.unsqueeze(1)
+        if target_mask.shape[-2:] != (tgt_h, tgt_w):
+            target_mask = F.interpolate(
+                target_mask.float(),
+                size=(tgt_h, tgt_w),
+                mode="nearest",
+            ).bool()
+        else:
+            target_mask = target_mask.to(dtype=torch.bool)
     invalid_pixel_mask = ~torch.isfinite(x_raw_cpu)
     border_margin = int(model.encoder_receptive_field()) // 2 if hasattr(model, "encoder_receptive_field") else 0
     border = int(max(0, min(border_margin, int(x_raw_cpu.shape[-2]) // 2, int(x_raw_cpu.shape[-1]) // 2)))
@@ -380,6 +437,7 @@ def _prepare_full_mask_debug_2d(
         cdd_orig_in=cdd_raw_cpu,
         use_cdd=cdd_raw_cpu is not None,
         invalid_pixel_mask_in=invalid_pixel_mask,
+        target_mask=target_mask,
     )
     debug = context_data[4] if len(context_data) > 4 else {}
     out = {
@@ -387,6 +445,8 @@ def _prepare_full_mask_debug_2d(
         "target_scales": context_data[2],
         "target_valid": context_data[3],
     }
+    if target_mask is not None:
+        out["target_allowed_mask_map"] = target_mask.to(dtype=torch.float32)
     if "mask_map" in debug:
         out["target_mask_map"] = debug["mask_map"].unsqueeze(1)
     for src, dst in (
@@ -435,11 +495,22 @@ def _run_tiled_dense_inference_2d(
         log_floor = torch.clamp(base_std * float(getattr(model, "cdd_log_std_floor_mult", 0.05)), min=eps)
     else:
         log_floor = torch.ones((b, 1, 1, 1), dtype=x_raw.dtype, device=x_raw.device)
+    cdd_source = cdd_raw
+    cdd_preencoded = False
+    if cdd_raw is not None and str(getattr(model, "encoder_type", "")) == "cdd_scaleaware_convnext":
+        cdd_source = cdd_raw.to(device, non_blocking=True)
+        if bool(getattr(model, "post_log_transform", False)):
+            cdd_source = torch.log(torch.clamp(cdd_source, min=0.0) + log_floor.to(device, non_blocking=True))
+        if bool(getattr(model, "scaleaware_norm_per_scale", False)):
+            cdd_source = norm_per_sample_channel(cdd_source)
+        cdd_source = cdd_source.detach().cpu()
+        cdd_preencoded = True
 
     print(
         f"[{config_name}] tiled 2D dense inference: tile={tile_size} "
         f"y_tiles={len(y_starts)} x_tiles={len(x_starts)} dense_output_rf={rf} "
-        f"discard_margin={margin} overlap={overlap_eff}"
+        f"discard_margin={margin} overlap={overlap_eff} "
+        f"cdd_preencoded_full_field={cdd_preencoded}"
     )
     sums: dict[str, torch.Tensor] = {}
     weight = torch.zeros((b, 1, h, w), dtype=torch.float32)
@@ -458,11 +529,18 @@ def _run_tiled_dense_inference_2d(
             if wx1 <= wx0:
                 continue
             x_tile = x_raw[:, :, y0:ye, x0:xe]
-            cdd_tile = None if cdd_raw is None else cdd_raw[:, :, y0:ye, x0:xe]
+            cdd_tile = None if cdd_source is None else cdd_source[:, :, y0:ye, x0:xe]
             pad_h = max(0, int(tile_size) - int(x_tile.shape[-2]))
             pad_w = max(0, int(tile_size) - int(x_tile.shape[-1]))
             if pad_h or pad_w:
-                pad_mode = "reflect" if min(x_tile.shape[-2:]) > 1 else "replicate"
+                min_dim = min(x_tile.shape[-2:])
+                # reflect mode requires pad < input_dim; fall back to replicate
+                # when the tile is smaller than the padding (e.g. 256 px image
+                # with a 512 px tile size needs 256 px of padding).
+                if min_dim > max(pad_h, pad_w):
+                    pad_mode = "reflect" if min_dim > 1 else "replicate"
+                else:
+                    pad_mode = "replicate"
                 x_tile = F.pad(x_tile, (0, pad_w, 0, pad_h), mode=pad_mode)
                 if cdd_tile is not None:
                     cdd_tile = F.pad(cdd_tile, (0, pad_w, 0, pad_h), mode=pad_mode)
@@ -471,6 +549,7 @@ def _run_tiled_dense_inference_2d(
                 x_tile.to(device, non_blocking=True),
                 None if cdd_tile is None else cdd_tile.to(device, non_blocking=True),
                 log_floor.to(device, non_blocking=True),
+                cdd_preencoded=cdd_preencoded,
             )
             out_y0, out_y1 = y0 + wy0, y0 + wy1
             out_x0, out_x1 = x0 + wx0, x0 + wx1
@@ -487,6 +566,34 @@ def _run_tiled_dense_inference_2d(
         raise RuntimeError(f"[{config_name}] tiled 2D dense inference produced no tiles")
     weight = weight.clamp_min(1.0)
     return {key: value / weight for key, value in sums.items()}
+
+
+def _load_cdd_cache_for_image(session_dir: str, full_h: int, full_w: int, h: int, w: int,
+                              use_log: bool = False) -> torch.Tensor | None:
+    """Load CDD from disk cache, returning a (1, S, h, w) tile from center."""
+    import glob as _glob
+    cdd_dir = os.path.join(session_dir, "cdd_cache")
+    if not os.path.isdir(cdd_dir):
+        return None
+    # Prefer new .npz format; fall back to legacy .npy.
+    candidates_npz = _glob.glob(os.path.join(cdd_dir, "*.npz"))
+    candidates_npy = _glob.glob(os.path.join(cdd_dir, "*.npy"))
+    if candidates_npz:
+        loaded = np.load(candidates_npz[0])
+        variant = "transformed" if use_log else "untransformed"
+        if variant not in loaded:
+            return None
+        cdd_full = loaded[variant].astype(np.float32)  # (S, H, W)
+    elif candidates_npy:
+        cdd_full = np.load(candidates_npy[0]).astype(np.float32)  # legacy (S, H, W)
+    else:
+        return None
+    if cdd_full.ndim != 3:
+        return None
+    y0 = max(0, (cdd_full.shape[-2] - h) // 2)
+    x0 = max(0, (cdd_full.shape[-1] - w) // 2)
+    tile = cdd_full[:, y0:y0 + h, x0:x0 + w]
+    return torch.from_numpy(tile).unsqueeze(0)  # (1, S, h, w)
 
 
 def _first_full_resolution_batch(dataloader):
@@ -531,12 +638,10 @@ def run_post_training_inference(
     force_recompute_inference: bool,
     inference_mask_passes: int,
     mask_inference: bool,
-    viz_crop_border: bool,
-    viz_crop_border_px: int | None,
+    target_mask: torch.Tensor | None = None,
+    inference_mask_border: bool | int | float = True,
     compute_jepa_energy_fn: Callable,
     compute_target_energy_map_fn: Callable,
-    inference_visit_batches: int = 32,
-    training_d4_augment: bool = False,
     inference_tta_enabled: bool = False,
     inference_tta_mode: str = "flip4",
     max_diagnostic_size: int | None = None,
@@ -545,6 +650,7 @@ def run_post_training_inference(
     inference_discard_margin: int | None = None,
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
+    print(f"[{config_name}] inference_version={INFERENCE_VERSION}", flush=True)
     if (not force_recompute_inference) and os.path.exists(inference_outputs_path):
         print(
             f"[{config_name}] inference_outputs.pt already exists; "
@@ -648,11 +754,26 @@ def run_post_training_inference(
             )
             mask_debug_full = {}
             if bool(mask_inference):
+                # Prefer the CDD cache from disk to avoid on-the-fly
+                # decomposition on the full image (slow for large fields).
+                cdd_for_mask = None
+                if cdd_raw is None:
+                    cdd_cache_dir = os.path.join(session_dir, "cdd_cache")
+                    if os.path.isdir(cdd_cache_dir):
+                        import glob as _glob
+                        _candidates = _glob.glob(os.path.join(cdd_cache_dir, "*.npy"))
+                        if _candidates:
+                            cdd_for_mask = torch.from_numpy(
+                                np.load(_candidates[0])
+                            ).float().unsqueeze(0)
+                else:
+                    cdd_for_mask = cdd_raw
                 mask_debug_full = _prepare_full_mask_debug_2d(
                     model=model,
                     x_raw_cpu=x_raw.detach().cpu(),
-                    cdd_raw_cpu=None if cdd_raw is None else cdd_raw.detach().cpu(),
+                    cdd_raw_cpu=None if cdd_for_mask is None else cdd_for_mask.detach().cpu(),
                     lattice_shift_override=(0, 0),
+                    target_mask=target_mask,
                 )
             tiled = _run_tiled_dense_inference_2d(
                 model=model,
@@ -791,6 +912,8 @@ def run_post_training_inference(
         inference_outputs["network_target_in"] = outputs["network_target_in"][:8].detach().cpu()
     if "target_mask_map" in outputs:
         inference_outputs["target_mask_map"] = outputs["target_mask_map"][:8].detach().cpu()
+    if "target_allowed_mask_map" in outputs:
+        inference_outputs["target_allowed_mask_map"] = outputs["target_allowed_mask_map"][:8].detach().cpu()
     if "cdd_channels_orig" in outputs:
         inference_outputs["cdd_channels_orig"] = outputs["cdd_channels_orig"][:8].detach().cpu()
     if "cdd_channels_masked" in outputs:
@@ -835,49 +958,30 @@ def run_post_training_inference(
     inference_outputs["target_energy_point_map"] = e_map_points[:8].detach().cpu()
     inference_outputs["target_energy_count_map"] = count_map[:8].detach().cpu()
 
-    if bool(viz_crop_border):
-        if viz_crop_border_px is None or str(viz_crop_border_px).strip().lower() == "auto":
-            auto_border = int(_visual_border_half_fov(model))
-        else:
-            auto_border = int(max(0, viz_crop_border_px))
-        inference_outputs["target_energy_map"] = _apply_nan_boundary_frame(
-            inference_outputs["target_energy_map"], auto_border
-        )
-        inference_outputs["target_energy_raw_map"] = _apply_nan_boundary_frame(
-            inference_outputs["target_energy_raw_map"], auto_border
-        )
-        inference_outputs["target_energy_rel_gt_map"] = _apply_nan_boundary_frame(
-            inference_outputs["target_energy_rel_gt_map"], auto_border
-        )
-        inference_outputs["target_energy_cosine_map"] = _apply_nan_boundary_frame(
-            inference_outputs["target_energy_cosine_map"], auto_border
-        )
-        inference_outputs["target_energy_point_map"] = _apply_nan_boundary_frame(
-            inference_outputs["target_energy_point_map"], auto_border
-        )
-
-    if "target_mask_map" in inference_outputs:
-        tmap = inference_outputs["target_mask_map"]
+    # Encoder FOV border: true/auto → half-FOV; number → that many px; false/0 → skip.
+    if isinstance(inference_mask_border, bool):
+        fov_border = int(_visual_border_half_fov(model)) if inference_mask_border else 0
     else:
-        # Fallback map should represent target centers as points, not squares.
-        tloc = inference_outputs["target_locations"]
-        tvalid = inference_outputs["target_valid"]
-        bsz, _, _ = tloc.shape
-        h, w = inference_outputs["x_clean"].shape[-2:]
-        tmap = torch.zeros((bsz, 1, h, w), dtype=inference_outputs["x_clean"].dtype)
-        for bi in range(bsz):
-            for ki in range(tloc.shape[1]):
-                if not bool(tvalid[bi, ki].item()):
-                    continue
-                cy = int(tloc[bi, ki, 0].item())
-                cx = int(tloc[bi, ki, 1].item())
-                if 0 <= cy < h and 0 <= cx < w:
-                    # 3×3 cross so targets are visible when downscaled
-                    for dy in (-1, 0, 1):
-                        for dx in (-1, 0, 1):
-                            yy, xx = cy + dy, cx + dx
-                            if 0 <= yy < h and 0 <= xx < w:
-                                tmap[bi, 0, yy, xx] = 1.0
+        fov_border = int(max(0, float(inference_mask_border)))
+    if fov_border > 0:
+        for key in ("pred_map", "gt_map", "context_map",
+                    "target_energy_map", "target_energy_raw_map",
+                    "target_energy_rel_gt_map", "target_energy_cosine_map",
+                    "target_energy_point_map"):
+            if key in inference_outputs:
+                inference_outputs[key] = _apply_nan_boundary_frame(
+                    inference_outputs[key], fov_border
+                )
+
+    # target_map is a center-point diagnostic. Keep sampled mask footprints in
+    # target_mask_map/mask_cube only; do not reuse them as target locations.
+    h, w = inference_outputs["x_clean"].shape[-2:]
+    tmap = _target_center_map(
+        inference_outputs["target_locations"],
+        inference_outputs["target_valid"],
+        (h, w),
+        dtype=inference_outputs["x_clean"].dtype,
+    )
     inference_outputs["target_map"] = tmap
     torch.save(inference_outputs, inference_outputs_path)
     print(f"[{config_name}] saved inference_outputs.pt")
@@ -899,6 +1003,8 @@ def run_post_training_inference(
     _save_npz(os.path.join(session_dir, "target_valid.npz"), inference_outputs["target_valid"].numpy())
     if "target_mask_map" in inference_outputs:
         _save_npz(os.path.join(session_dir, "target_mask_map.npz"), inference_outputs["target_mask_map"].numpy())
+    if "target_allowed_mask_map" in inference_outputs:
+        _save_npz(os.path.join(session_dir, "target_allowed_mask_map.npz"), inference_outputs["target_allowed_mask_map"].numpy())
     if "cdd_channels_orig" in inference_outputs:
         _save_npz(os.path.join(session_dir, "cdd_channels_orig.npz"), inference_outputs["cdd_channels_orig"].numpy())
     if "cdd_channels_masked" in inference_outputs:
@@ -926,7 +1032,10 @@ def run_post_training_inference(
     encoder_rf = int(_encoder_receptive_field_2d(model))
     dense_output_rf = int(_dense_output_receptive_field_2d(model))
     if inference_discard_margin is None or str(inference_discard_margin).strip().lower() == "auto":
-        discard_margin = int(max(0, dense_output_rf // 2))
+        # Tiled inference already handles tile-boundary overlap via tile_overlap.
+        # No discard margin is needed; a positive value leaks into downstream
+        # dashboard border logic where it is misinterpreted as a crop signal.
+        discard_margin = 0
     else:
         discard_margin = int(max(0, int(inference_discard_margin)))
     with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
@@ -947,6 +1056,13 @@ def run_post_training_inference(
                 "inference_encoder_receptive_field": int(encoder_rf),
                 "inference_dense_output_receptive_field": int(dense_output_rf),
                 "inference_discard_margin": int(discard_margin),
+                "target_allowed_mask_present": bool("target_allowed_mask_map" in inference_outputs),
+                "target_allowed_mask_fraction": (
+                    float(inference_outputs["target_allowed_mask_map"].float().mean().item())
+                    if "target_allowed_mask_map" in inference_outputs
+                    else None
+                ),
+                "target_valid_fraction": float(inference_outputs["target_valid"].float().mean().item()),
             },
             f,
             indent=2,
@@ -973,86 +1089,6 @@ def run_post_training_inference(
         }
         with open(os.path.join(session_dir, "target_selection_summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
-    # Canonical target-visit heatmap from inference loader (d4_augment is forced off there).
-    # This avoids mirrored-symmetry artefacts from training-time augmentation logs.
-    visit_h = int(inference_outputs["x_clean"].shape[-2])
-    visit_w = int(inference_outputs["x_clean"].shape[-1])
-    canonical_visit_counts = np.zeros((visit_h, visit_w), dtype=np.float32)
-    canonical_rows = []
-    max_visit_batches = int(inference_visit_batches)
-    if max_visit_batches <= 0:
-        _save_npz(os.path.join(session_dir, "visited_target_frequency.npz"), canonical_visit_counts)
-        _save_npz(os.path.join(session_dir, "visited_target_frequency_canonical.npz"), canonical_visit_counts)
-        np.save(os.path.join(session_dir, "target_visit_rows.npy"), np.zeros((0, 6), dtype=np.float32))
-        with open(
-            os.path.join(session_dir, "visited_target_locations_canonical.csv"),
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as f:
-            csv.writer(f).writerow(["batch", "sample", "target", "y", "x", "scale"])
-        print(f"[{config_name}] target_visit_heatmap skipped inference_visit_batches={max_visit_batches}")
-        _save_npz(os.path.join(session_dir, "pred_map.npz"), inference_outputs["pred_map"].numpy())
-        _save_npz(os.path.join(session_dir, "gt_map.npz"), inference_outputs["gt_map"].numpy())
-        pred_norm = inference_outputs["pred_map"].norm(dim=1).numpy()
-        gt_norm = inference_outputs["gt_map"].norm(dim=1).numpy()
-        err_norm = (inference_outputs["pred_map"] - inference_outputs["gt_map"]).norm(dim=1).numpy()
-        _save_npz(os.path.join(session_dir, "pred_norm.npz"), pred_norm)
-        _save_npz(os.path.join(session_dir, "gt_norm.npz"), gt_norm)
-        _save_npz(os.path.join(session_dir, "err_norm.npz"), err_norm)
-        return session_dir
-    dev = next(model.parameters()).device
-    with torch.no_grad():
-        for ib, batch in enumerate(dataloader):
-            if max_visit_batches > 0 and ib >= max_visit_batches:
-                break
-            if isinstance(batch, (tuple, list)) and len(batch) == 2 and batch[1] is not None:
-                cdd_b, xb = batch
-                cdd_b = cdd_b.to(dev)
-            else:
-                cdd_b = None
-                xb = batch if not isinstance(batch, (tuple, list)) else batch[0]
-            xb = xb.to(dev)
-            outb = model(
-                xb,
-                return_debug=False,
-                enable_grid_jitter=False,
-                mask_inference=bool(mask_inference),
-                cdd_orig=cdd_b,
-            )
-            tloc_b = outb["target_locations"].detach().cpu().numpy()
-            tvalid_b = outb["target_valid"].detach().cpu().numpy().astype(bool)
-            tscale_b = outb["target_scales"].detach().cpu().numpy()
-            for bi in range(tloc_b.shape[0]):
-                for ki in range(tloc_b.shape[1]):
-                    if not bool(tvalid_b[bi, ki]):
-                        continue
-                    yy = int(tloc_b[bi, ki, 0])
-                    xx = int(tloc_b[bi, ki, 1])
-                    if 0 <= yy < visit_h and 0 <= xx < visit_w:
-                        canonical_visit_counts[yy, xx] += 1.0
-                        canonical_rows.append(
-                            [int(ib), int(bi), int(ki), int(yy), int(xx), float(tscale_b[bi, ki])]
-                        )
-    _save_npz(
-        os.path.join(session_dir, "visited_target_frequency_canonical.npz"),
-        canonical_visit_counts.astype(np.float32),
-    )
-    with open(
-        os.path.join(session_dir, "visited_target_locations_canonical.csv"),
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as f:
-        w = csv.writer(f)
-        w.writerow(["inference_batch", "sample_idx", "target_idx", "y", "x", "scale"])
-        if canonical_rows:
-            w.writerows(canonical_rows)
-    if bool(training_d4_augment):
-        print(
-            f"[{config_name}] canonical_visit_map_saved "
-            "(built from d4_augment=false inference loader)"
-        )
     _save_npz(os.path.join(session_dir, "pred_map.npz"), inference_outputs["pred_map"].numpy())
     _save_npz(os.path.join(session_dir, "gt_map.npz"), inference_outputs["gt_map"].numpy())
     pred_norm = inference_outputs["pred_map"].norm(dim=1).numpy()
@@ -1082,8 +1118,10 @@ def run_post_training_inference_3d(
     spatial_overlap: int | None = None,
     inference_tta_enabled: bool = False,
     inference_tta_mode: str = "flip4",
+    inference_mask_border: bool | int | float = True,
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
+    print(f"[{config_name}] inference_version={INFERENCE_VERSION}", flush=True)
     if (not force_recompute_inference) and os.path.exists(inference_outputs_path):
         summary_path = os.path.join(session_dir, "jepa_energy_summary.json")
         if cdd_cache:
@@ -1100,7 +1138,11 @@ def run_post_training_inference_3d(
     model.eval()
     with torch.no_grad():
         if cdd_cache:
-            (path, _), cdd_vol = next(iter(cdd_cache.items()))
+            (path, _), cdd_vol_raw = next(iter(cdd_cache.items()))
+            if isinstance(cdd_vol_raw, dict):
+                cdd_vol = cdd_vol_raw["untransformed"]
+            else:
+                cdd_vol = cdd_vol_raw
             cdd_np = np.asarray(cdd_vol, dtype=np.float32)
             if cdd_np.ndim != 4:
                 raise ValueError(f"Expected cached CDD cube SxDxHxW, got {tuple(cdd_np.shape)} for {path}")
@@ -1304,9 +1346,35 @@ def run_post_training_inference_3d(
         "target_energy_cosine_map": slab_energy["energy_cosine"],
         "center_slab_middle_index": torch.tensor(center_slab_middle_index, dtype=torch.int64),
     }
+    if "target_mask_map" in outputs:
+        inference_outputs["target_mask_map"] = outputs["target_mask_map"][:1].detach().cpu()
     inference_outputs["selected_slab_start_index"] = outputs["selected_slab_start_index"][:1].detach().cpu()
     inference_outputs["selected_slab_depth"] = outputs["selected_slab_depth"][:1].detach().cpu()
     inference_outputs["inference_3d_full_xy_slice"] = bool(outputs.get("_inference_3d_full_xy_slice", False))
+
+    # Encoder FOV border: true/auto → half-FOV; number → that many px; false/0 → skip.
+    if isinstance(inference_mask_border, bool):
+        fov_border_3d = (int(getattr(model, "encoder_receptive_field_depth", 1) or 1) // 2) if inference_mask_border else 0
+    else:
+        fov_border_3d = int(max(0, float(inference_mask_border)))
+    if fov_border_3d > 0:
+        for key in ("pred_map", "gt_map", "context_map"):
+            if key in inference_outputs and inference_outputs[key].dim() == 5 and inference_outputs[key].shape[2] == 1:
+                inference_outputs[key] = _apply_nan_boundary_frame(
+                    inference_outputs[key].squeeze(2), fov_border_3d
+                ).unsqueeze(2)
+
+    if fov_border_3d > 0:
+        for key in ("target_energy_map", "target_energy_raw_map",
+                    "target_energy_rel_gt_map", "target_energy_cosine_map"):
+            if key in inference_outputs:
+                t = inference_outputs[key]
+                if t.dim() == 5 and t.shape[2] == 1:
+                    t = _apply_nan_boundary_frame(t.squeeze(2), fov_border_3d).unsqueeze(2)
+                elif t.dim() == 4:
+                    t = _apply_nan_boundary_frame(t, fov_border_3d)
+                inference_outputs[key] = t
+
     torch.save(inference_outputs, inference_outputs_path)
 
     _save_npz(os.path.join(session_dir, "network_input_clean_3d.npz"), x_clean.numpy())

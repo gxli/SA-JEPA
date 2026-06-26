@@ -62,7 +62,7 @@ model:
   priority_min_targets_per_map: 10
   priority_dithering_pixels: 6
   priority_candidate_oversample: 0
-  viz_crop_border: false
+  inference_mask_border: true
 train:
   batch_size: 4
   lr: 0.0001

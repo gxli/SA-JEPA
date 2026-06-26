@@ -3,7 +3,7 @@ import torch
 
 from scripts.legacy.check_session_integrity import check_session
 from scripts.legacy.migrate_embedding_artifacts import migrate_results
-from scripts.session_to_dash import compute_dash_data
+from scripts.session_to_dash import compute_dash_data, plot_dash_html
 from src.models.masking import (
     ALLOWED_TARGET_SAMPLING_MODES,
     _build_priority_catalogue_from_cdd_ratio,
@@ -362,6 +362,113 @@ def test_dashboard_accepts_chw_embedding_artifacts(tmp_path):
     assert pred_umap.shape == (16, 3)
     np.testing.assert_allclose(pred_pca[0], np.array([10.0, 26.0, 42.0], dtype=np.float32))
     np.testing.assert_allclose(pred_umap[0], np.array([20.0, 36.0, 52.0], dtype=np.float32))
+
+    html_path = plot_dash_html(str(session_dir), overwrite=True)
+    html = open(html_path, "r", encoding="utf-8").read()
+    assert "Predict UMAP RGB" in html
+    assert "Predict UMAP 3D Scatter" in html
+
+
+def test_dashboard_uses_session_level_umap_artifact_and_keeps_partial_finite_rows(tmp_path):
+    session_dir = tmp_path / "session_default_umap"
+    results_dir = session_dir / "results"
+    results_dir.mkdir(parents=True)
+    outputs = {
+        "x_clean": torch.ones((1, 1, 8, 8), dtype=torch.float32),
+        "x_context": torch.ones((1, 1, 8, 8), dtype=torch.float32),
+        "target_locations": torch.zeros((1, 1, 2), dtype=torch.long),
+        "target_valid": torch.ones((1, 1), dtype=torch.bool),
+        "pred_map": torch.zeros((1, 4, 4, 4), dtype=torch.float32),
+        "gt_map": torch.zeros((1, 4, 4, 4), dtype=torch.float32),
+        "context_map": torch.zeros((1, 4, 4, 4), dtype=torch.float32),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+    base = np.arange(3 * 4 * 4, dtype=np.float32).reshape(3, 4, 4)
+    umap = base + 30.0
+    umap[:, 0, 0] = np.nan
+    np.save(results_dir / "pca_xyz.npy", base + 10.0)
+    np.save(results_dir / "umap_xyz.npy", umap)
+
+    dash_path = compute_dash_data(str(session_dir), overwrite=True)
+    with np.load(dash_path) as data:
+        pred_umap = data["pred_umap3d"]
+
+    assert pred_umap.shape == (16, 3)
+    assert np.isnan(pred_umap[0]).all()
+    np.testing.assert_allclose(pred_umap[1], np.array([31.0, 47.0, 63.0], dtype=np.float32))
+
+    html_path = plot_dash_html(str(session_dir), overwrite=True)
+    html = open(html_path, "r", encoding="utf-8").read()
+    assert "Predict UMAP RGB" in html
+
+
+def test_inference_dashboard_masks_invalid_edges_in_saved_embedding_artifacts(tmp_path):
+    from src.utils import viz
+
+    session_dir = tmp_path / "session_embedding_edges"
+    session_dir.mkdir()
+    x_clean = torch.ones((1, 1, 8, 8), dtype=torch.float32)
+    x_clean[:, :, 0, :] = 0.0
+    outputs = {
+        "x_clean": x_clean,
+        "x_clean_raw": x_clean.clone(),
+        "x_context": x_clean.clone(),
+        "target_locations": torch.zeros((1, 1, 2), dtype=torch.long),
+        "target_valid": torch.ones((1, 1), dtype=torch.bool),
+        "pred_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
+        "gt_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
+        "context_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
+    }
+    old_umap = viz._compute_umap_nd
+    viz._compute_umap_nd = lambda x, **_kwargs: x[:, :3].astype("float32")
+    try:
+        viz.save_inference_dashboard(str(session_dir), outputs, umap_cfg={})
+    finally:
+        viz._compute_umap_nd = old_umap
+
+    pred_pca = np.load(session_dir / "results" / "predict_pca_xyz.npy").transpose(1, 2, 0)
+    pred_umap = np.load(session_dir / "results" / "predict_umap_xyz.npy").transpose(1, 2, 0)
+
+    assert np.isnan(pred_pca[0]).all()
+    assert np.isnan(pred_umap[0]).all()
+    assert np.isfinite(pred_pca[1:]).all()
+    assert np.isfinite(pred_umap[1:]).all()
+
+
+def test_inference_dashboard_respects_target_allowed_mask_for_embeddings(tmp_path):
+    from src.utils import viz
+
+    session_dir = tmp_path / "session_target_allowed"
+    session_dir.mkdir()
+    x_clean = torch.ones((1, 1, 8, 8), dtype=torch.float32)
+    target_allowed = torch.zeros((1, 1, 8, 8), dtype=torch.float32)
+    target_allowed[:, :, :4, :4] = 1.0
+    outputs = {
+        "x_clean": x_clean,
+        "x_clean_raw": x_clean.clone(),
+        "x_context": x_clean.clone(),
+        "target_locations": torch.zeros((1, 1, 2), dtype=torch.long),
+        "target_valid": torch.ones((1, 1), dtype=torch.bool),
+        "target_allowed_mask_map": target_allowed,
+        "pred_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
+        "gt_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
+        "context_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
+    }
+    old_umap = viz._compute_umap_nd
+    viz._compute_umap_nd = lambda x, **_kwargs: x[:, :3].astype("float32")
+    try:
+        viz.save_inference_dashboard(str(session_dir), outputs, umap_cfg={})
+    finally:
+        viz._compute_umap_nd = old_umap
+
+    pred_pca = np.load(session_dir / "results" / "predict_pca_xyz.npy").transpose(1, 2, 0)
+    pred_umap = np.load(session_dir / "results" / "predict_umap_xyz.npy").transpose(1, 2, 0)
+
+    finite = np.isfinite(pred_pca).all(axis=-1)
+    assert int(finite.sum()) == 4
+    assert np.isfinite(pred_umap[:2, :2]).all()
+    assert np.isnan(pred_pca[2:, :]).all()
+    assert np.isnan(pred_pca[:, 2:]).all()
 
 
 def test_inference_dashboard_exports_embedding_maps_not_flat_triplets(tmp_path):

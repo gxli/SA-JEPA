@@ -63,6 +63,16 @@ def spectral_rank_stats(fmap: torch.Tensor, eps: float = 1e-12, dead_thresh: flo
 
     z = z.float()
     z = _subsample_rows_torch(z)
+    finite = torch.isfinite(z).all(dim=-1)
+    z = z[finite]
+    if z.shape[0] < 2:
+        return {
+            "erank": 0.0, "manifold_size": 0.0,
+            "top1_energy": 0.0, "top4_energy": 0.0, "top8_energy": 0.0,
+            "dead_channel_fraction": 1.0, "dead_channel_count": 0,
+            "mean_channel_std": 0.0, "min_channel_std": 0.0, "max_channel_std": 0.0,
+            "dead_channel_threshold": float(dead_thresh),
+        }
     z = z - z.mean(dim=0, keepdim=True)
 
     ch_std = z.std(dim=0, unbiased=False)
@@ -70,12 +80,7 @@ def spectral_rank_stats(fmap: torch.Tensor, eps: float = 1e-12, dead_thresh: flo
     dead_frac = dead.float().mean().item()
 
     denom = max(1, z.shape[0] - 1)
-    try:
-        eig_raw = torch.linalg.svdvals(z)
-    except RuntimeError:
-        jitter_scale = z.std(unbiased=False).clamp_min(1e-12) * 1e-5
-        z_jitter = z + torch.randn_like(z) * jitter_scale
-        eig_raw = torch.linalg.svdvals(z_jitter)
+    eig_raw = torch.linalg.svdvals(z)
     eig = eig_raw.pow(2).div(float(denom)).clamp_min(0)
 
     total = eig.sum().clamp_min(eps)
