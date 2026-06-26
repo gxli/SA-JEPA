@@ -565,7 +565,6 @@ def make_pyramid_grid_context(
     target_invalid_region_skip: bool = True,
     target_invalid_region_values=(0.0, "nan"),
     invalid_pixel_mask: Optional[torch.Tensor] = None,
-    target_mask: Optional[torch.Tensor] = None,
     target_sampling_mode: str = "random",
     priority_top_percent: float = 5.0,
     priority_n_target: int | str = 20,
@@ -578,7 +577,6 @@ def make_pyramid_grid_context(
     cdd_use_gpu: bool = False,
     cdd_orig_in: Optional[torch.Tensor] = None,
     use_cdd: bool = True,
-    invalid_pixel_mask_in: Optional[torch.Tensor] = None,
 ):
     """
     x_clean: B x 1 x H x W

@@ -23,26 +23,6 @@ def _next_power_of_two_batch(current: int) -> int:
     return max(1, 2 ** int(math.log2(current - 1)))
 
 
-def auto_batch_size(
-    initial_batch: int = 4,
-    target_batch: int = 32,
-    scale_mode: str = "power_of_two",
-    max_retries: int = 5,
-) -> int:
-    """Determine a safe batch size, retrying with smaller sizes on OOM.
-
-    Args:
-        initial_batch: Starting batch size to try.
-        target_batch: Desired effective batch size (for accumulation).
-        scale_mode: "power_of_two" halves each retry; "linear" subtracts 1.
-        max_retries: Maximum number of OOM retries before giving up.
-
-    Returns:
-        Safe batch size (<= initial_batch).
-    """
-    return int(initial_batch)
-
-
 def compute_accumulation_steps(
     batch_size: int,
     target_batch: int = 32,

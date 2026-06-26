@@ -20,7 +20,8 @@ import torch
 from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap, _target_region_mask_from_outputs
 
 
-DASHBOARD_VERSION = "production-diagnostics-v18-render-only-artifacts"
+DASHBOARD_VERSION = "production-diagnostics-v20-card-local-controls"
+CONTROL_SCRIPT_SENTINEL = "window.JEPADashboardControls"
 DASHBOARD_COMPUTE_UMAP = os.environ.get("DASHBOARD_COMPUTE_UMAP", "").strip().lower() in {"1", "true", "yes", "on"}
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.join(ROOT_DIR, "scripts")
@@ -145,6 +146,20 @@ def _find_readable_session_config(session_dir: str) -> tuple[dict[str, Any], str
 def _find_readable_session_config_path(session_dir: str) -> str | None:
     _cfg, cfg_path = _find_readable_session_config(session_dir)
     return cfg_path
+
+
+def _dashboard_html_is_current(path: str) -> bool:
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return False
+    return (
+        f'name="jepa-dashboard-version" content="{DASHBOARD_VERSION}"' in text
+        and CONTROL_SCRIPT_SENTINEL in text
+    )
 
 
 def _load_session_config(session_dir: str) -> tuple[dict[str, Any], str | None]:
@@ -2316,7 +2331,6 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             }
         )
     rendered = []
-    seen_groups: set[str] = set()
     for i, card in enumerate(cards):
         fig = card["fig"]
         group = card["group"]
@@ -2330,27 +2344,45 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         else:
             save_control = f'<button class="save-panel" type="button" data-panel-title="{panel_title_html}">Save plot PNG</button>'
         controls = ""
-        if group not in seen_groups and ("-pca" in group or "-umap" in group):
+        control_id = f"panel-{i}"
+        control_kind = "scatter" if "Scatter" in panel_title else "image"
+        if "-pca" in group or "-umap" in group:
+            if control_kind == "image":
+                axis_controls = (
+                    f'<label>xmin <input type="number" step="any" data-k="xmin" placeholder="auto"></label>'
+                    f'<label>xmax <input type="number" step="any" data-k="xmax" placeholder="auto"></label>'
+                    f'<label>ymin <input type="number" step="any" data-k="ymin" placeholder="auto"></label>'
+                    f'<label>ymax <input type="number" step="any" data-k="ymax" placeholder="auto"></label>'
+                    f'<label>color low <input type="number" step="any" data-k="color_low" placeholder="visible 1%"></label>'
+                    f'<label>color high <input type="number" step="any" data-k="color_high" placeholder="visible 99%"></label>'
+                    f'<label><input type="checkbox" data-k="invert_x"> invert R</label>'
+                    f'<label><input type="checkbox" data-k="invert_y"> invert G</label>'
+                    f'<label><input type="checkbox" data-k="invert_z"> invert B</label>'
+                    f'<label><input type="checkbox" data-k="invert_color"> invert all</label>'
+                )
+            else:
+                axis_controls = (
+                    f'<label>xmin <input type="number" step="any" data-k="xmin" placeholder="auto"></label>'
+                    f'<label>xmax <input type="number" step="any" data-k="xmax" placeholder="auto"></label>'
+                    f'<label>ymin <input type="number" step="any" data-k="ymin" placeholder="auto"></label>'
+                    f'<label>ymax <input type="number" step="any" data-k="ymax" placeholder="auto"></label>'
+                    f'<label>zmin <input type="number" step="any" data-k="zmin" placeholder="auto"></label>'
+                    f'<label>zmax <input type="number" step="any" data-k="zmax" placeholder="auto"></label>'
+                    f'<label>color low <input type="number" step="any" data-k="color_low" placeholder="visible 1%"></label>'
+                    f'<label>color high <input type="number" step="any" data-k="color_high" placeholder="visible 99%"></label>'
+                    f'<label><input type="checkbox" data-k="invert_x"> invert x</label>'
+                    f'<label><input type="checkbox" data-k="invert_y"> invert y</label>'
+                    f'<label><input type="checkbox" data-k="invert_z"> invert z</label>'
+                    f'<label><input type="checkbox" data-k="invert_color"> invert color</label>'
+                )
             controls = (
-                f'<div class="controls local-controls" data-group="{group}">'
-                f'<label>xmin <input type="number" step="any" data-k="xmin" placeholder="auto"></label>'
-                f'<label>xmax <input type="number" step="any" data-k="xmax" placeholder="auto"></label>'
-                f'<label>ymin <input type="number" step="any" data-k="ymin" placeholder="auto"></label>'
-                f'<label>ymax <input type="number" step="any" data-k="ymax" placeholder="auto"></label>'
-                f'<label>zmin <input type="number" step="any" data-k="zmin" placeholder="auto"></label>'
-                f'<label>zmax <input type="number" step="any" data-k="zmax" placeholder="auto"></label>'
-                f'<label>color low <input type="number" step="any" data-k="color_low" placeholder="visible 1%"></label>'
-                f'<label>color high <input type="number" step="any" data-k="color_high" placeholder="visible 99%"></label>'
-                f'<label><input type="checkbox" data-k="invert_x"> invert x</label>'
-                f'<label><input type="checkbox" data-k="invert_y"> invert y</label>'
-                f'<label><input type="checkbox" data-k="invert_z"> invert z</label>'
-                f'<label><input type="checkbox" data-k="invert_color"> invert color</label>'
-                f'<button class="apply-local" type="button" data-group="{group}">Apply</button>'
+                f'<div class="controls local-controls" data-control-id="{control_id}" data-kind="{control_kind}">'
+                f'{axis_controls}'
+                f'<button class="apply-local" type="button" data-control-id="{control_id}">Apply</button>'
                 f"</div>"
             )
-            seen_groups.add(group)
         rendered.append(
-            f'<section class="card" data-group="{group}">'
+            f'<section class="card" data-group="{group}" data-control-id="{control_id}">'
             f'<div class="card-tools">{save_control}</div>'
             f'{controls}'
             f'{fig.to_html(full_html=False, include_plotlyjs=(True if i == 0 else False), config={"responsive": True, "displaylogo": False, "modeBarButtonsToRemove": ["toImage"]})}'
@@ -2504,6 +2536,20 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     let y = clamp01((Number(v) - lo) / den);
     return invertAxis ? 1.0 - y : y;
   }}
+  function imageVisibleRange(baseImage, loPct, hiPct) {{
+    const vals = [];
+    (baseImage || []).forEach((row) => {{
+      (row || []).forEach((pixel) => {{
+        if (Array.isArray(pixel) || ArrayBuffer.isView(pixel)) {{
+          for (let i = 0; i < Math.min(3, pixel.length); i++) {{
+            const v = Number(pixel[i]);
+            if (Number.isFinite(v)) vals.push(v);
+          }}
+        }}
+      }});
+    }});
+    return percentileRange(vals, loPct, hiPct);
+  }}
   function ensureTraceBases(gd) {{
     (gd.data || []).forEach((tr) => {{
       if (!tr) return;
@@ -2523,9 +2569,11 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
       }}
     }});
   }}
-  function applyRangesForGroup(group) {{
-    const controls = document.querySelector('.local-controls[data-group="' + group + '"]');
+  function applyRangesForControl(controlId) {{
+    const controls = document.querySelector('.local-controls[data-control-id="' + controlId + '"]');
     if (!controls || !window.Plotly) return;
+    const card = controls.closest(".card");
+    if (!card) return;
     const get = (k) => {{
       const el = controls.querySelector('input[data-k="' + k + '"]');
       return el ? num(el) : null;
@@ -2542,14 +2590,15 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     const invertY = !!(controls.querySelector('input[data-k="invert_y"]') || {{}}).checked;
     const invertZ = !!(controls.querySelector('input[data-k="invert_z"]') || {{}}).checked;
     const invertColor = !!(controls.querySelector('input[data-k="invert_color"]') || {{}}).checked;
-    const plots = document.querySelectorAll('.card[data-group="' + group + '"] .js-plotly-plot');
+    const plots = card.querySelectorAll(".js-plotly-plot");
     plots.forEach((gd) => {{
       ensureTraceBases(gd);
       (gd.data || []).forEach((tr, i) => {{
         if (!tr) return;
         if (tr.type === "image") {{
-          const lo = colorLow !== null ? colorLow : 0.0;
-          const hi = colorHigh !== null ? colorHigh : 255.0;
+          const autoRange = imageVisibleRange(tr._jepaBaseImage, 0.01, 0.99);
+          const lo = colorLow !== null ? colorLow : autoRange[0];
+          const hi = colorHigh !== null ? colorHigh : autoRange[1];
           const recolored = tr._jepaBaseImage.map((row) => row.map((pixel) => {{
             let r = invertX ? 255.0 - pixel[0] : pixel[0];
             let g = invertY ? 255.0 - pixel[1] : pixel[1];
@@ -2609,21 +2658,23 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
   }}
   function bindLocalControls() {{
     document.querySelectorAll(".apply-local").forEach((btn) => {{
-      btn.addEventListener("click", () => applyRangesForGroup(btn.getAttribute("data-group")));
+      btn.addEventListener("click", () => applyRangesForControl(btn.getAttribute("data-control-id")));
     }});
     document.querySelectorAll('.local-controls input').forEach((input) => {{
       input.addEventListener("change", () => {{
         const controls = input.closest(".local-controls");
-        if (controls) applyRangesForGroup(controls.getAttribute("data-group"));
+        if (controls) applyRangesForControl(controls.getAttribute("data-control-id"));
       }});
     }});
     initControlDefaults();
   }}
   window.JEPADashboardControls = {{
-    applyRangesForGroup,
+    applyRangesForControl,
+    applyRangesForGroup: applyRangesForControl,
     bindLocalControls,
   }};
-  window.applyRangesForGroup = applyRangesForGroup;
+  window.applyRangesForControl = applyRangesForControl;
+  window.applyRangesForGroup = applyRangesForControl;
   if (document.readyState === "loading") {{
     document.addEventListener("DOMContentLoaded", bindLocalControls);
   }} else {{
@@ -2968,7 +3019,9 @@ def main():
         print(f"dashboard_session_begin={session_dir}")
         dash_html_path = os.path.join(session_dir, "dashboard.html")
         export_path = os.path.join(export_dir, f"{name.replace('/', '_')}.html")
-        if (not args.overwrite) and (not args.reset) and os.path.exists(dash_html_path) and os.path.exists(export_path):
+        session_html_current = _dashboard_html_is_current(dash_html_path)
+        export_html_current = _dashboard_html_is_current(export_path)
+        if (not args.overwrite) and (not args.reset) and session_html_current and export_html_current:
             print(
                 f"skip_dashboard_exists={session_dir} "
                 f"session_html={dash_html_path} export_html={export_path}"
@@ -2976,6 +3029,11 @@ def main():
             skipped += 1
             print(f"dashboard_session_end={session_dir}")
             continue
+        if (not args.overwrite) and (not args.reset) and os.path.exists(dash_html_path) and os.path.exists(export_path):
+            print(
+                f"dashboard_html_stale_recompute={session_dir} "
+                f"session_current={int(session_html_current)} export_current={int(export_html_current)}"
+            )
         inf_path = os.path.join(session_dir, "inference_outputs.pt")
         if not os.path.exists(inf_path):
             print(f"skip_no_inference={session_dir}")

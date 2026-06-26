@@ -1067,7 +1067,7 @@ def _observed_completed_epoch(session_dir: str) -> int:
     return best_epoch
 
 
-def resolve_pipeline_config(data_cfg: dict, model_cfg: dict) -> bool:
+def resolve_pipeline_config(model_cfg: dict) -> bool:
     return bool(model_cfg.get("post_log_transform", True))
 
 
@@ -1143,7 +1143,7 @@ def _resolve_encoder_alias_3d(name: str) -> str:
 def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, device: torch.device) -> PyramidGridJEPA:
     """Construct a PyramidGridJEPA from config dicts."""
     mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", 1.5))
-    model_post_log = resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
+    model_post_log = resolve_pipeline_config(model_cfg=model_cfg)
     resolved_encoder_type = _resolve_encoder_alias_2d(resolve_encoder_type_default(model_cfg))
     resolved_mode = str(model_cfg.get("mode", "image")).lower()
     if resolved_mode == "image":
@@ -1499,7 +1499,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         raise ValueError("3D model modes require data.input_type='cube'.")
     image_batch_inference = (input_type == "image_batch")
 
-    resolve_pipeline_config(data_cfg=data_cfg, model_cfg=model_cfg)
     if is_main_process:
         _write_data_profile(data_cfg=data_cfg, session_dir=session_dir, config_name=config_name)
 
@@ -1766,31 +1765,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             f"[{config_name}] training complete but {missing} missing; "
             "continuing to dataloader/inference setup."
         )
-
-    scale_max = float(max(model_cfg.get("sigmas", [2, 4, 8, 16])))
-    def _param_max(value_key: str, default: float) -> float:
-        values = model_cfg.get(value_key, default)
-        if isinstance(values, (list, tuple)):
-            if len(values) != 2:
-                raise ValueError(f"{value_key} range must contain exactly two values, got {values!r}")
-            return float(max(values))
-        return float(values)
-
-    _msb = _param_max("mask_size_scaling", 1.0)
-    _mb = int(round(_param_max("mask_size", 16)))
-    _manual_mask_sizes = model_cfg.get("mask_size_manual")
-    if _manual_mask_sizes is not None:
-        if isinstance(_manual_mask_sizes, str):
-            _manual_items = [v.strip() for v in _manual_mask_sizes.split(",") if v.strip()]
-        else:
-            try:
-                _manual_items = list(_manual_mask_sizes)
-            except TypeError:
-                _manual_items = [_manual_mask_sizes]
-        max_box = max(int(round(float(v))) for v in _manual_items)
-    else:
-        max_box = round(scale_max * _msb + _mb)
-    _mss = float(model_cfg.get("mask_spacing_scaling", 1.5))
 
     # --- image_batch pre-selection ---
     image_batch_selected_indices = None
