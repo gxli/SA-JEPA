@@ -11,6 +11,7 @@ import warnings
 from tqdm import tqdm
 import os
 import random
+import sys
 import time
 from collections import defaultdict
 
@@ -43,6 +44,7 @@ from src.models.build_jepa import CDD_CUBE_ENCODER_TYPES, CDD_DEBUG_ENCODER_TYPE
 from src.models.build_jepa3d import PyramidGridJEPA3D, compute_3d_encoder_receptive_field_depth
 from src.models.masking import _max_effective_mask_box_size, prepare_context_batch
 from src.utils import log_error, set_error_log_path
+from src.utils.cdd_import import import_constrained_diffusion
 from src.utils.npy import _safe_load_npy
 from src.utils.viz import _target_location_yx, save_inference_dashboard, save_volumetric_umap_embeddings
 
@@ -79,6 +81,12 @@ def _fmt_metric(v: float) -> str:
 
 def _format_metric_dict(metrics: dict[str, str]) -> str:
     return " ".join(f"{key}={value}" for key, value in metrics.items())
+
+
+def _seed_dataloader_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def _format_progress_line(
@@ -424,7 +432,6 @@ def _precompute_cdd_cache(
 ) -> dict:
     """Pre-compute a bounded CDD decomposition cache on GPU, store in CPU RAM."""
     import glob as _glob
-    import constrained_diffusion as cdd
 
     enabled = bool(data_cfg.get("cdd_precompute", True))
     if not enabled:
@@ -446,7 +453,7 @@ def _precompute_cdd_cache(
     expected_default_scales = cdd_num_channels
     model_num_scales = int(model_cfg.get("num_scales", expected_default_scales))
     if device.type not in ("cuda", "mps"):
-        raise RuntimeError(f"[{config_name}] CDD precompute requires CUDA or MPS. Got device={device.type}.")
+        log_info(f"[{config_name}] CDD precompute: using CPU backend because device={device.type}")
     npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
     if not npy_files:
         log_info(f"[{config_name}] CDD precompute: no files found for pattern, skipping")
@@ -507,6 +514,7 @@ def _precompute_cdd_cache(
     cache = {}
     disk_hits = 0
     disk_writes = 0
+    cdd = None
     for path in npy_files:
         disk_data_path = disk_meta_path = None
         if disk_cache_enabled:
@@ -533,6 +541,13 @@ def _precompute_cdd_cache(
                     f"transformed_shape={tuple(cached['transformed'].shape)}"
                 )
                 continue
+        if cdd is None:
+            allow_monai = cdd_gaussian_backend == "monai"
+            cdd = import_constrained_diffusion(session_dir=session_dir, allow_monai=allow_monai)
+            log_info(
+                f"[{config_name}] CDD import: constrained_diffusion "
+                f"monai={'on' if allow_monai else 'blocked'}"
+            )
         log_info(f"[{config_name}] CDD GPU compute: path={path}")
         if path.endswith(".fits"):
             from astropy.io import fits as _fits
@@ -1949,8 +1964,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
     requested_workers = int(train_cfg.get("num_workers", 4))
     # macOS/MPS-safe default: avoid multiprocessing worker hangs unless explicitly set.
-    if device.type == "mps":
-        num_workers = 0  # macOS spawn can't pickle closures
+    if device.type == "mps" or (sys.platform == "darwin" and device.type != "cuda"):
+        num_workers = 0  # macOS spawn/shared-memory transport is fragile outside CUDA workers.
     elif "num_workers" in train_cfg:
         num_workers = requested_workers
     else:
@@ -1963,16 +1978,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         f"pin_memory={pin_memory}, persistent_workers={persistent_workers}, "
         f"prefetch_factor={prefetch_factor}"
     )
-    def _worker_init_fn(worker_id: int) -> None:
-        """Ensure each DataLoader worker has a unique NumPy and Python random seed."""
-        worker_seed = torch.initial_seed() % 2**32
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
-
     loader_worker_kwargs = {}
     if num_workers > 0:
         loader_worker_kwargs["prefetch_factor"] = prefetch_factor
-        loader_worker_kwargs["worker_init_fn"] = _worker_init_fn
+        loader_worker_kwargs["worker_init_fn"] = _seed_dataloader_worker
 
     # DDP: distribute data across GPUs
     train_sampler = DistributedSampler(train_dataset) if is_ddp else None

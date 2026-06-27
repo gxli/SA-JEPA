@@ -14,6 +14,7 @@ from .masking3d import extract_location_cubes
 from .predictor3d import FullResPredictor3D
 from .symmetry import symmetric_forward_3d
 from src.losses import l2_normalize_patches
+from src.utils.cdd_import import import_constrained_diffusion
 
 
 def compute_3d_encoder_receptive_field_depth(encoder_depth: int = 3, encoder_kernel_size: int = 5) -> int:
@@ -357,7 +358,7 @@ class PyramidGridJEPA3D(nn.Module):
         b, s, _, _, _ = x_clean.shape
         if s == 1 and s != self.num_scales:
             # On-the-fly 3D CDD decomposition (DDP fallback — no precomputed cache).
-            import constrained_diffusion as cdd
+            cdd = import_constrained_diffusion(allow_monai=False)
             import numpy as np
             x_np = x_clean[:, 0].cpu().numpy()  # (B, D, H, W)
             decomposed = []

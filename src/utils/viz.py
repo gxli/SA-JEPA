@@ -296,6 +296,9 @@ def _compute_umap_nd(
     init_mode = str(init).lower()
     if init_mode not in ("spectral", "random"):
         init_mode = "spectral"
+    fallback = _compute_pca_3d(x, fit_max_tokens=fit_max_tokens)
+    if int(n_components) != 3:
+        fallback = fallback[:, : int(n_components)]
 
     if x.shape[0] > fit_max_tokens:
         rng = np.random.default_rng(random_state)
@@ -305,64 +308,71 @@ def _compute_umap_nd(
     else:
         needs_fit_transform = False
 
-    try:
-        from cuml.manifold import UMAP as CuMLUMAP
+    if torch.cuda.is_available():
+        try:
+            from cuml.manifold import UMAP as CuMLUMAP
 
-        print("[inference] UMAP backend: cuML (GPU)")
-        model = CuMLUMAP(
-            n_components=n_components,
-            n_neighbors=int(n_neighbors),
-            min_dist=float(min_dist),
-            metric=str(metric),
-            random_state=int(random_state),
-            init=init_mode,
-        )
-        if needs_fit_transform:
-            model.fit(fit_x)
-            return model.transform(x)
-        return model.fit_transform(x)
-    except Exception as e:
-        print(f"[warning] cuML UMAP failed: {type(e).__name__}: {e}")
-
-    try:
-        import torchdr
-
-        if hasattr(torchdr, "UMAP"):
-            model = torchdr.UMAP(
+            print("[inference] UMAP backend: cuML (GPU)")
+            model = CuMLUMAP(
                 n_components=n_components,
                 n_neighbors=int(n_neighbors),
                 min_dist=float(min_dist),
+                metric=str(metric),
+                random_state=int(random_state),
+                init=init_mode,
             )
             if needs_fit_transform:
-                model.fit(torch.from_numpy(fit_x.astype(np.float32)))
-                z = model.transform(torch.from_numpy(x.astype(np.float32)))
-            else:
-                z = model.fit_transform(torch.from_numpy(x.astype(np.float32)))
-            if isinstance(z, torch.Tensor):
-                return z.cpu().numpy()
-            return np.asarray(z)
-    except Exception as e:
-        print(f"[warning] torchdr UMAP failed: {type(e).__name__}: {e}")
+                model.fit(fit_x)
+                return model.transform(x)
+            return model.fit_transform(x)
+        except Exception as e:
+            print(f"[warning] cuML UMAP failed: {type(e).__name__}: {e}")
 
-    try:
-        import umap
+    enable_torchdr = os.environ.get("SAJEPA_ENABLE_TORCHDR_UMAP", "").strip().lower() in {"1", "true", "yes", "on"}
+    if enable_torchdr:
+        try:
+            import torchdr
 
-        model = umap.UMAP(
-            n_components=n_components,
-            n_neighbors=int(n_neighbors),
-            min_dist=float(min_dist),
-            metric=str(metric),
-            random_state=int(random_state),
-            init=init_mode,
-        )
-        if needs_fit_transform:
-            model.fit(fit_x)
-            return model.transform(x)
-        return model.fit_transform(x)
-    except Exception as e:
-        print(f"[warning] umap-learn failed: {type(e).__name__}: {e}")
+            if hasattr(torchdr, "UMAP"):
+                model = torchdr.UMAP(
+                    n_components=n_components,
+                    n_neighbors=int(n_neighbors),
+                    min_dist=float(min_dist),
+                )
+                if needs_fit_transform:
+                    model.fit(torch.from_numpy(fit_x.astype(np.float32)))
+                    z = model.transform(torch.from_numpy(x.astype(np.float32)))
+                else:
+                    z = model.fit_transform(torch.from_numpy(x.astype(np.float32)))
+                if isinstance(z, torch.Tensor):
+                    return z.cpu().numpy()
+                return np.asarray(z)
+        except Exception as e:
+            print(f"[warning] torchdr UMAP failed: {type(e).__name__}: {e}")
 
-    raise RuntimeError(f"UMAP({n_components}D) failed: all backends exhausted")
+    enable_cpu_umap_default = sys.platform != "darwin"
+    enable_cpu_umap = os.environ.get("SAJEPA_ENABLE_CPU_UMAP", str(int(enable_cpu_umap_default))).strip().lower()
+    if enable_cpu_umap in {"1", "true", "yes", "on"}:
+        try:
+            import umap
+
+            model = umap.UMAP(
+                n_components=n_components,
+                n_neighbors=int(n_neighbors),
+                min_dist=float(min_dist),
+                metric=str(metric),
+                random_state=int(random_state),
+                init=init_mode,
+            )
+            if needs_fit_transform:
+                model.fit(fit_x)
+                return model.transform(x)
+            return model.fit_transform(x)
+        except Exception as e:
+            print(f"[warning] umap-learn failed: {type(e).__name__}: {e}")
+
+    print("[warning] UMAP backend unavailable/disabled; using PCA coordinates as UMAP fallback")
+    return fallback.astype(np.float32, copy=False)
 
 
 def _save_latent_overview_html(session_dir: str, pca_points: np.ndarray, umap_points: np.ndarray, h: int, w: int) -> str:

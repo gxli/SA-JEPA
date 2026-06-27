@@ -6,6 +6,7 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from src.utils.cdd_import import import_constrained_diffusion
 
 PRIMARY_TARGET_SAMPLING_MODES = ("random", "priority", "priority_small_scale")
 LEGACY_TARGET_SAMPLING_MODES = ("lattice",)
@@ -746,7 +747,7 @@ def make_pyramid_grid_context(
                 cdd_residual_t = None
                 use_cdd_for_sample = True
             elif use_cdd_for_sample:
-                import constrained_diffusion as cdd
+                cdd = import_constrained_diffusion(allow_monai=False)
 
                 cdd_kwargs = dict(
                     mode=cdd_mode,
