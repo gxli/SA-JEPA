@@ -12,7 +12,7 @@ from src.losses import representation_dense_energy
 from src.models.masking import extract_location_patches, norm_per_sample_channel, prepare_context_batch
 
 # Bump this on every inference-affecting change so session logs show which code ran.
-INFERENCE_VERSION = "v2-border-nan-3d-fix-2025"
+INFERENCE_VERSION = "v4-even-parity-tiled-2d-tta-2026"
 from src.utils.viz import _target_location_yx
 
 
@@ -67,6 +67,20 @@ def _apply_tta_2d(name: str, z: torch.Tensor) -> torch.Tensor:
         k = int(rest)
         return torch.rot90(z, k=-k, dims=(-2, -1))
     raise ValueError(name)
+
+
+def _pad_even_spatial_2d(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int]]:
+    h, w = int(x.shape[-2]), int(x.shape[-1])
+    pad_h = h % 2
+    pad_w = w % 2
+    if pad_h or pad_w:
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+    return x, (h, w)
+
+
+def _crop_spatial_2d(x: torch.Tensor, shape_hw: tuple[int, int]) -> torch.Tensor:
+    h, w = int(shape_hw[0]), int(shape_hw[1])
+    return x[..., :h, :w]
 
 
 def _forward_tta_streaming_2d(
@@ -568,6 +582,63 @@ def _run_tiled_dense_inference_2d(
     return {key: value / weight for key, value in sums.items()}
 
 
+def _run_tiled_dense_inference_2d_tta(
+    *,
+    model,
+    x_raw: torch.Tensor,
+    cdd_raw: torch.Tensor | None,
+    tile_size: int,
+    tile_overlap: int | None,
+    config_name: str,
+    tta_enabled: bool,
+    tta_mode: str,
+) -> tuple[dict[str, torch.Tensor], int]:
+    if not bool(tta_enabled):
+        return (
+            _run_tiled_dense_inference_2d(
+                model=model,
+                x_raw=x_raw,
+                cdd_raw=cdd_raw,
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
+                config_name=config_name,
+            ),
+            1,
+        )
+
+    sums: dict[str, torch.Tensor] = {}
+    counts: dict[str, int] = {}
+    n_views = 0
+    x_tta, original_hw = _pad_even_spatial_2d(x_raw)
+    cdd_tta = None
+    if cdd_raw is not None:
+        cdd_tta, _ = _pad_even_spatial_2d(cdd_raw)
+    cdd_iter = _iter_tta_views_2d(cdd_tta, tta_mode) if cdd_tta is not None else None
+    for view_name, x_view in _iter_tta_views_2d(x_tta, tta_mode):
+        cdd_view = next(cdd_iter)[1] if cdd_iter is not None else None
+        tiled_view = _run_tiled_dense_inference_2d(
+            model=model,
+            x_raw=x_view,
+            cdd_raw=cdd_view,
+            tile_size=tile_size,
+            tile_overlap=tile_overlap,
+            config_name=f"{config_name}/tta:{view_name}",
+        )
+        n_views += 1
+        for key, value in tiled_view.items():
+            aligned = _crop_spatial_2d(_apply_tta_2d(view_name, value), original_hw)
+            if key not in sums:
+                sums[key] = aligned
+                counts[key] = 1
+            else:
+                sums[key].add_(aligned)
+                counts[key] += 1
+        del tiled_view
+    if not sums:
+        raise RuntimeError(f"[{config_name}] tiled 2D TTA produced no views")
+    return {key: value.div(float(max(1, counts[key]))) for key, value in sums.items()}, n_views
+
+
 def _load_cdd_cache_for_image(session_dir: str, full_h: int, full_w: int, h: int, w: int,
                               use_log: bool = False) -> torch.Tensor | None:
     """Load CDD from disk cache, returning a (1, S, h, w) tile from center."""
@@ -775,13 +846,15 @@ def run_post_training_inference(
                     lattice_shift_override=(0, 0),
                     target_mask=target_mask,
                 )
-            tiled = _run_tiled_dense_inference_2d(
+            tiled, tta_view_count = _run_tiled_dense_inference_2d_tta(
                 model=model,
                 x_raw=x_raw.detach().cpu(),
                 cdd_raw=None if cdd_raw is None else cdd_raw.detach().cpu(),
                 tile_size=int(tile_size),
                 tile_overlap=tile_overlap,
                 config_name=config_name,
+                tta_enabled=bool(inference_tta_enabled),
+                tta_mode=inference_tta_mode,
             )
             for key in ("x_clean", "x_context", "context_map", "pred_map", "gt_map"):
                 outputs[key] = tiled[key].to(x_raw.device)

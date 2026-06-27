@@ -66,6 +66,13 @@ def _normalize_convnext_dilations(dilations, depth: int) -> list[int]:
     return values
 
 
+def _require_odd_kernel_size(kernel_size: int, name: str) -> int:
+    k = int(kernel_size)
+    if k <= 0 or k % 2 == 0:
+        raise ValueError(f"{name} must be a positive odd integer for dense phase alignment, got {kernel_size!r}.")
+    return k
+
+
 class ConvNeXtDenseBlock(nn.Module):
     def __init__(
         self,
@@ -78,6 +85,7 @@ class ConvNeXtDenseBlock(nn.Module):
         use_grn: bool = True,
     ):
         super().__init__()
+        kernel_size = _require_odd_kernel_size(kernel_size, "ConvNeXtDenseBlock.kernel_size")
         self.use_grn = bool(use_grn)
         self.dilation = int(dilation)
         pad = (int(kernel_size) // 2) * self.dilation
@@ -141,6 +149,7 @@ class ConvNeXtDenseEncoder(nn.Module):
         stem_norm: bool = True,
     ):
         super().__init__()
+        kernel_size = _require_odd_kernel_size(kernel_size, "ConvNeXtDenseEncoder.kernel_size")
         depth = int(depth)
         dilations = _normalize_convnext_dilations(dilations, depth)
         self.dilations = tuple(dilations)
@@ -306,6 +315,11 @@ class CDDScaleAwareConvNeXtEncoder(nn.Module):
         dilations=None,
     ):
         super().__init__()
+        kernel_size = _require_odd_kernel_size(kernel_size, "CDDScaleAwareConvNeXtEncoder.kernel_size")
+        adapter_kernel_size = _require_odd_kernel_size(
+            adapter_kernel_size,
+            "CDDScaleAwareConvNeXtEncoder.adapter_kernel_size",
+        )
         self.scales = tuple(float(s) for s in scales)
         self.num_scales = len(self.scales)
         self.scale_feat_channels = int(scale_feat_channels)

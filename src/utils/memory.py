@@ -81,6 +81,8 @@ class OOMSafeTrainer:
             return False
         clear_memory_cache()
         prev_batch = self.batch_size
+        if prev_batch <= 1:
+            return False
         if self.scale_mode == "power_of_two":
             self.batch_size = _next_power_of_two_batch(self.batch_size)
         else:

@@ -3019,9 +3019,9 @@ def main():
         print(f"dashboard_session_begin={session_dir}")
         dash_html_path = os.path.join(session_dir, "dashboard.html")
         export_path = os.path.join(export_dir, f"{name.replace('/', '_')}.html")
-        session_html_current = _dashboard_html_is_current(dash_html_path)
-        export_html_current = _dashboard_html_is_current(export_path)
-        if (not args.overwrite) and (not args.reset) and session_html_current and export_html_current:
+        # Plain exists skip — mirrors movie PNG behavior: if both files are
+        # already there and we're not forcing overwrite/reset, skip.
+        if (not args.overwrite) and (not args.reset) and os.path.exists(dash_html_path) and os.path.exists(export_path):
             print(
                 f"skip_dashboard_exists={session_dir} "
                 f"session_html={dash_html_path} export_html={export_path}"
@@ -3029,11 +3029,6 @@ def main():
             skipped += 1
             print(f"dashboard_session_end={session_dir}")
             continue
-        if (not args.overwrite) and (not args.reset) and os.path.exists(dash_html_path) and os.path.exists(export_path):
-            print(
-                f"dashboard_html_stale_recompute={session_dir} "
-                f"session_current={int(session_html_current)} export_current={int(export_html_current)}"
-            )
         inf_path = os.path.join(session_dir, "inference_outputs.pt")
         if not os.path.exists(inf_path):
             print(f"skip_no_inference={session_dir}")

@@ -20,6 +20,37 @@ from src.train import load_config, reject_removed_config_aliases, run_training
 from src.utils.memory import OOMSafeTrainer, clear_memory_cache
 
 
+def _run_training_with_oom_retries(cfg: dict, *, config_name: str, sessions_root: str) -> str:
+    train_cfg = cfg.setdefault("train", {})
+    initial_batch = max(1, int(train_cfg.get("batch_size", 4)))
+    configured_accum = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
+    target_batch = int(train_cfg.get("target_batch_size", train_cfg.get("target_batch", initial_batch * configured_accum)))
+    trainer = OOMSafeTrainer(
+        initial_batch=initial_batch,
+        target_batch=target_batch,
+        scale_mode=str(train_cfg.get("auto_scale_batch_size", "power_of_two")),
+        max_retries=int(train_cfg.get("oom_max_retries", 5)),
+    )
+    train_cfg["batch_size"] = trainer.batch_size
+    train_cfg["gradient_accumulation_steps"] = trainer.accumulation_steps
+
+    while True:
+        try:
+            _logger.info(
+                "batch=%d accum=%d session=%s",
+                trainer.batch_size,
+                trainer.accumulation_steps,
+                os.path.join(sessions_root, config_name),
+            )
+            return run_training(cfg, config_name=config_name, sessions_root=sessions_root)
+        except RuntimeError as exc:
+            if not trainer.handle_oom(exc):
+                raise
+            train_cfg["batch_size"] = trainer.batch_size
+            train_cfg["gradient_accumulation_steps"] = trainer.accumulation_steps
+            clear_memory_cache()
+
+
 class ScaleAwareJEPA:
     """Scale-Aware Joint-Embedding Predictive Architecture for physical fields.
 
@@ -111,9 +142,7 @@ class ScaleAwareJEPA:
             new_dir = os.path.join(sessions_dir, config_name)
             self._seed_session_from_base(base_session, new_dir, mode=base_session_mode)
 
-        # NOTE: OOM-safe auto-scaling is not yet wired into train();
-        # use fit() for large models/fields that may OOM.
-        session_dir = run_training(cfg, config_name=config_name, sessions_root=sessions_dir)
+        session_dir = _run_training_with_oom_retries(cfg, config_name=config_name, sessions_root=sessions_dir)
         self._config = cfg
         self._session_dir = os.path.abspath(session_dir)
         self._is_trained = True
@@ -166,38 +195,17 @@ class ScaleAwareJEPA:
         cfg.setdefault("data", {})["npy_pattern"] = "_input.npy"
         cfg.setdefault("data", {})["data_root"] = sessions_dir
 
-        # --- auto-batch OOM handling ---
         train_cfg = cfg.setdefault("train", {})
-        trainer = OOMSafeTrainer(
-            initial_batch=int(train_cfg.get("batch_size", 4)),
-            target_batch=int(train_cfg.get("target_batch_size", train_cfg.get("target_batch", 32))),
-            scale_mode=str(train_cfg.get("auto_scale_batch_size", "power_of_two")),
-            max_retries=int(train_cfg.get("oom_max_retries", 5)),
-        )
-        train_cfg["batch_size"] = trainer.batch_size
-        train_cfg["gradient_accumulation_steps"] = trainer.accumulation_steps
-
         if "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:
             os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         if not torch.cuda.is_available():
             train_cfg["num_workers"] = 0
 
-        _logger.info(f"batch=%d accum=%d session=%s", trainer.batch_size, trainer.accumulation_steps, session_dir or "(temp)")
-
         old_cwd = os.getcwd()
         os.chdir(sessions_dir)
         sd = None
         try:
-            while True:
-                try:
-                    sd = run_training(cfg, config_name="sajepa", sessions_root=".")
-                    break
-                except RuntimeError as e:
-                    if not trainer.handle_oom(e):
-                        raise
-                    train_cfg["batch_size"] = trainer.batch_size
-                    train_cfg["gradient_accumulation_steps"] = trainer.accumulation_steps
-                    clear_memory_cache()
+            sd = _run_training_with_oom_retries(cfg, config_name="sajepa", sessions_root=".")
         finally:
             self._session_dir = os.path.abspath(sd) if sd else None
             os.chdir(old_cwd)

@@ -77,6 +77,41 @@ def test_api_train_wrapper_uses_default_plus_overrides(monkeypatch, tmp_path):
     assert "sigmas" in captured["cfg"]["model"]
 
 
+def test_api_train_retries_oom_with_smaller_batch(monkeypatch, tmp_path):
+    import src.api as api
+    from sajepa import ScaleAwareJEPA
+
+    calls = []
+
+    def fake_run_training(cfg, config_name, sessions_root):
+        calls.append(
+            (
+                int(cfg["train"]["batch_size"]),
+                int(cfg["train"]["gradient_accumulation_steps"]),
+            )
+        )
+        if len(calls) == 1:
+            raise RuntimeError("CUDA out of memory")
+        session = tmp_path / config_name
+        session.mkdir(exist_ok=True)
+        return str(session)
+
+    monkeypatch.setattr(api, "run_training", fake_run_training)
+
+    model = ScaleAwareJEPA(
+        config={
+            "train": {
+                "batch_size": 8,
+                "gradient_accumulation_steps": 1,
+                "oom_max_retries": 3,
+            }
+        }
+    ).train(config_name="oom_demo", sessions_dir=str(tmp_path))
+
+    assert model.session_dir == str((tmp_path / "oom_demo").resolve())
+    assert calls == [(8, 1), (4, 2)]
+
+
 def test_api_train_base_session_defaults_to_weights_only(monkeypatch, tmp_path):
     import src.api as api
     from sajepa import ScaleAwareJEPA
