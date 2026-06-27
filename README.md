@@ -185,44 +185,6 @@ model.open_dashboard()           # opens dashboard.html
 model.open_interactive_umap()    # opens interactive UMAP
 ```
 
-### Recovery Run: MHD 2D `ms=1.2`
-
-The current constrained-CDD recovery baseline for MHD 2D
-`mask_size_scaling=1.2` is:
-
-```text
-configs/local_configs/gen216_mhd2d_cddctrl_ms12.yaml
-```
-
-It is exactly:
-
-- data: `data/C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy`
-- model: pyramid mode, constrained `cdd_scaleaware_convnext`, `sigmas: [2, 4, 8, 16, 32]`
-- mask geometry: `mask_size_scaling: 1.2`, `mask_box_hardcap: 48`
-- training: `epochs: 10`, `spread_regularizer.weight: 5.0`
-- inference: full-frame 2D (`inference_tile_size: 0`), `force_recompute_inference: true`
-
-Run it from the repository root:
-
-```bash
-PYTHONPATH=. python scripts/train.py \
-  --config configs/local_configs/gen216_mhd2d_cddctrl_ms12.yaml \
-  --sessions-dir sessions \
-  --recompute-inference
-
-PYTHON_BIN=python SAJEPA_LOCAL_ROOT=$PWD \
-  bash scripts/local_scripts/flush_embedding.sh sessions/gen216_mhd2d_cddctrl_ms12
-
-PYTHONPATH=. SESSION_DASH_CONFIG_DIR=$PWD/configs python scripts/session_to_dash.py \
-  --sessions-dir sessions \
-  --stage all \
-  --export-dir results/dashboards \
-  --overwrite \
-  --reset
-```
-
----
-
 **Reloading & Continuing Workspaces**
 
 ```python
