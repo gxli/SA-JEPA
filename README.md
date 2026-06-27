@@ -101,6 +101,13 @@ configure your environment to use the native PyTorch fallback engine:
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 ```
 
+On macOS non-CUDA runs, training uses `num_workers=0` to avoid PyTorch
+spawn/shared-memory failures. CPU UMAP is disabled by default on macOS because
+the local `umap-learn`/native dependency stack can hang during import; embedding
+artifact generation writes PCA coordinates into UMAP artifact files as a
+dashboard-safe fallback. To force CPU UMAP anyway, set
+`SAJEPA_ENABLE_CPU_UMAP=1`.
+
 ## 🚀 Quick Start
 
 ### 🐍 Python API
@@ -180,16 +187,17 @@ model.open_interactive_umap()    # opens interactive UMAP
 
 ### Recovery Run: MHD 2D `ms=1.2`
 
-The current recovery baseline for MHD 2D `mask_size_scaling=1.2` is:
+The current constrained-CDD recovery baseline for MHD 2D
+`mask_size_scaling=1.2` is:
 
 ```text
-configs/local_configs/gen215_mhd2d_ms12.yaml
+configs/local_configs/gen216_mhd2d_cddctrl_ms12.yaml
 ```
 
 It is exactly:
 
 - data: `data/C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5.npy`
-- model: pyramid mode, `cdd_scaleaware_convnext`, `sigmas: [2, 4, 8, 16, 32]`
+- model: pyramid mode, constrained `cdd_scaleaware_convnext`, `sigmas: [2, 4, 8, 16, 32]`
 - mask geometry: `mask_size_scaling: 1.2`, `mask_box_hardcap: 48`
 - training: `epochs: 10`, `spread_regularizer.weight: 5.0`
 - inference: full-frame 2D (`inference_tile_size: 0`), `force_recompute_inference: true`
@@ -198,12 +206,12 @@ Run it from the repository root:
 
 ```bash
 PYTHONPATH=. python scripts/train.py \
-  --config configs/local_configs/gen215_mhd2d_ms12.yaml \
+  --config configs/local_configs/gen216_mhd2d_cddctrl_ms12.yaml \
   --sessions-dir sessions \
   --recompute-inference
 
 PYTHON_BIN=python SAJEPA_LOCAL_ROOT=$PWD \
-  bash scripts/local_scripts/flush_embedding.sh sessions/gen215_mhd2d_ms12
+  bash scripts/local_scripts/flush_embedding.sh sessions/gen216_mhd2d_cddctrl_ms12
 
 PYTHONPATH=. SESSION_DASH_CONFIG_DIR=$PWD/configs python scripts/session_to_dash.py \
   --sessions-dir sessions \
@@ -261,6 +269,12 @@ written when post-training artifact generation or the dashboard tools are run.
 > capped only by `train.umap.volumetric_max_points` (default `100000`). No
 > default fraction sampling is applied.
 
+> **CDD cache reproducibility:** CUDA and CPU CDD use different Gaussian
+> smoothing implementations (PyTorch separable convolution vs. SciPy
+> `ndimage.gaussian_filter`) and are not bit-identical. Session CDD cache
+> metadata records the effective backend via `cdd_effective_use_gpu`; compare
+> runs using the same backend when exact recovery numbers matter.
+
 ## ⚙️ Hyperparameter Knobs
 
 > Config files should either declare `base_config` or be run through the
@@ -282,6 +296,14 @@ written when post-training artifact generation or the dashboard tools are run.
 - The per-step token count for the JEPA loss and spread regularizer is
   $B \times N_{\text{targets}}$, where $N_{\text{targets}}$ is determined
   automatically from the image size and mask geometry.
+- Optional target-region masks:
+  - `data.target_mask`: path to a precomputed `.npy` valid-target map. Values
+    `>0` allow target centers; `0` rejects them. The map is resized with
+    nearest-neighbor if needed.
+  - `data.target_threshold`: fallback valid-target map generated from raw data
+    when `data.target_mask` is absent.
+  These masks restrict target sampling and inference validity; they are not the
+  same thing as saved JEPA mask footprint artifacts such as `target_mask_map`.
 - **Optimization Details:** AdamW optimizer with cosine decay: base learning rate
   $1\times10^{-4}$, minimum $1\times10^{-6}$, 1-epoch linear warmup, weight decay
   $1\times10^{-5}$.
@@ -300,15 +322,14 @@ written when post-training artifact generation or the dashboard tools are run.
 > **Large Fields & Crop Size**
 >
 > For fields larger than $\sim 512^2$ px, GPU memory becomes the limiting
-> factor. Set `crop_size` in the config (or via `infer_npy` for inference-only
-> runs):
+> factor. Training crops and inference tiling use different code paths:
 >
-> - `crop_size`: set under `data.crop_size` in YAML. Use `256` for most
->   fields; drop to `128` for $>1024^2$ px; raise to `512` if GPU headroom
->   allows.
-> - `crop_mode`: `"none"` (default, full field), `"center"` (single window),
->   or `"tile"` (sliding window, stitches results).
-> - `crop_min_valid_fraction`: `0.5` — tiles with less valid data are skipped.
+> - Training: set `data.crop_size` and `data.crop_mode` in YAML.
+>   `data.crop_mode` supports `"none"` (default), `"random"`, and `"center"`.
+>   `data.crop_min_valid_fraction` applies to random crops.
+> - Inference-only: use `model.infer_npy(..., crop_size=..., crop_mode="tile")`
+>   or `python -m src.inference_from_session ... --crop-mode tile` for sliding
+>   tiled inference and stitching.
 
 For inference on an already-trained session, pass directly:
 ```python

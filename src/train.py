@@ -447,6 +447,7 @@ def _precompute_cdd_cache(
     cdd_gaussian_backend = str(
         model_cfg.get("cdd_gaussian_backend", data_cfg.get("cdd_gaussian_backend", "cuda"))
     )
+    cdd_effective_use_gpu = bool(device.type == "cuda")
     sigmas = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
     cdd_num_channels = int(model_cfg.get("cdd_num_channels", len(sigmas)))
     cdd_request_num_channels = model_cfg.get("cdd_request_num_channels", None)
@@ -471,6 +472,7 @@ def _precompute_cdd_cache(
         "cdd_append_last_residual": cdd_append_last_residual,
         "cdd_pre_log_transform": cdd_pre_log_transform,
         "cdd_gaussian_backend": cdd_gaussian_backend,
+        "cdd_effective_use_gpu": cdd_effective_use_gpu,
         "log_eps": float(model_cfg.get("log_eps", 1.0)),
         "cdd_log_std_floor_mult": float(model_cfg.get("cdd_log_std_floor_mult", 0.05)),
         "cdd_min_scale": float(min(float(s) for s in sigmas)),
@@ -573,7 +575,7 @@ def _precompute_cdd_cache(
             sm_mode=cdd_sm_mode,
             return_scales=True,
             verbose=False,
-            use_gpu=(device.type == "cuda"),
+            use_gpu=cdd_effective_use_gpu,
             gaussian_backend=cdd_gaussian_backend,
         )
         if cdd_request_num_channels is not None:
