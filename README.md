@@ -73,7 +73,7 @@ model.save_interactive_umap("predict_umap_xyz.npy", "out.html")      # Save to f
 ```
 
 <img src="figures/output.gif" width="60%" alt="Interactive UMAP demo">
-## 🧩 Core Primitives Mapping
+## ⚡ Installation
 
 ```bash
 git clone https://github.com/gxli/SA-JEPA.git
