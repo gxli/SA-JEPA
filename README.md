@@ -72,7 +72,7 @@ model.open_interactive_umap()                                          # Generat
 model.save_interactive_umap("predict_umap_xyz.npy", "out.html")      # Save to file
 ```
 
-![Interactive UMAP demo](figures/output.gif)
+<img src="figures/output.gif" width="60%" alt="Interactive UMAP demo">
 ## 🧩 Core Primitives Mapping
 
 ```bash
