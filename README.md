@@ -72,21 +72,8 @@ model.open_interactive_umap()                                          # Generat
 model.save_interactive_umap("predict_umap_xyz.npy", "out.html")      # Save to file
 ```
 
-| Spiral Arm                                  | Interarm                                      |
-|:-------------------------------------------:|:---------------------------------------------:|
-| ![spiral arm](figures/spiral_arm.png)       | ![interarm](figures/interarm.png)             |
-<!-- 
+![Interactive UMAP demo](figures/output.gif)
 ## 🧩 Core Primitives Mapping
-
-| AMI Labs JEPA Philosophy    | `sajepa` Implementation       | Physical Science Advantage                                                                               |
-|:----------------------------|:-------------------------------|:----------------------------------------------------------------------------------------------------------|
-| **Non-Generative Objective**  | Multi-target Latent MSE        | Completely eliminates pixel-level hallucinations.                                                         |
-| **Visual Backbone**           | ConvNeXt (Saining Xie et al.)  | Modern, battle-tested image backbone; depthwise convolutions + GRN deliver efficiency for high-resolution fields. |
-| **Vicinal Regularization**    | Variance Hinge (`std_hinge`)   | Explicitly forces maximum entropy across spatial latents; prevents representation collapse.               |
-| **Spatio-Temporal Masking**   | CDD Scale-Aware Masking        | Preserves fractal, multi-scale physical boundaries instead of breaking them with block masks.             |
-| **World Model Component**     | Context Encoder + Predictor    | Allows downstream components to simulate physical field evolutions in a stable latent space.              | -->
-
-## ⚡ Installation
 
 ```bash
 git clone https://github.com/gxli/SA-JEPA.git
