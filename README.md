@@ -138,6 +138,31 @@ print(f"Dashboard:     outputs/my_run/dashboard.html")
 print(f"Interactive:   {umap_html}")
 ```
 
+### 🔋 Battery-Included Masked-Field Blueprint
+
+For masked fields such as Perseus, start from the cropped blueprint config. It
+uses a precomputed valid-target map, random `400×400` training crops, masked
+inference diagnostics, and dashboard artifact generation. Replace the dummy
+filenames in `configs/examples/perseus_masked_crop_blueprint.yaml` with your
+local field and target-mask files.
+
+```python
+from sajepa import ScaleAwareJEPA
+
+model = ScaleAwareJEPA(config="configs/examples/perseus_masked_crop_blueprint.yaml")
+model.train(config_name="perseus_masked_blueprint", sessions_dir="outputs", dashboard=True)
+interactive = model.open_interactive_umap()
+
+print(f"Dashboard:     {model.session_dir}/dashboard.html")
+print(f"Interactive:   {interactive}")
+```
+
+One-line version:
+
+```bash
+python -c "from sajepa import ScaleAwareJEPA; m=ScaleAwareJEPA(config='configs/examples/perseus_masked_crop_blueprint.yaml'); m.train(config_name='perseus_masked_blueprint', sessions_dir='outputs', dashboard=True); print('dashboard:', m.session_dir + '/dashboard.html'); print('interactive:', m.open_interactive_umap())"
+```
+
 ### ⚙️ Config-driven
 
 > 📘 YAML configs can inherit from `base_pyramid_scaleaware_convnext.yaml` via

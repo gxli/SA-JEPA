@@ -1,0 +1,42 @@
+# Perseus-style masked-field blueprint.
+# Replace the two dummy filenames with local data files:
+#   data/example_field.npy
+#   data/example_target_mask.npy
+#
+# `target_mask` is a precomputed valid-target map:
+#   >0 means targets may be sampled there, 0 means skip.
+# It is used for target rejection and masked inference diagnostics.
+
+base_config: ../base_pyramid_scaleaware_convnext.yaml
+
+data:
+  data_root: data
+  npy_pattern: example_field.npy
+  num_samples: 200
+  d4_augment: true
+  target_mask: example_target_mask.npy
+  crop_size: 400
+  crop_mode: random
+
+model:
+  mask_size_scaling: 1.2
+  sigmas: [2, 4, 8, 16, 32]
+  mask_box_hardcap: 48
+
+train:
+  epochs: 10
+  spread_regularizer:
+    type: std_hinge
+    target: context
+    spatial_mode: pooled
+    weight: 5.0
+    target_std: 1.0
+    eps: 0.0001
+  inference_max_diagnostic_size: 0
+  inference_tile_size: 512
+  inference_visit_batches: 1
+  mask_inference: true
+  force_recompute_inference: true
+  post_training_artifacts: true
+  inference_discard_margin: auto
+  viz_crop_border: false
