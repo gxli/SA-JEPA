@@ -40,13 +40,13 @@ continuous 2D/3D environments where discrete semantic tokens do not exist. By
 executing predictions entirely within a latent bottleneck, the model acts as
 the perceptual front-end of a physical world model.
 
-> **Abstract Concept Tracking Without Generation**
+<!-- > **Abstract Concept Tracking Without Generation**
 >
 > Instead of training expensive generative models (Diffusion, VAEs) to
 > synthesize noisy fields, `sajepa` focuses on representation alignment. This
 > enables the discovery of complex physical morphologies — MHD turbulence
 > cascades, diffuse filament networks, and macro-scale astronomical structures
-> — directly from raw, unannotated sensor streams.
+> — directly from raw, unannotated sensor streams. -->
 
 ### 🌌 Dense Latent Atlas Projections
 
@@ -285,22 +285,6 @@ written when post-training artifact generation or the dashboard tools are run.
 
 **Large Fields & Crop Size**
 
-> **Large Fields & Crop Size**
->
-> For fields larger than $\sim 512^2$ px, GPU memory becomes the limiting
-> factor. Training crops and inference tiling use different code paths:
->
-> - Training: set `data.crop_size` and `data.crop_mode` in YAML.
->   `data.crop_mode` supports `"none"` (default), `"random"`, and `"center"`.
->   `data.crop_min_valid_fraction` applies to random crops.
-> - Inference-only: use `model.infer_npy(..., crop_size=..., crop_mode="tile")`
->   or `python -m src.inference_from_session ... --crop-mode tile` for sliding
->   tiled inference and stitching.
-
-For inference on an already-trained session, pass directly:
-```python
-model.infer_npy("large_field.npy", crop_size=256, crop_mode="tile")
-```
 
 **Modeling Dimensions**
 
@@ -325,6 +309,24 @@ model.infer_npy("large_field.npy", crop_size=256, crop_mode="tile")
   The full encoder adds a $3\times3$ adapter and $3\times3$ stem
   ($\approx +4$ px additional); with GRN enabled the strict dependency is
   global across the feature map.
+
+ **Large Fields & Crop Size**
+
+ For fields larger than $\sim 512^2$ px, GPU memory becomes the limiting
+ factor. Training crops and inference tiling use different code paths:
+
+ - Training: set `data.crop_size` and `data.crop_mode` in YAML.
+   `data.crop_mode` supports `"none"` (default), `"random"`, and `"center"`.
+   `data.crop_min_valid_fraction` applies to random crops.
+ - Inference-only: use `model.infer_npy(..., crop_size=..., crop_mode="tile")`
+   or `python -m src.inference_from_session ... --crop-mode tile` for sliding
+   tiled inference and stitching.
+
+For inference on an already-trained session, pass directly:
+```python
+model.infer_npy("large_field.npy", crop_size=256, crop_mode="tile")
+```
+
 
 ## 💻 API Reference
 
