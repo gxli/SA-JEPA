@@ -82,7 +82,7 @@ cd sajepa
 pip install -e .
 ```
 
-**Apple Silicon (MPS) Note:** If you encounter missing operations on Apple GPUs,
+<!-- **Apple Silicon (MPS) Note:** If you encounter missing operations on Apple GPUs,
 configure your environment to use the native PyTorch fallback engine:
 
 ```bash
@@ -94,7 +94,7 @@ spawn/shared-memory failures. CPU UMAP is disabled by default on macOS because
 the local `umap-learn`/native dependency stack can hang during import; embedding
 artifact generation writes PCA coordinates into UMAP artifact files as a
 dashboard-safe fallback. To force CPU UMAP anyway, set
-`SAJEPA_ENABLE_CPU_UMAP=1`.
+`SAJEPA_ENABLE_CPU_UMAP=1`. -->
 
 ## 🚀 Quick Start
 
