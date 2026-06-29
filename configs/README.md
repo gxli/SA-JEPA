@@ -18,7 +18,6 @@ and `cdd_scale_space` are rejected.
 | `data.d4_augment` | `true` | Dihedral D4 augmentation (rotations + flips). |
 | `data.crop_mode` | `none` | Training crop mode: `none`, `random`, or `center`. Tiled stitching is inference-only via `src.inference_from_session` / `model.infer_npy`. |
 | `data.crop_size` | — | Crop size in pixels for training crop modes. |
-| `data.crop_min_valid_fraction` | — | Reserved for inference tiling and direct dataset use. The main training loader currently does not pass this knob into `JEPADataset`. |
 | `data.cube_slice_strategy` | `center` | How 2D slices are extracted from 3D cubes. |
 | `data.cube_slice_axis` | `0` | Depth axis for cube slicing. |
 | `data.cube_slice_index` | `0` | Fixed slice index when strategy is `fixed`. |
