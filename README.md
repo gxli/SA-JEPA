@@ -6,28 +6,27 @@
 
 `sajepa` is a PyTorch implementation of **ScaleAware JEPA**, a non-generative
 self-supervised architecture that learns abstract latent representations of
-continuous physical fields — designed as a production-grade perceptual front-end
-for physical world models.
+continuous physical fields.
 
-## 🏛️ Architecture & World Model Blueprint
+## 🏛️ Architecture
 
-ScaleAware JEPA rejects pixel-reconstruction and generative tokenization in
-favor of a joint-embedding predictive architecture that models continuous
-multi-scale physical structures entirely in representation space:
+ScaleAware JEPA uses latent prediction rather than pixel reconstruction: a
+joint-embedding predictive architecture that models continuous multi-scale
+physical structures entirely in representation space:
 
 - **Multi-Scale Spatial Aggregation:** Constrained Diffusion Decomposition (CDD)
-  replaces uniform grid-masking — which breaks down on continuous fields — with
-  a physics-informed spatial aggregator. It decomposes raw scalar inputs into
-  aligned fine-to-coarse components and dynamically scales target masks to match
-  the underlying physical topology.
+  replaces fixed-grid masking with scale-aware, physics-informed spatial
+  aggregation. Raw scalar inputs are decomposed into aligned fine-to-coarse
+  components; the context-mask footprint is tied to each CDD diffusion scale,
+  while the target patch remains fixed.
 - **ConvNeXt-Driven Latent Coding:** Scale-aware CDD components feed directly
   into a modern ConvNeXt backbone (depthwise convolutions, inverted bottlenecks,
   GRN normalization) to produce dense 32-channel latent representations with the
   efficiency and expressivity required for high-resolution physical fields.
 
-- **Dense Representation Topography:** Every physical coordinate maps
-  deterministically to a distinct 32-channel latent coordinate, establishing a
-  stable, back-mappable coordinate system for downstream reasoning.
+- **Dense Latent Coordinates:** The architecture produces a dense 32-channel
+  latent vector at each spatial location, yielding a back-mappable latent atlas
+  for downstream reasoning.
 - **Modality Support:**
   - 2D fields: fully supported and tested.
   - 3D volumetric training (`3d_slab`): under active development.
@@ -38,15 +37,15 @@ multi-scale physical structures entirely in representation space:
 `sajepa` provides a foundation for unsupervised representation learning in
 continuous 2D/3D environments where discrete semantic tokens do not exist. By
 executing predictions entirely within a latent bottleneck, the model acts as
-the perceptual front-end of a physical world model.
+a dense latent encoder for continuous fields.
 
-<!-- > **Abstract Concept Tracking Without Generation**
+> **Abstract Concept Tracking Without Generation**
 >
 > Instead of training expensive generative models (Diffusion, VAEs) to
 > synthesize noisy fields, `sajepa` focuses on representation alignment. This
-> enables the discovery of complex physical morphologies — MHD turbulence
-> cascades, diffuse filament networks, and macro-scale astronomical structures
-> — directly from raw, unannotated sensor streams. -->
+> enables the discovery of complex physical morphologies — MHD density
+> morphology, filamentary interfaces, and compact structures — from
+> unlabelled scalar fields.
 
 ### 🌌 Dense Latent Atlas Projections
 
@@ -59,7 +58,7 @@ structural morphology.
 | MHD Turbulence                                                          | NGC 3627                                                                                                                                        |
 |:-----------------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------------------------------------------------------:|
 | ![MHD](figures/mhd.png)                                                 | ![NGC 3627](figures/ngc.png)                                                                                                                    |
-| UMAP and PCA projections for a continuous MHD plasma simulation.        | UMAP and PCA projections for the molecular gas intensity field of NGC 3627. Latent neighborhoods map onto spiral structures and diffuse halo regions. |
+| UMAP and PCA projections for a continuous MHD plasma simulation.        | UMAP and PCA projections for the molecular gas intensity field of NGC 3627. Latent neighborhoods separate arm and interarm regions and recover a fainter diffuse interarm component. |
 
 #### 🖥️ Interactive Dashboard — NGC 3627
 
@@ -82,19 +81,14 @@ cd sajepa
 pip install -e .
 ```
 
-<!-- **Apple Silicon (MPS) Note:** If you encounter missing operations on Apple GPUs,
+**Apple Silicon (MPS) Note:** If you encounter missing operations on Apple GPUs,
 configure your environment to use the native PyTorch fallback engine:
 
 ```bash
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 ```
 
-On macOS non-CUDA runs, training uses `num_workers=0` to avoid PyTorch
-spawn/shared-memory failures. CPU UMAP is disabled by default on macOS because
-the local `umap-learn`/native dependency stack can hang during import; embedding
-artifact generation writes PCA coordinates into UMAP artifact files as a
-dashboard-safe fallback. To force CPU UMAP anyway, set
-`SAJEPA_ENABLE_CPU_UMAP=1`. -->
+
 
 ## 🚀 Quick Start
 
@@ -148,9 +142,10 @@ print("Interactive UMAP is generated by model.open_interactive_umap().")
 ### 🔋 Cropped Field Training and Inference Mode
 
 For large fields where full-frame training would OOM, use cropped-FOV training
-with masked inference. The config sets a random crop window, a precomputed
-valid-target mask, and masked-inference diagnostics — the model trains on crops
-at training time and runs full-frame masked inference for dashboard artifacts.
+with dense, unmasked target-branch inference. The config sets a random crop
+window and a precomputed valid-target mask for training; at inference the EMA
+target encoder runs densely (no JEPA masking) to produce full-frame latent
+maps and dashboard artifacts.
 
 ```python
 from sajepa import ScaleAwareJEPA
@@ -248,7 +243,7 @@ written when post-training artifact generation or the dashboard tools are run.
 > The exhaustive breakdown is in the
 > [**Configuration Knobs Dictionary**](configs/README.md).
 
-### Baseline Production Targets:
+### Baseline Configuration:
 
 **Training Settings**
 
@@ -279,7 +274,7 @@ written when post-training artifact generation or the dashboard tools are run.
 **Loss Components**
 
 - `prediction_loss_weight`: `50` (primary JEPA latent prediction MSE multiplier).
-- `spread_regularizer`: configured as `std_hinge`, with a scaling `weight: 2` (recommend `5` for production; see `configs/examples/mhd_example.yaml`), mapping against `target: context` inside a `"pooled"` spatial_mode.
+- `spread_regularizer`: configured as `std_hinge`, with a scaling `weight: 2` (recommend `5` for typical use; see `configs/examples/mhd_example.yaml`), mapping against `target: context` inside a `"pooled"` spatial_mode.
 - `symmetry_loss_weight`: `0.0` (off by default; set to `0.003` for weak four-view flip consistency).
 - `normalize_loss_l2`: `false` (preserves exact latent spatial amplitude calculations).
 
@@ -306,9 +301,7 @@ written when post-training artifact generation or the dashboard tools are run.
   | `[1, 1, 1, 1]` | 25 px |
   | `[1, 1, 2, 4]` | 49 px |
 
-  The full encoder adds a $3\times3$ adapter and $3\times3$ stem
-  ($\approx +4$ px additional); with GRN enabled the strict dependency is
-  global across the feature map.
+  With GRN enabled the receptive field is global across the feature map.
 
  **Large Fields & Crop Size**
 
