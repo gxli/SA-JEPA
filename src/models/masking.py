@@ -558,6 +558,7 @@ def make_pyramid_grid_context(
     cdd_pre_log_transform: bool = False,
     cdd_log_eps: float = 1.0,
     cdd_log_std_floor_mult: float = 0.05,
+    cdd_gaussian_backend: str = "cuda",
     inner_target_size: int = 2,
     return_debug: bool = False,
     enable_grid_jitter: bool = True,
@@ -756,6 +757,7 @@ def make_pyramid_grid_context(
                     return_scales=False,
                     verbose=False,
                     use_gpu=bool(cdd_use_gpu),
+                    gaussian_backend=str(cdd_gaussian_backend),
                 )
                 if cdd_pre_log_transform:
                     eps = max(1e-6, float(cdd_log_eps))
@@ -1213,6 +1215,7 @@ def prepare_context_batch(
     cdd_pre_log_transform: bool = False,
     cdd_log_eps: float = 1.0,
     cdd_log_std_floor_mult: float = 0.05,
+    cdd_gaussian_backend: str = "cuda",
     patch_size: int = 3,
     return_debug: bool = False,
     enable_grid_jitter: bool = True,
@@ -1274,6 +1277,7 @@ def prepare_context_batch(
         cdd_pre_log_transform=cdd_pre_log_transform,
         cdd_log_eps=cdd_log_eps,
         cdd_log_std_floor_mult=cdd_log_std_floor_mult,
+        cdd_gaussian_backend=cdd_gaussian_backend,
         inner_target_size=patch_size,
         return_debug=return_debug,
         enable_grid_jitter=enable_grid_jitter,

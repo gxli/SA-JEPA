@@ -251,10 +251,14 @@ written when post-training artifact generation or the dashboard tools are run.
 - `epochs`: `10`
 - `batch_size`: `4`
 - `gradient_accumulation_steps`: `1`
+- `gradient_accumulation_mode`: `step`
 
   $$B_{\text{eff}} = B \times G$$
 
   where $B$ is `batch_size` and $G$ is `gradient_accumulation_steps`.
+  `step` preserves the classic microbatch gradient accumulation path; `batch`
+  concatenates accumulated outputs and computes the loss once over the full
+  accumulation window.
 - The per-step token count for the JEPA loss and spread regularizer is
   $B \times N_{\text{targets}}$, where $N_{\text{targets}}$ is determined
   automatically from the image size and mask geometry.

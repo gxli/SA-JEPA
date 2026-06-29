@@ -431,6 +431,7 @@ def _prepare_full_mask_debug_2d(
         cdd_sm_mode=model.cdd_sm_mode,
         cdd_append_last_residual=model.cdd_append_last_residual,
         cdd_pre_log_transform=model.cdd_pre_log_transform,
+        cdd_gaussian_backend=getattr(model, "cdd_gaussian_backend", "cuda"),
         patch_size=model.patch_size,
         return_debug=True,
         enable_grid_jitter=False,

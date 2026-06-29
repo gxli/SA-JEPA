@@ -65,6 +65,7 @@ model:
   inference_mask_border: true
 train:
   batch_size: 4
+  gradient_accumulation_mode: step
   lr: 0.0001
   weight_decay: 1.0e-05
   num_workers: 8

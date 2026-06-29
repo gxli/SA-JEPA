@@ -174,6 +174,30 @@ def _flush_csv_rows(path: str, rows: list[list]) -> None:
     rows.clear()
 
 
+def _concat_accumulated_outputs(outputs_list: list[dict]) -> dict:
+    """Concatenate per-microbatch outputs so batch-stat losses see the full window."""
+    if not outputs_list:
+        raise ValueError("Cannot concatenate an empty accumulation window")
+    if len(outputs_list) == 1:
+        return outputs_list[0]
+
+    merged = {}
+    keys = set().union(*(outputs.keys() for outputs in outputs_list))
+    for key in keys:
+        values = [outputs[key] for outputs in outputs_list if key in outputs]
+        if len(values) != len(outputs_list):
+            continue
+        first = values[0]
+        if torch.is_tensor(first) and first.dim() > 0:
+            if all(torch.is_tensor(v) and v.dim() > 0 and tuple(v.shape[1:]) == tuple(first.shape[1:]) for v in values):
+                merged[key] = torch.cat(values, dim=0)
+            else:
+                merged[key] = first
+        else:
+            merged[key] = first
+    return merged
+
+
 def _collate_pad_spatial(batch: list[torch.Tensor]) -> torch.Tensor:
     if len(batch) == 0:
         raise ValueError("Empty batch is not supported")
@@ -896,6 +920,7 @@ def _prepare_context_from_model(
         cdd_sm_mode=model.cdd_sm_mode,
         cdd_append_last_residual=model.cdd_append_last_residual,
         cdd_pre_log_transform=model.cdd_pre_log_transform,
+        cdd_gaussian_backend=model.cdd_gaussian_backend,
         patch_size=model.patch_size,
         return_debug=need_debug,
         target_invalid_region_skip=model.target_invalid_region_skip,
@@ -1216,6 +1241,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         cdd_sm_mode=model_cfg.get("cdd_sm_mode", data_cfg.get("cdd_sm_mode", "reflect")),
         cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
         cdd_pre_log_transform=bool(model_cfg.get("cdd_pre_log_transform", False)),
+        cdd_gaussian_backend=model_cfg.get("cdd_gaussian_backend", data_cfg.get("cdd_gaussian_backend", "cuda")),
         post_log_transform=model_cfg.get("post_log_transform", model_post_log),
         log_eps=model_cfg.get("log_eps", float(data_cfg.get("log_eps", 1.0))),
         cdd_log_std_floor_mult=model_cfg.get("cdd_log_std_floor_mult", 0.05),
@@ -1456,10 +1482,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             pass
         if is_main_process:
             log_info(f"[{config_name}] torch_threads={num_threads}")
-    if is_ddp and bool(data_cfg.get("cdd_precompute", True)):
-        data_cfg["cdd_precompute"] = False
-        if is_main_process:
-            log_info(f"[{config_name}] DDP detected: disabling in-process CDD RAM precompute")
     seed = int(train_cfg.get("seed", train_cfg.get("split_seed", 42)))
     rank_seed = seed + int(global_rank)
     random.seed(rank_seed)
@@ -1823,6 +1845,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     # mask-token runs build masks directly on the raw image.
     encoder_type_lower = str(getattr(model_without_ddp, "encoder_type", "")).lower()
     uses_cdd_channels = encoder_type_lower in CDD_CUBE_ENCODER_TYPES
+    if uses_cdd_channels and not bool(data_cfg.get("cdd_precompute", True)):
+        data_cfg["cdd_precompute"] = True
+        if is_main_process:
+            log_info(
+                f"[{config_name}] CDD precompute: forcing on because "
+                f"encoder_type={encoder_type_lower} requires cached CDD channels"
+            )
     cdd_cache = _precompute_cdd_cache(
         data_cfg=data_cfg,
         model_cfg=model_cfg,
@@ -1831,6 +1860,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         session_dir=session_dir,
         cache_replicas=cdd_cache_replicas,
     ) if uses_cdd_channels else None
+    if uses_cdd_channels and not cdd_cache:
+        raise RuntimeError(
+            f"[{config_name}] encoder_type={encoder_type_lower} requires a precomputed CDD cache, "
+            "but no CDD entries were built. Check data.data_root/npy_pattern, cdd_precompute_max_files, "
+            "and cdd_precompute_max_gb."
+        )
     if is_main_process:
         _write_cdd_cache_profile(cdd_cache=cdd_cache, session_dir=session_dir, config_name=config_name)
 
@@ -2004,14 +2039,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     masking_collate = None if is_3d_mode else _MaskingCollator(
         model,
         return_debug=bool(train_cfg.get("debug_masking_tensors", False)),
-        require_precomputed_cdd=bool(cdd_cache),
+        require_precomputed_cdd=uses_cdd_channels,
         target_mask=target_mask,
         target_threshold=target_threshold,
     )
     if is_main_process and (not is_3d_mode) and str(getattr(model, "encoder_type", "")).lower() in CDD_CUBE_ENCODER_TYPES:
         log_info(
             f"[{config_name}] CDD batch source: "
-            f"{'precomputed_cache' if cdd_cache else 'on_the_fly_fallback'}"
+            "precomputed_cache"
         )
     dataloader = DataLoader(
         train_dataset,
@@ -2111,6 +2146,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     log_info(f"[{config_name}] umap_config={json.dumps(umap_cfg, sort_keys=True)}")
     prediction_loss_weight = float(train_cfg.get("prediction_loss_weight", 100.0))
     normalize_loss_l2_active = bool(model_cfg.get("normalize_loss_l2", model_cfg.get("normalize_loss", False)))
+    gradient_accumulation_mode = str(train_cfg.get("gradient_accumulation_mode", "step")).lower()
+    if gradient_accumulation_mode not in ("step", "batch"):
+        raise ValueError(
+            f"Unsupported train.gradient_accumulation_mode={gradient_accumulation_mode!r}. "
+            "Use 'step' or 'batch'."
+        )
+    accum_steps = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
+    log_info(f"[{config_name}] gradient_accumulation_mode={gradient_accumulation_mode}")
     spread_regularizer = parse_spread_regularizer_config(train_cfg)
     spread_regularizer_weight = float(spread_regularizer["weight"])
     embed_spread_target = float(spread_regularizer["target_std"])
@@ -2289,6 +2332,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         metrics_rows = []
         masked_scale_rows = []
         visited_rows = []
+        accumulated_outputs: list[dict] = []
         tqdm.write(f"[{config_name}]")
         pbar = tqdm(
             enumerate(dataloader),
@@ -2318,6 +2362,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
             with autocast(device_type=autocast_device, enabled=use_amp):
                 outputs = model(x_clean, context_data=context_data) if not is_3d_mode else model(x_clean)
+                if gradient_accumulation_mode == "batch":
+                    accumulated_outputs.append(outputs)
+                    is_accum_boundary = ((batch_idx + 1) % accum_steps == 0) or ((batch_idx + 1) == len(dataloader))
+                    if not is_accum_boundary:
+                        continue
+                    outputs = _concat_accumulated_outputs(accumulated_outputs)
+                    accumulated_outputs.clear()
                 zero_loss = outputs["pred_patches"].new_zeros(())
                 if abs(vicreg_var_weight) > 1e-12 or abs(vicreg_cov_weight) > 1e-12:
                     _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
@@ -2359,10 +2410,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             else:
                 log_loss_val = float(total_loss.item())
 
-            accum_steps = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
-            scaler.scale(total_loss / accum_steps).backward()
+            loss_for_backward = total_loss / accum_steps if gradient_accumulation_mode == "step" else total_loss
+            scaler.scale(loss_for_backward).backward()
 
-            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+            if gradient_accumulation_mode == "batch" or (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
                 scaler_scale_before_step = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()

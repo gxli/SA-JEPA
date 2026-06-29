@@ -57,6 +57,7 @@ class PyramidGridJEPA(nn.Module):
         cdd_sm_mode: str = "reflect",
         cdd_append_last_residual: bool = True,
         cdd_pre_log_transform: bool = False,
+        cdd_gaussian_backend: str = "cuda",
         post_log_transform: bool = True,
         log_eps: float = 1.0,
         cdd_log_std_floor_mult: float = 0.05,
@@ -149,6 +150,7 @@ class PyramidGridJEPA(nn.Module):
         self.cdd_sm_mode = str(cdd_sm_mode)
         self.cdd_append_last_residual = bool(cdd_append_last_residual)
         self.cdd_pre_log_transform = bool(cdd_pre_log_transform)
+        self.cdd_gaussian_backend = str(cdd_gaussian_backend)
         self.post_log_transform = bool(post_log_transform)
         self.log_eps = float(log_eps)
         self.cdd_log_std_floor_mult = float(cdd_log_std_floor_mult)
@@ -472,6 +474,7 @@ class PyramidGridJEPA(nn.Module):
                     cdd_sm_mode=self.cdd_sm_mode,
                     cdd_append_last_residual=self.cdd_append_last_residual,
                     cdd_pre_log_transform=self.cdd_pre_log_transform,
+                    cdd_gaussian_backend=self.cdd_gaussian_backend,
                     inner_target_size=self.patch_size,
                     return_debug=True,
                     enable_grid_jitter=enable_grid_jitter,
@@ -510,6 +513,7 @@ class PyramidGridJEPA(nn.Module):
                     cdd_sm_mode=self.cdd_sm_mode,
                     cdd_append_last_residual=self.cdd_append_last_residual,
                     cdd_pre_log_transform=self.cdd_pre_log_transform,
+                    cdd_gaussian_backend=self.cdd_gaussian_backend,
                     inner_target_size=self.patch_size,
                     enable_grid_jitter=enable_grid_jitter,
                     enable_target_dithering=enable_target_dithering,

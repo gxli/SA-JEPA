@@ -112,6 +112,33 @@ def test_api_train_retries_oom_with_smaller_batch(monkeypatch, tmp_path):
     assert calls == [(8, 1), (4, 2)]
 
 
+def test_api_fit_points_data_root_at_saved_input(monkeypatch, tmp_path):
+    import torch
+    import src.api as api
+    from sajepa import ScaleAwareJEPA
+
+    captured = {}
+
+    def fake_run_training(cfg, config_name, sessions_root):
+        captured["cfg"] = cfg
+        captured["config_name"] = config_name
+        captured["sessions_root"] = sessions_root
+        session = tmp_path / "sajepa"
+        session.mkdir()
+        return str(session)
+
+    monkeypatch.setattr(api, "run_training", fake_run_training)
+
+    model = ScaleAwareJEPA().fit(torch.zeros(8, 8), epochs=1, session_dir=str(tmp_path))
+
+    data_root = captured["cfg"]["data"]["data_root"]
+    npy_pattern = captured["cfg"]["data"]["npy_pattern"]
+    assert model.session_dir == str((tmp_path / "sajepa").resolve())
+    assert data_root == str(tmp_path / "data")
+    assert npy_pattern == "_input.npy"
+    assert (tmp_path / "data" / "_input.npy").exists()
+
+
 def test_api_train_base_session_defaults_to_weights_only(monkeypatch, tmp_path):
     import src.api as api
     from sajepa import ScaleAwareJEPA

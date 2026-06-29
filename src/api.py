@@ -193,7 +193,7 @@ class ScaleAwareJEPA:
             arr = arr[np.newaxis, :, :]
         np.save(data_path, arr)
         cfg.setdefault("data", {})["npy_pattern"] = "_input.npy"
-        cfg.setdefault("data", {})["data_root"] = sessions_dir
+        cfg.setdefault("data", {})["data_root"] = data_dir
 
         train_cfg = cfg.setdefault("train", {})
         if "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ:

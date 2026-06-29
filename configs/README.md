@@ -149,6 +149,7 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.epochs` | `10` | Number of training epochs. |
 | `train.batch_size` | `4` | Per-GPU batch size. |
 | `train.gradient_accumulation_steps` | `1` | Effective batch = `batch_size × grad_accum`. |
+| `train.gradient_accumulation_mode` | `step` | `step` backprops each microbatch loss scaled by accumulation steps; `batch` concatenates accumulated outputs and computes one loss over the full window before backprop. |
 | `train.lr` | `0.0001` | Base learning rate (AdamW). |
 | `train.weight_decay` | `1e-5` | AdamW weight decay. |
 | `train.num_workers` | `8` | DataLoader worker processes. |
