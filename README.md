@@ -101,7 +101,8 @@ import torch
 from sajepa import ScaleAwareJEPA
 
 # 1. Load any 2D scalar field (H, W)
-field = torch.from_numpy(np.load("path/to/your_field.npy"))
+arr = np.asarray(np.load("path/to/your_field.npy"), dtype=np.float32)
+field = torch.from_numpy(arr)
 
 # 2. Train a default scale-aware model
 model = ScaleAwareJEPA()
