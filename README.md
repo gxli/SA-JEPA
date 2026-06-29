@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+📧 **Contact:** [gxli.ai@proton.me](mailto:gxli.ai@proton.me) · [ligx.ngc7293@gmail.com](mailto:ligx.ngc7293@gmail.com)
 
 `sajepa` is a PyTorch implementation of **ScaleAware JEPA**, a non-generative
 self-supervised architecture that learns abstract latent representations of
