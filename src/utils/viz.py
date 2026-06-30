@@ -325,6 +325,11 @@ def _compute_umap_nd(
                 model.fit(fit_x)
                 return model.transform(x)
             return model.fit_transform(x)
+        except ModuleNotFoundError as e:
+            if e.name == "cuml" or str(e).endswith("No module named 'cuml'"):
+                print("[inference] UMAP backend: cuML not installed; trying CPU/torch alternatives")
+            else:
+                print(f"[warning] cuML UMAP import failed: {type(e).__name__}: {e}")
         except Exception as e:
             print(f"[warning] cuML UMAP failed: {type(e).__name__}: {e}")
 

@@ -19,6 +19,11 @@ dependencies = [
     "umap-learn",
 ]
 
+[project.optional-dependencies]
+umap-gpu = [
+    "cuml-cu12; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
+
 [project.scripts]
 sajepa-train = "scripts.train:main"
 
