@@ -409,11 +409,14 @@ python -m src.inference_from_session \
 ```bibtex
 @article{li2026scaleaware,
   author  = {Li, Guang-Xing},
-  title   = {ScaleAware-{JEPA}: Latent Representation for Discovery in
+  title   = {{ScaleAware-JEPA}: Latent Representation for Discovery in
              Multiscale Physical Fields},
   journal = {arXiv preprint},
   year    = {2026},
-  note    = {arXiv:XXXX.XXXXX}
+  eprint  = {2606.29723},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  doi     = {10.48550/arXiv.2606.29723}
 }
 ```
 

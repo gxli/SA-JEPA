@@ -327,9 +327,20 @@ def _dense_forward_2d_tile(
     log_floor: torch.Tensor,
     *,
     cdd_preencoded: bool = False,
+    center_mask_region: tuple[int, int, int, int] | None = None,
 ):
     post_log = bool(getattr(model, "post_log_transform", False))
     x_enc = torch.log(torch.clamp(x_tile, min=0.0) + log_floor) if post_log else x_tile
+    mask_2d = None
+    if center_mask_region is not None:
+        my0, my1, mx0, mx1 = (int(v) for v in center_mask_region)
+        my0 = max(0, min(my0, int(x_enc.shape[-2])))
+        my1 = max(my0, min(my1, int(x_enc.shape[-2])))
+        mx0 = max(0, min(mx0, int(x_enc.shape[-1])))
+        mx1 = max(mx0, min(mx1, int(x_enc.shape[-1])))
+        if my1 > my0 and mx1 > mx0:
+            mask_2d = torch.zeros_like(x_enc[:, :1])
+            mask_2d[:, :, my0:my1, mx0:mx1] = 1.0
 
     encoder_type = str(getattr(model, "encoder_type", ""))
     if encoder_type == "cdd_scaleaware_convnext":
@@ -340,6 +351,12 @@ def _dense_forward_2d_tile(
             cdd_enc = norm_per_sample_channel(cdd_enc)
         zero = torch.zeros_like(cdd_enc)
         context_map = model.context_encoder(cdd_enc, mask_tokens=zero)
+        if mask_2d is not None:
+            mask_tokens = mask_2d.expand_as(cdd_enc)
+            cdd_masked = cdd_enc * (1.0 - mask_tokens)
+            masked_context_map = model.context_encoder(cdd_masked, mask_tokens=mask_tokens)
+        else:
+            masked_context_map = context_map
         with torch.no_grad():
             gt_base = model.target_encoder(cdd_enc, mask_tokens=zero)
     elif encoder_type in ("convnext_dense_pyramid", "escnn_c4_pyramid"):
@@ -349,29 +366,43 @@ def _dense_forward_2d_tile(
         zero = torch.zeros_like(cdd_enc)
         enc = torch.cat([cdd_enc, zero], dim=1)
         context_map = model.context_encoder(enc)
+        if mask_2d is not None:
+            mask_tokens = mask_2d.expand_as(cdd_enc)
+            cdd_masked = cdd_enc * (1.0 - mask_tokens)
+            masked_context_map = model.context_encoder(torch.cat([cdd_masked, mask_tokens], dim=1))
+        else:
+            masked_context_map = context_map
         with torch.no_grad():
             gt_base = model.target_encoder(enc)
     elif encoder_type == "convnext_dense_masktoken":
         zero = torch.zeros_like(x_enc[:, :1])
         enc = torch.cat([x_enc, zero], dim=1)
         context_map = model.context_encoder(enc)
+        if mask_2d is not None:
+            masked_context_map = model.context_encoder(torch.cat([x_enc * (1.0 - mask_2d), mask_2d], dim=1))
+        else:
+            masked_context_map = context_map
         with torch.no_grad():
             gt_base = model.target_encoder(enc)
     else:
         context_map = model.context_encoder(x_enc)
+        masked_context_map = model.context_encoder(x_enc * (1.0 - mask_2d)) if mask_2d is not None else context_map
         with torch.no_grad():
             gt_base = model.target_encoder(x_enc)
 
     context_proj = model.projector(context_map)
     pred_map = model.predictor(context_proj)
+    masked_context_proj = model.projector(masked_context_map)
+    masked_pred_map = model.predictor(masked_context_proj)
     with torch.no_grad():
         gt_map = model.target_projector(gt_base)
-    energy = representation_dense_energy(pred_map, gt_map)
+    energy = representation_dense_energy(masked_pred_map, gt_map)
     return {
         "x_clean": x_enc,
         "x_context": x_enc,
         "context_map": context_map,
         "pred_map": pred_map,
+        "masked_pred_map": masked_pred_map,
         "gt_map": gt_map,
         "energy_rel_sym": energy["energy_rel_sym"],
         "energy_raw": energy["energy_raw"],
@@ -565,6 +596,7 @@ def _run_tiled_dense_inference_2d(
                 None if cdd_tile is None else cdd_tile.to(device, non_blocking=True),
                 log_floor.to(device, non_blocking=True),
                 cdd_preencoded=cdd_preencoded,
+                center_mask_region=(wy0, wy1, wx0, wx1),
             )
             out_y0, out_y1 = y0 + wy0, y0 + wy1
             out_x0, out_x1 = x0 + wx0, x0 + wx1
@@ -857,7 +889,7 @@ def run_post_training_inference(
                 tta_enabled=bool(inference_tta_enabled),
                 tta_mode=inference_tta_mode,
             )
-            for key in ("x_clean", "x_context", "context_map", "pred_map", "gt_map"):
+            for key in ("x_clean", "x_context", "context_map", "pred_map", "masked_pred_map", "gt_map"):
                 outputs[key] = tiled[key].to(x_raw.device)
             outputs["x_clean_raw"] = x_raw
             outputs["x_context_raw"] = x_raw
@@ -922,7 +954,7 @@ def run_post_training_inference(
                     )
                 else:
                     out_i = _forward_one_tta(x_raw, cdd_raw)
-                for key in ("pred_map", "gt_map", "context_map"):
+                for key in ("pred_map", "masked_pred_map", "gt_map", "context_map"):
                     value = out_i.get(key)
                     if value is None:
                         continue
@@ -945,8 +977,16 @@ def run_post_training_inference(
                     bsz = outputs["x_clean"].shape[0]
                     energy_sum = torch.zeros((bsz, 1, h, w), device=outputs["x_clean"].device, dtype=outputs["x_clean"].dtype)
                     count_map = torch.zeros_like(energy_sum)
+                point_energy_outputs = out_i
+                if "masked_pred_map" in out_i and "context_map" in out_i:
+                    point_energy_outputs = dict(out_i)
+                    point_energy_outputs["pred_patches"] = extract_location_patches(
+                        out_i["masked_pred_map"],
+                        out_i["target_locations"],
+                        patch_size=patch_size,
+                    )
                 e_tot_i, n_val_i = _accumulate_point_energy(
-                    outputs=out_i,
+                    outputs=point_energy_outputs,
                     energy_sum=energy_sum,
                     count_map=count_map,
                     image_size=(h, w),
@@ -958,6 +998,8 @@ def run_post_training_inference(
         if len(shifts) > 1:
             for key, value in shift_sums.items():
                 outputs[key] = value.div(float(max(1, shift_counts[key])))
+        if bool(mask_inference) and "masked_pred_map" not in outputs:
+            outputs["masked_pred_map"] = outputs["pred_map"]
 
     inference_outputs = {
         "inference_scope": "dashboard_sample_batch",
@@ -975,6 +1017,7 @@ def run_post_training_inference(
         "target_scales": outputs["target_scales"][:8].detach().cpu(),
         "target_valid": outputs["target_valid"][:8].detach().cpu(),
         "pred_map": outputs["pred_map"][:2].detach().cpu(),
+        "masked_pred_map": outputs.get("masked_pred_map", outputs["pred_map"])[:2].detach().cpu(),
         "gt_map": outputs["gt_map"][:2].detach().cpu(),
         "context_map": outputs.get("context_map", outputs["pred_map"])[:2].detach().cpu(),
         "pred_patches": outputs["pred_patches"][:2].detach().cpu(),
@@ -1005,7 +1048,16 @@ def run_post_training_inference(
         if k in outputs:
             inference_outputs[k] = outputs[k][:8].detach().cpu()
     energy_scalar = float(total_energy / max(1, total_valid))
-    energy_scalar_norm = compute_jepa_energy_fn(outputs, normalize=True)
+    energy_outputs = outputs
+    if "masked_pred_map" in outputs:
+        energy_outputs = dict(outputs)
+        energy_outputs["pred_map"] = outputs["masked_pred_map"]
+        energy_outputs["pred_patches"] = extract_location_patches(
+            outputs["masked_pred_map"],
+            outputs["target_locations"],
+            patch_size=int(getattr(model, "patch_size", 1)),
+        )
+    energy_scalar_norm = compute_jepa_energy_fn(energy_outputs, normalize=True)
     # Dense full-image energy from prediction/target maps. For tiled 2D
     # inference, use the stitched energy maps computed tile-by-tile so the
     # dashboard never falls back to a one-shot full-frame pass.
@@ -1018,7 +1070,7 @@ def run_post_training_inference(
         }
     else:
         e_map_dense = compute_target_energy_map_fn(
-            outputs,
+            energy_outputs,
             image_size=(int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])),
         )
     # Keep point-sampled target energy as a secondary diagnostic.
@@ -1038,7 +1090,7 @@ def run_post_training_inference(
     else:
         fov_border = int(max(0, float(inference_mask_border)))
     if fov_border > 0:
-        for key in ("pred_map", "gt_map", "context_map",
+        for key in ("pred_map", "masked_pred_map", "gt_map", "context_map",
                     "target_energy_map", "target_energy_raw_map",
                     "target_energy_rel_gt_map", "target_energy_cosine_map",
                     "target_energy_point_map"):
@@ -1130,6 +1182,7 @@ def run_post_training_inference(
                 "inference_encoder_receptive_field": int(encoder_rf),
                 "inference_dense_output_receptive_field": int(dense_output_rf),
                 "inference_discard_margin": int(discard_margin),
+                "energy_reference": "masked_predict_minus_target",
                 "target_allowed_mask_present": bool("target_allowed_mask_map" in inference_outputs),
                 "target_allowed_mask_fraction": (
                     float(inference_outputs["target_allowed_mask_map"].float().mean().item())
@@ -1164,13 +1217,18 @@ def run_post_training_inference(
         with open(os.path.join(session_dir, "target_selection_summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
     _save_npz(os.path.join(session_dir, "pred_map.npz"), inference_outputs["pred_map"].numpy())
+    _save_npz(os.path.join(session_dir, "masked_pred_map.npz"), inference_outputs["masked_pred_map"].numpy())
     _save_npz(os.path.join(session_dir, "gt_map.npz"), inference_outputs["gt_map"].numpy())
     pred_norm = inference_outputs["pred_map"].norm(dim=1).numpy()
+    masked_pred_norm = inference_outputs["masked_pred_map"].norm(dim=1).numpy()
     gt_norm = inference_outputs["gt_map"].norm(dim=1).numpy()
     err_norm = (inference_outputs["pred_map"] - inference_outputs["gt_map"]).norm(dim=1).numpy()
+    masked_err_norm = (inference_outputs["masked_pred_map"] - inference_outputs["gt_map"]).norm(dim=1).numpy()
     _save_npz(os.path.join(session_dir, "pred_latent_norm.npz"), pred_norm)
+    _save_npz(os.path.join(session_dir, "masked_pred_latent_norm.npz"), masked_pred_norm)
     _save_npz(os.path.join(session_dir, "gt_latent_norm.npz"), gt_norm)
     _save_npz(os.path.join(session_dir, "pred_gt_latent_error_norm.npz"), err_norm)
+    _save_npz(os.path.join(session_dir, "masked_pred_gt_latent_error_norm.npz"), masked_err_norm)
     print(
         f"[{config_name}] post_training_artifacts_saved session_dir={session_dir} "
         f"(run scripts/session_to_dash.py to generate plots/dashboards)"

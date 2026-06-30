@@ -47,6 +47,12 @@ DASH_DATA_REQUIRED = {
     "pred_pca_rgb_flat",
     "pred_umap_rgb",
     "pred_umap_rgb_flat",
+    "masked_pred_pca3d",
+    "masked_pred_umap3d",
+    "masked_pred_pca_rgb",
+    "masked_pred_pca_rgb_flat",
+    "masked_pred_umap_rgb",
+    "masked_pred_umap_rgb_flat",
     "gt_pca3d",
     "gt_umap3d",
     "gt_pca_rgb",
@@ -1006,6 +1012,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     def _slice_latent_xyz(prefix_out: str) -> np.ndarray:
         if prefix_out == "pred":
             src_map = outputs.get("pred_map", outputs.get("context_map"))
+        elif prefix_out == "masked_pred":
+            src_map = outputs.get("masked_pred_map", outputs.get("pred_map", outputs.get("context_map")))
         elif prefix_out == "gt":
             src_map = outputs.get("gt_map", outputs.get("pred_map"))
         else:
@@ -1020,6 +1028,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     def _slice_latent_vectors(prefix_out: str) -> np.ndarray:
         if prefix_out == "pred":
             src_map = outputs.get("pred_map", outputs.get("context_map"))
+        elif prefix_out == "masked_pred":
+            src_map = outputs.get("masked_pred_map", outputs.get("pred_map", outputs.get("context_map")))
         elif prefix_out == "gt":
             src_map = outputs.get("gt_map", outputs.get("pred_map"))
         else:
@@ -1063,7 +1073,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         return pca, um
 
     bundles = {}
-    for prefix_saved, prefix_out in (("context", "context"), ("predict", "pred"), ("target", "gt")):
+    for prefix_saved, prefix_out in (
+        ("context", "context"),
+        ("predict", "pred"),
+        ("masked_predict", "masked_pred"),
+        ("target", "gt"),
+    ):
         src_prefix = prefix_saved
         try:
             hh, ww = _load_hw(src_prefix)
@@ -1315,6 +1330,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         pred_pca_rgb_flat=bundles["pred"]["pca_rgb_flat"],
         pred_umap_rgb=bundles["pred"]["umap_rgb"],
         pred_umap_rgb_flat=bundles["pred"]["umap_rgb_flat"],
+        masked_pred_pca3d=bundles["masked_pred"]["pca3d"],
+        masked_pred_umap3d=bundles["masked_pred"]["umap3d"],
+        masked_pred_pca_rgb=bundles["masked_pred"]["pca_rgb"],
+        masked_pred_pca_rgb_flat=bundles["masked_pred"]["pca_rgb_flat"],
+        masked_pred_umap_rgb=bundles["masked_pred"]["umap_rgb"],
+        masked_pred_umap_rgb_flat=bundles["masked_pred"]["umap_rgb_flat"],
         gt_pca3d=bundles["gt"]["pca3d"],
         gt_umap3d=bundles["gt"]["umap3d"],
         gt_pca_rgb=bundles["gt"]["pca_rgb"],
@@ -2193,7 +2214,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     )
     fig_energy_dist.update_layout(
         template="plotly_white",
-        title={"text": "Energy Map Distribution (0-1.5)", "x": 0.02},
+        title={"text": "Energy Map Distribution (Masked Predict - Target, 0-1.5)", "x": 0.02},
         margin=dict(l=42, r=8, t=36, b=36),
         height=330,
         xaxis=dict(title="energy value", range=[0.0, 1.5]),
@@ -2201,7 +2222,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     )
 
     cards: list[dict] = []
-    for name, stem in (("Context", "context"), ("Predict", "pred"), ("Target", "gt")):
+    for name, stem in (("Context", "context"), ("Masked Predict", "masked_pred"), ("Predict", "pred"), ("Target", "gt")):
         pca_scatter, _, _ = scatter3d(f"{name} PCA 3D Scatter", data[f"{stem}_pca3d"], data[f"{stem}_pca_rgb_flat"])
         umap_scatter, _, _ = scatter3d(f"{name} UMAP 3D Scatter", data[f"{stem}_umap3d"], data[f"{stem}_umap_rgb_flat"])
         # Keep strict left-right pairing: RGB map (left), RGB scatter (right).
@@ -2307,7 +2328,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             {"title": "Energy Distribution", "fig": fig_energy_dist, "group": "energy-dist"},
             {"title": "Target Locations", "fig": heat("Target Locations", data["target"], "Magma"), "group": "target-loc", "raw_png": _raw_png_data_url(data["target"])},
             {"title": "Target Location Heatmap", "fig": heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma"), "group": "target-heat", "raw_png": _raw_png_data_url(data["target_loc_heatmap"])},
-            {"title": "Energy Map", "fig": heat("Energy Map", data["energy_map"], "Inferno"), "group": "energy", "raw_png": _raw_png_data_url(data["energy_map"])},
+            {"title": "Energy Map (Masked Predict - Target)", "fig": heat("Energy Map (Masked Predict - Target)", data["energy_map"], "Inferno"), "group": "energy", "raw_png": _raw_png_data_url(data["energy_map"])},
             {
                 "title": str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap",
                 "fig": heat(
@@ -2888,7 +2909,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         print(f"dashboard_plot_item=CDD Scale Response: ok (source={src} shape={tuple(sp.shape)})")
     else:
         print("dashboard_plot_item=CDD Scale Response: empty (missing *_scale_response.pt)")
-    for name, stem in (("Context", "context"), ("Predict", "pred"), ("Target", "gt")):
+    for name, stem in (("Context", "context"), ("Masked Predict", "masked_pred"), ("Predict", "pred"), ("Target", "gt")):
         pca_arr = np.asarray(data[f"{stem}_pca3d"], dtype=np.float32)
         um_arr = np.asarray(data[f"{stem}_umap3d"], dtype=np.float32)
         print(f"dashboard_plot_item={name} PCA Array Shape: shape={tuple(pca_arr.shape)}")

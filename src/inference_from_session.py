@@ -479,6 +479,7 @@ def run_inference_on_data(
     model.eval()
 
     pred_maps = []
+    masked_pred_maps = []
     gt_maps = []
     context_maps = []
     x_clean_list = []
@@ -517,11 +518,16 @@ def run_inference_on_data(
             out = _forward_one(x_in, cdd_fields)
 
         pred_map = out.get("pred_map")
+        masked_pred_map = out.get("masked_pred_map")
+        if masked_pred_map is None and bool(mask_inference):
+            masked_pred_map = pred_map
         gt_map = out.get("gt_map")
         context_map = out.get("context_map")
 
         if pred_map is not None:
             pred_maps.append(pred_map.cpu())
+        if masked_pred_map is not None:
+            masked_pred_maps.append(masked_pred_map.cpu())
         if gt_map is not None:
             gt_maps.append(gt_map.cpu())
         if context_map is not None:
@@ -549,6 +555,7 @@ def run_inference_on_data(
 
     outputs = {
         "pred_map": _stack_or_none(pred_maps),
+        "masked_pred_map": _stack_or_none(masked_pred_maps),
         "gt_map": _stack_or_none(gt_maps),
         "context_map": _stack_or_none(context_maps),
         "x_clean_raw": _stack_or_none(x_clean_list) if x_clean_list else None,
@@ -620,7 +627,7 @@ def save_inference_session(
         np.save(os.path.join(output_dir, "tile_visit_map.npy"), tile_layout.visit_map.astype(np.int32))
 
     # Save compressed NPZ maps and target metadata.
-    for key in ("pred_map", "gt_map", "context_map", "target_locations", "target_scales", "target_valid"):
+    for key in ("pred_map", "masked_pred_map", "gt_map", "context_map", "target_locations", "target_scales", "target_valid"):
         val = outputs.get(key)
         if val is not None:
             _save_npz(os.path.join(output_dir, f"{key}.npz"), val.cpu().numpy() if hasattr(val, "cpu") else val)

@@ -473,13 +473,16 @@ def test_inference_dashboard_respects_target_allowed_mask_for_embeddings(tmp_pat
 
 def test_inference_dashboard_exports_embedding_maps_not_flat_triplets(tmp_path):
     session_dir = tmp_path / "export_session"
+    pred_map = torch.randn((1, 4, 4, 4), dtype=torch.float32)
+    masked_pred_map = pred_map + 10.0
     outputs = {
         "x_clean": torch.ones((1, 1, 8, 8), dtype=torch.float32),
         "x_clean_raw": torch.ones((1, 1, 8, 8), dtype=torch.float32),
         "x_context": torch.ones((1, 1, 8, 8), dtype=torch.float32),
         "target_locations": torch.zeros((1, 1, 2), dtype=torch.long),
         "target_valid": torch.ones((1, 1), dtype=torch.bool),
-        "pred_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
+        "pred_map": pred_map,
+        "masked_pred_map": masked_pred_map,
         "gt_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
         "context_map": torch.randn((1, 4, 4, 4), dtype=torch.float32),
     }
@@ -493,6 +496,17 @@ def test_inference_dashboard_exports_embedding_maps_not_flat_triplets(tmp_path):
     assert np.load(results_dir / "predict_latent_vectors_full.npy").shape == (4, 4, 4)
     assert np.load(results_dir / "predict_pca_xyz.npy").shape == (3, 4, 4)
     assert np.load(results_dir / "predict_umap_xyz.npy").shape == (3, 4, 4)
+    assert np.load(results_dir / "masked_predict_latent_vectors_full.npy").shape == (4, 4, 4)
+    assert np.load(results_dir / "masked_predict_pca_xyz.npy").shape == (3, 4, 4)
+    assert np.load(results_dir / "masked_predict_umap_xyz.npy").shape == (3, 4, 4)
+    np.testing.assert_allclose(
+        np.load(results_dir / "masked_predict_latent_vectors_full.npy"),
+        masked_pred_map[0].numpy(),
+    )
+    assert not np.allclose(
+        np.load(results_dir / "masked_predict_latent_vectors_full.npy"),
+        np.load(results_dir / "predict_latent_vectors_full.npy"),
+    )
     assert not (results_dir / "predict_umap_x.npy").exists()
     assert not (results_dir / "predict_umap_y.npy").exists()
     assert not (results_dir / "predict_umap_z.npy").exists()

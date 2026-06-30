@@ -702,6 +702,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     x_context_raw = outputs.get("x_context_raw", x_context)
     target_locations = outputs["target_locations"]
     pred_map = outputs["pred_map"]
+    masked_pred_map = outputs.get("masked_pred_map", pred_map)
     gt_map = outputs["gt_map"]
     context_map = outputs.get("context_map")
 
@@ -812,6 +813,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         return latent_map, pca_map, umap_map
 
     default_latent_map, default_pca_map, default_umap_map = _save_branch_embeddings("predict", pred_map)
+    _save_branch_embeddings("masked_predict", masked_pred_map)
     np.save(os.path.join(results_dir, "latent_vectors_full.npy"), default_latent_map)
     np.save(os.path.join(results_dir, "pca_xyz.npy"), default_pca_map)
     np.save(os.path.join(results_dir, "umap_xyz.npy"), default_umap_map)
