@@ -6,7 +6,7 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from src.utils.cdd_import import import_constrained_diffusion
+from src.utils.cdd_import import import_constrained_diffusion, safe_constrained_diffusion_decomposition
 
 PRIMARY_TARGET_SAMPLING_MODES = ("random", "priority", "priority_small_scale")
 LEGACY_TARGET_SAMPLING_MODES = ("lattice",)
@@ -767,7 +767,8 @@ def make_pyramid_grid_context(
                     arr_log = np.log(arr_clamp + log_floor).astype(np.float32)
                 else:
                     arr_log = arr.astype(np.float32)
-                cdd_channels_arr, cdd_residual = cdd.constrained_diffusion_decomposition(
+                cdd_channels_arr, cdd_residual = safe_constrained_diffusion_decomposition(
+                    cdd,
                     arr_log,
                     num_channels=len(active_sigmas),
                     max_scale=max(active_sigmas),

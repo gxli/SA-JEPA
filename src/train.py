@@ -44,7 +44,7 @@ from src.models.build_jepa import CDD_CUBE_ENCODER_TYPES, CDD_DEBUG_ENCODER_TYPE
 from src.models.build_jepa3d import PyramidGridJEPA3D, compute_3d_encoder_receptive_field_depth
 from src.models.masking import _max_effective_mask_box_size, prepare_context_batch
 from src.utils import log_error, set_error_log_path
-from src.utils.cdd_import import import_constrained_diffusion
+from src.utils.cdd_import import import_constrained_diffusion, safe_constrained_diffusion_decomposition
 from src.utils.npy import _safe_load_npy
 from src.utils.viz import _target_location_yx, save_inference_dashboard, save_volumetric_umap_embeddings
 
@@ -607,8 +607,8 @@ def _precompute_cdd_cache(
 
         def _compute_cdd_variant(input_arr: np.ndarray, label: str) -> np.ndarray:
             """Run CDD on *input_arr* and return (S, *spatial) channels."""
-            channels_arr, residual, scales_used = cdd.constrained_diffusion_decomposition(
-                input_arr, **cdd_kwargs,
+            channels_arr, residual, scales_used = safe_constrained_diffusion_decomposition(
+                cdd, input_arr, **cdd_kwargs,
             )
             actual_ch = int(len(channels_arr))
             if actual_ch < cdd_num_channels:

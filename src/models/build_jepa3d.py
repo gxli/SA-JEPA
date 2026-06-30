@@ -14,7 +14,7 @@ from .masking3d import extract_location_cubes
 from .predictor3d import FullResPredictor3D
 from .symmetry import symmetric_forward_3d
 from src.losses import l2_normalize_patches
-from src.utils.cdd_import import import_constrained_diffusion
+from src.utils.cdd_import import import_constrained_diffusion, safe_constrained_diffusion_decomposition
 
 
 def compute_3d_encoder_receptive_field_depth(encoder_depth: int = 3, encoder_kernel_size: int = 5) -> int:
@@ -366,7 +366,8 @@ class PyramidGridJEPA3D(nn.Module):
                 arr = x_np[bi].astype(np.float32)
                 arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
                 arr = (arr - arr.min()) / max(arr.max() - arr.min(), 1e-20)
-                channels_arr, _residual = cdd.constrained_diffusion_decomposition(
+                channels_arr, _residual = safe_constrained_diffusion_decomposition(
+                    cdd,
                     arr,
                     num_channels=self.num_scales,
                     max_scale=16.0,

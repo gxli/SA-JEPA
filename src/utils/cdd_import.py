@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import os
 import tempfile
+import warnings
 from types import ModuleType
 
 
@@ -46,3 +47,38 @@ def import_constrained_diffusion(*, session_dir: str = "", allow_monai: bool = F
     finally:
         builtins.__import__ = original_import
     return cdd
+
+
+def safe_constrained_diffusion_decomposition(cdd: ModuleType, *args, **kwargs):
+    """Call CDD with compatibility fallbacks for older/GPU-fragile installs."""
+    try:
+        return cdd.constrained_diffusion_decomposition(*args, **kwargs)
+    except TypeError as exc:
+        msg = str(exc)
+        if "gaussian_backend" not in msg and "unexpected keyword" not in msg:
+            raise
+        if "gaussian_backend" not in kwargs:
+            raise
+        retry_kwargs = dict(kwargs)
+        retry_kwargs.pop("gaussian_backend", None)
+        retry_kwargs["use_gpu"] = False
+        warnings.warn(
+            "CDD backend does not accept gaussian_backend; retrying CDD on CPU without that argument.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return cdd.constrained_diffusion_decomposition(*args, **retry_kwargs)
+    except Exception:
+        requested_gpu = bool(kwargs.get("use_gpu", False))
+        requested_backend = kwargs.get("gaussian_backend")
+        if not requested_gpu and requested_backend in (None, "", "cpu"):
+            raise
+        retry_kwargs = dict(kwargs)
+        retry_kwargs.pop("gaussian_backend", None)
+        retry_kwargs["use_gpu"] = False
+        warnings.warn(
+            "CDD failed with the requested Gaussian/GPU backend; retrying CDD on CPU.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return cdd.constrained_diffusion_decomposition(*args, **retry_kwargs)

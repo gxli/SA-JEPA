@@ -45,6 +45,7 @@ from src.inference import (
     _forward_tta_streaming_2d,
 )
 from src.utils.npy import _safe_load_npy, normalize01
+from src.utils.cdd_import import import_constrained_diffusion, safe_constrained_diffusion_decomposition
 from src.utils.viz import save_inference_dashboard
 
 
@@ -426,26 +427,35 @@ def _build_cdd_pyramid(
     For pure inference this is essentially computing CDD decomposition
     using the same pipeline as training.
     """
-    from src.cdd import constrained_diffusion_decomposition
-
     # x: B×1×H×W → list of B×S×H×W
     sigmas = model_cfg.get("sigmas", [2, 4, 8, 16])
     cdd_mode = str(data_cfg.get("cdd_mode", model_cfg.get("cdd_mode", "log")))
     cdd_constrained = bool(model_cfg.get("cdd_constrained", True))
     cdd_sm_mode = str(data_cfg.get("cdd_sm_mode", model_cfg.get("cdd_sm_mode", "reflect")))
+    cdd_gaussian_backend = str(model_cfg.get("cdd_gaussian_backend", data_cfg.get("cdd_gaussian_backend", "cuda")))
+    cdd = import_constrained_diffusion(allow_monai=cdd_gaussian_backend == "monai")
 
     bsz = x.shape[0]
     x_np = x.squeeze(1).detach().cpu().numpy().astype(np.float32)
 
     cdd_list = []
     for i in range(bsz):
-        cdd_result = constrained_diffusion_decomposition(
+        cdd_result = safe_constrained_diffusion_decomposition(
+            cdd,
             x_np[i],
-            scales=list(sigmas),
+            num_channels=len(sigmas),
+            min_scale=min(float(s) for s in sigmas),
+            max_scale=max(float(s) for s in sigmas),
             mode=cdd_mode,
             constrained=cdd_constrained,
             sm_mode=cdd_sm_mode,
+            return_scales=False,
+            verbose=False,
+            use_gpu=device.type == "cuda",
+            gaussian_backend=cdd_gaussian_backend,
         )
+        if isinstance(cdd_result, tuple):
+            cdd_result = cdd_result[0]
         # cdd_result should be S×H×W
         cdd_t = torch.from_numpy(np.asarray(cdd_result, dtype=np.float32)).to(device)
         if cdd_t.ndim == 3:

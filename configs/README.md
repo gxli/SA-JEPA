@@ -33,7 +33,7 @@ and `cdd_scale_space` are rejected.
 | `data.cdd_sm_mode` / `model.cdd_sm_mode` | `reflect` | Boundary smoothing mode for CDD. Model value wins when both are set. |
 | `model.cdd_append_last_residual` | `true` | Fold residual into the last retained scale channel. |
 | `model.cdd_pre_log_transform` | `false` | Apply log transform before CDD precompute. Usually keep `false` when `data.cdd_mode: log` is used. |
-| `data.cdd_gaussian_backend` / `model.cdd_gaussian_backend` | `cuda` | Gaussian backend for CDD precompute. `cuda` falls back to CPU on non-CUDA devices; `monai` is opt-in. Model value wins when both are set. |
+| `data.cdd_gaussian_backend` / `model.cdd_gaussian_backend` | `cuda` | Advanced CDD Gaussian backend preference. Older CDD installs that reject this argument are retried on CPU without it; `monai` remains opt-in. Model value wins when both are set. |
 | `model.cdd_num_channels` | `len(sigmas)` | Number of returned CDD bands to keep for the encoder. |
 | `model.cdd_request_num_channels` | — | Optional number of CDD bands requested from the decomposition backend before truncation. Leave unset unless intentionally over-requesting bands. |
 | `data.cdd_precompute` | `true` | Precompute CDD cache into the session. CUDA and CPU CDD are not bit-identical, and cache metadata records `cdd_effective_use_gpu`. |
