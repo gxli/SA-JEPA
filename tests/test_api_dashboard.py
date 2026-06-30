@@ -175,6 +175,233 @@ def test_dashboard_target_mask_map_does_not_clip_energy_or_visit_panels(tmp_path
     assert data["visit_heatmap"][7, 7] == 1.0
 
 
+def test_dashboard_keeps_full_field_visit_frequency_for_cropped_sample(tmp_path):
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    outputs = {
+        "x_clean": torch.ones(1, 1, 4, 4),
+        "x_context": torch.ones(1, 1, 4, 4),
+        "pred_map": torch.randn(1, 4, 4, 4),
+        "gt_map": torch.randn(1, 4, 4, 4),
+        "context_map": torch.randn(1, 4, 4, 4),
+        "target_locations": torch.tensor([[[1, 1]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True]]),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+
+    full_field_visits = np.zeros((8, 8), dtype=np.float32)
+    full_field_visits[7, 7] = 3.0
+    np.savez_compressed(session_dir / "visited_target_frequency_canonical.npz", arr=full_field_visits)
+
+    old_umap = dashboard._compute_umap_nd
+    dashboard._compute_umap_nd = lambda x, **_kwargs: x[:, :3].astype("float32")
+    try:
+        dash_npz = dashboard.compute_dash_data(str(session_dir), overwrite=True)
+    finally:
+        dashboard._compute_umap_nd = old_umap
+
+    data = np.load(dash_npz)
+    assert data["visit_heatmap"].shape == (8, 8)
+    assert data["visit_heatmap"][7, 7] == 3.0
+
+
+def test_dashboard_ignores_stale_masked_predict_pca_artifact(tmp_path):
+    import os
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    results_dir = session_dir / "results"
+    results_dir.mkdir(parents=True)
+    h = w = 4
+    pred = torch.randn(1, 4, h, w)
+    yy = torch.linspace(-1.0, 1.0, h).view(1, 1, h, 1).expand(1, 1, h, w)
+    xx = torch.linspace(-1.0, 1.0, w).view(1, 1, 1, w).expand(1, 1, h, w)
+    masked = torch.cat([xx, yy, xx + yy, xx - yy], dim=1)
+    outputs = {
+        "x_clean": torch.ones(1, 1, h, w),
+        "x_context": torch.ones(1, 1, h, w),
+        "pred_map": pred,
+        "masked_pred_map": masked,
+        "gt_map": torch.randn(1, 4, h, w),
+        "context_map": torch.randn(1, 4, h, w),
+        "target_locations": torch.tensor([[[1, 1]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True]]),
+    }
+
+    stale_pca = np.zeros((3, h, w), dtype=np.float32)
+    stale_umap = np.zeros((3, h, w), dtype=np.float32)
+    for branch in ("predict", "masked_predict", "target", "context"):
+        np.save(results_dir / f"{branch}_spatial_shape.npy", np.asarray([h, w], dtype=np.int64))
+        np.save(results_dir / f"{branch}_pca_xyz.npy", stale_pca)
+        np.save(results_dir / f"{branch}_umap_xyz.npy", stale_umap)
+    old_time = 1_700_000_000
+    for path in results_dir.glob("*.npy"):
+        os.utime(path, (old_time, old_time))
+
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+
+    old_umap = dashboard._compute_umap_nd
+    old_dashboard_compute_umap = dashboard.DASHBOARD_COMPUTE_UMAP
+    dashboard.DASHBOARD_COMPUTE_UMAP = False
+    dashboard._compute_umap_nd = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("UMAP called"))
+    try:
+        dash_npz = dashboard.compute_dash_data(str(session_dir), overwrite=True)
+    finally:
+        dashboard._compute_umap_nd = old_umap
+        dashboard.DASHBOARD_COMPUTE_UMAP = old_dashboard_compute_umap
+
+    data = np.load(dash_npz)
+    assert np.nanstd(data["masked_pred_pca3d"]) > 0.0
+    assert not np.allclose(data["masked_pred_pca3d"], 0.0, equal_nan=True)
+
+
+def test_dashboard_recomputes_fresh_collapsed_pca_when_latents_have_spread(tmp_path):
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    results_dir = session_dir / "results"
+    results_dir.mkdir(parents=True)
+    h = w = 4
+    yy = torch.linspace(-1.0, 1.0, h).view(1, 1, h, 1).expand(1, 1, h, w)
+    xx = torch.linspace(-1.0, 1.0, w).view(1, 1, 1, w).expand(1, 1, h, w)
+    masked = torch.cat([xx, yy, xx + yy, xx - yy], dim=1)
+    outputs = {
+        "x_clean": torch.ones(1, 1, h, w),
+        "x_context": torch.ones(1, 1, h, w),
+        "pred_map": torch.randn(1, 4, h, w),
+        "masked_pred_map": masked,
+        "gt_map": torch.randn(1, 4, h, w),
+        "context_map": torch.randn(1, 4, h, w),
+        "target_locations": torch.tensor([[[1, 1]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True]]),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+
+    zero_pca = np.zeros((3, h, w), dtype=np.float32)
+    spread_umap = np.stack(
+        [
+            np.tile(np.linspace(-1, 1, w, dtype=np.float32), (h, 1)),
+            np.tile(np.linspace(-1, 1, h, dtype=np.float32)[:, None], (1, w)),
+            np.ones((h, w), dtype=np.float32),
+        ],
+        axis=0,
+    )
+    for branch in ("predict", "masked_predict", "target", "context"):
+        np.save(results_dir / f"{branch}_spatial_shape.npy", np.asarray([h, w], dtype=np.int64))
+        np.save(results_dir / f"{branch}_pca_xyz.npy", zero_pca)
+        np.save(results_dir / f"{branch}_umap_xyz.npy", spread_umap)
+
+    old_umap = dashboard._compute_umap_nd
+    old_dashboard_compute_umap = dashboard.DASHBOARD_COMPUTE_UMAP
+    dashboard.DASHBOARD_COMPUTE_UMAP = False
+    dashboard._compute_umap_nd = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("UMAP called"))
+    try:
+        dash_npz = dashboard.compute_dash_data(str(session_dir), overwrite=True)
+    finally:
+        dashboard._compute_umap_nd = old_umap
+        dashboard.DASHBOARD_COMPUTE_UMAP = old_dashboard_compute_umap
+
+    data = np.load(dash_npz)
+    assert np.nanstd(data["masked_pred_pca3d"]) > 0.0
+    notes = "\n".join(str(x) for x in data["embedding_health_notes"].reshape(-1))
+    assert "masked_pred: PCA collapsed" in notes
+    assert data["masked_pred_latent_norm"].shape == (h, w)
+
+
+def test_dashboard_warns_when_inference_tensors_contain_nan(tmp_path):
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    masked = torch.randn(1, 4, 4, 4)
+    masked[0, 0, 0, 0] = float("nan")
+    outputs = {
+        "x_clean": torch.ones(1, 1, 4, 4),
+        "x_context": torch.ones(1, 1, 4, 4),
+        "pred_map": torch.randn(1, 4, 4, 4),
+        "masked_pred_map": masked,
+        "gt_map": torch.randn(1, 4, 4, 4),
+        "context_map": torch.randn(1, 4, 4, 4),
+        "target_locations": torch.tensor([[[1, 1]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True]]),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+
+    old_umap = dashboard._compute_umap_nd
+    dashboard._compute_umap_nd = lambda x, **_kwargs: x[:, :3].astype("float32")
+    try:
+        html_path = dashboard.plot_dash_html(str(session_dir), overwrite=True)
+    finally:
+        dashboard._compute_umap_nd = old_umap
+
+    html = (session_dir / "dashboard.html").read_text(encoding="utf-8")
+    assert html_path.endswith("dashboard.html")
+    assert "Numerical health warning" in html
+    assert "masked_pred_map: nonfinite" in html
+
+
+def test_dashboard_warns_when_masked_predict_pca_collapses(tmp_path):
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    outputs = {
+        "x_clean": torch.ones(1, 1, 4, 4),
+        "x_context": torch.ones(1, 1, 4, 4),
+        "pred_map": torch.randn(1, 4, 4, 4),
+        "masked_pred_map": torch.ones(1, 4, 4, 4),
+        "gt_map": torch.randn(1, 4, 4, 4),
+        "context_map": torch.randn(1, 4, 4, 4),
+        "target_locations": torch.tensor([[[1, 1]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True]]),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+
+    old_umap = dashboard._compute_umap_nd
+    dashboard._compute_umap_nd = lambda x, **_kwargs: x[:, :3].astype("float32")
+    try:
+        html_path = dashboard.plot_dash_html(str(session_dir), overwrite=True)
+    finally:
+        dashboard._compute_umap_nd = old_umap
+
+    html = (session_dir / "dashboard.html").read_text(encoding="utf-8")
+    assert html_path.endswith("dashboard.html")
+    assert "masked_pred_map: COLLAPSED latent map" in html
+    assert "masked_pred_pca3d: COLLAPSED embedding" in html
+
+
+def test_dashboard_places_latent_norm_after_embedding_pairs(tmp_path):
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    outputs = {
+        "x_clean": torch.ones(1, 1, 4, 4),
+        "x_context": torch.ones(1, 1, 4, 4),
+        "pred_map": torch.randn(1, 4, 4, 4),
+        "masked_pred_map": torch.randn(1, 4, 4, 4),
+        "gt_map": torch.randn(1, 4, 4, 4),
+        "context_map": torch.randn(1, 4, 4, 4),
+        "target_locations": torch.tensor([[[1, 1]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True]]),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+
+    old_umap = dashboard._compute_umap_nd
+    dashboard._compute_umap_nd = lambda x, **_kwargs: x[:, :3].astype("float32")
+    try:
+        dashboard.plot_dash_html(str(session_dir), overwrite=True)
+    finally:
+        dashboard._compute_umap_nd = old_umap
+
+    html = (session_dir / "dashboard.html").read_text(encoding="utf-8")
+    assert html.index('data-group="context-pca"') < html.index('data-group="context-umap"')
+    assert html.index('data-group="context-umap"') < html.index('data-group="masked_pred-pca"')
+    assert html.index('data-group="gt-umap"') < html.index('data-group="context-latent-norm"')
+
+
 def test_inference_target_map_is_centers_not_mask_boxes():
     from src.inference import _target_center_map
 

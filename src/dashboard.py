@@ -20,7 +20,7 @@ import torch
 from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap, _target_region_mask_from_outputs
 
 
-DASHBOARD_VERSION = "production-diagnostics-v20-card-local-controls"
+DASHBOARD_VERSION = "production-diagnostics-v26-latent-norm-after-embeddings"
 CONTROL_SCRIPT_SENTINEL = "window.JEPADashboardControls"
 DASHBOARD_COMPUTE_UMAP = os.environ.get("DASHBOARD_COMPUTE_UMAP", "").strip().lower() in {"1", "true", "yes", "on"}
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -460,6 +460,14 @@ def _extract_hw_map(src: dict, keys: tuple[str, ...], shape: tuple[int, int]) ->
     return None
 
 
+def _canonicalize_2d_map(arr: np.ndarray) -> np.ndarray | None:
+    arr = np.asarray(arr, dtype=np.float32)
+    arr = np.squeeze(arr)
+    if arr.ndim != 2:
+        return None
+    return np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
+
+
 def _canonicalize_cube_hw(arr: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     """Return an S,H,W cube aligned to the dashboard image shape when possible."""
     arr = np.asarray(arr, dtype=np.float32)
@@ -842,14 +850,14 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     tile_visit_path = _prefer_npz(os.path.join(session_dir, "tile_visit_map.npy"))
     visit_heatmap_kind = "Visit Frequency Heatmap"
     if os.path.exists(tile_visit_path):
-        visit_heatmap = np.asarray(_load_array(tile_visit_path), dtype=np.float32)
-        if visit_heatmap.shape != (h, w):
+        visit_heatmap = _canonicalize_2d_map(_load_array(tile_visit_path))
+        if visit_heatmap is None or visit_heatmap.shape != (h, w):
             visit_heatmap = np.zeros((h, w), dtype=np.float32)
         else:
             visit_heatmap_kind = "Tile Coverage Heatmap"
     elif os.path.exists(visit_path):
-        visit_heatmap = np.asarray(_load_array(visit_path), dtype=np.float32)
-        if visit_heatmap.shape != (h, w):
+        visit_heatmap = _canonicalize_2d_map(_load_array(visit_path))
+        if visit_heatmap is None:
             visit_heatmap = np.zeros((h, w), dtype=np.float32)
     else:
         visit_heatmap = np.zeros((h, w), dtype=np.float32)
@@ -927,6 +935,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     h_lat, w_lat = int(pred_map.shape[-2]), int(pred_map.shape[-1])
 
     dashboard_config_source = _find_readable_session_config_path(session_dir)
+    inference_mtime = os.path.getmtime(inf_path)
 
     def _chw_or_n3_to_xyz(arr: np.ndarray, hh: int, ww: int, path: str) -> np.ndarray:
         xyz = np.asarray(arr, dtype=np.float32)
@@ -947,16 +956,28 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             f"expected (3,{hh},{ww}) or (N,3)"
         )
 
+    def _artifact_is_fresh(path: str) -> bool:
+        try:
+            if os.path.getmtime(path) + 1e-6 >= inference_mtime:
+                return True
+        except OSError:
+            return False
+        print(
+            f"dashboard_note={session_dir}: ignoring stale embedding artifact "
+            f"{os.path.relpath(path, session_dir)} older_than=inference_outputs.pt"
+        )
+        return False
+
     def _resolve_artifact_path(base_name: str, volumetric_name: str, generic_name: str | None = None) -> str | None:
         path = os.path.join(results_dir, base_name)
-        if os.path.exists(path):
+        if os.path.exists(path) and _artifact_is_fresh(path):
             return path
         if generic_name:
             gpath = os.path.join(results_dir, generic_name)
-            if os.path.exists(gpath):
+            if os.path.exists(gpath) and _artifact_is_fresh(gpath):
                 return gpath
         vpath = os.path.join(results_dir, volumetric_name)
-        if os.path.exists(vpath):
+        if os.path.exists(vpath) and _artifact_is_fresh(vpath):
             return vpath
         return None
 
@@ -984,7 +1005,14 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         ux = os.path.join(results_dir, f"{prefix}_umap_x.npy")
         uy = os.path.join(results_dir, f"{prefix}_umap_y.npy")
         uz = os.path.join(results_dir, f"{prefix}_umap_z.npy")
-        if not (os.path.exists(ux) and os.path.exists(uy) and os.path.exists(uz)):
+        if not (
+            os.path.exists(ux)
+            and os.path.exists(uy)
+            and os.path.exists(uz)
+            and _artifact_is_fresh(ux)
+            and _artifact_is_fresh(uy)
+            and _artifact_is_fresh(uz)
+        ):
             raise RuntimeError(
                 f"{session_dir}: missing required UMAP artifacts for {prefix} "
                 f"(expected {ux}, {uy}, {uz})\n"
@@ -1072,7 +1100,33 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             um[valid] = umap_valid
         return pca, um
 
+    def _embedding_spread_axes(arr: np.ndarray, *, eps: float = 1e-6) -> int:
+        vals = np.asarray(arr, dtype=np.float32)
+        if vals.ndim == 3 and vals.shape[0] == 3:
+            vals = np.transpose(vals, (1, 2, 0)).reshape(-1, 3)
+        elif vals.ndim == 3 and vals.shape[-1] == 3:
+            vals = vals.reshape(-1, 3)
+        if vals.ndim != 2 or vals.shape[1] < 3:
+            return 0
+        finite = np.isfinite(vals[:, :3]).all(axis=1)
+        if int(np.count_nonzero(finite)) < 4:
+            return 0
+        std = np.nanstd(vals[finite, :3], axis=0)
+        return int(np.count_nonzero(std > float(eps)))
+
+    def _latent_has_spread(prefix_out: str, *, eps: float = 1e-6) -> bool:
+        z = _slice_latent_vectors(prefix_out)
+        if z.ndim != 2 or z.shape[0] < 4 or z.shape[1] == 0:
+            return False
+        finite = np.isfinite(z).all(axis=1)
+        if int(np.count_nonzero(finite)) < 4:
+            return False
+        std = np.nanstd(z[finite], axis=0)
+        return bool(np.any(std > float(eps)))
+
     bundles = {}
+    embedding_health_notes: list[str] = []
+    latent_norm_maps: dict[str, np.ndarray] = {}
     for prefix_saved, prefix_out in (
         ("context", "context"),
         ("predict", "pred"),
@@ -1113,6 +1167,34 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             )
             pca, um = _compute_slice_pca_umap(prefix_out)
             hh, ww = h_lat, w_lat
+        pca_spread = _embedding_spread_axes(pca)
+        um_spread = _embedding_spread_axes(um)
+        latent_spread = _latent_has_spread(prefix_out)
+        if pca_spread < 2 and (um_spread >= 2 or latent_spread):
+            note = (
+                f"{prefix_out}: PCA collapsed but "
+                f"latent_spread={int(latent_spread)} umap_spread_axes={um_spread}; "
+                "recomputed PCA from inference_outputs.pt"
+            )
+            print(f"dashboard_note={session_dir}: {note}")
+            pca_fallback, _um_fallback = _compute_slice_pca_umap(prefix_out)
+            if _embedding_spread_axes(pca_fallback) >= 2:
+                pca = pca_fallback
+                hh, ww = h_lat, w_lat
+                embedding_health_notes.append(note)
+            else:
+                embedding_health_notes.append(
+                    f"{prefix_out}: PCA remains collapsed after recompute from inference_outputs.pt"
+                )
+        z_branch = _slice_latent_vectors(prefix_out)
+        if z_branch.ndim == 2 and z_branch.shape[0] == h_lat * w_lat and z_branch.shape[1] > 0:
+            finite_branch = np.isfinite(z_branch).all(axis=1)
+            norm_branch = np.full((z_branch.shape[0],), np.nan, dtype=np.float32)
+            if np.any(finite_branch):
+                norm_branch[finite_branch] = np.linalg.norm(z_branch[finite_branch], axis=1).astype(np.float32)
+            latent_norm_maps[prefix_out] = norm_branch.reshape(h_lat, w_lat)
+        else:
+            latent_norm_maps[prefix_out] = np.full((h_lat, w_lat), np.nan, dtype=np.float32)
         pca_rgb, pca_rgb_flat = _rgb_from_xyz(pca, hh, ww)
         um_rgb, um_rgb_flat = _rgb_from_xyz(um, hh, ww)
         bundles[prefix_out] = {
@@ -1310,6 +1392,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         dashboard_version=np.asarray(DASHBOARD_VERSION),
         rgb_render_source=np.asarray("inference-fov-nan"),
         dashboard_config_source=np.asarray(dashboard_config_source or "none"),
+        embedding_health_notes=np.asarray(embedding_health_notes, dtype=str),
         orig=orig,
         blurred=blurred,
         target=target.astype(np.float32),
@@ -1342,6 +1425,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         gt_pca_rgb_flat=bundles["gt"]["pca_rgb_flat"],
         gt_umap_rgb=bundles["gt"]["umap_rgb"],
         gt_umap_rgb_flat=bundles["gt"]["umap_rgb_flat"],
+        context_latent_norm=latent_norm_maps["context"],
+        pred_latent_norm=latent_norm_maps["pred"],
+        masked_pred_latent_norm=latent_norm_maps["masked_pred"],
+        gt_latent_norm=latent_norm_maps["gt"],
         loss_x=np.asarray(loss_x, dtype=np.float32),
         loss_total=np.asarray(loss_total, dtype=np.float32),
         loss_prediction=np.asarray(loss_prediction, dtype=np.float32),
@@ -2244,6 +2331,17 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             }
         )
         cards.append({"title": f"{name} UMAP RGB Scatter", "fig": umap_scatter, "group": f"{stem}-umap"})
+    for name, stem in (("Context", "context"), ("Masked Predict", "masked_pred"), ("Predict", "pred"), ("Target", "gt")):
+        norm_key = f"{stem}_latent_norm"
+        if norm_key in data.files:
+            cards.append(
+                {
+                    "title": f"{name} Latent Norm",
+                    "fig": heat(f"{name} Latent Norm", data[norm_key], "Viridis"),
+                    "group": f"{stem}-latent-norm",
+                    "raw_png": _raw_png_data_url(data[norm_key]),
+                }
+            )
     if "scale_probe_sensitivity_maps" in data.files and "scale_probe_names" in data.files:
         sp_names = data["scale_probe_names"]
         sp_sens_maps = _orient_cdd_probe_for_display(data["scale_probe_sensitivity_maps"])
@@ -2437,6 +2535,141 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         f'<span class="build-chip">generated={html_lib.escape(generated_utc)}</span>'
     )
 
+    def _health_entry(name: str, arr: Any, *, rows: bool = False) -> str | None:
+        vals = _to_np(arr).astype(np.float32, copy=False)
+        if vals.size == 0:
+            return f"{name}: empty"
+        finite = np.isfinite(vals)
+        bad = int(vals.size - int(np.count_nonzero(finite)))
+        if bad <= 0:
+            return None
+        nan = int(np.count_nonzero(np.isnan(vals)))
+        inf = int(np.count_nonzero(np.isinf(vals)))
+        pct = 100.0 * float(bad) / float(max(1, vals.size))
+        entry = f"{name}: nonfinite {bad}/{vals.size} ({pct:.3g}%), NaN={nan}, Inf={inf}"
+        if rows and vals.ndim == 2 and vals.shape[1] >= 3:
+            row_finite = np.isfinite(vals[:, :3]).all(axis=1)
+            entry += f", finite_rows={int(np.count_nonzero(row_finite))}/{int(row_finite.size)}"
+        return entry
+
+    def _embedding_spread_entry(name: str, arr: Any, *, eps: float = 1e-6) -> str | None:
+        vals = _to_np(arr).astype(np.float32, copy=False)
+        if vals.ndim == 3 and vals.shape[0] == 3:
+            vals = np.transpose(vals, (1, 2, 0)).reshape(-1, 3)
+        elif vals.ndim == 3 and vals.shape[-1] == 3:
+            vals = vals.reshape(-1, 3)
+        if vals.ndim != 2 or vals.shape[1] < 3:
+            return None
+        finite_rows = np.isfinite(vals[:, :3]).all(axis=1)
+        n_finite = int(np.count_nonzero(finite_rows))
+        if n_finite <= 0:
+            return f"{name}: collapsed/no finite rows"
+        xyz = vals[finite_rows, :3]
+        std = np.nanstd(xyz, axis=0)
+        spread_axes = int(np.count_nonzero(std > float(eps)))
+        if spread_axes >= 2:
+            return None
+        return (
+            f"{name}: COLLAPSED embedding, spread_axes={spread_axes}/3, "
+            f"finite_rows={n_finite}/{int(finite_rows.size)}, "
+            f"axis_std=[{std[0]:.3g}, {std[1]:.3g}, {std[2]:.3g}]"
+        )
+
+    def _latent_spread_entry(name: str, arr: Any, *, eps: float = 1e-6) -> str | None:
+        vals = _to_np(arr).astype(np.float32, copy=False)
+        if vals.ndim == 5 and vals.shape[0] > 0:
+            vals = vals[0, :, vals.shape[2] // 2]
+        elif vals.ndim == 4 and vals.shape[0] > 0:
+            vals = vals[0]
+        if vals.ndim != 3:
+            return None
+        c, h_v, w_v = vals.shape
+        vectors = np.transpose(vals, (1, 2, 0)).reshape(h_v * w_v, c)
+        finite_rows = np.isfinite(vectors).all(axis=1)
+        n_finite = int(np.count_nonzero(finite_rows))
+        if n_finite <= 0:
+            return f"{name}: latent has no finite spatial vectors"
+        z = vectors[finite_rows]
+        channel_std = np.nanstd(z, axis=0)
+        active_channels = int(np.count_nonzero(channel_std > float(eps)))
+        total_std = float(np.nanstd(z))
+        if active_channels > 0 and total_std > float(eps):
+            return None
+        return (
+            f"{name}: COLLAPSED latent map, active_channels={active_channels}/{int(c)}, "
+            f"finite_vectors={n_finite}/{int(finite_rows.size)}, total_std={total_std:.3g}"
+        )
+
+    health_entries: list[str] = []
+    if "embedding_health_notes" in data.files:
+        for note in np.asarray(data["embedding_health_notes"]).reshape(-1):
+            text = str(note)
+            if text:
+                health_entries.append(f"embedding_guard: {text}")
+    inf_path_for_health = os.path.join(session_dir, "inference_outputs.pt")
+    if os.path.exists(inf_path_for_health):
+        try:
+            health_outputs = torch.load(inf_path_for_health, map_location="cpu", weights_only=False)
+            for key in ("pred_map", "masked_pred_map", "gt_map", "context_map", "target_energy_map"):
+                if key in health_outputs:
+                    entry = _health_entry(key, health_outputs[key])
+                    if entry:
+                        health_entries.append(entry)
+                    spread_entry = _latent_spread_entry(key, health_outputs[key])
+                    if spread_entry:
+                        health_entries.append(spread_entry)
+                else:
+                    if key == "masked_pred_map":
+                        health_entries.append("masked_pred_map: missing from inference_outputs.pt")
+            if "pred_map" in health_outputs and "masked_pred_map" in health_outputs:
+                pred_arr = _to_np(health_outputs["pred_map"]).astype(np.float32, copy=False)
+                masked_arr = _to_np(health_outputs["masked_pred_map"]).astype(np.float32, copy=False)
+                if pred_arr.shape == masked_arr.shape:
+                    finite = np.isfinite(pred_arr) & np.isfinite(masked_arr)
+                    n_finite = int(np.count_nonzero(finite))
+                    if n_finite > 0:
+                        diff = pred_arr[finite] - masked_arr[finite]
+                        max_abs = float(np.nanmax(np.abs(diff)))
+                        std = float(np.nanstd(diff))
+                        if max_abs <= 1e-6:
+                            health_entries.append(
+                                f"pred_vs_masked_pred: IDENTICAL on finite values, finite_values={n_finite}/{pred_arr.size}"
+                            )
+                        else:
+                            health_entries.append(
+                                f"pred_vs_masked_pred: finite max_abs={max_abs:.3g}, std={std:.3g}, finite_values={n_finite}/{pred_arr.size}"
+                            )
+        except Exception as e:
+            health_entries.append(f"inference_outputs.pt: health check failed ({type(e).__name__})")
+    for key in (
+        "pred_pca3d",
+        "masked_pred_pca3d",
+        "pred_umap3d",
+        "masked_pred_umap3d",
+        "energy_map",
+        "visit_heatmap",
+    ):
+        if key in data.files:
+            entry = _health_entry(key, data[key], rows=key.endswith("3d"))
+            if entry:
+                health_entries.append(entry)
+            if key.endswith("3d"):
+                spread_entry = _embedding_spread_entry(key, data[key])
+                if spread_entry:
+                    health_entries.append(spread_entry)
+    health_banner_html = ""
+    if health_entries:
+        items = "".join(f"<li>{html_lib.escape(entry)}</li>" for entry in health_entries[:16])
+        more = ""
+        if len(health_entries) > 16:
+            more = f"<li>{len(health_entries) - 16} more non-finite diagnostics omitted</li>"
+        health_banner_html = (
+            '<div class="health-banner">'
+            '<div class="health-title">Numerical health warning: non-finite values detected</div>'
+            f"<ul>{items}{more}</ul>"
+            "</div>"
+        )
+
     summary_parts = []
     for s in ms_summary:
         summary_parts.append(f'<span class="val">{s}</span>')
@@ -2459,6 +2692,10 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     .build-banner {{ margin: 8px 0 10px 0; padding: 10px 12px; background: #fff7d6; border: 2px solid #f0b429; border-radius: 8px; color: #1f2937; font-size: 14px; font-weight: 650; }}
     .build-chip {{ display: inline-block; margin-right: 14px; }}
     .build-chip.strong {{ color: #9a3412; font-weight: 800; }}
+    .health-banner {{ margin: 8px 0 12px 0; padding: 12px 14px; background: #fff1f2; border: 2px solid #fb7185; border-radius: 8px; color: #4c0519; font-size: 13px; }}
+    .health-title {{ font-weight: 800; margin-bottom: 6px; }}
+    .health-banner ul {{ margin: 0; padding-left: 20px; }}
+    .health-banner li {{ margin: 3px 0; }}
     .mask-summary {{ margin: 0 0 18px 2px; padding: 14px 18px; background: #fff; border: 1px solid #d9deea; border-radius: 8px; font-size: 15px; line-height: 1.8; }}
     .mask-summary .val {{ color: #3a4055; margin-right: 20px; }}
     .mask-summary .erank {{ display: inline-block; margin-left: 8px; padding: 4px 14px; background: #1a1a2e; color: #fde725; border-radius: 6px; font-weight: 700; font-size: 17px; }}
@@ -2481,6 +2718,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
   <div class="topbar">
     <h1>JEPA Session Dashboard: {os.path.basename(session_dir)} <span class="version">{DASHBOARD_VERSION}</span></h1>
     <div class="build-banner">{build_banner_html}</div>
+    {health_banner_html}
   </div>
   <div class="mask-summary">{mask_summary_html}</div>
   <div class="grid">{''.join(rendered)}</div>
