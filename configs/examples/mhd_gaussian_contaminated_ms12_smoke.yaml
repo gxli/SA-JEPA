@@ -1,0 +1,14 @@
+# Fast config-driven smoke test: MHD 2D with deterministic Gaussian contaminants, ms=1.2
+base_config: mhd_gaussian_contaminated_ms12.yaml
+
+data:
+  num_samples: 1
+  d4_augment: false
+
+train:
+  epochs: 1
+  batch_size: 1
+  num_workers: 0
+  scale_probe_enabled: false
+  compute_effective_rank: false
+  force_recompute_inference: true

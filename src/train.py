@@ -127,6 +127,31 @@ def _format_target_z_counts(
     return ",".join(counts)
 
 
+def _inverse_augmented_yx_to_native(yy: int, xx: int, meta: dict | None) -> tuple[int, int]:
+    if not isinstance(meta, dict):
+        return int(yy), int(xx)
+    y = int(yy)
+    x = int(xx)
+    post_h = int(meta.get("post_aug_h", meta.get("pre_aug_h", 0)) or 0)
+    post_w = int(meta.get("post_aug_w", meta.get("pre_aug_w", 0)) or 0)
+    pre_h = int(meta.get("pre_aug_h", post_h) or post_h)
+    pre_w = int(meta.get("pre_aug_w", post_w) or post_w)
+    if bool(meta.get("flip_x", False)) and post_w > 0:
+        x = post_w - 1 - x
+    if bool(meta.get("flip_y", False)) and post_h > 0:
+        y = post_h - 1 - y
+    rot_k = int(meta.get("rot_k", 0) or 0) % 4
+    if rot_k == 1:
+        y, x = x, pre_h - 1 - y
+    elif rot_k == 2:
+        y, x = pre_h - 1 - y, pre_w - 1 - x
+    elif rot_k == 3:
+        y, x = pre_w - 1 - x, y
+    y += int(meta.get("crop_y0", 0) or 0)
+    x += int(meta.get("crop_x0", 0) or 0)
+    return int(y), int(x)
+
+
 def _format_active_loss_terms(
     *,
     total: float,
@@ -828,6 +853,10 @@ class _MaskingCollator:
         return float(mask_scale), int(mask_box_size)
 
     def __call__(self, batch):
+        metadata = None
+        if isinstance(batch[0], (tuple, list)) and len(batch[0]) >= 2 and isinstance(batch[0][-1], dict):
+            metadata = [item[-1] for item in batch]
+            batch = [item[:-1] for item in batch]
         use_cdd = isinstance(batch[0], (tuple, list)) and len(batch[0]) == 2
         if self.use_cdd and self.require_precomputed_cdd and not use_cdd:
             raise RuntimeError(
@@ -878,6 +907,13 @@ class _MaskingCollator:
             target_mask=batch_target_mask,
             **self.context_kwargs,
         )
+        if metadata is not None:
+            if len(context_data) >= 5 and isinstance(context_data[4], dict):
+                debug = dict(context_data[4])
+                debug["augment_metadata"] = metadata
+                context_data = tuple(context_data[:4]) + (debug,)
+            else:
+                context_data = tuple(context_data[:4]) + ({"augment_metadata": metadata},)
         x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
         return x_clean, context_data
 
@@ -1954,6 +1990,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             image_batch_selected_indices=image_batch_selected_indices,
             cdd_cache=cdd_cache,
             cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
+            return_metadata=True,
         )
         val_fraction = float(train_cfg.get("val_fraction", 0.1))
         val_fraction = min(max(val_fraction, 0.0), 0.95)
@@ -2530,19 +2567,32 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
                 tloc = outputs["target_locations"].detach().cpu().numpy()
                 if (not is_3d_mode) and visit_counts is None:
-                    hh, ww = int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])
+                    aug_meta = debug.get("augment_metadata") if isinstance(debug, dict) else None
+                    if isinstance(aug_meta, list) and aug_meta:
+                        hh = int(aug_meta[0].get("full_h", outputs["x_clean"].shape[-2]))
+                        ww = int(aug_meta[0].get("full_w", outputs["x_clean"].shape[-1]))
+                    else:
+                        hh, ww = int(outputs["x_clean"].shape[-2]), int(outputs["x_clean"].shape[-1])
                     visit_counts = np.zeros((hh, ww), dtype=np.float32)
                 ndim_loc = int(tloc.shape[-1])
                 loc_y, loc_x = _target_location_yx(tloc)
+                aug_meta = debug.get("augment_metadata") if isinstance(debug, dict) else None
                 for bi in range(tloc.shape[0]):
+                    meta_bi = aug_meta[bi] if isinstance(aug_meta, list) and bi < len(aug_meta) else None
                     for ki in range(tloc.shape[1]):
                         if not bool(tvalid[bi, ki]):
                             continue
                         yy = int(loc_y[bi, ki])
                         xx = int(loc_x[bi, ki])
+                        yy_native, xx_native = _inverse_augmented_yx_to_native(yy, xx, meta_bi)
                         zz = int(tloc[bi, ki, 0]) if ndim_loc >= 3 else 0
-                        if (visit_counts is not None) and ndim_loc == 2 and 0 <= yy < visit_counts.shape[0] and 0 <= xx < visit_counts.shape[1]:
-                            visit_counts[yy, xx] += 1.0
+                        if (
+                            (visit_counts is not None)
+                            and ndim_loc == 2
+                            and 0 <= yy_native < visit_counts.shape[0]
+                            and 0 <= xx_native < visit_counts.shape[1]
+                        ):
+                            visit_counts[yy_native, xx_native] += 1.0
                         visited_rows.append(
                             [
                                 epoch + 1,
@@ -2550,8 +2600,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                                 bi,
                                 ki,
                                 zz,
-                                yy,
-                                xx,
+                                yy_native,
+                                xx_native,
                                 float(scales[bi, ki]),
                             ]
                         )
@@ -2795,7 +2845,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     # Save NPY artifacts (PCA/UMAP/latent embeddings) required by session_to_dash.py.
     # No PNG, HTML, or dashboard rendering is performed here.
     inf_path = os.path.join(session_dir, "inference_outputs.pt")
-    post_training_artifacts = bool(train_cfg.get("post_training_artifacts", True))
+    post_training_artifacts = bool(train_cfg.get("post_training_artifacts", False))
     artifacts_exist = os.path.exists(os.path.join(session_dir, "rank_diagnostics.json")) and any(
         os.path.getsize(p) > 0 for p in glob.glob(os.path.join(session_dir, "results", "*_pca_*.npy"))
     ) if os.path.isdir(os.path.join(session_dir, "results")) else False

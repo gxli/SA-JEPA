@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a self-contained click-to-similarity HTML visualizer for UMAP XYZ `.npy` images."""
+"""Build a self-contained click-to-similarity HTML visualizer for latent maps."""
 
 from __future__ import annotations
 
@@ -14,29 +14,38 @@ import numpy as np
 from PIL import Image
 
 
-def _as_hwc_xyz(arr: np.ndarray) -> np.ndarray:
+def _as_hwc_features(arr: np.ndarray, *, name: str) -> np.ndarray:
     arr = np.asarray(arr, dtype=np.float32)
     if arr.ndim != 3:
-        raise ValueError(f"expected a 3D XYZ array, got shape {arr.shape}")
-    if arr.shape[0] in (3, 4):
-        arr = np.moveaxis(arr[:3], 0, -1)
-    elif arr.shape[-1] in (3, 4):
-        arr = arr[..., :3]
+        raise ValueError(f"expected a 3D {name} array, got shape {arr.shape}")
+    if arr.shape[-1] <= 128 and arr.shape[0] > arr.shape[-1] and arr.shape[1] > arr.shape[-1]:
+        pass
+    elif arr.shape[0] <= 128 and arr.shape[1] > 1 and arr.shape[2] > 1:
+        arr = np.moveaxis(arr, 0, -1)
+    elif arr.shape[-1] <= 128:
+        pass
     else:
         raise ValueError(
-            "expected shape (3,H,W), (4,H,W), (H,W,3), or (H,W,4); "
+            "expected shape (C,H,W) or (H,W,C) with a reasonable channel count; "
             f"got {arr.shape}"
         )
     return arr
 
 
-def _robust_rgb(xyz: np.ndarray, lo_pct: float, hi_pct: float) -> tuple[np.ndarray, dict]:
-    valid = np.isfinite(xyz).all(axis=-1)
-    rgb = np.zeros((*xyz.shape[:2], 4), dtype=np.uint8)
+def _display_xyz(features: np.ndarray) -> np.ndarray:
+    if features.shape[-1] < 3:
+        raise ValueError(f"display array needs at least 3 channels, got shape {features.shape}")
+    return np.asarray(features[..., :3], dtype=np.float32)
+
+
+def _robust_rgb(display_xyz: np.ndarray, similarity_features: np.ndarray, lo_pct: float, hi_pct: float) -> tuple[np.ndarray, dict]:
+    valid = np.isfinite(display_xyz).all(axis=-1) & np.isfinite(similarity_features).all(axis=-1)
+    rgb = np.zeros((*display_xyz.shape[:2], 4), dtype=np.uint8)
     rgb[..., 3] = np.where(valid, 255, 0).astype(np.uint8)
 
     stats = {
-        "shape": list(xyz.shape),
+        "shape": list(display_xyz.shape),
+        "similarity_shape": list(similarity_features.shape),
         "valid_pixels": int(valid.sum()),
         "total_pixels": int(valid.size),
         "channels": [],
@@ -45,7 +54,7 @@ def _robust_rgb(xyz: np.ndarray, lo_pct: float, hi_pct: float) -> tuple[np.ndarr
         return rgb, stats
 
     for channel in range(3):
-        values = xyz[..., channel][valid]
+        values = display_xyz[..., channel][valid]
         lo, hi = np.nanpercentile(values, [lo_pct, hi_pct])
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             lo = float(np.nanmin(values))
@@ -54,7 +63,7 @@ def _robust_rgb(xyz: np.ndarray, lo_pct: float, hi_pct: float) -> tuple[np.ndarr
             rgb[..., channel] = 127
             lo = hi = float(values[0]) if values.size else 0.0
         else:
-            scaled = (xyz[..., channel] - lo) / (hi - lo)
+            scaled = (display_xyz[..., channel] - lo) / (hi - lo)
             scaled = np.clip(scaled, 0.0, 1.0)
             rgb[..., channel] = np.where(valid, np.round(scaled * 255.0), 0).astype(np.uint8)
         stats["channels"].append(
@@ -81,22 +90,47 @@ def _float32_base64(arr: np.ndarray) -> str:
     return base64.b64encode(contiguous.tobytes()).decode("ascii")
 
 
-def build_html(input_path: Path, output_path: Path | None, lo_pct: float, hi_pct: float) -> Path:
+def build_html(
+    input_path: Path,
+    output_path: Path | None,
+    lo_pct: float,
+    hi_pct: float,
+    *,
+    similarity_input_path: Path | None = None,
+    display_label: str = "umap",
+    similarity_label: str | None = None,
+) -> Path:
     input_path = input_path.expanduser().resolve()
     if output_path is None:
         output_path = input_path.with_name(f"{input_path.stem}_visualizer.html")
     else:
         output_path = output_path.expanduser().resolve()
 
-    xyz = _as_hwc_xyz(np.load(input_path))
-    rgba, stats = _robust_rgb(xyz, lo_pct=lo_pct, hi_pct=hi_pct)
+    display_features = _as_hwc_features(np.load(input_path), name="display")
+    display_xyz = _display_xyz(display_features)
+    if similarity_input_path is None:
+        similarity_input_path = input_path
+    similarity_input_path = similarity_input_path.expanduser().resolve()
+    similarity_features = _as_hwc_features(np.load(similarity_input_path), name="similarity")
+    if similarity_features.shape[:2] != display_xyz.shape[:2]:
+        raise ValueError(
+            "display and similarity arrays must share spatial shape, "
+            f"got display={display_xyz.shape[:2]} similarity={similarity_features.shape[:2]}"
+        )
+    rgba, stats = _robust_rgb(display_xyz, similarity_features, lo_pct=lo_pct, hi_pct=hi_pct)
     data_url = _png_data_url(rgba)
-    xyz_b64 = _float32_base64(xyz)
+    display_b64 = _float32_base64(display_xyz)
+    similarity_b64 = _float32_base64(similarity_features)
 
-    title = f"{input_path.name} visualizer"
+    display_label = str(display_label)
+    similarity_label = str(similarity_label or display_label)
+    title = f"{display_label} interactive dashboard"
     stats_json = json.dumps(stats, separators=(",", ":"))
     source_text = html.escape(str(input_path))
+    similarity_source_text = html.escape(str(similarity_input_path))
     title_text = html.escape(title)
+    display_label_text = html.escape(display_label)
+    similarity_label_text = html.escape(similarity_label)
     html_text = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -235,7 +269,8 @@ def build_html(input_path: Path, output_path: Path | None, lo_pct: float, hi_pct
 <header>
   <div>
     <h1>{title_text}</h1>
-    <div class="meta">{source_text}</div>
+    <div class="meta">display={display_label_text}: {source_text}</div>
+    <div class="meta">similarity={similarity_label_text}: {similarity_source_text}</div>
   </div>
   <div class="toolbar">
     <button id="fit" type="button">Fit</button>
@@ -264,7 +299,8 @@ def build_html(input_path: Path, output_path: Path | None, lo_pct: float, hi_pct
   <section class="stage"><canvas id="view"></canvas></section>
   <aside>
     <dl>
-      <dt>Array</dt><dd id="shape"></dd>
+      <dt>Display array</dt><dd id="shape"></dd>
+      <dt>Similarity array</dt><dd id="simshape"></dd>
       <dt>Valid pixels</dt><dd id="valid"></dd>
       <dt>Cursor</dt><dd id="cursor">-</dd>
       <dt>Selected</dt><dd id="selected">click a valid pixel</dd>
@@ -273,7 +309,7 @@ def build_html(input_path: Path, output_path: Path | None, lo_pct: float, hi_pct
       <dt>Save orientation</dt><dd>original array shape/orientation</dd>
       <dt>Zoom</dt><dd id="zoom">-</dd>
     </dl>
-    <p class="hint">Click a valid pixel to draw a cosine-similarity map against the selected XYZ vector.</p>
+    <p class="hint">Click a valid pixel to draw a cosine-similarity map against the selected {similarity_label_text} vector.</p>
     <div class="channel"><span class="swatch r"></span><span id="ch0"></span></div>
     <div class="channel"><span class="swatch g"></span><span id="ch1"></span></div>
     <div class="channel"><span class="swatch b"></span><span id="ch2"></span></div>
@@ -281,12 +317,18 @@ def build_html(input_path: Path, output_path: Path | None, lo_pct: float, hi_pct
 </main>
 <script>
 const DATA_URL = {json.dumps(data_url)};
-const XYZ_B64 = {json.dumps(xyz_b64)};
+const DISPLAY_B64 = {json.dumps(display_b64)};
+const SIMILARITY_B64 = {json.dumps(similarity_b64)};
 const STATS = {stats_json};
+const DISPLAY_LABEL = {json.dumps(display_label)};
+const SIMILARITY_LABEL = {json.dumps(similarity_label)};
+const DISPLAY_CHANNELS = 3;
+const SIMILARITY_CHANNELS = STATS.similarity_shape[2];
 const canvas = document.getElementById("view");
 const ctx = canvas.getContext("2d");
 const img = new Image();
 let xyz = null;
+let similarity = null;
 let simCanvas = null;
 let simValues = null;
 let simMin = 0;
@@ -312,8 +354,11 @@ function decodeFloat32(base64) {{
   return new Float32Array(bytes.buffer);
 }}
 
-function finite3(index) {{
-  return Number.isFinite(xyz[index]) && Number.isFinite(xyz[index + 1]) && Number.isFinite(xyz[index + 2]);
+function finiteVector(values, index, channels) {{
+  for (let c = 0; c < channels; c++) {{
+    if (!Number.isFinite(values[index + c])) return false;
+  }}
+  return true;
 }}
 
 function fmt(v) {{
@@ -557,14 +602,16 @@ function saveDisplayedNpy() {{
 }}
 
 function computeSimilarity(px, py) {{
-  if (!xyz || px < 0 || py < 0 || px >= img.width || py >= img.height) return;
-  const seedIndex = (py * img.width + px) * 3;
-  if (!finite3(seedIndex)) return;
+  if (!similarity || px < 0 || py < 0 || px >= img.width || py >= img.height) return;
+  const seedIndex = (py * img.width + px) * SIMILARITY_CHANNELS;
+  if (!finiteVector(similarity, seedIndex, SIMILARITY_CHANNELS)) return;
 
-  const sx = xyz[seedIndex];
-  const sy = xyz[seedIndex + 1];
-  const sz = xyz[seedIndex + 2];
-  const seedNorm = Math.hypot(sx, sy, sz);
+  let seedNorm2 = 0;
+  for (let c = 0; c < SIMILARITY_CHANNELS; c++) {{
+    const v = similarity[seedIndex + c];
+    seedNorm2 += v * v;
+  }}
+  const seedNorm = Math.sqrt(seedNorm2);
   if (!Number.isFinite(seedNorm) || seedNorm <= 1e-12) return;
 
   simValues = new Float32Array(img.width * img.height);
@@ -573,18 +620,23 @@ function computeSimilarity(px, py) {{
   let maxSim = -Infinity;
   for (let y = 0; y < img.height; y++) {{
     for (let x = 0; x < img.width; x++) {{
-      const i = (y * img.width + x) * 3;
-      if (!finite3(i)) {{
+      const i = (y * img.width + x) * SIMILARITY_CHANNELS;
+      if (!finiteVector(similarity, i, SIMILARITY_CHANNELS)) {{
         continue;
       }}
-      const vx = xyz[i];
-      const vy = xyz[i + 1];
-      const vz = xyz[i + 2];
-      const norm = Math.hypot(vx, vy, vz);
+      let dot = 0;
+      let norm2 = 0;
+      for (let c = 0; c < SIMILARITY_CHANNELS; c++) {{
+        const sv = similarity[seedIndex + c];
+        const vv = similarity[i + c];
+        dot += sv * vv;
+        norm2 += vv * vv;
+      }}
+      const norm = Math.sqrt(norm2);
       if (!Number.isFinite(norm) || norm <= 1e-12) {{
         continue;
       }}
-      const sim = (sx * vx + sy * vy + sz * vz) / (seedNorm * norm);
+      const sim = dot / (seedNorm * norm);
       minSim = Math.min(minSim, sim);
       maxSim = Math.max(maxSim, sim);
       simValues[y * img.width + x] = sim;
@@ -597,14 +649,17 @@ function computeSimilarity(px, py) {{
   selectedPy = py;
   renderSimilarity();
   mode = "sim";
-  document.getElementById("mode").textContent = `similarity map, cosine ${{fmt(minSim)}} to ${{fmt(maxSim)}}`;
-  document.getElementById("selected").textContent = `x=${{px}}, y=${{py}}, vector=(${{fmt(sx)}}, ${{fmt(sy)}}, ${{fmt(sz)}})`;
+  const preview = [];
+  for (let c = 0; c < Math.min(6, SIMILARITY_CHANNELS); c++) preview.push(fmt(similarity[seedIndex + c]));
+  const suffix = SIMILARITY_CHANNELS > 6 ? ", ..." : "";
+  document.getElementById("mode").textContent = `${{SIMILARITY_LABEL}} cosine map, ${{fmt(minSim)}} to ${{fmt(maxSim)}}`;
+  document.getElementById("selected").textContent = `x=${{px}}, y=${{py}}, ${{SIMILARITY_LABEL}}[${{SIMILARITY_CHANNELS}}]=(${{preview.join(", ")}}${{suffix}})`;
   draw();
 }}
 
 function showRgb() {{
   mode = "rgb";
-  document.getElementById("mode").textContent = "RGB projection";
+  document.getElementById("mode").textContent = `${{DISPLAY_LABEL}} RGB projection`;
   document.getElementById("window").textContent = "-";
   draw();
 }}
@@ -673,6 +728,7 @@ document.getElementById("colormap").addEventListener("change", renderSimilarity)
 window.addEventListener("resize", resize);
 
 document.getElementById("shape").textContent = STATS.shape.join(" x ");
+document.getElementById("simshape").textContent = STATS.similarity_shape.join(" x ");
 document.getElementById("valid").textContent = `${{STATS.valid_pixels}} / ${{STATS.total_pixels}}`;
 for (let i = 0; i < 3; i++) {{
   const ch = STATS.channels[i] || {{}};
@@ -680,7 +736,8 @@ for (let i = 0; i < 3; i++) {{
     `raw ${{fmt(ch.min)}} to ${{fmt(ch.max)}}, scaled ${{fmt(ch.lo_pct)}} to ${{fmt(ch.hi_pct)}}`;
 }}
 
-xyz = decodeFloat32(XYZ_B64);
+xyz = decodeFloat32(DISPLAY_B64);
+similarity = decodeFloat32(SIMILARITY_B64);
 img.onload = () => {{ resize(); fit(); }};
 img.src = DATA_URL;
 </script>
@@ -693,12 +750,23 @@ img.src = DATA_URL;
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path, help="Path to a UMAP XYZ .npy file")
+    parser.add_argument("input", type=Path, help="Path to a display embedding .npy file, usually *_umap_xyz.npy")
     parser.add_argument("--output", type=Path, default=None, help="HTML output path")
+    parser.add_argument("--similarity-input", type=Path, default=None, help="Optional full latent/PCA/UMAP .npy used for cosine similarity")
+    parser.add_argument("--display-label", default="umap", help="Human label for the displayed RGB embedding")
+    parser.add_argument("--similarity-label", default=None, help="Human label for the cosine similarity embedding")
     parser.add_argument("--lo-pct", type=float, default=1.0, help="lower percentile for RGB scaling")
     parser.add_argument("--hi-pct", type=float, default=99.0, help="upper percentile for RGB scaling")
     args = parser.parse_args()
-    out = build_html(args.input, args.output, args.lo_pct, args.hi_pct)
+    out = build_html(
+        args.input,
+        args.output,
+        args.lo_pct,
+        args.hi_pct,
+        similarity_input_path=args.similarity_input,
+        display_label=args.display_label,
+        similarity_label=args.similarity_label,
+    )
     print(f"html_saved={out}")
     print(f"open {out}")
 

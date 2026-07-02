@@ -53,7 +53,7 @@ def test_tiled_inference_errors_when_no_tile_is_valid(tmp_path):
         raise AssertionError("Expected invalid tiled input to raise")
 
 
-def test_inference_session_saves_tile_visit_heatmap_for_dashboard(tmp_path):
+def test_inference_session_saves_tile_visit_map_but_dashboard_prefers_target_coverage(tmp_path):
     arr = np.zeros((8, 8), dtype=np.float32)
     arr[:4, :4] = 1.0
     arr[4:, 4:] = 2.0
@@ -94,8 +94,8 @@ def test_inference_session_saves_tile_visit_heatmap_for_dashboard(tmp_path):
     visit = np.load(session_dir / "tile_visit_map.npy")
     assert visit.shape == (8, 8)
     with np.load(dash_path) as data:
-        assert str(data["visit_heatmap_kind"]) == "Tile Coverage Heatmap"
-        np.testing.assert_array_equal(data["visit_heatmap"], visit.astype(np.float32))
+        assert str(data["visit_heatmap_kind"]) == "Target Coverage Heatmap"
+        assert not np.array_equal(data["visit_heatmap"], visit.astype(np.float32))
 
 
 def test_post_training_inference_exports_clean_and_masked_predictions_separately(tmp_path):
@@ -230,9 +230,33 @@ def test_tiled_cdd_masked_inference_uses_shared_encoder_wrapper(monkeypatch):
             self.projector = torch.nn.Identity()
             self.predictor = torch.nn.Identity()
             self.target_projector = torch.nn.Identity()
+            self.masked_forward_calls = []
 
         def sample_mask_params(self, device):
             return torch.tensor(1.0, device=device), torch.tensor(1, device=device)
+
+        def forward(
+            self,
+            x,
+            *,
+            return_debug=False,
+            enable_grid_jitter=False,
+            enable_target_dithering=False,
+            lattice_shift_override=(0, 0),
+            mask_inference=False,
+            cdd_orig=None,
+        ):
+            assert mask_inference is True
+            assert return_debug is False
+            assert enable_grid_jitter is False
+            assert enable_target_dithering is False
+            assert lattice_shift_override == (0, 0)
+            assert cdd_orig is not None
+            self.masked_forward_calls.append(cdd_orig.detach().clone())
+            return {
+                "pred_map": cdd_orig + 100.0,
+                "context_map": cdd_orig + 50.0,
+            }
 
     x_raw = torch.ones((1, 1, 4, 4), dtype=torch.float32)
     cdd_raw = torch.full((1, 2, 4, 4), 2.0, dtype=torch.float32)
@@ -246,8 +270,9 @@ def test_tiled_cdd_masked_inference_uses_shared_encoder_wrapper(monkeypatch):
 
     monkeypatch.setattr(inference_mod, "prepare_context_batch", fail_prepare_context_batch)
 
+    model = FakeScaleAware()
     out = _run_tiled_dense_inference_2d(
-        model=FakeScaleAware(),
+        model=model,
         x_raw=x_raw,
         cdd_raw=cdd_raw,
         cdd_masked_raw=cdd_masked,
@@ -258,6 +283,8 @@ def test_tiled_cdd_masked_inference_uses_shared_encoder_wrapper(monkeypatch):
         mask_inference=True,
     )
 
-    expected_masked = cdd_masked + 10.0 * mask_token
+    assert len(model.masked_forward_calls) == 1
+    np.testing.assert_allclose(model.masked_forward_calls[0].numpy(), cdd_raw.numpy())
+    expected_masked = cdd_raw + 100.0
     np.testing.assert_allclose(out["pred_map"].numpy(), cdd_raw.numpy())
     np.testing.assert_allclose(out["masked_pred_map"].numpy(), expected_masked.numpy())

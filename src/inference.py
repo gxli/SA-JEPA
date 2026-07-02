@@ -12,7 +12,7 @@ from src.losses import representation_dense_energy
 from src.models.masking import extract_location_patches, norm_per_sample_channel, prepare_context_batch
 
 # Bump this on every inference-affecting change so session logs show which code ran.
-INFERENCE_VERSION = "v4-even-parity-tiled-2d-tta-2026"
+INFERENCE_VERSION = "v6-scaleaware-sliding-window-masked-encoder-2026"
 from src.utils.viz import _target_location_yx
 
 
@@ -391,6 +391,7 @@ def _dense_forward_2d_tile(
     log_floor: torch.Tensor,
     *,
     cdd_preencoded: bool = False,
+    cdd_raw_tile: torch.Tensor | None = None,
     x_masked_tile: torch.Tensor | None = None,
     cdd_masked_tile: torch.Tensor | None = None,
     mask_token_tile: torch.Tensor | None = None,
@@ -412,16 +413,31 @@ def _dense_forward_2d_tile(
     if mask_inference:
         encoder_type = str(getattr(model, "encoder_type", ""))
         if encoder_type in ("cdd_scaleaware_convnext", "convnext_dense_pyramid", "escnn_c4_pyramid"):
-            if cdd_masked_tile is None or mask_token_tile is None:
-                raise RuntimeError("masked tiled CDD inference requires cdd_masked_tile and mask_token_tile")
-            masked_context_map, _ = _encode_context_2d(
-                model,
-                x_enc=x_enc,
-                cdd_tile=cdd_masked_tile,
-                log_floor=log_floor,
-                mask_tokens=mask_token_tile,
-                cdd_preencoded=False,
-            )
+            if encoder_type == "cdd_scaleaware_convnext":
+                masked_out = model(
+                    x_tile,
+                    return_debug=False,
+                    enable_grid_jitter=False,
+                    enable_target_dithering=False,
+                    lattice_shift_override=(0, 0),
+                    mask_inference=True,
+                    cdd_orig=cdd_raw_tile,
+                )
+                masked_pred_map = masked_out["pred_map"]
+                masked_context_map = masked_out.get("context_map")
+                if masked_context_map is None:
+                    masked_context_map = context_map
+            else:
+                if cdd_masked_tile is None or mask_token_tile is None:
+                    raise RuntimeError("masked tiled CDD inference requires cdd_masked_tile and mask_token_tile")
+                masked_context_map, _ = _encode_context_2d(
+                    model,
+                    x_enc=x_enc,
+                    cdd_tile=cdd_masked_tile,
+                    log_floor=log_floor,
+                    mask_tokens=mask_token_tile,
+                    cdd_preencoded=False,
+                )
         elif encoder_type == "convnext_dense_masktoken":
             if x_masked_tile is None or mask_token_tile is None:
                 raise RuntimeError("masked tiled image inference requires x_masked_tile and mask_token_tile")
@@ -449,8 +465,9 @@ def _dense_forward_2d_tile(
 
     context_proj = model.projector(context_map)
     pred_map = model.predictor(context_proj)
-    masked_context_proj = model.projector(masked_context_map)
-    masked_pred_map = model.predictor(masked_context_proj)
+    if "masked_pred_map" not in locals():
+        masked_context_proj = model.projector(masked_context_map)
+        masked_pred_map = model.predictor(masked_context_proj)
     with torch.no_grad():
         gt_map = model.target_projector(gt_base)
     energy = representation_dense_energy(masked_pred_map, gt_map)
@@ -640,6 +657,7 @@ def _run_tiled_dense_inference_2d(
             if wx1 <= wx0:
                 continue
             x_tile = x_raw[:, :, y0:ye, x0:xe]
+            cdd_raw_tile = None if cdd_raw is None else cdd_raw[:, :, y0:ye, x0:xe]
             cdd_tile = None if cdd_source is None else cdd_source[:, :, y0:ye, x0:xe]
             x_masked_tile = None if x_masked_raw is None else x_masked_raw[:, :, y0:ye, x0:xe]
             cdd_masked_tile = None if cdd_masked_raw is None else cdd_masked_raw[:, :, y0:ye, x0:xe]
@@ -653,6 +671,8 @@ def _run_tiled_dense_inference_2d(
                 else:
                     pad_mode = "replicate"
                 x_tile = F.pad(x_tile, (0, pad_w, 0, pad_h), mode=pad_mode)
+                if cdd_raw_tile is not None:
+                    cdd_raw_tile = F.pad(cdd_raw_tile, (0, pad_w, 0, pad_h), mode=pad_mode)
                 if cdd_tile is not None:
                     cdd_tile = F.pad(cdd_tile, (0, pad_w, 0, pad_h), mode=pad_mode)
                 if x_masked_tile is not None:
@@ -667,6 +687,7 @@ def _run_tiled_dense_inference_2d(
                 None if cdd_tile is None else cdd_tile.to(device, non_blocking=True),
                 log_floor.to(device, non_blocking=True),
                 cdd_preencoded=cdd_preencoded,
+                cdd_raw_tile=None if cdd_raw_tile is None else cdd_raw_tile.to(device, non_blocking=True),
                 x_masked_tile=None if x_masked_tile is None else x_masked_tile.to(device, non_blocking=True),
                 cdd_masked_tile=None if cdd_masked_tile is None else cdd_masked_tile.to(device, non_blocking=True),
                 mask_token_tile=None if mask_token_tile is None else mask_token_tile.to(device, non_blocking=True),
@@ -685,8 +706,11 @@ def _run_tiled_dense_inference_2d(
 
     if not sums:
         raise RuntimeError(f"[{config_name}] tiled 2D dense inference produced no tiles")
+    tile_visit_map = weight.clone()
     weight = weight.clamp_min(1.0)
-    return {key: value / weight for key, value in sums.items()}
+    out = {key: value / weight for key, value in sums.items()}
+    out["tile_visit_map"] = tile_visit_map
+    return out
 
 
 def _run_tiled_dense_inference_2d_tta(
@@ -960,8 +984,9 @@ def run_post_training_inference(
             mask_debug_full = {}
             if bool(mask_inference):
                 # Full-frame mask debug metadata (target locations, mask maps)
-                # for diagnostics — the actual per-tile masking happens inside
-                # _run_tiled_dense_inference_2d via masked_inference_encoder.
+                # for diagnostics. For cdd_scaleaware_convnext, the actual
+                # masked branch is produced by calling the model's masked
+                # encoder wrapper on each raw sliding-window tile.
                 cdd_for_mask = None
                 if cdd_raw is None:
                     cdd_cache_dir = os.path.join(session_dir, "cdd_cache")
@@ -1013,6 +1038,8 @@ def run_post_training_inference(
             )
             for key in ("x_clean", "x_context", "context_map", "pred_map", "masked_pred_map", "gt_map"):
                 outputs[key] = tiled[key].to(x_raw.device)
+            if "tile_visit_map" in tiled:
+                outputs["tile_visit_map"] = tiled["tile_visit_map"].to(x_raw.device)
             outputs["x_clean_raw"] = x_raw
             outputs["x_context_raw"] = x_raw
             for key in (
@@ -1155,8 +1182,15 @@ def run_post_training_inference(
             outputs["masked_pred_map"] = outputs["pred_map"]
 
     inference_outputs = {
+        "inference_version": INFERENCE_VERSION,
         "inference_scope": "dashboard_sample_batch",
         "mask_inference": bool(mask_inference),
+        "masked_inference_contract": (
+            "cdd_scaleaware_convnext tiled inference calls model(mask_inference=True) "
+            "on each raw sliding-window tile, letting the model wrapper prepare "
+            "masked CDD fields and mask tokens; "
+            "legacy pyramid encoders use masked CDD fields plus concatenated mask tokens"
+        ),
         "patch_size": int(getattr(model, "patch_size", 1)),
         "inference_input_shape": tuple(int(v) for v in outputs["x_clean"].shape[-2:]),
         "inference_pred_shape": tuple(int(v) for v in outputs["pred_map"].shape[-2:]),
@@ -1192,6 +1226,8 @@ def run_post_training_inference(
         inference_outputs["dip_field_per_channel"] = outputs["dip_field_per_channel"][:8].detach().cpu()
     if "pyramid_mask_token" in outputs:
         inference_outputs["pyramid_mask_token"] = outputs["pyramid_mask_token"][:8].detach().cpu()
+    if "tile_visit_map" in outputs:
+        inference_outputs["tile_visit_map"] = outputs["tile_visit_map"][:8].detach().cpu()
     for k in (
         "priority_good_candidates",
         "priority_nonzero_mean",
@@ -1308,6 +1344,8 @@ def run_post_training_inference(
     _save_npz(os.path.join(session_dir, "target_energy_cosine_map.npz"), inference_outputs["target_energy_cosine_map"].numpy())
     _save_npz(os.path.join(session_dir, "target_energy_point_map.npz"), inference_outputs["target_energy_point_map"].numpy())
     _save_npz(os.path.join(session_dir, "target_energy_count_map.npz"), inference_outputs["target_energy_count_map"].numpy())
+    if "tile_visit_map" in inference_outputs:
+        _save_npz(os.path.join(session_dir, "tile_visit_map.npz"), inference_outputs["tile_visit_map"].numpy())
     encoder_rf = int(_encoder_receptive_field_2d(model))
     dense_output_rf = int(_dense_output_receptive_field_2d(model))
     if inference_discard_margin is None or str(inference_discard_margin).strip().lower() == "auto":

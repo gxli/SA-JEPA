@@ -333,8 +333,8 @@ def _compute_umap_nd(
         except Exception as e:
             print(f"[warning] cuML UMAP failed: {type(e).__name__}: {e}")
 
-    enable_torchdr = os.environ.get("SAJEPA_ENABLE_TORCHDR_UMAP", "").strip().lower() in {"1", "true", "yes", "on"}
-    if enable_torchdr:
+    enable_torchdr_umap = os.environ.get("SAJEPA_ENABLE_TORCHDR_UMAP", "0").strip().lower()
+    if enable_torchdr_umap in {"1", "true", "yes", "on"}:
         try:
             import torchdr
 
@@ -343,6 +343,7 @@ def _compute_umap_nd(
                     n_components=n_components,
                     n_neighbors=int(n_neighbors),
                     min_dist=float(min_dist),
+                    backend=None,  # PyTorch-native NN — avoids faiss MPS crash
                 )
                 if needs_fit_transform:
                     model.fit(torch.from_numpy(fit_x.astype(np.float32)))
@@ -350,7 +351,7 @@ def _compute_umap_nd(
                 else:
                     z = model.fit_transform(torch.from_numpy(x.astype(np.float32)))
                 if isinstance(z, torch.Tensor):
-                    return z.cpu().numpy()
+                    return z.detach().cpu().numpy()
                 return np.asarray(z)
         except Exception as e:
             print(f"[warning] torchdr UMAP failed: {type(e).__name__}: {e}")

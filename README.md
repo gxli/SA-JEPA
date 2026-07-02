@@ -63,15 +63,16 @@ structural morphology.
 
 #### 🖥️ Interactive Dashboard — NGC 3627
 
-Click-to-similarity inspection of spiral arm and interarm regions. Selecting a
-latent neighborhood in the UMAP view back-maps to the corresponding physical
-structure in the galaxy field.
+Click-to-similarity inspection of spiral arm and interarm regions. The default
+interactive view displays UMAP RGB while computing cosine similarity from the
+original full latent vector, so the colors are navigational and the distance is
+measured in the model latent space.
 
 ```python
 dashboard_html = model.open_dashboard()                              # Generate/open dashboard.html
-umap_html = model.open_interactive_umap("predict")                   # Generate/open click-to-similarity UMAP
+umap_html = model.open_interactive_umap("predict")                   # UMAP display, full-latent similarity
 masked_umap_html = model.open_interactive_umap("masked_predict")     # Center-masked prediction manifold, when available
-model.save_interactive_umap("predict_umap_xyz.npy", "out.html")      # Save a UMAP HTML without opening it
+full_html = model.open_interactive_dashboard("predict", display="full", similarity="full")
 ```
 
 <img src="figures/output.gif" width="60%" alt="Interactive UMAP demo">
@@ -92,8 +93,11 @@ NVIDIA package index:
 pip install -e ".[umap-gpu]" --extra-index-url=https://pypi.nvidia.com
 ```
 
-If cuML is absent, SA-JEPA falls back to the installed CPU/torch UMAP path and
-then PCA; the missing-cuML message is informational.
+If cuML is absent, SA-JEPA uses the installed CPU/torch UMAP path where UMAP is
+optional. The session dashboard is stricter: `--model umap` requires a real CPU
+UMAP backend and refuses to write a PCA fallback as UMAP. Set
+`DASHBOARD_UMAP_PYTHON=/path/to/python-with-umap` when UMAP lives in a separate
+environment.
 
 **Apple Silicon (MPS) Note:** If you encounter missing operations on Apple GPUs,
 configure your environment to use the native PyTorch fallback engine:
@@ -186,25 +190,37 @@ PYTHONPATH=. python scripts/train.py --config configs/base_pyramid_scaleaware_co
 PYTHONPATH=. python scripts/session_to_dash.py --sessions-dir outputs --stage all
 ```
 
-The dashboard is written inside each session directory. Run
-`model.open_interactive_umap()` from Python to generate the optional interactive
-UMAP view.
+The dashboard is written inside each session directory. Training saves the
+inference session first; heavy PCA/UMAP dashboard artifacts are regenerated as a
+separate step so the epoch loop does not fail after completion. The default
+right-hand latent panels use the original full latent vector (`--model full`).
+Use `--model pca` for PCA panels or `--model umap` for real CPU UMAP panels.
+UMAP mode fits at most `DASHBOARD_UMAP_FIT_MAX_TOKENS` points by default
+(`12000`) and transforms the rest in batches to avoid local RAM spikes; set
+`DASHBOARD_UMAP_ALLOW_LARGE_FIT=1` only when intentionally fitting a larger
+UMAP. UMAP mode fails loudly if the backend is unavailable instead of writing a
+fake UMAP dashboard. Run `model.open_interactive_umap()` from Python to generate
+the optional click-to-similarity view: it displays UMAP RGB by default but
+computes similarity from the full latent vector unless `similarity="umap"` is
+requested.
 
 ### 📊 Dashboard Output
 
 After a run, `dashboard.html` can be generated from the saved session artifacts.
-The click-to-similarity UMAP browser is generated only when explicitly requested.
+The click-to-similarity browser is generated only when explicitly requested.
 
 | Path                                                              | Purpose                                                              |
 |:------------------------------------------------------------------|:---------------------------------------------------------------------|
 | `<outdir>/<session_name>/dashboard.html`                          | Plotly diagnostic dashboard (loss curves, latent projections, rank metrics) |
-| `<outdir>/<session_name>/results/interactive_umap_predict.html`   | Optional click-to-similarity interactive UMAP browser                |
+| `<outdir>/<session_name>/results/interactive_*_display_*_similarity_predict.html` | Optional click-to-similarity interactive browser |
 
 Reopen later:
 ```python
 model = ScaleAwareJEPA.load_session("outputs/my_run")
-model.open_dashboard()           # opens dashboard.html
-model.open_interactive_umap()    # opens interactive UMAP
+model.open_dashboard()           # opens dashboard.html with full-latent panels
+model.open_dashboard(model="umap")  # requires real UMAP; no PCA fallback
+model.open_interactive_umap()    # UMAP display, full-latent similarity
+model.open_interactive_dashboard(display="full", similarity="full")
 ```
 
 **Reloading & Continuing Workspaces**
@@ -358,9 +374,10 @@ model.infer_npy("large_field.npy", crop_size=256, crop_mode="tile")
 | `model.infer_npy(path, **kwargs)` | string       | Runs direct automated forward passes on a target `.npy` layout file path.                |
 | `model.analyze_rank()`            | dict         | Evaluates structural properties (effective manifold rank, dead channel screens).         |
 | `model.save_session(path)`        | —            | Serializes all weight structures, evaluation dumps, and session configurations.          |
-| `model.generate_dashboard(path=None)` | —         | Compiles `dashboard.html` from the current session artifacts.                            |
-| `model.open_dashboard()`          | string       | Generates if needed, opens `dashboard.html`, and returns the HTML path.                  |
-| `model.open_interactive_umap(branch="predict")` | string | Generates/opens a click-to-similarity UMAP for `predict`, `masked_predict`, `target`, or `context`. |
+| `model.generate_dashboard(path=None, model="full")` | — | Compiles `dashboard.html` from the current session artifacts. `model` selects `full`, `pca`, or real `umap` latent panels. |
+| `model.open_dashboard(model="full")` | string    | Generates if needed, opens `dashboard.html`, and returns the HTML path.                  |
+| `model.open_interactive_dashboard(branch="predict", display="umap", similarity="full")` | string | Generates/opens click-to-similarity for `predict`, `masked_predict`, `target`, or `context`; `display` and `similarity` accept `umap`, `pca`, or `full`. |
+| `model.open_interactive_umap(branch="predict", similarity="full")` | string | Compatibility wrapper for UMAP display with full-latent similarity by default. |
 
 ## ⌨️ Command Line Utility & Diagnostics
 
@@ -371,8 +388,9 @@ PYTHONPATH=. python scripts/train.py --config configs/base_pyramid_scaleaware_co
 # Audit active latent spaces to search for systemic channel collapse and calculate manifold summaries
 python scripts/print_session_summary.py sessions/gen_*
 
-# Launch your structural interactive Plotly analytics dashboard
-PYTHONPATH=. python scripts/session_to_dash.py --sessions-dir sessions --stage all --export-dir results/dashboard
+# Launch your structural interactive Plotly analytics dashboard.
+# --model full is default; use pca or umap for the right-hand latent panels.
+PYTHONPATH=. python scripts/session_to_dash.py --sessions-dir sessions --stage all --export-dir results/dashboard --model full
 
 # Execute a sliding-window tiled inference workflow on very large out-of-core fields
 python -m src.inference_from_session \

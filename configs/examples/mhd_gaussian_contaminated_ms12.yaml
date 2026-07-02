@@ -1,0 +1,32 @@
+# Config-driven masked-inference regression: MHD 2D with deterministic Gaussian contaminants, ms=1.2
+base_config: ../base_pyramid_scaleaware_convnext.yaml
+
+data:
+  data_root: data
+  npy_pattern: C12_Beta20_256_0060-rho.npy_slice.npy_sm_0.5_gaussian_contaminated.npy
+  num_samples: 200
+  d4_augment: true
+  cdd_constrained: true
+
+model:
+  mode: pyramid
+  model_key: cdd_scaleaware_convnext
+  cdd_constrained: true
+  mask_size_scaling: 1.2
+  sigmas: [2, 4, 8, 16, 32]
+  mask_box_hardcap: 48
+
+train:
+  epochs: 10
+  spread_regularizer:
+    type: std_hinge
+    target: context
+    spatial_mode: pooled
+    weight: 5.0
+    target_std: 1.0
+    eps: 0.0001
+  inference_max_diagnostic_size: 0
+  inference_tile_size: 0
+  force_recompute_inference: true
+  inference_discard_margin: auto
+  viz_crop_border: false

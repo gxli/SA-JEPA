@@ -457,14 +457,20 @@ class ScaleAwareJEPA:
         output_html: Optional[str] = None,
         lo_pct: float = 1.0,
         hi_pct: float = 99.0,
+        similarity_npy: Optional[str] = None,
+        display_label: str = "umap",
+        similarity_label: Optional[str] = None,
     ) -> str:
-        """Build a self-contained click-to-similarity HTML from a UMAP XYZ .npy.
+        """Build a self-contained click-to-similarity HTML from latent maps.
 
         Args:
-            input_npy: path to a (3,H,W) or (H,W,3) UMAP embedding .npy file.
+            input_npy: path to a display embedding .npy file.
             output_html: output .html path (default: input_npy with .html extension).
             lo_pct: lower percentile for RGB scaling.
             hi_pct: upper percentile for RGB scaling.
+            similarity_npy: optional latent map used for cosine similarity.
+            display_label: label for the displayed RGB embedding.
+            similarity_label: label for the similarity embedding.
 
         Returns:
             path to the generated HTML file.
@@ -473,54 +479,110 @@ class ScaleAwareJEPA:
         from pathlib import Path
         in_path = Path(input_npy)
         out_path = Path(output_html) if output_html else in_path.with_suffix(".html")
-        html_path = build_html(in_path, out_path, lo_pct, hi_pct)
+        html_path = build_html(
+            in_path,
+            out_path,
+            lo_pct,
+            hi_pct,
+            similarity_input_path=Path(similarity_npy) if similarity_npy else None,
+            display_label=display_label,
+            similarity_label=similarity_label,
+        )
         return str(html_path)
 
-    def open_dashboard(self) -> str:
-        """Open the session dashboard in a browser.  Returns the file path."""
+    def open_dashboard(self, model: str = "full") -> str:
+        """Open the session dashboard in a browser. Returns the file path.
+
+        ``model`` selects the right-hand latent panels: ``"full"`` (raw latent,
+        default), ``"pca"``, or ``"umap"``. UMAP mode requires a real UMAP
+        backend and will fail rather than writing a PCA fallback dashboard.
+        """
         if self._session_dir is None:
             raise RuntimeError("No session. Call fit() or load_session() first.")
         import webbrowser
         dash = os.path.join(self._session_dir, "dashboard.html")
         if not os.path.exists(dash):
-            self.generate_dashboard()
+            self.generate_dashboard(model=model)
         if os.path.exists(dash):
             webbrowser.open(f"file://{dash}")
         return dash
 
-    def open_interactive_umap(self, branch: str = "predict") -> str:
-        """Open an interactive click-to-similarity UMAP in a browser.
+    def open_interactive_dashboard(
+        self,
+        branch: str = "predict",
+        display: str = "umap",
+        similarity: str = "full",
+    ) -> str:
+        """Open an interactive click-to-similarity latent dashboard.
 
-        *branch* can be ``"predict"``, ``"target"``, or ``"context"``.
+        ``display`` selects the RGB image basis: ``"umap"``, ``"pca"``, or
+        ``"full"``/``"full_latent"``. ``similarity`` selects the cosine
+        similarity basis and defaults to the original full latent vector.
         Returns the path to the generated HTML file.
         """
         if self._session_dir is None:
             raise RuntimeError("No session. Call fit() or load_session() first.")
         import webbrowser
         results = os.path.join(self._session_dir, "results")
-        npy = os.path.join(results, f"{branch}_umap_xyz.npy")
-        if not os.path.exists(npy):
-            npy = os.path.join(results, "predict_umap_xyz.npy")
-        if not os.path.exists(npy):
-            raise FileNotFoundError(f"No UMAP file found in {results}")
-        html = os.path.join(results, f"interactive_umap_{branch}.html")
-        self.save_interactive_umap(npy, html)
+        def _norm(value: str) -> str:
+            v = str(value).strip().lower()
+            if v in {"latent", "raw", "32d", "full_latent"}:
+                return "full"
+            return v
+
+        def _artifact(kind: str) -> tuple[str, str]:
+            kind = _norm(kind)
+            if kind == "umap":
+                suffix, label = "umap_xyz", "umap"
+            elif kind == "pca":
+                suffix, label = "pca_xyz", "pca"
+            elif kind == "full":
+                suffix, label = "latent_vectors_full", "full_latent"
+            else:
+                raise ValueError(f"Unsupported interactive embedding {kind!r}; expected umap, pca, or full")
+            path = os.path.join(results, f"{branch}_{suffix}.npy")
+            if not os.path.exists(path):
+                path = os.path.join(results, f"predict_{suffix}.npy")
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"No {label} artifact found for branch={branch!r} in {results}")
+            return path, label
+
+        display_npy, display_label = _artifact(display)
+        similarity_npy, similarity_label = _artifact(similarity)
+        html = os.path.join(results, f"interactive_{display_label}_display_{similarity_label}_similarity_{branch}.html")
+        self.save_interactive_umap(
+            display_npy,
+            html,
+            similarity_npy=similarity_npy,
+            display_label=display_label,
+            similarity_label=similarity_label,
+        )
         webbrowser.open(f"file://{html}")
         return html
 
-    def generate_dashboard(self, output_path: Optional[str] = None):
+    def open_interactive_umap(self, branch: str = "predict", similarity: str = "full") -> str:
+        """Open an interactive UMAP-display dashboard.
+
+        Similarity defaults to the original full latent vector; pass
+        ``similarity="umap"`` for legacy 3D-UMAP cosine behavior.
+        """
+        return self.open_interactive_dashboard(branch=branch, display="umap", similarity=similarity)
+
+    def generate_dashboard(self, output_path: Optional[str] = None, model: str = "full"):
         """Generate interactive HTML dashboard from the current session.
 
         If session already has dash artifacts (from post-training inference),
-        uses those.  Otherwise falls back to session_to_dash.py.
+        uses those. Otherwise falls back to session_to_dash.py. ``model`` is
+        ``"full"`` (default), ``"pca"``, or ``"umap"`` for the right-hand latent
+        panels.
         """
         if self._session_dir is None:
             raise RuntimeError("No session. Call fit() or load_session() first.")
+        dashboard_model = str(model).strip().lower()
         try:
-            self._ensure_inference_umap_artifacts()
             from src.dashboard import compute_dash_data, plot_dash
-            compute_dash_data(self._session_dir, overwrite=False)
-            plot_dash(self._session_dir, overwrite=False)
+            compute_dash_data(self._session_dir, overwrite=False, model=dashboard_model)
+            plot_dash(self._session_dir, overwrite=False, model=dashboard_model)
             dash = os.path.join(self._session_dir, "dashboard.html")
             if output_path and os.path.exists(dash):
                 import shutil
@@ -528,6 +590,8 @@ class ScaleAwareJEPA:
                     shutil.copy2(dash, output_path)
             print(f"[sajepa] dashboard: {output_path or dash}")
         except Exception as e:
+            if dashboard_model == "umap":
+                raise
             print(f"[sajepa] dashboard failed ({type(e).__name__}), generating minimal dashboard...")
             _generate_minimal_dashboard(self._session_dir, output_path)
 

@@ -36,6 +36,7 @@ class JEPADataset(Dataset):
         cdd_cache: dict | None = None,
         crop_min_valid_fraction: float = 0.0,
         cdd_use_log: bool = False,
+        return_metadata: bool = False,
     ):
         self.input_type = str(input_type).lower()
         allowed_input_types = {"image", "cube", "image_batch"}
@@ -65,6 +66,7 @@ class JEPADataset(Dataset):
         self.d4_augment = bool(d4_augment)
         self.cdd_cache = cdd_cache or None
         self.cdd_use_log = bool(cdd_use_log)
+        self.return_metadata = bool(return_metadata)
         self.crop_min_valid_fraction = float(crop_min_valid_fraction) if crop_min_valid_fraction is not None else 0.0
 
         pattern = os.path.join(data_root, npy_pattern)
@@ -288,23 +290,36 @@ class JEPADataset(Dataset):
     def _normalize01(arr: np.ndarray) -> np.ndarray:
         return normalize01(arr)
 
-    def _apply_augmentations(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def _apply_augmentations(self, *tensors: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], dict]:
         """Apply d4 flips to all tensors identically. Shared by both data paths."""
+        meta = {
+            "rot_k": 0,
+            "flip_y": False,
+            "flip_x": False,
+            "pre_aug_h": int(tensors[0].shape[-2]) if tensors else 0,
+            "pre_aug_w": int(tensors[0].shape[-1]) if tensors else 0,
+        }
         if not tensors:
-            return tensors
+            return tensors, meta
         if self.d4_augment:
             h, w = tensors[0].shape[-2], tensors[0].shape[-1]
             if h == w:
                 k = int(self.rng.integers(0, 4))
+                meta["rot_k"] = k
                 if k:
                     tensors = tuple(torch.rot90(t, k=k, dims=(-2, -1)) for t in tensors)
                 if bool(self.rng.integers(0, 2)):
+                    meta["flip_x"] = True
                     tensors = tuple(torch.flip(t, dims=(-1,)) for t in tensors)
             elif bool(self.rng.integers(0, 2)):
+                meta["flip_y"] = True
                 tensors = tuple(torch.flip(t, dims=(-2,)) for t in tensors)
             if h != w and bool(self.rng.integers(0, 2)):
+                meta["flip_x"] = True
                 tensors = tuple(torch.flip(t, dims=(-1,)) for t in tensors)
-        return tensors
+        meta["post_aug_h"] = int(tensors[0].shape[-2])
+        meta["post_aug_w"] = int(tensors[0].shape[-1])
+        return tensors, meta
 
     def __len__(self):
         return self.num_samples
@@ -348,14 +363,30 @@ class JEPADataset(Dataset):
                     break
                 if attempt == max_retries - 1:
                     break
-            cdd_orig, x_clean = self._apply_augmentations(cdd_cropped, x_clean)
+            (cdd_orig, x_clean), aug_meta = self._apply_augmentations(cdd_cropped, x_clean)
+            if self.return_metadata:
+                if crop is None:
+                    cy0 = cx0 = 0
+                else:
+                    cy0, cx0 = int(crop[0].start), int(crop[1].start)
+                aug_meta.update({
+                    "full_h": int(x_clean_full.shape[-2]),
+                    "full_w": int(x_clean_full.shape[-1]),
+                    "crop_y0": cy0,
+                    "crop_x0": cx0,
+                })
+                return cdd_orig, x_clean, aug_meta
             return cdd_orig, x_clean
 
         path, forced_slice_idx = key
         max_retries = 100
         for attempt in range(max_retries):
             sample = self._load_sample(path, forced_slice_idx=forced_slice_idx).clone()  # 1 x H x W
-            sample = self._crop_tensor(sample)
+            full_h, full_w = int(sample.shape[-2]), int(sample.shape[-1])
+            crop = self._crop_slices(full_h, full_w)
+            if crop is not None:
+                crop_y, crop_x = crop
+                sample = sample[..., crop_y, crop_x]
             if self.crop_min_valid_fraction > 0.0 and self.crop_mode == "random":
                 arr = sample.squeeze(0).numpy()
                 finite_nonzero = np.isfinite(arr) & (arr > 1e-8)
@@ -365,5 +396,17 @@ class JEPADataset(Dataset):
                 break
             if attempt == max_retries - 1:
                 break  # accept anyway after max retries
-        (sample,) = self._apply_augmentations(sample)
+        (sample,), aug_meta = self._apply_augmentations(sample)
+        if self.return_metadata:
+            if crop is None:
+                cy0 = cx0 = 0
+            else:
+                cy0, cx0 = int(crop[0].start), int(crop[1].start)
+            aug_meta.update({
+                "full_h": full_h,
+                "full_w": full_w,
+                "crop_y0": cy0,
+                "crop_x0": cx0,
+            })
+            return sample, aug_meta
         return sample

@@ -159,7 +159,7 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.inference_tta_mode` | `flip4` | TTA view set: `flip4`, `rot4`, `d4`. |
 | `train.inference_discard_margin` | FOV/2 | Border pixels discarded during inference. Set to `0` for full-image presentation. |
 | `train.force_recompute_inference` | `false` | Re-run inference even if `inference_outputs.pt` exists. |
-| `train.post_training_artifacts` | `true` | Generate PCA/UMAP embeddings after training. |
+| `train.post_training_artifacts` | `false` | Generate legacy PCA/UMAP embedding artifacts inside the training process. Keep this off for large sessions; regenerate dashboards after training from `inference_outputs.pt`. |
 
 ## 8. Diagnostics & Visualization
 
@@ -173,6 +173,8 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.umap.l2_normalize` | `false` | L2-normalize latent features before UMAP. |
 | `train.umap.n_neighbors` | `50` | UMAP neighborhood size. |
 | `train.umap.min_dist` | `0.2` | UMAP minimum embedding distance. |
+| `train.umap.fit_max_tokens` | `12000` | Maximum points fit by strict dashboard UMAP before batched transform. Raise only on machines with enough RAM. |
+| `train.umap.transform_batch` | `8192` | Batch size for transforming non-fit points through strict dashboard UMAP. |
 | `train.umap.volumetric_max_points` | `100000` | Absolute cap for 3D volumetric UMAP points from the inferred slice/slab/volume extent. There is no fraction-sampling knob; all valid inferred voxels are used until this cap is reached. |
 
 Embedding artifacts reject invalid inputs before PCA/UMAP. Rows outside the
@@ -181,6 +183,12 @@ written as `NaN` in saved PCA/UMAP coordinate maps. Dashboard code should render
 those saved NaNs; it should not repair colorful borders after the fact.
 
 On macOS non-CUDA runs, CPU `umap-learn` is disabled by default because the
-native dependency stack can hang during import. In that case embedding artifact
-generation writes PCA coordinates into the UMAP artifact files as a dashboard
-fallback. Set `SAJEPA_ENABLE_CPU_UMAP=1` to force CPU UMAP.
+native dependency stack can hang during import. `torchdr` UMAP is also opt-in
+(`SAJEPA_ENABLE_TORCHDR_UMAP=1`) because it can allocate heavily and has failed
+on some local environments. Use the strict session dashboard
+`scripts/session_to_dash.py --model umap` with `DASHBOARD_UMAP_PYTHON` for real
+UMAP dashboards; it fails loudly instead of writing PCA-as-UMAP.
+The strict dashboard additionally refuses UMAP fits above
+`DASHBOARD_UMAP_MAX_FIT_TOKENS` (`20000`) unless
+`DASHBOARD_UMAP_ALLOW_LARGE_FIT=1` is set, because full 65k-point local UMAP can
+consume tens of GB of RAM.

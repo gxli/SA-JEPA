@@ -97,13 +97,51 @@ def test_dashboard_does_not_compute_umap_by_default(tmp_path):
 
     data = np.load(dash_npz)
     assert np.isfinite(data["pred_pca3d"]).all()
-    assert not np.isfinite(data["pred_umap3d"]).any()
+    assert str(np.asarray(data["dashboard_model"]).reshape(-1)[0]) == "full"
+    assert np.isfinite(data["pred_umap3d"]).all()
+    np.testing.assert_allclose(data["pred_umap3d"], data["pred_full_latent3d"])
 
     html_path = dashboard.plot_dash_html(str(session_dir), overwrite=True)
     html = html_path and (session_dir / "dashboard.html").read_text(encoding="utf-8")
     assert "Predict PCA RGB" in html
-    assert "Predict UMAP RGB" in html
-    assert "Predict UMAP 3D Scatter" in html
+    assert "Predict Full Latent RGB" in html
+    assert "Predict Full Latent 3D Scatter" in html
+
+
+def test_umap_dashboard_recomputes_pca_from_same_slice_latents(tmp_path):
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    results_dir = session_dir / "results"
+    results_dir.mkdir()
+    outputs = {
+        "x_clean": torch.ones(1, 1, 8, 8),
+        "x_context": torch.ones(1, 1, 8, 8),
+        "pred_map": torch.randn(1, 4, 4, 4),
+        "gt_map": torch.randn(1, 4, 4, 4),
+        "context_map": torch.randn(1, 4, 4, 4),
+        "target_locations": torch.tensor([[[0, 0], [7, 7]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True, True]]),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+    np.save(results_dir / "predict_pca_xyz.npy", np.full((3, 4, 4), 123.0, dtype=np.float32))
+
+    old_external_umap = dashboard._compute_external_umap_nd
+    dashboard._compute_external_umap_nd = lambda x, **_kwargs: x[:, :3].astype("float32")
+    try:
+        dash_npz = dashboard.compute_dash_data(str(session_dir), overwrite=True, model="umap")
+    finally:
+        dashboard._compute_external_umap_nd = old_external_umap
+
+    with np.load(dash_npz) as data:
+        assert str(np.asarray(data["dashboard_model"]).reshape(-1)[0]) == "umap"
+        assert data["pred_pca3d"].shape == data["pred_umap3d"].shape == (16, 3)
+        assert not np.allclose(data["pred_pca3d"], 123.0, equal_nan=True)
+        np.testing.assert_allclose(
+            data["pred_full_latent3d"][:, :3],
+            outputs["pred_map"][0].permute(1, 2, 0).reshape(-1, 4).numpy()[:, :3],
+        )
 
 
 def test_dashboard_keeps_total_only_loss_history(tmp_path):
@@ -137,6 +175,37 @@ def test_dashboard_keeps_total_only_loss_history(tmp_path):
     assert html_path.endswith("dashboard.html")
     assert "Active Loss Terms (Weighted)" in html
     assert "loss_total" in html
+
+
+def test_dashboard_omits_blank_rank_cards_when_rank_data_missing(tmp_path):
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    outputs = {
+        "x_clean": torch.ones(1, 1, 4, 4),
+        "x_context": torch.ones(1, 1, 4, 4),
+        "pred_map": torch.randn(1, 4, 4, 4),
+        "gt_map": torch.randn(1, 4, 4, 4),
+        "context_map": torch.randn(1, 4, 4, 4),
+        "target_locations": torch.tensor([[[1, 1]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True]]),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+
+    old_umap = dashboard._compute_umap_nd
+    dashboard._compute_umap_nd = lambda x, **_kwargs: x[:, :3].astype("float32")
+    try:
+        dashboard.plot_dash_html(str(session_dir), overwrite=True)
+    finally:
+        dashboard._compute_umap_nd = old_umap
+
+    html = (session_dir / "dashboard.html").read_text(encoding="utf-8")
+    assert "Manifold Diagnostics" in html
+    assert "Rank Energy Concentration" in html
+    assert "Rank Energy Top-k" in html
+    assert 'data-group="eff-rank"' in html
+    assert "effective_rank=not computed" not in html
 
 
 def test_dashboard_target_mask_map_does_not_clip_energy_or_visit_panels(tmp_path):
@@ -205,6 +274,99 @@ def test_dashboard_keeps_full_field_visit_frequency_for_cropped_sample(tmp_path)
     data = np.load(dash_npz)
     assert data["visit_heatmap"].shape == (8, 8)
     assert data["visit_heatmap"][7, 7] == 3.0
+
+
+def test_dashboard_target_coverage_takes_priority_over_tile_coverage(tmp_path):
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    outputs = {
+        "x_clean": torch.ones(1, 1, 4, 4),
+        "x_context": torch.ones(1, 1, 4, 4),
+        "pred_map": torch.randn(1, 4, 4, 4),
+        "gt_map": torch.randn(1, 4, 4, 4),
+        "context_map": torch.randn(1, 4, 4, 4),
+        "target_locations": torch.tensor([[[1, 1]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True]]),
+        "tile_visit_map": torch.full((4, 4), 9.0),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+    np.savez_compressed(session_dir / "tile_visit_map.npz", arr=np.full((4, 4), 9.0, dtype=np.float32))
+    target_visits = np.zeros((4, 4), dtype=np.float32)
+    target_visits[2, 3] = 5.0
+    np.savez_compressed(session_dir / "visited_target_frequency.npz", arr=target_visits)
+
+    old_umap = dashboard._compute_umap_nd
+    dashboard._compute_umap_nd = lambda x, **_kwargs: x[:, :3].astype("float32")
+    try:
+        dash_npz = dashboard.compute_dash_data(str(session_dir), overwrite=True)
+    finally:
+        dashboard._compute_umap_nd = old_umap
+
+    data = np.load(dash_npz)
+    assert str(data["visit_heatmap_kind"]) == "Target Coverage Heatmap"
+    np.testing.assert_array_equal(data["visit_heatmap"], target_visits)
+
+
+def test_dashboard_visit_heatmap_respects_configured_zero_invalid_region(tmp_path):
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    x_clean = torch.zeros(1, 1, 4, 4)
+    x_clean[:, :, :2, :2] = 1.0
+    outputs = {
+        "x_clean": x_clean,
+        "x_context": x_clean.clone(),
+        "pred_map": torch.randn(1, 4, 4, 4),
+        "gt_map": torch.randn(1, 4, 4, 4),
+        "context_map": torch.randn(1, 4, 4, 4),
+        "target_locations": torch.tensor([[[0, 0], [3, 3]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True, True]]),
+        "target_energy_map": torch.ones(1, 1, 4, 4),
+        "target_energy_count_map": torch.ones(1, 1, 4, 4),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+    (session_dir / "config_used.json").write_text(
+        '{"model":{"target_invalid_region_skip":true,"target_invalid_region_values":[0,"nan"]}}',
+        encoding="utf-8",
+    )
+
+    dash_npz = dashboard.compute_dash_data(str(session_dir), overwrite=True)
+    data = np.load(dash_npz)
+    assert data["visit_heatmap"][0, 0] == 1.0
+    assert data["visit_heatmap"][3, 3] == 0.0
+    assert data["energy_map"][3, 3] == 0.0
+    assert data["target"][3, 3] == 0.0
+
+
+def test_dashboard_does_not_invent_zero_mask_when_config_allows_zero_targets(tmp_path):
+    from src import dashboard
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    x_clean = torch.zeros(1, 1, 4, 4)
+    outputs = {
+        "x_clean": x_clean,
+        "x_context": x_clean.clone(),
+        "pred_map": torch.randn(1, 4, 4, 4),
+        "gt_map": torch.randn(1, 4, 4, 4),
+        "context_map": torch.randn(1, 4, 4, 4),
+        "target_locations": torch.tensor([[[3, 3]]], dtype=torch.long),
+        "target_valid": torch.tensor([[True]]),
+        "target_energy_count_map": torch.ones(1, 1, 4, 4),
+    }
+    torch.save(outputs, session_dir / "inference_outputs.pt")
+    (session_dir / "config_used.json").write_text(
+        '{"model":{"target_invalid_region_skip":false,"target_invalid_region_values":[0,"nan"]}}',
+        encoding="utf-8",
+    )
+
+    dash_npz = dashboard.compute_dash_data(str(session_dir), overwrite=True)
+    data = np.load(dash_npz)
+    assert data["visit_heatmap"][3, 3] == 1.0
+    assert data["target"][3, 3] == 1.0
 
 
 def test_dashboard_ignores_stale_masked_predict_pca_artifact(tmp_path):
@@ -338,8 +500,8 @@ def test_dashboard_warns_when_inference_tensors_contain_nan(tmp_path):
 
     html = (session_dir / "dashboard.html").read_text(encoding="utf-8")
     assert html_path.endswith("dashboard.html")
-    assert "Numerical health warning" in html
-    assert "masked_pred_map: nonfinite" in html
+    assert "Numerical health warning" not in html
+    assert "masked_pred_map: nonfinite" not in html
 
 
 def test_dashboard_warns_when_masked_predict_pca_collapses(tmp_path):
@@ -368,8 +530,8 @@ def test_dashboard_warns_when_masked_predict_pca_collapses(tmp_path):
 
     html = (session_dir / "dashboard.html").read_text(encoding="utf-8")
     assert html_path.endswith("dashboard.html")
-    assert "masked_pred_map: COLLAPSED latent map" in html
-    assert "masked_pred_pca3d: COLLAPSED embedding" in html
+    assert "masked_pred_map: COLLAPSED latent map" not in html
+    assert "masked_pred_pca3d: COLLAPSED embedding" not in html
 
 
 def test_dashboard_places_latent_norm_after_embedding_pairs(tmp_path):
@@ -397,9 +559,9 @@ def test_dashboard_places_latent_norm_after_embedding_pairs(tmp_path):
         dashboard._compute_umap_nd = old_umap
 
     html = (session_dir / "dashboard.html").read_text(encoding="utf-8")
-    assert html.index('data-group="context-pca"') < html.index('data-group="context-umap"')
-    assert html.index('data-group="context-umap"') < html.index('data-group="masked_pred-pca"')
-    assert html.index('data-group="gt-umap"') < html.index('data-group="context-latent-norm"')
+    assert html.index('data-group="context-pca"') < html.index('data-group="context-full-latent"')
+    assert html.index('data-group="context-full-latent"') < html.index('data-group="masked_pred-pca"')
+    assert html.index('data-group="gt-full-latent"') < html.index('data-group="context-latent-norm"')
 
 
 def test_inference_target_map_is_centers_not_mask_boxes():

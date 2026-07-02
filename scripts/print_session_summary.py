@@ -132,6 +132,34 @@ def _read_effective_rank(session_dir: str) -> str:
     return ""
 
 
+def _ensure_rank_diagnostics(session_dir: str) -> None:
+    rank_path = os.path.join(session_dir, "rank_diagnostics.json")
+    erank_path = os.path.join(session_dir, "effective_rank.txt")
+    have_rank = os.path.exists(rank_path)
+    have_erank = os.path.exists(erank_path) and bool(_read_effective_rank(session_dir).strip())
+    if have_rank and have_erank:
+        return
+    inf_path = os.path.join(session_dir, "inference_outputs.pt")
+    if not os.path.exists(inf_path):
+        return
+    try:
+        import torch
+        from src.diagnostics import rank_dashboard
+
+        outputs = torch.load(inf_path, map_location="cpu")
+        diag = rank_dashboard(outputs)
+        if not have_rank:
+            with open(rank_path, "w", encoding="utf-8") as f:
+                json.dump(diag, f, indent=2, sort_keys=True)
+        if not have_erank:
+            gt_erank = float(diag.get("gt", {}).get("erank", float("nan")))
+            if math.isfinite(gt_erank):
+                with open(erank_path, "w", encoding="utf-8") as f:
+                    f.write(f"{gt_erank:.8f}\n")
+    except Exception:
+        return
+
+
 def _read_loss_ratios(session_dir: str) -> dict[str, str]:
     path = os.path.join(session_dir, "metrics.csv")
     if not os.path.exists(path):
@@ -237,6 +265,7 @@ def rank_summary(session_dirs: List[str], prefix: str = "") -> List[Tuple[str, .
         name = os.path.basename(path.rstrip("/"))
         if prefix and not name.startswith(prefix):
             continue
+        _ensure_rank_diagnostics(path)
         rank = _read_effective_rank(path)
         inputs = _read_model_inputs(path)
         diag = _read_rank_diag(path)
