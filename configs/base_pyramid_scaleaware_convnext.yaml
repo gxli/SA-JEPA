@@ -86,9 +86,13 @@ train:
   inference_tta_enabled: false
   inference_tta_mode: flip4
   compute_effective_rank: true
+  post_training_artifacts: true
   umap:
     metric: euclidean
     standardize: true
     l2_normalize: false
     n_neighbors: 50
     min_dist: 0.2
+    save_umap_weights: true
+    reuse_umap_weights: true
+    transform_batch: 8192

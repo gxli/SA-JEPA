@@ -1111,7 +1111,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False, model: str | No
         (h, w),
     )
     if target_loc_heatmap is None:
-        target_loc_heatmap = target.copy()
+        target_loc_heatmap = np.zeros((h, w), dtype=np.float32)
+        target_loc_heatmap_kind = "Target Location Heatmap Unavailable"
+    else:
+        target_loc_heatmap_kind = "Target Location Heatmap"
     target_loc_heatmap = np.where(display_valid_target_mask, target_loc_heatmap, 0.0).astype(np.float32)
 
     energy_map = _extract_hw_map(outputs, ("target_energy_map",), (h, w))
@@ -1152,6 +1155,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False, model: str | No
             visit_heatmap_kind = "Target Energy Coverage Heatmap"
     else:
         visit_heatmap = np.zeros((h, w), dtype=np.float32)
+        visit_heatmap_kind = "Target Coverage Unavailable"
     if visit_heatmap.shape == display_valid_target_mask.shape:
         visit_heatmap = np.where(display_valid_target_mask, visit_heatmap, 0.0).astype(np.float32)
 
@@ -1739,6 +1743,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False, model: str | No
         blurred=blurred,
         target=target.astype(np.float32),
         target_loc_heatmap=target_loc_heatmap.astype(np.float32),
+        target_loc_heatmap_kind=np.asarray(target_loc_heatmap_kind),
         energy_map=energy_map.astype(np.float32),
         visit_heatmap=visit_heatmap.astype(np.float32),
         visit_heatmap_kind=np.asarray(visit_heatmap_kind),
@@ -2835,22 +2840,31 @@ def plot_dash_html(session_dir: str, overwrite: bool = False, model: str | None 
         [
             {"title": "Energy Distribution", "fig": fig_energy_dist, "group": "energy-dist"},
             {"title": "Target Locations", "fig": heat("Target Locations", data["target"], "Magma"), "group": "target-loc", "raw_png": _raw_png_data_url(data["target"])},
-            {"title": "Target Location Heatmap", "fig": heat("Target Location Heatmap", data["target_loc_heatmap"], "Magma"), "group": "target-heat", "raw_png": _raw_png_data_url(data["target_loc_heatmap"])},
             {"title": "Energy Map (Masked Predict - Target)", "fig": heat("Energy Map (Masked Predict - Target)", data["energy_map"], "Inferno"), "group": "energy", "raw_png": _raw_png_data_url(data["energy_map"])},
-            {
-                "title": str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap",
-                "fig": heat(
-                    f"{str(data['visit_heatmap_kind']) if 'visit_heatmap_kind' in data.files else 'Visit Frequency Heatmap'} (log1p, zero=NaN)",
-                    data["visit_heatmap"],
-                    "Cividis",
-                    percentile_scale=False,
-                    log1p_nonzero_nan=True,
-                ),
-                "group": "visit",
-                "raw_png": _raw_png_data_url(data["visit_heatmap"]),
-            },
         ]
     )
+    target_loc_heatmap_kind = str(data["target_loc_heatmap_kind"]) if "target_loc_heatmap_kind" in data.files else "Target Location Heatmap"
+    if "Unavailable" not in target_loc_heatmap_kind:
+        cards.append({
+            "title": target_loc_heatmap_kind,
+            "fig": heat(target_loc_heatmap_kind, data["target_loc_heatmap"], "Magma"),
+            "group": "target-heat",
+            "raw_png": _raw_png_data_url(data["target_loc_heatmap"]),
+        })
+    visit_title = str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap"
+    if "Unavailable" not in visit_title:
+        cards.append({
+            "title": visit_title,
+            "fig": heat(
+                f"{visit_title} (log1p, zero=NaN)",
+                data["visit_heatmap"],
+                "Cividis",
+                percentile_scale=False,
+                log1p_nonzero_nan=True,
+            ),
+            "group": "visit",
+            "raw_png": _raw_png_data_url(data["visit_heatmap"]),
+        })
     if model_mode in ("pyramid", "3d_slab") and "pyramid_mask_stack" in data.files:
         cards.append(
             {
@@ -3605,13 +3619,18 @@ def plot_dash_html(session_dir: str, overwrite: bool = False, model: str | None 
             f"{'same' if umap_equals_pca else 'different'} "
             f"(relative_l2_diff={rel_diff:.6g})"
         )
-    for title, key in (
+    summary_items = [
         ("Input (Log-Norm)", "orig"),
         ("Target Locations", "target"),
-        ("Target Location Heatmap", "target_loc_heatmap"),
         ("Energy Map", "energy_map"),
-        (str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap", "visit_heatmap"),
-    ):
+    ]
+    target_loc_heatmap_kind = str(data["target_loc_heatmap_kind"]) if "target_loc_heatmap_kind" in data.files else "Target Location Heatmap"
+    if "Unavailable" not in target_loc_heatmap_kind:
+        summary_items.append((target_loc_heatmap_kind, "target_loc_heatmap"))
+    visit_title = str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap"
+    if "Unavailable" not in visit_title:
+        summary_items.append((visit_title, "visit_heatmap"))
+    for title, key in summary_items:
         finite = int(np.isfinite(np.asarray(data[key])).sum())
         print(f"dashboard_plot_item={title}: {'ok' if finite > 0 else 'empty'} (finite_pixels={finite})")
     print(f"dashboard_plot_summary_end session={session_dir} out_html={out_html}")
@@ -3675,7 +3694,7 @@ def _preferred_html_for_export(session_dir: str, fallback_html: str) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Build dashboards from existing sessions")
     parser.add_argument("--sessions-dir", type=str, default="sessions")
-    parser.add_argument("--export-dir", type=str, default="results/dashboard")
+    parser.add_argument("--export-dir", type=str, default="sessions/results")
     parser.add_argument("--stage", type=str, choices=["compute", "plot", "all"], default="all")
     parser.add_argument(
         "--model",

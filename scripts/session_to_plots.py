@@ -47,7 +47,7 @@ def plot_session(metrics_path, out_dir):
 def main():
     parser = argparse.ArgumentParser(description="Convert session logs into result plots")
     parser.add_argument("--sessions-dir", type=str, default="sessions")
-    parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--results-dir", type=str, default="sessions/results")
     args = parser.parse_args()
 
     metrics_files = glob.glob(os.path.join(args.sessions_dir, "*", "metrics.csv"))

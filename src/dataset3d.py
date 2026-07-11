@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.dataset import resolve_input_files
 from src.utils.npy import _safe_load_npy, normalize01
 
 
@@ -25,6 +26,7 @@ class JEPA3DCropDataset(Dataset):
         self,
         data_root: str = "data",
         npy_pattern: str = "*.npy",
+        input_files=None,
         num_samples: int = 1000,
         crop_size: int = 64,
         crop_depth: int | None = None,
@@ -36,8 +38,7 @@ class JEPA3DCropDataset(Dataset):
         cdd_cache: dict | None = None,
         cdd_use_log: bool = False,
     ):
-        import glob
-        self.npy_files = sorted(glob.glob(os.path.join(data_root, npy_pattern)))
+        self.npy_files = [p for p in resolve_input_files(data_root=data_root, npy_pattern=npy_pattern, input_files=input_files) if p.endswith(".npy")]
         if not self.npy_files:
             raise FileNotFoundError(f"No .npy files found in {data_root}/{npy_pattern}")
 

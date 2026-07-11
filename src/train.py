@@ -22,7 +22,7 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-from src.dataset import JEPADataset
+from src.dataset import JEPADataset, resolve_input_files
 from src.dataset3d import JEPA3DCropDataset
 from src.diagnostics import (
     compute_effective_rank_from_features,
@@ -293,12 +293,13 @@ def _summarize_data_array(arr: np.ndarray) -> dict:
 
 
 def _write_data_profile(*, data_cfg: dict, session_dir: str, config_name: str) -> None:
-    import glob as _glob
-
-    pattern = os.path.join(data_cfg.get("data_root", "data"), data_cfg.get("npy_pattern", "*.npy"))
-    files = sorted(_glob.glob(pattern))
+    data_root = data_cfg.get("data_root", "data")
+    npy_pattern = data_cfg.get("npy_pattern", "*.npy")
+    pattern = os.path.join(data_root, npy_pattern)
+    files = resolve_input_files(data_root=data_root, npy_pattern=npy_pattern, input_files=data_cfg.get("input_files"))
     profile = {
         "pattern": pattern,
+        "input_files": data_cfg.get("input_files"),
         "crop_mode": str(data_cfg.get("crop_mode", "none")),
         "crop_size": data_cfg.get("crop_size"),
         "files": [],
@@ -480,8 +481,6 @@ def _precompute_cdd_cache(
     cache_replicas: int = 1,
 ) -> dict:
     """Pre-compute a bounded CDD decomposition cache on GPU, store in CPU RAM."""
-    import glob as _glob
-
     enabled = bool(data_cfg.get("cdd_precompute", True))
     if not enabled:
         log_info(f"[{config_name}] CDD precompute: disabled by data.cdd_precompute=false")
@@ -504,7 +503,10 @@ def _precompute_cdd_cache(
     model_num_scales = int(model_cfg.get("num_scales", expected_default_scales))
     if device.type not in ("cuda", "mps"):
         log_info(f"[{config_name}] CDD precompute: using CPU backend because device={device.type}")
-    npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
+    npy_files = [
+        p for p in resolve_input_files(data_root=data_root, npy_pattern=npy_pattern, input_files=data_cfg.get("input_files"))
+        if p.endswith((".npy", ".fits"))
+    ]
     if not npy_files:
         log_info(f"[{config_name}] CDD precompute: no files found for pattern, skipping")
         return {}
@@ -723,8 +725,10 @@ def _move_to_device(value, device: torch.device):
 
 def _target_mask_from_data_threshold(data_cfg: dict, threshold: float, config_name: str) -> torch.Tensor | None:
     """Build a full-frame valid-target mask from the configured input array."""
-    pattern = os.path.join(data_cfg.get("data_root", "data"), data_cfg.get("npy_pattern", "*.npy"))
-    paths = sorted(glob.glob(pattern))
+    data_root = data_cfg.get("data_root", "data")
+    npy_pattern = data_cfg.get("npy_pattern", "*.npy")
+    pattern = os.path.join(data_root, npy_pattern)
+    paths = resolve_input_files(data_root=data_root, npy_pattern=npy_pattern, input_files=data_cfg.get("input_files"))
     if not paths:
         log_info(f"[{config_name}] target_threshold mask skipped: no files for {pattern}")
         return None
@@ -788,6 +792,13 @@ def _clear_stale_dashboard_artifacts(session_dir: str) -> None:
                 os.remove(os.path.join(results_dir, name))
             except OSError:
                 pass
+
+
+def _input_inference_dir(session_dir: str, ordinal: int, sample_key) -> str:
+    path = sample_key[0] if isinstance(sample_key, (tuple, list)) and sample_key else str(sample_key)
+    stem = os.path.splitext(os.path.basename(str(path)))[0] or "input"
+    safe_stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)
+    return os.path.join(session_dir, "inference_inputs", f"{ordinal:03d}_{safe_stem}")
 
 
 class _MaskingCollator:
@@ -1402,57 +1413,6 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
     ).to(device)
 
 
-def _dump_movie_frame(
-    model,
-    movie_batch,
-    session_dir,
-    epoch,
-    batch_idx,
-    is_3d_mode,
-    device,
-    movie_context_data=None,
-    fixed_targets: bool = False,
-):
-    """Save a single movie frame (pred_map, gt_map, x_clean) for later rendering.
-
-    Returns updated movie_context_data.  When fixed_targets is false, the 2D
-    movie probe keeps the same image batch but resamples target masks per frame.
-    """
-    movie_dir = os.path.join(session_dir, "movie_frames")
-    os.makedirs(movie_dir, exist_ok=True)
-    frame_idx = len([f for f in os.listdir(movie_dir) if f.endswith(".pt")])
-    with torch.no_grad():
-        model.eval()
-        if isinstance(movie_batch, (tuple, list)):
-            mb = movie_batch[1] if movie_batch[1] is not None else movie_batch[0]
-        else:
-            mb = movie_batch
-        x_movie = mb.to(device, non_blocking=True)
-        if is_3d_mode:
-            x_movie = torch.nan_to_num(x_movie, nan=0.0, posinf=0.0, neginf=0.0)
-            out_m = model(x_movie)
-        else:
-            if (not bool(fixed_targets)) or movie_context_data is None:
-                movie_context_data = _prepare_context_from_model(model, x_movie, return_debug=False)
-            out_m = model(x_movie, context_data=movie_context_data)
-        frame = {
-            "pred_map": out_m["pred_map"][:1].detach().cpu(),
-            "gt_map": out_m["gt_map"][:1].detach().cpu(),
-            "x_clean": x_movie[:1].detach().cpu(),
-            "target_locations": out_m["target_locations"][:1].detach().cpu(),
-            "target_valid": out_m["target_valid"][:1].detach().cpu(),
-            "target_scales": out_m["target_scales"][:1].detach().cpu(),
-            "epoch": epoch,
-            "batch": batch_idx,
-            "movie_fixed_targets": bool(fixed_targets),
-        }
-        ctx = out_m.get("context_map")
-        if ctx is not None:
-            frame["context_map"] = ctx[:1].detach().cpu()
-        torch.save(frame, os.path.join(movie_dir, f"frame_{frame_idx:05d}.pt"))
-    return movie_context_data
-
-
 def run_training(config: dict, config_name: str, sessions_root: str = "sessions") -> str:
     reject_removed_config_aliases(config)
     _ensure_training_logging()
@@ -1845,10 +1805,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     image_batch_selected_indices = None
     image_batch_n_sample = data_cfg.get("image_batch_n_sample", None)
     if input_type == "image_batch" and image_batch_n_sample is not None:
-        import glob as _glob
         data_root = data_cfg.get("data_root", "data")
         npy_pattern = data_cfg.get("npy_pattern", "*.npy")
-        npy_files = sorted(_glob.glob(os.path.join(data_root, npy_pattern)))
+        npy_files = [
+            p for p in resolve_input_files(data_root=data_root, npy_pattern=npy_pattern, input_files=data_cfg.get("input_files"))
+            if p.endswith(".npy")
+        ]
         selected = {}
         sel_path = os.path.join(session_dir, "selected_slices.json")
         rng = random.Random(int(train_cfg.get("split_seed", 42)))
@@ -1941,6 +1903,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         dataset = JEPA3DCropDataset(
             data_root=data_cfg.get("data_root", "data"),
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+            input_files=data_cfg.get("input_files"),
             num_samples=int(data_cfg.get("num_samples", 2000)),
             crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
             crop_depth=crop_depth_3d,
@@ -1957,6 +1920,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         inference_dataset = JEPA3DCropDataset(
             data_root=data_cfg.get("data_root", "data"),
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+            input_files=data_cfg.get("input_files"),
             num_samples=max(1, int(train_cfg.get("inference_num_samples", 8))),
             crop_size=int(data_cfg.get("volume_crop_size", data_cfg.get("crop_size_3d", 64))),
             crop_depth=inference_crop_depth_3d,
@@ -1980,6 +1944,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             num_samples=data_cfg.get("num_samples", 2000),
             data_root=data_cfg.get("data_root", "data"),
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+            input_files=data_cfg.get("input_files"),
             cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
             cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
             cube_slice_index=data_cfg.get("cube_slice_index", 0),
@@ -1994,7 +1959,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
         val_fraction = float(train_cfg.get("val_fraction", 0.1))
         val_fraction = min(max(val_fraction, 0.0), 0.95)
-        total_idx = list(dataset.sample_index)
+        ordered_total_idx = list(dataset.sample_index)
+        total_idx = list(ordered_total_idx)
         split_seed = int(train_cfg.get("split_seed", 42))
         random.Random(split_seed).shuffle(total_idx)
         n_total = len(total_idx)
@@ -2015,6 +1981,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 num_samples=max(1, int(train_cfg.get("val_num_samples", max(16, int(0.25 * train_dataset.num_samples))))),
                 data_root=data_cfg.get("data_root", "data"),
                 npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+                input_files=data_cfg.get("input_files"),
                 cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
                 cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
                 cube_slice_index=data_cfg.get("cube_slice_index", 0),
@@ -2027,6 +1994,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
             )
             val_dataset.sample_index = val_idx
+    if is_3d_mode:
+        inference_sample_index = [(path, None) for path in getattr(inference_dataset, "npy_files", [])]
+    else:
+        inference_sample_index = list(ordered_total_idx)
     log_info(
         f"[{config_name}] Dataset split: total_index={n_total}, train_index={len(train_idx)}, "
         f"val_index={len(val_idx)}, val_fraction={val_fraction:.3f}"
@@ -2116,6 +2087,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             num_samples=train_dataset.num_samples,
             data_root=data_cfg.get("data_root", "data"),
             npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+            input_files=data_cfg.get("input_files"),
             cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
             cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
             cube_slice_index=data_cfg.get("cube_slice_index", 0),
@@ -2128,8 +2100,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             cdd_cache=cdd_cache,
             cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
         )
-        inference_dataset.sample_index = list(train_idx)
-        inference_dataset.num_samples = train_dataset.num_samples
+        inference_dataset.sample_index = inference_sample_index[:1] if inference_sample_index else list(train_idx[:1])
+        inference_dataset.num_samples = max(1, len(inference_dataset.sample_index))
     inference_loader = DataLoader(
         inference_dataset,
         batch_size=train_cfg.get("batch_size", 32),
@@ -2338,12 +2310,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             f.write("\n")
     if is_ddp:
         dist.barrier()
-
-    movie_dump_every_epoch = bool(train_cfg.get("movie_dump_every_epoch", False))
-    movie_dump_every_n_batches = int(train_cfg.get("movie_dump_every_n_batches", 0))
-    movie_fixed_targets = bool(train_cfg.get("movie_fixed_targets", False))
-    movie_batch = next(iter(inference_loader)) if (movie_dump_every_epoch or movie_dump_every_n_batches > 0) else None
-    movie_context_data = None
 
     model.train()
     start = time.time()
@@ -2676,21 +2642,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             epoch_context_manifold_size += ctx_stats["context_manifold_size"]
             epoch_batches += 1
 
-            # Per-N-batches movie frame dump (captures rapid early learning)
-            if is_main_process and movie_dump_every_n_batches > 0 and (batch_idx + 1) % movie_dump_every_n_batches == 0:
-                movie_context_data = _dump_movie_frame(
-                    model_without_ddp,
-                    movie_batch,
-                    session_dir,
-                    epoch + 1,
-                    batch_idx + 1,
-                    is_3d_mode,
-                    device,
-                    movie_context_data,
-                    fixed_targets=movie_fixed_targets,
-                )
-                model.train()
-
         # Only the main process writes files in DDP mode
         if is_main_process:
             if metrics_rows:
@@ -2780,21 +2731,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             os.replace(tmp_model, model_ckpt_path)
             tqdm.write(f"[{config_name}] ckpt_saved epoch={epoch + 1}")
 
-        # Per-epoch embedding snapshot for movie generation.
-        if is_main_process and movie_dump_every_epoch:
-            movie_context_data = _dump_movie_frame(
-                model_without_ddp,
-                movie_batch,
-                session_dir,
-                epoch + 1,
-                0,
-                is_3d_mode,
-                device,
-                movie_context_data,
-                fixed_targets=movie_fixed_targets,
-            )
-            model.train()
-
     if is_main_process:
         tmp_final = os.path.join(session_dir, "model_last.pt.tmp")
         torch.save(model_without_ddp.state_dict(), tmp_final)
@@ -2842,10 +2778,83 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 tile_overlap=train_cfg.get("inference_tile_overlap"),
                 inference_discard_margin=train_cfg.get("inference_discard_margin"),
             )
+            run_all_input_inference = bool(train_cfg.get("inference_all_inputs", bool(data_cfg.get("input_files"))))
+            if run_all_input_inference and len(inference_sample_index) > 1:
+                manifest = []
+                for ordinal, sample_key in enumerate(inference_sample_index):
+                    if ordinal == 0:
+                        manifest.append({
+                            "index": ordinal,
+                            "sample_key": list(sample_key),
+                            "output_dir": session_dir,
+                            "dashboard_source": True,
+                        })
+                        continue
+                    input_session_dir = _input_inference_dir(session_dir, ordinal, sample_key)
+                    os.makedirs(input_session_dir, exist_ok=True)
+                    if force_recompute_inference:
+                        _clear_stale_dashboard_artifacts(input_session_dir)
+                    input_dataset = JEPADataset(
+                        num_samples=1,
+                        data_root=data_cfg.get("data_root", "data"),
+                        npy_pattern=data_cfg.get("npy_pattern", "*.npy"),
+                        input_files=data_cfg.get("input_files"),
+                        cube_slice_strategy=data_cfg.get("cube_slice_strategy", "random"),
+                        cube_slice_axis=data_cfg.get("cube_slice_axis", 0),
+                        cube_slice_index=data_cfg.get("cube_slice_index", 0),
+                        crop_mode="none",
+                        crop_size=None,
+                        d4_augment=False,
+                        input_type=input_type,
+                        image_batch_inference=image_batch_inference,
+                        image_batch_selected_indices=image_batch_selected_indices,
+                        cdd_cache=cdd_cache,
+                        cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
+                    )
+                    input_dataset.sample_index = [sample_key]
+                    input_loader = DataLoader(
+                        input_dataset,
+                        batch_size=1,
+                        shuffle=False,
+                        num_workers=num_workers,
+                        pin_memory=pin_memory,
+                        persistent_workers=persistent_workers,
+                        collate_fn=_collate_for_inference,
+                        **loader_worker_kwargs,
+                    )
+                    run_post_training_inference(
+                        model=model_without_ddp,
+                        dataloader=input_loader,
+                        session_dir=input_session_dir,
+                        config_name=f"{config_name}/input{ordinal:03d}",
+                        visit_counts=None,
+                        force_recompute_inference=force_recompute_inference,
+                        inference_mask_passes=inference_mask_passes,
+                        mask_inference=dashboard_mask_inference,
+                        target_mask=target_mask,
+                        inference_mask_border=inference_mask_border,
+                        compute_jepa_energy_fn=compute_jepa_energy,
+                        compute_target_energy_map_fn=compute_target_energy_map,
+                        inference_tta_enabled=inference_tta_enabled,
+                        inference_tta_mode=inference_tta_mode,
+                        max_diagnostic_size=train_cfg.get("inference_max_diagnostic_size"),
+                        tile_size=train_cfg.get("inference_tile_size", train_cfg.get("full_volume_spatial_tile_size", 512)),
+                        tile_overlap=train_cfg.get("inference_tile_overlap"),
+                        inference_discard_margin=train_cfg.get("inference_discard_margin"),
+                    )
+                    manifest.append({
+                        "index": ordinal,
+                        "sample_key": list(sample_key),
+                        "output_dir": input_session_dir,
+                        "dashboard_source": False,
+                    })
+                with open(os.path.join(session_dir, "inference_inputs_manifest.json"), "w", encoding="utf-8") as f:
+                    json.dump({"inputs": manifest}, f, indent=2)
+                    f.write("\n")
     # Save NPY artifacts (PCA/UMAP/latent embeddings) required by session_to_dash.py.
     # No PNG, HTML, or dashboard rendering is performed here.
     inf_path = os.path.join(session_dir, "inference_outputs.pt")
-    post_training_artifacts = bool(train_cfg.get("post_training_artifacts", False))
+    post_training_artifacts = bool(train_cfg.get("post_training_artifacts", True))
     artifacts_exist = os.path.exists(os.path.join(session_dir, "rank_diagnostics.json")) and any(
         os.path.getsize(p) > 0 for p in glob.glob(os.path.join(session_dir, "results", "*_pca_*.npy"))
     ) if os.path.isdir(os.path.join(session_dir, "results")) else False

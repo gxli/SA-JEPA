@@ -631,13 +631,25 @@ def save_inference_session(
         outputs["x_clean"] = outputs["x_clean_raw"]
     if outputs.get("x_context") is None and outputs.get("x_context_raw") is not None:
         outputs["x_context"] = outputs["x_context_raw"]
+    if outputs.get("target_energy_map") is None:
+        pred = outputs.get("masked_pred_map", outputs.get("pred_map"))
+        target = outputs.get("gt_map")
+        if pred is not None and target is not None:
+            pred_t = torch.as_tensor(pred).detach().float().cpu()
+            target_t = torch.as_tensor(target).detach().float().cpu()
+            if pred_t.dim() == 5:
+                pred_t = pred_t[:, :, pred_t.shape[2] // 2]
+            if target_t.dim() == 5:
+                target_t = target_t[:, :, target_t.shape[2] // 2]
+            if pred_t.dim() == 4 and target_t.dim() == 4 and pred_t.shape == target_t.shape:
+                outputs["target_energy_map"] = (pred_t - target_t).pow(2).mean(dim=1, keepdim=True)
     torch.save(outputs, os.path.join(output_dir, "inference_outputs.pt"))
     # Save tile visit heatmap for tiled inference
     if tile_layout is not None and tile_layout.visit_map is not None:
         np.save(os.path.join(output_dir, "tile_visit_map.npy"), tile_layout.visit_map.astype(np.int32))
 
     # Save compressed NPZ maps and target metadata.
-    for key in ("pred_map", "masked_pred_map", "gt_map", "context_map", "target_locations", "target_scales", "target_valid"):
+    for key in ("pred_map", "masked_pred_map", "gt_map", "context_map", "target_locations", "target_scales", "target_valid", "target_energy_map"):
         val = outputs.get(key)
         if val is not None:
             _save_npz(os.path.join(output_dir, f"{key}.npz"), val.cpu().numpy() if hasattr(val, "cpu") else val)

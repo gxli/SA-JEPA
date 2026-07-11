@@ -409,6 +409,11 @@ class ScaleAwareJEPA:
             src = os.path.join(self._session_dir, name)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(path, name))
+        for name in os.listdir(self._session_dir):
+            if name.startswith("umap_weights_") and name.endswith(".pkl"):
+                src = os.path.join(self._session_dir, name)
+                if os.path.isfile(src):
+                    shutil.copy2(src, os.path.join(path, name))
         with open(os.path.join(path, "config.yaml"), "w") as f:
             yaml.dump(self._config, f, default_flow_style=False)
         print(f"[sajepa] session saved to {path}")

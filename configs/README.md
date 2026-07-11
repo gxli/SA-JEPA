@@ -13,6 +13,7 @@ and `cdd_scale_space` are rejected.
 |:----|:-------:|:------------|
 | `data.data_root` | `data` | Root directory for input `.npy` files. |
 | `data.npy_pattern` | `*.npy` | Glob pattern matching input files. |
+| `data.input_files` | — | Optional ordered list of files or glob patterns, resolved relative to `data.data_root` unless absolute. Training rotates across the resolved files; CDD cache is precomputed per resolved input. |
 | `data.input_type` | `image` | `image` (2D) or `cube` (3D volume). |
 | `data.num_samples` | `200` | Virtual dataset size (augmented views per epoch). |
 | `data.d4_augment` | `true` | Dihedral D4 augmentation (rotations + flips). |
@@ -159,7 +160,8 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.inference_tta_mode` | `flip4` | TTA view set: `flip4`, `rot4`, `d4`. |
 | `train.inference_discard_margin` | FOV/2 | Border pixels discarded during inference. Set to `0` for full-image presentation. |
 | `train.force_recompute_inference` | `false` | Re-run inference even if `inference_outputs.pt` exists. |
-| `train.post_training_artifacts` | `false` | Generate legacy PCA/UMAP embedding artifacts inside the training process. Keep this off for large sessions; regenerate dashboards after training from `inference_outputs.pt`. |
+| `train.inference_all_inputs` | `data.input_files` set | Run post-training inference for every resolved 2D input. Root `inference_outputs.pt` and dashboard artifacts use the first input; additional inputs are written under `inference_inputs/NNN_name/`. |
+| `train.post_training_artifacts` | `true` | Generate PCA/UMAP branch embedding artifacts from saved `inference_outputs.pt` after training. Set to `false` only for very large sessions where dashboard artifacts should be regenerated later. |
 
 ## 8. Diagnostics & Visualization
 
@@ -175,6 +177,8 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.umap.min_dist` | `0.2` | UMAP minimum embedding distance. |
 | `train.umap.fit_max_tokens` | `12000` | Maximum points fit by strict dashboard UMAP before batched transform. Raise only on machines with enough RAM. |
 | `train.umap.transform_batch` | `8192` | Batch size for transforming non-fit points through strict dashboard UMAP. |
+| `train.umap.save_umap_weights` | `true` | Save fitted branch UMAP transformers as `umap_weights_<branch>.pkl` in the session directory when embedding artifacts are generated. |
+| `train.umap.reuse_umap_weights` | `true` | In inference-only sessions, reuse fitted UMAP transformers from the source session so new crops land in comparable UMAP coordinates. |
 | `train.umap.volumetric_max_points` | `100000` | Absolute cap for 3D volumetric UMAP points from the inferred slice/slab/volume extent. There is no fraction-sampling knob; all valid inferred voxels are used until this cap is reached. |
 
 Embedding artifacts reject invalid inputs before PCA/UMAP. Rows outside the

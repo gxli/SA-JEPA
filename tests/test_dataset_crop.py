@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.dataset import JEPADataset
-from src.train import _inverse_augmented_yx_to_native
+from src.dataset import JEPADataset, resolve_input_files
+from src.train import _input_inference_dir, _inverse_augmented_yx_to_native
 
 
 def test_cdd_cache_crop_size_int_is_square_tuple(tmp_path):
@@ -72,3 +72,28 @@ def test_inverse_augmented_yx_to_native_undoes_d4_transform():
     }
 
     assert _inverse_augmented_yx_to_native(1, 2, meta) == (1, 2)
+
+
+def test_dataset_accepts_explicit_input_files_in_order(tmp_path):
+    first = tmp_path / "first.npy"
+    second = tmp_path / "second.npy"
+    np.save(first, np.ones((4, 4), dtype=np.float32))
+    np.save(second, np.ones((4, 4), dtype=np.float32) * 2)
+
+    files = resolve_input_files(data_root=str(tmp_path), input_files=["second.npy", "first.npy"])
+    dataset = JEPADataset(
+        num_samples=4,
+        data_root=str(tmp_path),
+        input_files=["second.npy", "first.npy"],
+    )
+
+    assert files == [str(second), str(first)]
+    assert dataset.sample_index == [(str(second), None), (str(first), None)]
+    assert tuple(dataset[0].shape) == (1, 4, 4)
+    assert tuple(dataset[1].shape) == (1, 4, 4)
+
+
+def test_input_inference_dir_is_stable_and_numbered(tmp_path):
+    out = _input_inference_dir(str(tmp_path), 3, ("/data/a weird:name.npy", None))
+
+    assert out.endswith("inference_inputs/003_a_weird_name")

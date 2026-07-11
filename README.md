@@ -390,7 +390,7 @@ python scripts/print_session_summary.py sessions/gen_*
 
 # Launch your structural interactive Plotly analytics dashboard.
 # --model full is default; use pca or umap for the right-hand latent panels.
-PYTHONPATH=. python scripts/session_to_dash.py --sessions-dir sessions --stage all --export-dir results/dashboard --model full
+PYTHONPATH=. python scripts/session_to_dash.py --sessions-dir sessions --stage all --export-dir sessions/results --model full
 
 # Execute a sliding-window tiled inference workflow on very large out-of-core fields
 python -m src.inference_from_session \
@@ -419,7 +419,7 @@ python -m src.inference_from_session \
 │   ├── train.py                                 # Core training terminal application interface
 │   ├── print_session_summary.py                 # Post-run evaluation summary calculator
 │   ├── session_to_dash.py                       # Exporter script managing Plotly layouts
-│   ├── session_to_movie.py                      # Converts saved movie frames into latent-space movies
+│   ├── session_to_movie.py                      # Post-hoc TorchDR UMAP movie frames from saved session results
 │   └── session_to_plots.py                      # Exports static publication-ready vector figures
 ├── src/
 │   ├── api.py                                   # Main developer ScaleAwareJEPA interface endpoint

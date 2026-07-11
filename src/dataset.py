@@ -18,12 +18,39 @@ except ImportError:
     fits = None
 
 
+def resolve_input_files(data_root: str = "data", npy_pattern: str = "*.npy", input_files=None) -> list[str]:
+    """Resolve explicit input files/patterns, or fall back to data_root/npy_pattern."""
+    if input_files is None:
+        return sorted(glob.glob(os.path.join(data_root, npy_pattern)))
+    if isinstance(input_files, (str, os.PathLike)):
+        specs = [input_files]
+    else:
+        specs = list(input_files)
+    files: list[str] = []
+    seen: set[str] = set()
+    for spec in specs:
+        raw = os.fspath(spec)
+        pattern = raw if os.path.isabs(raw) else os.path.join(data_root, raw)
+        matches = sorted(glob.glob(pattern))
+        if not matches and os.path.exists(pattern):
+            matches = [pattern]
+        if not matches:
+            raise FileNotFoundError(f"No input files matched: {raw!r} (resolved as {pattern!r})")
+        for path in matches:
+            norm = os.path.normpath(path)
+            if norm not in seen:
+                seen.add(norm)
+                files.append(norm)
+    return files
+
+
 class JEPADataset(Dataset):
     def __init__(
         self,
         num_samples: int = 1000,
         data_root: str = "data",
         npy_pattern: str = "*.npy",
+        input_files=None,
         cube_slice_strategy: str = "auto",
         cube_slice_axis: int = 0,
         cube_slice_index: int = 0,
@@ -71,16 +98,20 @@ class JEPADataset(Dataset):
 
         pattern = os.path.join(data_root, npy_pattern)
         self.pattern = pattern
-        self.npy_files = sorted(glob.glob(pattern))
+        resolved_files = resolve_input_files(data_root=data_root, npy_pattern=npy_pattern, input_files=input_files)
+        self.npy_files = [p for p in resolved_files if p.endswith(".npy")]
 
         # Also scan for .h5 files (preferred for fast random-access slicing)
-        h5_pattern = pattern.replace(".npy", ".h5") if pattern.endswith(".npy") else os.path.join(data_root, "*.h5")
-        self.h5_files = sorted(glob.glob(h5_pattern)) if h5py is not None else []
+        if input_files is None:
+            h5_pattern = pattern.replace(".npy", ".h5") if pattern.endswith(".npy") else os.path.join(data_root, "*.h5")
+            self.h5_files = sorted(glob.glob(h5_pattern)) if h5py is not None else []
+        else:
+            self.h5_files = [p for p in resolved_files if p.endswith(".h5")] if h5py is not None else []
         if self.h5_files:
             print(f"[dataset] Found {len(self.h5_files)} .h5 file(s); using chunked HDF5 for fast I/O")
 
-        self.fits_files = []
-        if not self.npy_files and not self.h5_files:
+        self.fits_files = [p for p in resolved_files if p.endswith(".fits")]
+        if not self.npy_files and not self.h5_files and not self.fits_files:
             raise FileNotFoundError(f"No .npy, .h5, or .fits files found with pattern: {pattern}")
         self.sample_index = self._build_sample_index()
         if self.num_samples is None:
@@ -123,7 +154,7 @@ class JEPADataset(Dataset):
         return path.endswith(".fits")
 
     def _build_sample_index(self):
-        all_files = list(self.npy_files) + list(self.h5_files)
+        all_files = list(self.npy_files) + list(self.h5_files) + list(self.fits_files)
         index = []
         for path in all_files:
             shape = self._probe_file_shape(path)
