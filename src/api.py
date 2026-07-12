@@ -527,6 +527,7 @@ class ScaleAwareJEPA:
         """
         if self._session_dir is None:
             raise RuntimeError("No session. Call fit() or load_session() first.")
+        self._ensure_inference_umap_artifacts()
         import webbrowser
         results = os.path.join(self._session_dir, "results")
         def _norm(value: str) -> str:

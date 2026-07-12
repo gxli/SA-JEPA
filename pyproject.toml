@@ -9,8 +9,6 @@ description = "Scale-Aware Joint-Embedding Predictive Architecture for Physical 
 readme = "README.md"
 authors = [{ name = "Guang-Xing Li", email = "ligx.ngc7293@gmail.com" }]
 dependencies = [
-    "torch>=2.0",
-    "torchvision",
     "torchdr>=0.1.0",
     "pyyaml",
     "numpy",
