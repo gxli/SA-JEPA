@@ -2869,7 +2869,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     ):
         try:
             outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
-            artifacts_dir = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg)
+            inference_pca = bool(train_cfg.get("inference_pca", True))
+            inference_umap = bool(train_cfg.get("inference_umap", True))
+            artifacts_dir = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg, inference_pca=inference_pca, inference_umap=inference_umap)
             log_info(f"[{config_name}] artifacts_saved={artifacts_dir}")
             effective_rank = ""
             rank_diag = {}

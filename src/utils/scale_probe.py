@@ -50,7 +50,10 @@ def _effective_rank(z: torch.Tensor, max_points: int = 50000, eps: float = 1e-12
         x = x[idx]
     x = x - x.mean(dim=0, keepdim=True)
     cov = (x.T @ x) / max(1, x.shape[0] - 1)
-    evals = torch.linalg.eigvalsh(cov).clamp_min(0)
+    try:
+        evals = torch.linalg.eigvalsh(cov).clamp_min(0)
+    except (NotImplementedError, RuntimeError):
+        evals = torch.linalg.eigvalsh(cov.cpu()).clamp_min(0).to(cov.device)
     p = evals / evals.sum().clamp_min(eps)
     entropy = -(p * (p + eps).log()).sum()
     return float(torch.exp(entropy).item())

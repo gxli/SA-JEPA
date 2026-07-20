@@ -243,6 +243,10 @@ def _robust_umap(
 
 def _compute_pca_3d(x: np.ndarray, fit_max_tokens: int = MAX_PCA_FIT_TOKENS) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
+    finite = np.isfinite(x).all(axis=-1)
+    x = x[finite]
+    if x.shape[0] < 4:
+        return np.zeros((0, 3), dtype=np.float32)
     if x.shape[0] > fit_max_tokens:
         rng = np.random.default_rng(42)
         idx = rng.choice(x.shape[0], size=fit_max_tokens, replace=False)
@@ -364,7 +368,7 @@ def _fit_umap_nd_with_bundle(
     metric: str = "cosine",
     random_state: int = 42,
     init: str = "spectral",
-    fit_max_tokens: int = 65536,
+    fit_max_tokens: int = 12000,
     l2_normalize: bool = False,
     standardize: bool = False,
 ) -> tuple[np.ndarray, dict | None]:
@@ -427,28 +431,25 @@ def _fit_umap_nd_with_bundle(
         except Exception as e:
             print(f"[warning] cuML UMAP fit/save failed: {type(e).__name__}: {e}")
 
-    enable_torchdr_umap = os.environ.get("SAJEPA_ENABLE_TORCHDR_UMAP", "0").strip().lower()
-    if enable_torchdr_umap in {"1", "true", "yes", "on"}:
-        try:
-            import torchdr
+    try:
+        import torchdr
 
-            if hasattr(torchdr, "UMAP"):
-                model = torchdr.UMAP(
-                    n_components=int(n_components),
-                    n_neighbors=int(n_neighbors),
-                    min_dist=float(min_dist),
-                    backend=None,
-                )
-                if needs_fit_transform:
-                    model.fit(torch.from_numpy(fit_x.astype(np.float32)))
-                    out = model.transform(torch.from_numpy(z.astype(np.float32)))
-                else:
-                    out = model.fit_transform(torch.from_numpy(z.astype(np.float32)))
-                if isinstance(out, torch.Tensor):
-                    out = out.detach().cpu().numpy()
-                return np.asarray(out, dtype=np.float32), _bundle("torchdr", model)
-        except Exception as e:
-            print(f"[warning] torchdr UMAP fit/save failed: {type(e).__name__}: {e}")
+        if hasattr(torchdr, "UMAP"):
+            # torchdr transform() is unreliable — fit all data at once.
+            model = torchdr.UMAP(
+                n_components=int(n_components),
+                n_neighbors=int(n_neighbors),
+                min_dist=float(min_dist),
+                backend=None,
+            )
+            z_shift = z - float(z.min())
+            z_t = torch.from_numpy(np.nan_to_num(z_shift, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32))
+            out = model.fit_transform(z_t)
+            if isinstance(out, torch.Tensor):
+                out = out.detach().cpu().numpy()
+            return np.asarray(out, dtype=np.float32), _bundle("torchdr", model)
+    except Exception as e:
+        print(f"[warning] torchdr UMAP fit/save failed: {type(e).__name__}: {e}")
 
     enable_cpu_umap = os.environ.get("SAJEPA_ENABLE_CPU_UMAP", "1").strip().lower()
     if enable_cpu_umap in {"1", "true", "yes", "on"}:
@@ -496,7 +497,7 @@ def _compute_umap_nd(
     metric: str = "cosine",
     random_state: int = 42,
     init: str = "spectral",
-    fit_max_tokens: int = 65536,
+    fit_max_tokens: int = 12000,
 ) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     init_mode = str(init).lower()
@@ -540,28 +541,26 @@ def _compute_umap_nd(
         except Exception as e:
             print(f"[warning] cuML UMAP failed: {type(e).__name__}: {e}")
 
-    enable_torchdr_umap = os.environ.get("SAJEPA_ENABLE_TORCHDR_UMAP", "0").strip().lower()
-    if enable_torchdr_umap in {"1", "true", "yes", "on"}:
-        try:
-            import torchdr
+    # torchdr UMAP — always try (GPU/MPS via PyTorch, no native deps)
+    try:
+        import torchdr
 
-            if hasattr(torchdr, "UMAP"):
-                model = torchdr.UMAP(
-                    n_components=n_components,
-                    n_neighbors=int(n_neighbors),
-                    min_dist=float(min_dist),
-                    backend=None,  # PyTorch-native NN — avoids faiss MPS crash
-                )
-                if needs_fit_transform:
-                    model.fit(torch.from_numpy(fit_x.astype(np.float32)))
-                    z = model.transform(torch.from_numpy(x.astype(np.float32)))
-                else:
-                    z = model.fit_transform(torch.from_numpy(x.astype(np.float32)))
-                if isinstance(z, torch.Tensor):
-                    return z.detach().cpu().numpy()
-                return np.asarray(z)
-        except Exception as e:
-            print(f"[warning] torchdr UMAP failed: {type(e).__name__}: {e}")
+        if hasattr(torchdr, "UMAP"):
+            # torchdr transform() is unreliable — fit all data at once.
+            model = torchdr.UMAP(
+                n_components=n_components,
+                n_neighbors=int(n_neighbors),
+                min_dist=float(min_dist),
+                backend=None,
+            )
+            x_shift = x - float(x.min())
+            x_t = torch.from_numpy(np.nan_to_num(x_shift, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32))
+            z = model.fit_transform(x_t)
+            if isinstance(z, torch.Tensor):
+                return z.detach().cpu().numpy()
+            return np.asarray(z)
+    except Exception as e:
+        print(f"[warning] torchdr UMAP failed: {type(e).__name__}: {e}")
 
     enable_cpu_umap = os.environ.get("SAJEPA_ENABLE_CPU_UMAP", "1").strip().lower()
     if enable_cpu_umap in {"1", "true", "yes", "on"}:
@@ -893,7 +892,7 @@ def _target_region_mask_from_outputs(outputs: dict, target_h: int, target_w: int
     return mask
 
 
-def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | None = None) -> str:
+def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | None = None, *, inference_pca: bool = True, inference_umap: bool = True) -> str:
     umap_cfg = dict(umap_cfg or {})
     fit_max_tokens = int(umap_cfg.get("fit_max_tokens", 65536))
     umap_n_neighbors = int(umap_cfg.get("n_neighbors", 15))
@@ -996,64 +995,64 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
                 f"{branch_name} latent map must be CxHxW after slicing, got shape={latent_map.shape}"
             )
         z = np.transpose(latent_map, (1, 2, 0)).reshape(-1, fmap.shape[1]).astype(np.float32)
-        pca3 = _robust_pca(z, valid_mask_flat, fit_max_tokens=fit_max_tokens)
-        umap3 = None
-        source_weights = (
-            _umap_weights_path(source_session, branch_name)
-            if source_session is not None
-            else None
-        )
-        if source_weights and os.path.exists(source_weights):
-            combined = valid_mask_flat.copy() & np.isfinite(z).all(axis=-1)
-            umap3 = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
-            if combined.any():
-                try:
-                    bundle = _load_umap_bundle(source_weights)
-                    transformed = _transform_umap_nd_with_bundle(
+        pca3 = _robust_pca(z, valid_mask_flat, fit_max_tokens=fit_max_tokens) if inference_pca else np.full((z.shape[0], 3), np.nan, dtype=np.float32)
+        umap3 = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
+        if inference_umap:
+            source_weights = (
+                _umap_weights_path(source_session, branch_name)
+                if source_session is not None
+                else None
+            )
+            if source_weights and os.path.exists(source_weights):
+                combined = valid_mask_flat.copy() & np.isfinite(z).all(axis=-1)
+                if combined.any():
+                    try:
+                        bundle = _load_umap_bundle(source_weights)
+                        transformed = _transform_umap_nd_with_bundle(
+                            z[combined],
+                            bundle,
+                            transform_batch=umap_transform_batch,
+                        )
+                        umap3[combined] = transformed.astype(np.float32, copy=False)
+                        if umap_save_weights:
+                            _save_umap_bundle(_umap_weights_path(session_dir, branch_name), bundle)
+                        print(f"[dashboard] reused UMAP weights for {branch_name}: {source_weights}")
+                    except Exception as e:
+                        print(f"[warning] failed to reuse UMAP weights for {branch_name}: {type(e).__name__}: {e}")
+                        umap3[:] = np.nan
+            if np.all(np.isnan(umap3)) and umap_save_weights:
+                combined = valid_mask_flat.copy() & np.isfinite(z).all(axis=-1)
+                umap3 = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
+                if combined.any():
+                    emb, bundle = _fit_umap_nd_with_bundle(
                         z[combined],
-                        bundle,
-                        transform_batch=umap_transform_batch,
+                        n_components=3,
+                        n_neighbors=umap_n_neighbors,
+                        min_dist=umap_min_dist,
+                        metric=umap_metric,
+                        random_state=umap_random_state,
+                        init=umap_init,
+                        fit_max_tokens=fit_max_tokens,
+                        l2_normalize=umap_l2_normalize,
+                        standardize=umap_standardize,
                     )
-                    umap3[combined] = transformed.astype(np.float32, copy=False)
-                    if umap_save_weights:
-                        _save_umap_bundle(_umap_weights_path(session_dir, branch_name), bundle)
-                    print(f"[dashboard] reused UMAP weights for {branch_name}: {source_weights}")
-                except Exception as e:
-                    print(f"[warning] failed to reuse UMAP weights for {branch_name}: {type(e).__name__}: {e}")
-                    umap3 = None
-        if umap3 is None and umap_save_weights:
-            combined = valid_mask_flat.copy() & np.isfinite(z).all(axis=-1)
-            umap3 = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
-            if combined.any():
-                emb, bundle = _fit_umap_nd_with_bundle(
-                    z[combined],
-                    n_components=3,
-                    n_neighbors=umap_n_neighbors,
-                    min_dist=umap_min_dist,
-                    metric=umap_metric,
-                    random_state=umap_random_state,
-                    init=umap_init,
-                    fit_max_tokens=fit_max_tokens,
+                    umap3[combined] = emb.astype(np.float32, copy=False)
+                    if bundle is not None:
+                        weights_path = _umap_weights_path(session_dir, branch_name)
+                        try:
+                            _save_umap_bundle(weights_path, bundle)
+                            print(f"[dashboard] saved UMAP weights for {branch_name}: {weights_path}")
+                        except Exception as e:
+                            print(f"[warning] failed to save UMAP weights for {branch_name}: {type(e).__name__}: {e}")
+            if np.all(np.isnan(umap3)):
+                umap3 = _robust_umap(
+                    z, valid_mask_flat,
                     l2_normalize=umap_l2_normalize,
                     standardize=umap_standardize,
+                    n_neighbors=umap_n_neighbors, min_dist=umap_min_dist,
+                    metric=umap_metric, random_state=umap_random_state,
+                    init=umap_init, fit_max_tokens=fit_max_tokens,
                 )
-                umap3[combined] = emb.astype(np.float32, copy=False)
-                if bundle is not None:
-                    weights_path = _umap_weights_path(session_dir, branch_name)
-                    try:
-                        _save_umap_bundle(weights_path, bundle)
-                        print(f"[dashboard] saved UMAP weights for {branch_name}: {weights_path}")
-                    except Exception as e:
-                        print(f"[warning] failed to save UMAP weights for {branch_name}: {type(e).__name__}: {e}")
-        if umap3 is None:
-            umap3 = _robust_umap(
-                z, valid_mask_flat,
-                l2_normalize=umap_l2_normalize,
-                standardize=umap_standardize,
-                n_neighbors=umap_n_neighbors, min_dist=umap_min_dist,
-                metric=umap_metric, random_state=umap_random_state,
-                init=umap_init, fit_max_tokens=fit_max_tokens,
-            )
 
         expected_n = h_map * w_map
         if pca3.shape != (expected_n, 3):

@@ -369,9 +369,12 @@ class ScaleAwareJEPA:
                     n_neighbors=self._config.get("diagnostics", {}).get("umap", {}).get("n_neighbors", 50),
                     min_dist=self._config.get("diagnostics", {}).get("umap", {}).get("min_dist", 0.2),
                     device=str(self._get_device()),
+                    backend=None,
                 )
-                emb = reducer.fit_transform(flat.to(self._get_device()))
-                results["umap"] = emb.cpu().numpy()
+                flat_clean = torch.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
+                flat_clean = flat_clean - flat_clean.min()
+                emb = reducer.fit_transform(flat_clean.to(self._get_device()))
+                results["umap"] = emb.detach().cpu().numpy()
             except Exception as e:
                 _logger.warning(f"UMAP unavailable (%s), PCA only.", type(e).__name__)
 
@@ -495,19 +498,14 @@ class ScaleAwareJEPA:
         )
         return str(html_path)
 
-    def open_dashboard(self, model: str = "full") -> str:
-        """Open the session dashboard in a browser. Returns the file path.
-
-        ``model`` selects the right-hand latent panels: ``"full"`` (raw latent,
-        default), ``"pca"``, or ``"umap"``. UMAP mode requires a real UMAP
-        backend and will fail rather than writing a PCA fallback dashboard.
-        """
+    def open_dashboard(self) -> str:
+        """Open the session dashboard in a browser. Returns the file path."""
         if self._session_dir is None:
             raise RuntimeError("No session. Call fit() or load_session() first.")
         import webbrowser
         dash = os.path.join(self._session_dir, "dashboard.html")
         if not os.path.exists(dash):
-            self.generate_dashboard(model=model)
+            self.generate_dashboard()
         if os.path.exists(dash):
             webbrowser.open(f"file://{dash}")
         return dash
@@ -574,21 +572,14 @@ class ScaleAwareJEPA:
         """
         return self.open_interactive_dashboard(branch=branch, display="umap", similarity=similarity)
 
-    def generate_dashboard(self, output_path: Optional[str] = None, model: str = "full"):
-        """Generate interactive HTML dashboard from the current session.
-
-        If session already has dash artifacts (from post-training inference),
-        uses those. Otherwise falls back to session_to_dash.py. ``model`` is
-        ``"full"`` (default), ``"pca"``, or ``"umap"`` for the right-hand latent
-        panels.
-        """
+    def generate_dashboard(self, output_path: Optional[str] = None):
+        """Generate interactive HTML dashboard from the current session."""
         if self._session_dir is None:
             raise RuntimeError("No session. Call fit() or load_session() first.")
-        dashboard_model = str(model).strip().lower()
         try:
             from src.dashboard import compute_dash_data, plot_dash
-            compute_dash_data(self._session_dir, overwrite=False, model=dashboard_model)
-            plot_dash(self._session_dir, overwrite=False, model=dashboard_model)
+            compute_dash_data(self._session_dir, overwrite=False)
+            plot_dash(self._session_dir, overwrite=False)
             dash = os.path.join(self._session_dir, "dashboard.html")
             if output_path and os.path.exists(dash):
                 import shutil
@@ -596,8 +587,6 @@ class ScaleAwareJEPA:
                     shutil.copy2(dash, output_path)
             print(f"[sajepa] dashboard: {output_path or dash}")
         except Exception as e:
-            if dashboard_model == "umap":
-                raise
             print(f"[sajepa] dashboard failed ({type(e).__name__}), generating minimal dashboard...")
             _generate_minimal_dashboard(self._session_dir, output_path)
 

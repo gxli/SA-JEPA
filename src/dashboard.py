@@ -25,8 +25,6 @@ from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents
 DASHBOARD_VERSION = "production-diagnostics-v27-full-latent-dashboard-default"
 CONTROL_SCRIPT_SENTINEL = "window.JEPADashboardControls"
 DASHBOARD_COMPUTE_UMAP = os.environ.get("DASHBOARD_COMPUTE_UMAP", "1").strip().lower() in {"1", "true", "yes", "on"}
-DASHBOARD_MODEL_CHOICES = {"pca", "umap", "full"}
-DEFAULT_DASHBOARD_MODEL = os.environ.get("DASHBOARD_MODEL", "full")
 DASHBOARD_UMAP_FIT_MAX_TOKENS = int(os.environ.get("DASHBOARD_UMAP_FIT_MAX_TOKENS", "12000"))
 DASHBOARD_UMAP_TRANSFORM_BATCH = int(os.environ.get("DASHBOARD_UMAP_TRANSFORM_BATCH", "8192"))
 DASHBOARD_UMAP_PYTHON = os.environ.get("DASHBOARD_UMAP_PYTHON", "/Users/gxli/anaconda3/envs/test/bin/python")
@@ -35,7 +33,6 @@ SCRIPT_DIR = os.path.join(ROOT_DIR, "scripts")
 
 DASH_DATA_REQUIRED = {
     "dashboard_version",
-    "dashboard_model",
     "inference_version",
     "masked_inference_contract",
     "rgb_render_source",
@@ -121,15 +118,6 @@ def _ensure_session_rank_diagnostics(session_dir: str, outputs: dict[str, Any]) 
         except Exception as exc:
             print(f"dashboard_effective_rank_failed={session_dir} error={type(exc).__name__}: {exc}")
     return rank_diag
-
-
-def _normalize_dashboard_model(model: str | None) -> str:
-    value = str(DEFAULT_DASHBOARD_MODEL if model is None else model).strip().lower()
-    if value in {"full_latent", "latent", "raw", "32d"}:
-        value = "full"
-    if value not in DASHBOARD_MODEL_CHOICES:
-        raise ValueError(f"Unsupported dashboard model={model!r}; expected one of {sorted(DASHBOARD_MODEL_CHOICES)}")
-    return value
 
 
 def _dashboard_umap_params(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1023,8 +1011,7 @@ def _encoder_fov_border_from_config_dict(cfg: dict) -> int:
     return max(0, rf // 2)
 
 
-def compute_dash_data(session_dir: str, overwrite: bool = False, model: str | None = None) -> str:
-    dashboard_model = _normalize_dashboard_model(model)
+def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     out_npz = os.path.join(session_dir, "dash_data.npz")
     if os.path.exists(out_npz) and not overwrite:
         try:
@@ -1038,13 +1025,6 @@ def compute_dash_data(session_dir: str, overwrite: bool = False, model: str | No
                 version_str = str(version_arr[0]) if version_arr.size else ""
                 if version_str != DASHBOARD_VERSION:
                     missing.append("dashboard_version")
-            if "dashboard_model" in existing.files:
-                model_arr = np.asarray(existing["dashboard_model"]).reshape(-1)
-                model_str = str(model_arr[0]) if model_arr.size else ""
-                if model_str != dashboard_model:
-                    missing.append("dashboard_model")
-            else:
-                missing.append("dashboard_model")
             existing.close()
             npz_mtime = os.path.getmtime(out_npz)
             stale_inputs = []
@@ -1384,28 +1364,22 @@ def compute_dash_data(session_dir: str, overwrite: bool = False, model: str | No
             pca_pad[:, : pca_valid.shape[1]] = pca_valid
             pca_valid = pca_pad
         pca[valid] = pca_valid
-        if dashboard_model == "umap":
-            if not DASHBOARD_COMPUTE_UMAP:
-                raise RuntimeError(
-                    "dashboard_model=umap requested but DASHBOARD_COMPUTE_UMAP is disabled; "
-                    "refusing to write a fake UMAP dashboard"
-                )
-            umap_valid = _compute_external_umap_nd(
-                _preprocess_latents_for_umap(
-                    z_valid,
-                    l2_normalize=bool(umap_params["l2_normalize"]),
-                    standardize=bool(umap_params["standardize"]),
-                ),
-                n_components=3,
-                n_neighbors=int(umap_params["n_neighbors"]),
-                min_dist=float(umap_params["min_dist"]),
-                metric=str(umap_params["metric"]),
-                random_state=int(umap_params["random_state"]),
-                init=str(umap_params["init"]),
-                fit_max_tokens=max(1024, int(umap_params["fit_max_tokens"])),
-                transform_batch=max(256, int(umap_params["transform_batch"])),
-            ).astype(np.float32, copy=False)
-            um[valid] = umap_valid
+        umap_valid = _compute_external_umap_nd(
+            _preprocess_latents_for_umap(
+                z_valid,
+                l2_normalize=bool(umap_params["l2_normalize"]),
+                standardize=bool(umap_params["standardize"]),
+            ),
+            n_components=3,
+            n_neighbors=int(umap_params["n_neighbors"]),
+            min_dist=float(umap_params["min_dist"]),
+            metric=str(umap_params["metric"]),
+            random_state=int(umap_params["random_state"]),
+            init=str(umap_params["init"]),
+            fit_max_tokens=max(1024, int(umap_params["fit_max_tokens"])),
+            transform_batch=max(256, int(umap_params["transform_batch"])),
+        ).astype(np.float32, copy=False)
+        um[valid] = umap_valid
         return pca, um
 
     def _slice_full_latent_xyz(prefix_out: str) -> np.ndarray:
@@ -1456,40 +1430,22 @@ def compute_dash_data(session_dir: str, overwrite: bool = False, model: str | No
         ("target", "gt"),
     ):
         src_prefix = prefix_saved
-        if dashboard_model == "umap":
-            # Keep PCA/UMAP/full-latent panels registered to the same H×W
-            # flatten order. Mixing saved PCA artifacts with freshly computed
-            # UMAP can silently compare different token sources/orderings.
-            pca, um = _compute_slice_pca_umap(prefix_out)
-            hh, ww = h_lat, w_lat
-        else:
-            try:
-                hh, ww = _load_hw(src_prefix)
-                pca = _load_xyz_triplet(src_prefix, "pca", hh, ww)
-                um = np.full((hh * ww, 3), np.nan, dtype=np.float32)
-            except Exception:
-                if prefix_saved == "context":
-                    src_prefix = "predict"
-                    try:
-                        hh, ww = _load_hw(src_prefix)
-                        pca = _load_xyz_triplet(src_prefix, "pca", hh, ww)
-                        um = np.full((hh * ww, 3), np.nan, dtype=np.float32)
-                    except Exception:
-                        pca, um = _compute_slice_pca_umap(prefix_out)
-                        hh, ww = h_lat, w_lat
-                    else:
-                        print(
-                            f"dashboard_note={session_dir}: missing context embeddings; "
-                            "using predict embeddings for context panels"
-                        )
-                else:
+        try:
+            hh, ww = _load_hw(src_prefix)
+            pca = _load_xyz_triplet(src_prefix, "pca", hh, ww)
+            um = _load_xyz_triplet(src_prefix, "umap", hh, ww)
+        except Exception:
+            if prefix_saved == "context":
+                try:
+                    hh, ww = _load_hw("predict")
+                    pca = _load_xyz_triplet("predict", "pca", hh, ww)
+                    um = _load_xyz_triplet("predict", "umap", hh, ww)
+                except Exception:
                     pca, um = _compute_slice_pca_umap(prefix_out)
                     hh, ww = h_lat, w_lat
-        if dashboard_model == "full":
-            um = _slice_full_latent_xyz(prefix_out)
-            hh, ww = h_lat, w_lat
-        elif dashboard_model == "pca":
-            um = pca.copy()
+            else:
+                pca, um = _compute_slice_pca_umap(prefix_out)
+                hh, ww = h_lat, w_lat
         if pca.shape[0] != hh * ww or um.shape[0] != hh * ww:
             # Scatter artifacts can be sampled/volumetric and therefore cannot
             # be reshaped into the displayed slice. Use the actual slice latent
@@ -1729,10 +1685,6 @@ def compute_dash_data(session_dir: str, overwrite: bool = False, model: str | No
 
     dash_payload = dict(
         dashboard_version=np.asarray(DASHBOARD_VERSION),
-        dashboard_model=np.asarray(dashboard_model),
-        dashboard_embedding_label=np.asarray(
-            {"full": "Full Latent", "pca": "PCA", "umap": "UMAP"}[dashboard_model]
-        ),
         inference_version=np.asarray(inference_version),
         masked_inference_contract=np.asarray(masked_inference_contract),
         dashboard_umap_params=np.asarray(json.dumps(umap_params, sort_keys=True)),
@@ -1834,42 +1786,28 @@ def compute_dash_data(session_dir: str, overwrite: bool = False, model: str | No
     return out_npz
 
 
-def compute_dashboard(session_dir: str, overwrite: bool = False, model: str | None = "full") -> str:
-    """Compute dashboard data using PCA, UMAP, or raw full-latent coordinates."""
-    return compute_dash_data(session_dir, overwrite=overwrite, model=model)
+def compute_dashboard(session_dir: str, overwrite: bool = False) -> str:
+    """Compute dashboard data."""
+    return compute_dash_data(session_dir, overwrite=overwrite)
 
 
-def plot_dash_html(session_dir: str, overwrite: bool = False, model: str | None = None) -> str:
-    dashboard_model = _normalize_dashboard_model(model)
+def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     npz_path = os.path.join(session_dir, "dash_data.npz")
     out_html = os.path.join(session_dir, "dashboard.html")
-    # Always regenerate plot HTML, even if an existing dashboard file is present.
-    # This keeps plots in sync with the latest artifacts without requiring --overwrite.
     if not os.path.exists(npz_path):
-        compute_dash_data(session_dir, overwrite=False, model=dashboard_model)
+        compute_dash_data(session_dir, overwrite=False)
     data = np.load(npz_path)
     missing = sorted(DASH_DATA_REQUIRED.difference(data.files))
-    if "dashboard_model" in data.files:
-        arr = np.asarray(data["dashboard_model"]).reshape(-1)
-        existing_model = str(arr[0]) if arr.size else ""
-        if existing_model != dashboard_model:
-            missing.append("dashboard_model")
-    else:
-        missing.append("dashboard_model")
     scale_pt, _ = _find_scale_probe_artifacts(session_dir)
     if scale_pt is not None:
         missing.extend(sorted(SCALE_PROBE_KEYS.difference(data.files)))
     if missing:
         data.close()
         print(f"dash_data_stale_recompute={npz_path} missing={','.join(missing)}")
-        compute_dash_data(session_dir, overwrite=True, model=dashboard_model)
+        compute_dash_data(session_dir, overwrite=True)
         data = np.load(npz_path)
     embedding_label = "UMAP"
-    if "dashboard_embedding_label" in data.files:
-        arr = np.asarray(data["dashboard_embedding_label"]).reshape(-1)
-        if arr.size:
-            embedding_label = str(arr[0])
-    embedding_group = "umap" if embedding_label.lower() == "umap" else re.sub(r"[^a-z0-9]+", "-", embedding_label.lower()).strip("-")
+    embedding_group = "umap"
     model_mode = "unknown"
     cfg_used, _cfg_source = _load_session_config(session_dir)
     if cfg_used:
@@ -2949,7 +2887,6 @@ def plot_dash_html(session_dir: str, overwrite: bool = False, model: str | None 
         if gt_er_vals.size > 0:
             latest_er = float(gt_er_vals[-1])
     dash_data_version = str(np.asarray(data.get("dashboard_version", np.asarray("missing"))).reshape(-1)[0])
-    dashboard_model_label = str(np.asarray(data.get("dashboard_model", np.asarray("missing"))).reshape(-1)[0])
     inference_version = str(np.asarray(data.get("inference_version", np.asarray("missing"))).reshape(-1)[0])
     masked_contract = str(np.asarray(data.get("masked_inference_contract", np.asarray("missing"))).reshape(-1)[0])
     rgb_render_source = str(np.asarray(data.get("rgb_render_source", np.asarray("missing"))).reshape(-1)[0])
@@ -2965,7 +2902,6 @@ def plot_dash_html(session_dir: str, overwrite: bool = False, model: str | None 
     build_banner_html = (
         f'<span class="build-chip strong">html={html_lib.escape(DASHBOARD_VERSION)}</span>'
         f'<span class="build-chip">dash_data={html_lib.escape(dash_data_version)}</span>'
-        f'<span class="build-chip">embedding={html_lib.escape(dashboard_model_label)}</span>'
         f'<span class="build-chip">effective_rank={html_lib.escape(effective_rank_label)}</span>'
         f'<span class="build-chip">inference={html_lib.escape(inference_version)}</span>'
         f'<span class="build-chip">masked_encoder={html_lib.escape(masked_contract)}</span>'
@@ -3639,8 +3575,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False, model: str | None 
     return out_html
 
 
-def plot_dash(session_dir: str, overwrite: bool = False, model: str | None = None) -> str:
-    return plot_dash_html(session_dir, overwrite=overwrite, model=model)
+def plot_dash(session_dir: str, overwrite: bool = False) -> str:
+    return plot_dash_html(session_dir, overwrite=overwrite)
 
 
 def _preferred_html_for_export(session_dir: str, fallback_html: str) -> str:
@@ -3696,15 +3632,6 @@ def main():
     parser.add_argument("--sessions-dir", type=str, default="sessions")
     parser.add_argument("--export-dir", type=str, default="sessions/results")
     parser.add_argument("--stage", type=str, choices=["compute", "plot", "all"], default="all")
-    parser.add_argument(
-        "--model",
-        "--dashboard-model",
-        dest="dashboard_model",
-        type=str,
-        choices=sorted(DASHBOARD_MODEL_CHOICES),
-        default=None,
-        help="Embedding basis for the right-hand latent panels: full (default), pca, or umap.",
-    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--reset", action="store_true")
     args = parser.parse_args()
@@ -3765,12 +3692,12 @@ def main():
                 if os.path.exists(exp):
                     os.remove(exp)
             if args.stage in ("compute", "all"):
-                npz = compute_dash_data(session_dir, overwrite=args.overwrite, model=args.dashboard_model)
+                npz = compute_dash_data(session_dir, overwrite=args.overwrite)
                 print(f"dash_data_saved={npz}")
             if args.stage in ("plot", "all"):
                 if not os.path.exists(os.path.join(session_dir, "dash_data.npz")):
-                    compute_dash_data(session_dir, overwrite=args.overwrite, model=args.dashboard_model)
-                html = plot_dash_html(session_dir, overwrite=args.overwrite, model=args.dashboard_model)
+                    compute_dash_data(session_dir, overwrite=args.overwrite)
+                html = plot_dash_html(session_dir, overwrite=args.overwrite)
                 print(f"dashboard_html_saved={html}")
                 export_path = os.path.join(export_dir, f"{name.replace('/', '_')}.html")
                 src = _preferred_html_for_export(session_dir, html)
