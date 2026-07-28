@@ -15,6 +15,7 @@ dependencies = [
     "constrained-diffusion",
     "plotly",
     "umap-learn",
+    "Pillow",
 ]
 
 [project.optional-dependencies]

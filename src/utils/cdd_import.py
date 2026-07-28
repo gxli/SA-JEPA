@@ -8,22 +8,8 @@ from types import ModuleType
 
 
 def ensure_writable_mpl_config(session_dir: str = "") -> str:
-    """Keep optional CDD imports away from unwritable matplotlib home caches."""
-    existing = os.environ.get("MPLCONFIGDIR")
-    if existing:
-        return existing
-    candidates = []
-    if session_dir:
-        candidates.append(os.path.join(session_dir, ".matplotlib"))
-    candidates.append(os.path.join(tempfile.gettempdir(), "sajepa_mplconfig"))
-    for path in candidates:
-        try:
-            os.makedirs(path, exist_ok=True)
-            os.environ["MPLCONFIGDIR"] = path
-            return path
-        except OSError:
-            continue
-    raise RuntimeError("Could not create a writable MPLCONFIGDIR for CDD import")
+    """No-op: matplotlib has been removed from dependencies."""
+    return os.environ.get("MPLCONFIGDIR", tempfile.gettempdir())
 
 
 def import_constrained_diffusion(*, session_dir: str = "", allow_monai: bool = False) -> ModuleType:

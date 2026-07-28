@@ -371,12 +371,25 @@ class ScaleAwareJEPA:
                     device=str(self._get_device()),
                     backend=None,
                 )
-                flat_clean = torch.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
-                flat_clean = flat_clean - flat_clean.min()
-                emb = reducer.fit_transform(flat_clean.to(self._get_device()))
-                results["umap"] = emb.detach().cpu().numpy()
+                flat_np = torch.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0).cpu().numpy().astype("float32")
+                finite = np.isfinite(flat_np).all(axis=1)
+                _, unique_idx = np.unique(flat_np[finite].round(decimals=6), axis=0, return_index=True)
+                keep_mask = np.zeros(flat_np.shape[0], dtype=bool)
+                fp = np.flatnonzero(finite)
+                keep_mask[fp[unique_idx]] = True
+                if keep_mask.sum() < 2:
+                    raise RuntimeError("fewer than 2 unique finite rows for torchdr UMAP")
+                flat_use = flat_np[keep_mask]
+                flat_use = flat_use - flat_use.min()
+                rng = np.random.default_rng(42)
+                flat_use += rng.uniform(-1e-6, 1e-6, size=flat_use.shape).astype("float32")
+                emb = reducer.fit_transform(torch.from_numpy(flat_use).to(self._get_device()))
+                emb_np = emb.detach().cpu().numpy().astype("float32")
+                out = np.full((flat_np.shape[0], emb_np.shape[1]), np.nan, dtype="float32")
+                out[keep_mask] = emb_np
+                results["umap"] = out
             except Exception as e:
-                _logger.warning(f"UMAP unavailable (%s), PCA only.", type(e).__name__)
+                _logger.warning(f"[torchdr] failed: %s", type(e).__name__)
 
         return results
 
@@ -441,7 +454,7 @@ class ScaleAwareJEPA:
         """Return effective-rank diagnostics for the current session."""
         if self._session_dir is None:
             raise RuntimeError("No session. Call fit() or load_session() first.")
-        from scripts.print_session_summary import rank_summary
+        from src.diagnostics import rank_summary
         rows = rank_summary([self._session_dir])
         if not rows:
             return {}
@@ -483,7 +496,7 @@ class ScaleAwareJEPA:
         Returns:
             path to the generated HTML file.
         """
-        from scripts.session_umap_interactive import build_html
+        from src.interactive import build_html
         from pathlib import Path
         in_path = Path(input_npy)
         out_path = Path(output_html) if output_html else in_path.with_suffix(".html")
@@ -576,19 +589,15 @@ class ScaleAwareJEPA:
         """Generate interactive HTML dashboard from the current session."""
         if self._session_dir is None:
             raise RuntimeError("No session. Call fit() or load_session() first.")
-        try:
-            from src.dashboard import compute_dash_data, plot_dash
-            compute_dash_data(self._session_dir, overwrite=False)
-            plot_dash(self._session_dir, overwrite=False)
-            dash = os.path.join(self._session_dir, "dashboard.html")
-            if output_path and os.path.exists(dash):
-                import shutil
-                if os.path.abspath(dash) != os.path.abspath(output_path):
-                    shutil.copy2(dash, output_path)
-            print(f"[sajepa] dashboard: {output_path or dash}")
-        except Exception as e:
-            print(f"[sajepa] dashboard failed ({type(e).__name__}), generating minimal dashboard...")
-            _generate_minimal_dashboard(self._session_dir, output_path)
+        from src.dashboard import compute_dash_data, plot_dash
+        compute_dash_data(self._session_dir, overwrite=False)
+        plot_dash(self._session_dir, overwrite=False)
+        dash = os.path.join(self._session_dir, "dashboard.html")
+        if output_path and os.path.exists(dash):
+            import shutil
+            if os.path.abspath(dash) != os.path.abspath(output_path):
+                shutil.copy2(dash, output_path)
+        print(f"[sajepa] dashboard: {output_path or dash}")
 
     def _ensure_inference_umap_artifacts(self) -> None:
         if self._session_dir is None:
@@ -725,33 +734,6 @@ def _print_metrics_summary(session_dir: str) -> None:
         print(f"{'='*60}")
     except Exception:
         pass
-
-
-def _generate_minimal_dashboard(session_dir: str, output_path: Optional[str] = None) -> None:
-    """Fallback dashboard: reads whatever artifacts exist and renders a simple HTML."""
-    dash_path = output_path or os.path.join(session_dir, "dashboard.html")
-    try:
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-        import numpy as _np
-
-        # Try loading what's available
-        inf_path = os.path.join(session_dir, "inference_outputs.pt")
-        has_inference = os.path.exists(inf_path)
-        outputs = torch.load(inf_path, map_location="cpu", weights_only=False) if has_inference else {}
-
-        fig = make_subplots(rows=1, cols=1, subplot_titles=["sajepa Session"])
-        if has_inference:
-            ctx = outputs.get("context_map")
-            if ctx is not None:
-                img = ctx.squeeze().cpu().numpy()
-                if img.ndim == 3:
-                    img = img.mean(0)
-                fig.add_trace(go.Heatmap(z=img, colorscale="Viridis"), row=1, col=1)
-        fig.write_html(dash_path)
-        print(f"[sajepa] minimal dashboard saved: {dash_path}")
-    except Exception as e:
-        print(f"[sajepa] minimal dashboard failed: {e}")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

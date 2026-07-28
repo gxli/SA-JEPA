@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from sajepa import ScaleAwareJEPA
-from scripts.session_umap_interactive import build_html
+from src.interactive import build_html
 
 
 def _write_interactive_umap_full_latent(session_dir: str, branch: str = "predict") -> str:
@@ -74,14 +74,12 @@ def _write_interactive_umap_full_latent(session_dir: str, branch: str = "predict
 def main() -> None:
     model = ScaleAwareJEPA(config=os.path.join(ROOT, "configs", "examples", "mhd_example.yaml"))
     model.train(config_name="example_config_driven", sessions_dir=os.path.join(ROOT, "sessions"), dashboard=True)
-    dashboard_model = os.environ.get("SAJEPA_EXAMPLE_DASHBOARD_MODEL", "umap").strip().lower()
-    model.generate_dashboard(model=dashboard_model)
     dashboard = os.path.join(model.session_dir, "dashboard.html")
     interactive_html = _write_interactive_umap_full_latent(model.session_dir, branch="predict")
     print(
         "\nDone."
         f"\n  session:             {model.session_dir}"
-        f"\n  dashboard[{dashboard_model}]:  {dashboard}"
+        f"\n  dashboard:           {dashboard}"
         f"\n  interactive_review:  {interactive_html}"
     )
 
