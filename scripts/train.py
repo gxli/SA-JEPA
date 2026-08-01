@@ -30,6 +30,11 @@ def parse_args():
     parser.add_argument("--name", type=str, default=None, help="Session name; defaults to config filename stem")
     parser.add_argument("--sessions-dir", type=str, default="sessions", help="Session output root")
     parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="Skip the default session dashboard generation.",
+    )
+    parser.add_argument(
         "--update-effective-rank",
         action="store_true",
         help="Update mode: skip training, reuse session weights, and compute/save effective rank.",
@@ -62,6 +67,12 @@ def main():
         config = cfg
     session_dir = run_training(config, config_name=config_name, sessions_root=args.sessions_dir)
     print(f"session_saved={session_dir}")
+    if not args.no_dashboard:
+        from src.dashboard import compute_dash_data, plot_dash_html
+
+        compute_dash_data(session_dir, overwrite=True)
+        dashboard_path = plot_dash_html(session_dir, overwrite=True)
+        print(f"dashboard_saved={dashboard_path}")
 
 
 if __name__ == "__main__":

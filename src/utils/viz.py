@@ -12,6 +12,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from src.utils.support import encoder_border_from_config
+
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAX_PCA_FIT_TOKENS = 65536
@@ -119,33 +121,7 @@ def _encoder_fov_border_from_config(session_dir: str) -> int:
     cfg = _load_session_config(session_dir)
     if not cfg:
         return 0
-    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-    if not isinstance(model_cfg, dict):
-        return 0
-    depth = int(model_cfg.get("encoder_depth", 3))
-    kernel = int(model_cfg.get("encoder_kernel_size", 5))
-    mode = str(model_cfg.get("mode", "")).strip().lower()
-    encoder_type = str(model_cfg.get("encoder_type", "")).strip().lower()
-    if mode.startswith("3d") or "3d" in encoder_type:
-        rf = 1 + 2 * (3 - 1) + max(0, depth) * max(0, kernel - 1)
-        return max(0, rf // 2)
-    dilations = model_cfg.get("convnext_layer_dilations")
-    if dilations is None:
-        dil_list = [1] * max(0, depth)
-    else:
-        try:
-            dil_list = [int(v) for v in dilations]
-        except TypeError:
-            dil_list = [1] * max(0, depth)
-        if len(dil_list) < depth and dil_list:
-            reps = (depth + len(dil_list) - 1) // len(dil_list)
-            dil_list = (dil_list * reps)[:depth]
-        else:
-            dil_list = dil_list[:depth]
-    rf = 1 + 2 + 2
-    for dilation in dil_list:
-        rf += max(0, kernel - 1) * max(1, int(dilation))
-    return max(0, rf // 2)
+    return int(encoder_border_from_config(cfg))
 
 
 def _latent_border_from_summary_or_config(session_dir: str) -> int:
@@ -216,6 +192,7 @@ def _robust_umap(
     random_state: int = 42,
     init: str = "auto",
     fit_max_tokens: int = MAX_PCA_FIT_TOKENS,
+    backend: str = "auto",
 ) -> np.ndarray:
     """Strip NaN/Inf from input + mask, run UMAP, never crash."""
     combined = mask_flat.copy() & np.isfinite(z_flat).all(axis=-1)
@@ -235,6 +212,7 @@ def _robust_umap(
         random_state=random_state,
         init=init,
         fit_max_tokens=fit_max_tokens,
+        backend=backend,
     ).astype(np.float32)
     out = np.full((z_flat.shape[0], emb.shape[1]), np.nan, dtype=np.float32)
     out[combined] = emb
@@ -325,6 +303,49 @@ def _apply_umap_preprocess(x: np.ndarray, state: dict) -> np.ndarray:
     return z.astype(np.float32, copy=False)
 
 
+def _normalize_umap_backend(value: str | None) -> str:
+    key = str(value or "auto").strip().lower().replace("_", "-")
+    if key in ("auto", "gpu", "cuda"):
+        return "auto"
+    if key in ("cuml", "cu-ml", "rapids"):
+        return "cuml"
+    if key in ("torchdr", "torch-dr", "torch"):
+        return "torchdr"
+    if key in ("umap-learn", "umap", "cpu"):
+        return "umap-learn"
+    raise ValueError(f"Unsupported UMAP backend={value!r}; expected auto, cuml, torchdr, or umap-learn.")
+
+
+def _umap_result_to_numpy(value) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy().astype(np.float32, copy=False)
+    get = getattr(value, "get", None)
+    if callable(get):
+        value = get()
+    return np.asarray(value, dtype=np.float32)
+
+
+def _torchdr_umap_params(params: dict) -> dict:
+    metric = str(params.get("metric", "euclidean")).lower()
+    if metric == "euclidean":
+        metric = "sqeuclidean"
+    init = str(params.get("init", "pca")).lower()
+    if init == "spectral":
+        init = "pca"
+    if init not in ("pca", "random"):
+        init = "pca"
+    return {
+        "n_components": int(params.get("n_components", 3)),
+        "n_neighbors": int(params.get("n_neighbors", 15)),
+        "min_dist": float(params.get("min_dist", 0.05)),
+        "metric": metric,
+        "random_state": int(params.get("random_state", 42)),
+        "init": init,
+        "device": "auto",
+        "backend": None,
+    }
+
+
 def _umap_weights_path(session_dir: str, branch_name: str) -> str:
     return os.path.join(session_dir, f"umap_weights_{branch_name}.pkl")
 
@@ -371,6 +392,7 @@ def _fit_umap_nd_with_bundle(
     fit_max_tokens: int = 12000,
     l2_normalize: bool = False,
     standardize: bool = False,
+    backend: str = "auto",
 ) -> tuple[np.ndarray, dict | None]:
     x_raw = np.asarray(x, dtype=np.float32)
     z, preprocess_state = _fit_umap_preprocess(
@@ -413,6 +435,41 @@ def _fit_umap_nd_with_bundle(
             "fit_indices": None if fit_idx is None else np.asarray(fit_idx, dtype=np.int64),
         }
 
+    backend_norm = _normalize_umap_backend(backend)
+    if backend_norm in ("auto", "cuml"):
+        try:
+            from cuml.manifold import UMAP as CuMLUMAP
+
+            print("[inference] UMAP backend: cuML (GPU)", flush=True)
+            model = CuMLUMAP(**ctor_params)
+            if needs_fit_transform:
+                model.fit(fit_x)
+                out = model.transform(z)
+            else:
+                out = model.fit_transform(z)
+            return _umap_result_to_numpy(out), _bundle("cuml", model)
+        except Exception as e:
+            if backend_norm == "cuml":
+                raise RuntimeError(f"Requested UMAP backend 'cuml' failed: {type(e).__name__}: {e}") from e
+            print(f"[warning] cuML UMAP unavailable, falling back to TorchDR: {type(e).__name__}: {e}", flush=True)
+
+    if backend_norm in ("auto", "torchdr"):
+        try:
+            from torchdr import UMAP as TorchDRUMAP
+
+            print("[inference] UMAP backend: TorchDR", flush=True)
+            model = TorchDRUMAP(**_torchdr_umap_params(params))
+            if needs_fit_transform:
+                model.fit(fit_x)
+                out = model.transform(z)
+            else:
+                out = model.fit_transform(z)
+            return _umap_result_to_numpy(out), _bundle("torchdr", model)
+        except Exception as e:
+            if backend_norm == "torchdr":
+                raise RuntimeError(f"Requested UMAP backend 'torchdr' failed: {type(e).__name__}: {e}") from e
+            print(f"[warning] TorchDR UMAP unavailable, falling back to umap-learn: {type(e).__name__}: {e}", flush=True)
+
     import umap
 
     print("[inference] UMAP backend: umap-learn (CPU)", flush=True)
@@ -422,7 +479,7 @@ def _fit_umap_nd_with_bundle(
         out = model.transform(z)
     else:
         out = model.fit_transform(z)
-    return np.asarray(out, dtype=np.float32), _bundle("umap-learn", model)
+    return _umap_result_to_numpy(out), _bundle("umap-learn", model)
 
 
 def _transform_umap_nd_with_bundle(x: np.ndarray, bundle: dict, transform_batch: int = 8192) -> np.ndarray:
@@ -451,6 +508,7 @@ def _compute_umap_nd(
     random_state: int = 42,
     init: str = "spectral",
     fit_max_tokens: int = 12000,
+    backend: str = "auto",
 ) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     init_mode = str(init).lower()
@@ -466,10 +524,7 @@ def _compute_umap_nd(
     else:
         needs_fit_transform = False
 
-    import umap
-
-    print("[inference] UMAP backend: umap-learn (CPU)", flush=True)
-    model = umap.UMAP(
+    ctor_params = dict(
         n_components=n_components,
         n_neighbors=int(n_neighbors),
         min_dist=float(min_dist),
@@ -477,10 +532,47 @@ def _compute_umap_nd(
         random_state=int(random_state),
         init=init_mode,
     )
+    backend_norm = _normalize_umap_backend(backend)
+    if backend_norm in ("auto", "cuml"):
+        try:
+            from cuml.manifold import UMAP as CuMLUMAP
+
+            print("[inference] UMAP backend: cuML (GPU)", flush=True)
+            model = CuMLUMAP(**ctor_params)
+            if needs_fit_transform:
+                model.fit(fit_x)
+                return _umap_result_to_numpy(model.transform(x))
+            return _umap_result_to_numpy(model.fit_transform(x))
+        except Exception as e:
+            if backend_norm == "cuml":
+                raise RuntimeError(f"Requested UMAP backend 'cuml' failed: {type(e).__name__}: {e}") from e
+            print(f"[warning] cuML UMAP unavailable, falling back to TorchDR: {type(e).__name__}: {e}", flush=True)
+
+    if backend_norm in ("auto", "torchdr"):
+        try:
+            from torchdr import UMAP as TorchDRUMAP
+
+            print("[inference] UMAP backend: TorchDR", flush=True)
+            torchdr_params = dict(ctor_params)
+            torchdr_params["fit_max_tokens"] = int(fit_max_tokens)
+            model = TorchDRUMAP(**_torchdr_umap_params(torchdr_params))
+            if needs_fit_transform:
+                model.fit(fit_x)
+                return _umap_result_to_numpy(model.transform(x))
+            return _umap_result_to_numpy(model.fit_transform(x))
+        except Exception as e:
+            if backend_norm == "torchdr":
+                raise RuntimeError(f"Requested UMAP backend 'torchdr' failed: {type(e).__name__}: {e}") from e
+            print(f"[warning] TorchDR UMAP unavailable, falling back to umap-learn: {type(e).__name__}: {e}", flush=True)
+
+    import umap
+
+    print("[inference] UMAP backend: umap-learn (CPU)", flush=True)
+    model = umap.UMAP(**ctor_params)
     if needs_fit_transform:
         model.fit(fit_x)
-        return model.transform(x)
-    return model.fit_transform(x)
+        return _umap_result_to_numpy(model.transform(x))
+    return _umap_result_to_numpy(model.fit_transform(x))
 
 
 def _save_latent_overview_html(session_dir: str, pca_points: np.ndarray, umap_points: np.ndarray, h: int, w: int) -> str:
@@ -787,7 +879,8 @@ def _target_region_mask_from_outputs(outputs: dict, target_h: int, target_w: int
     return mask
 
 
-def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | None = None, *, inference_pca: bool = True, inference_umap: bool = True) -> str:
+def export_inference_dashboard_artifacts(session_dir: str, outputs: dict, umap_cfg: dict | None = None, *, inference_pca: bool = True, inference_umap: bool = True) -> str:
+    """Export PCA/UMAP/latent arrays consumed by the canonical session dashboard."""
     umap_cfg = dict(umap_cfg or {})
     fit_max_tokens = int(umap_cfg.get("fit_max_tokens", 65536))
     umap_n_neighbors = int(umap_cfg.get("n_neighbors", 15))
@@ -800,6 +893,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     umap_save_weights = bool(umap_cfg.get("save_umap_weights", False))
     umap_reuse_weights = bool(umap_cfg.get("reuse_umap_weights", True))
     umap_transform_batch = int(umap_cfg.get("transform_batch", 8192))
+    umap_backend = _normalize_umap_backend(umap_cfg.get("backend", "auto"))
     source_session = _source_session_from_config(session_dir) if umap_reuse_weights else None
 
     x_clean = outputs.get("x_clean")
@@ -930,6 +1024,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
                         fit_max_tokens=fit_max_tokens,
                         l2_normalize=umap_l2_normalize,
                         standardize=umap_standardize,
+                        backend=umap_backend,
                     )
                     umap3[combined] = emb.astype(np.float32, copy=False)
                     if bundle is not None:
@@ -947,6 +1042,7 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
                     n_neighbors=umap_n_neighbors, min_dist=umap_min_dist,
                     metric=umap_metric, random_state=umap_random_state,
                     init=umap_init, fit_max_tokens=fit_max_tokens,
+                    backend=umap_backend,
                 )
 
         expected_n = h_map * w_map
@@ -974,7 +1070,9 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
         return latent_map, pca_map, umap_map
 
     default_latent_map, default_pca_map, default_umap_map = _save_branch_embeddings("predict", pred_map)
-    _save_branch_embeddings("masked_predict", masked_pred_map)
+    mask_pred_map = outputs.get("mask_pred_map", masked_pred_map)
+    _save_branch_embeddings("mask_predict", mask_pred_map)
+    _save_branch_embeddings("masked_predict", mask_pred_map)
     np.save(os.path.join(results_dir, "latent_vectors_full.npy"), default_latent_map)
     np.save(os.path.join(results_dir, "pca_xyz.npy"), default_pca_map)
     np.save(os.path.join(results_dir, "umap_xyz.npy"), default_umap_map)
@@ -985,9 +1083,23 @@ def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | N
     # Log inference backend
     import json
     with open(os.path.join(session_dir, "inference_backend.json"), "w") as f:
-        json.dump({"umap_backend": "umap-learn", "pca_backend": "sklearn"}, f)
+        json.dump({"umap_backend": umap_backend, "pca_backend": "sklearn"}, f)
 
     return results_dir
+
+
+def save_inference_dashboard(session_dir: str, outputs: dict, umap_cfg: dict | None = None, *, inference_pca: bool = True, inference_umap: bool = True) -> str:
+    """Backward-compatible alias for artifact export.
+
+    HTML dashboard generation is centralized in ``src.dashboard``.
+    """
+    return export_inference_dashboard_artifacts(
+        session_dir,
+        outputs,
+        umap_cfg=umap_cfg,
+        inference_pca=inference_pca,
+        inference_umap=inference_umap,
+    )
 
 
 def _build_volume_validity_mask(x_clean_raw: torch.Tensor, target_d: int, target_h: int, target_w: int) -> np.ndarray:
@@ -1016,6 +1128,7 @@ def save_volumetric_umap_embeddings(session_dir: str, outputs: dict, umap_cfg: d
     umap_init = str(umap_cfg.get("init", "spectral")).lower()
     umap_l2_normalize = bool(umap_cfg.get("l2_normalize", False))
     umap_standardize = bool(umap_cfg.get("standardize", False))
+    umap_backend = _normalize_umap_backend(umap_cfg.get("backend", "auto"))
     max_points_raw = umap_cfg.get("volumetric_max_points", 100000)
     max_points = None if max_points_raw is None else int(max(128, max_points_raw))
     sample_seed = int(umap_cfg.get("volumetric_sample_seed", umap_random_state))
@@ -1059,6 +1172,7 @@ def save_volumetric_umap_embeddings(session_dir: str, outputs: dict, umap_cfg: d
         metric=umap_metric,
         random_state=umap_random_state,
         init=umap_init,
+        backend=umap_backend,
     ).astype(np.float32)
     pca3 = _compute_pca_3d(z_sub).astype(np.float32)
 

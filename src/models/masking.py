@@ -518,7 +518,7 @@ def _target_patch_has_valid_input(
     cx: int,
     inner_target_size: int,
 ) -> bool:
-    """Check whether at least one pixel in the target input patch is valid.
+    """Check whether every pixel in the target input patch is valid.
 
     ``valid_pixels`` is a precomputed boolean mask of the same shape as the
     full array: True = valid data, False = sentinel / NaN / invalid region.
@@ -536,7 +536,7 @@ def _target_patch_has_valid_input(
     patch = valid_pixels[py0:py1, px0:px1]
     if patch.size == 0:
         return False
-    return bool(np.any(patch))
+    return bool(np.all(patch))
 
 
 def make_pyramid_grid_context(
@@ -647,7 +647,7 @@ def make_pyramid_grid_context(
         nan_mask = np.isnan(arr)
 
         # Precompute valid-pixel mask ONCE per image so per-candidate
-        # _target_patch_has_valid_input is a cheap slice + any() instead
+        # _target_patch_has_valid_input is a cheap slice + all() instead
         # of per-patch np.zeros_like + np.isclose in a Python loop.
         valid_pixels = np.ones(arr.shape, dtype=bool)
         if sample_invalid_mask is not None:
@@ -1259,7 +1259,7 @@ def prepare_context_batch(
     if invalid_pixel_mask.any():
         x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
 
-    return make_pyramid_grid_context(
+    result = make_pyramid_grid_context(
         x_clean=x_clean,
         sigmas=sigmas,
         mask_fraction=mask_fraction,
@@ -1300,6 +1300,13 @@ def prepare_context_batch(
         cdd_orig_in=cdd_orig_in,
         use_cdd=use_cdd,
     )
+    # Inject the merged NaN/invalid mask into the debug dict so forward()
+    # can apply it to CDD features before the encoder sees them.
+    if return_debug and len(result) >= 5 and isinstance(result[4], dict):
+        debug = dict(result[4])
+        debug["_invalid_pixel_mask"] = invalid_pixel_mask
+        result = tuple(result[:4]) + (debug,)
+    return result
 
 
 def extract_location_patches(

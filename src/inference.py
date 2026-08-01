@@ -9,10 +9,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from src.losses import representation_dense_energy
-from src.models.masking import extract_location_patches, norm_per_sample_channel, prepare_context_batch
+from src.models.masking import (
+    _effective_mask_box_size_for_index,
+    _max_effective_mask_box_size,
+    extract_location_patches,
+    norm_per_sample_channel,
+    prepare_context_batch,
+)
+from src.utils.support import encoder_receptive_field_from_model
 
 # Bump this on every inference-affecting change so session logs show which code ran.
-INFERENCE_VERSION = "v6-scaleaware-sliding-window-masked-encoder-2026"
+INFERENCE_VERSION = "v7-scaleaware-per-channel-composite-mask-2026"
 from src.utils.viz import _target_location_yx
 
 
@@ -280,22 +287,7 @@ def _tile_starts_2d(length: int, window: int, overlap: int) -> list[int]:
 
 
 def _encoder_receptive_field_2d(model) -> int:
-    depth = int(getattr(model, "encoder_depth", 4))
-    kernel = int(getattr(model, "encoder_kernel_size", 7))
-    dilations = getattr(model, "convnext_layer_dilations", None)
-    if dilations is None:
-        dil_list = [1] * depth
-    else:
-        dil_list = [int(d) for d in dilations]
-        if len(dil_list) < depth:
-            reps = (depth + len(dil_list) - 1) // max(1, len(dil_list))
-            dil_list = (dil_list * reps)[:depth]
-        else:
-            dil_list = dil_list[:depth]
-    fov = 1 + 2 + 2
-    for dilation in dil_list:
-        fov += max(0, kernel - 1) * max(1, int(dilation))
-    return max(1, int(fov))
+    return int(encoder_receptive_field_from_model(model))
 
 
 def _dense_output_receptive_field_2d(model) -> int:
@@ -311,6 +303,72 @@ def _dense_output_receptive_field_2d(model) -> int:
             pred_kernel = 3
         rf += max(0, int(pred_kernel) - 1)
     return max(1, int(rf))
+
+
+def _default_mask_predict_box_size_2d(model) -> int:
+    try:
+        mask_scale, mask_box_size = model.sample_mask_params(device=next(model.parameters()).device)
+        return int(
+            _max_effective_mask_box_size(
+                getattr(model, "sigmas", (1.0,)),
+                mask_scale=float(mask_scale),
+                mask_box_size=int(mask_box_size),
+                inner_target_size=int(max(1, getattr(model, "patch_size", 1))),
+                hardcap=getattr(model, "mask_box_hardcap", None),
+                manual_mask_box_sizes=getattr(model, "manual_mask_box_sizes", None),
+            )
+        )
+    except Exception:
+        return int(max(1, getattr(model, "patch_size", 1)))
+
+
+def _center_box_bounds_2d(patch: int, box: int) -> tuple[int, int]:
+    patch = max(1, int(patch))
+    box = max(1, min(patch, int(box)))
+    if box % 2 == 0:
+        box = max(1, box - 1)
+    center = patch // 2
+    box0 = max(0, center - box // 2)
+    box1 = min(patch, box0 + box)
+    box0 = max(0, box1 - box)
+    return int(box0), int(box1)
+
+
+def _scaleaware_center_mask_tokens_2d(
+    *,
+    model,
+    batch_size: int,
+    channels: int,
+    patch: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    mask_scale: float,
+    mask_box_size: int,
+    uniform_box_size: int | None = None,
+) -> tuple[torch.Tensor, list[int]]:
+    tokens = torch.zeros((batch_size, channels, patch, patch), dtype=dtype, device=device)
+    sigmas = tuple(float(v) for v in getattr(model, "sigmas", ()))
+    if not sigmas:
+        sigmas = (1.0,) * int(channels)
+    inner_target_size = int(max(1, getattr(model, "patch_size", 1)))
+    boxes: list[int] = []
+    for ci in range(int(channels)):
+        if uniform_box_size is not None:
+            box = int(uniform_box_size)
+        else:
+            box = _effective_mask_box_size_for_index(
+                index=ci,
+                sigma=float(sigmas[min(ci, len(sigmas) - 1)]),
+                mask_scale=float(mask_scale),
+                mask_box_size=int(mask_box_size),
+                inner_target_size=inner_target_size,
+                hardcap=getattr(model, "mask_box_hardcap", None),
+                manual_mask_box_sizes=getattr(model, "manual_mask_box_sizes", None),
+            )
+        y0, y1 = _center_box_bounds_2d(patch, box)
+        tokens[:, ci : ci + 1, y0:y1, y0:y1] = 1.0
+        boxes.append(int(y1 - y0))
+    return tokens, boxes
 
 
 def _visual_border_half_fov(model) -> int:
@@ -396,6 +454,7 @@ def _dense_forward_2d_tile(
     cdd_masked_tile: torch.Tensor | None = None,
     mask_token_tile: torch.Tensor | None = None,
     mask_inference: bool = False,
+    cdd_masked_preencoded: bool = False,
 ):
     post_log = bool(getattr(model, "post_log_transform", False))
     x_enc = torch.log(torch.clamp(x_tile, min=0.0) + log_floor) if post_log else x_tile
@@ -414,7 +473,7 @@ def _dense_forward_2d_tile(
         encoder_type = str(getattr(model, "encoder_type", ""))
         if encoder_type in ("cdd_scaleaware_convnext", "convnext_dense_pyramid", "escnn_c4_pyramid"):
             if encoder_type == "cdd_scaleaware_convnext":
-                masked_out = model(
+                masked_target_out = model(
                     x_tile,
                     return_debug=False,
                     enable_grid_jitter=False,
@@ -423,24 +482,20 @@ def _dense_forward_2d_tile(
                     mask_inference=True,
                     cdd_orig=cdd_raw_tile,
                 )
-                masked_pred_map = masked_out["pred_map"]
-                masked_context_map = masked_out.get("context_map")
-                if masked_context_map is None:
-                    masked_context_map = context_map
-            else:
-                if cdd_masked_tile is None or mask_token_tile is None:
-                    raise RuntimeError("masked tiled CDD inference requires cdd_masked_tile and mask_token_tile")
-                masked_context_map, _ = _encode_context_2d(
-                    model,
-                    x_enc=x_enc,
-                    cdd_tile=cdd_masked_tile,
-                    log_floor=log_floor,
-                    mask_tokens=mask_token_tile,
-                    cdd_preencoded=False,
-                )
+                masked_target_pred_map = masked_target_out["pred_map"]
+            if cdd_masked_tile is None or mask_token_tile is None:
+                raise RuntimeError("mask_predict tiled CDD inference requires tile-local cdd_masked_tile and mask_token_tile")
+            masked_context_map, _ = _encode_context_2d(
+                model,
+                x_enc=x_enc,
+                cdd_tile=cdd_masked_tile,
+                log_floor=log_floor,
+                mask_tokens=mask_token_tile,
+                cdd_preencoded=bool(cdd_masked_preencoded),
+            )
         elif encoder_type == "convnext_dense_masktoken":
             if x_masked_tile is None or mask_token_tile is None:
-                raise RuntimeError("masked tiled image inference requires x_masked_tile and mask_token_tile")
+                raise RuntimeError("mask_predict tiled image inference requires tile-local x_masked_tile and mask_token_tile")
             x_masked_enc = torch.log(torch.clamp(x_masked_tile, min=0.0) + log_floor) if post_log else x_masked_tile
             masked_context_map, _ = _encode_context_2d(
                 model,
@@ -465,24 +520,172 @@ def _dense_forward_2d_tile(
 
     context_proj = model.projector(context_map)
     pred_map = model.predictor(context_proj)
-    if "masked_pred_map" not in locals():
-        masked_context_proj = model.projector(masked_context_map)
-        masked_pred_map = model.predictor(masked_context_proj)
+    masked_context_proj = model.projector(masked_context_map)
+    mask_pred_map = model.predictor(masked_context_proj)
+    if "masked_target_pred_map" not in locals():
+        masked_target_pred_map = mask_pred_map
     with torch.no_grad():
         gt_map = model.target_projector(gt_base)
-    energy = representation_dense_energy(masked_pred_map, gt_map)
+    energy_pred_map = mask_pred_map if bool(mask_inference) else pred_map
+    energy = representation_dense_energy(energy_pred_map, gt_map)
     return {
         "x_clean": x_enc,
         "x_context": x_enc,
         "context_map": context_map,
         "pred_map": pred_map,
-        "masked_pred_map": masked_pred_map,
+        "mask_pred_map": mask_pred_map,
+        "masked_pred_map": mask_pred_map,
+        "masked_target_pred_map": masked_target_pred_map,
         "gt_map": gt_map,
         "energy_rel_sym": energy["energy_rel_sym"],
         "energy_raw": energy["energy_raw"],
         "energy_rel_gt": energy["energy_rel_gt"],
         "energy_cosine": energy["energy_cosine"],
     }
+
+
+def _run_composed_mask_predict_2d(
+    *,
+    model,
+    x_raw: torch.Tensor,
+    cdd_raw: torch.Tensor | None,
+    patch_size: int,
+    sample_stride: int,
+    mask_box_size: int | None,
+    chunk_size: int,
+    config_name: str,
+) -> torch.Tensor:
+    """Pointwise mask+encoder+predictor diagnostic without feeding a global mask image."""
+    device = next(model.parameters()).device
+    if x_raw.dim() != 4 or int(x_raw.shape[0]) != 1:
+        raise RuntimeError("composed mask_predict expects x_raw shape 1,C,H,W")
+    b, _c, h, w = x_raw.shape
+    stride = max(1, int(sample_stride))
+    patch = max(3, int(patch_size))
+    if patch % 2 == 0:
+        patch += 1
+    center = patch // 2
+    sampled_mask_scale: float | None = None
+    sampled_mask_box_size: int | None = None
+    uniform_box_size: int | None = None
+    if mask_box_size is not None:
+        uniform_box_size = int(mask_box_size)
+        display_box = int(mask_box_size)
+    else:
+        sampled_mask_scale, sampled_mask_box_size = model.sample_mask_params(device=device)
+        display_box = int(
+            _max_effective_mask_box_size(
+                getattr(model, "sigmas", (1.0,)),
+                mask_scale=float(sampled_mask_scale),
+                mask_box_size=int(sampled_mask_box_size),
+                inner_target_size=int(max(1, getattr(model, "patch_size", 1))),
+                hardcap=getattr(model, "mask_box_hardcap", None),
+                manual_mask_box_sizes=getattr(model, "manual_mask_box_sizes", None),
+            )
+        )
+    display_box = max(1, min(patch, int(display_box)))
+    box0, box1 = _center_box_bounds_2d(patch, display_box)
+    ys = list(range(0, h, stride))
+    xs = list(range(0, w, stride))
+    if ys[-1] != h - 1:
+        ys.append(h - 1)
+    if xs[-1] != w - 1:
+        xs.append(w - 1)
+    print(
+        f"[{config_name}] mask_predict composed encoder: "
+        f"patch={patch} stride={stride} max_box={box1 - box0} samples={len(ys) * len(xs)} chunk={chunk_size}"
+    )
+    pad = center
+    x_pad = F.pad(x_raw.detach().cpu(), (pad, pad, pad, pad), mode="replicate")
+    cdd_pad = None if cdd_raw is None else F.pad(cdd_raw.detach().cpu(), (pad, pad, pad, pad), mode="replicate")
+    coords = [(iy, ix, y, x) for iy, y in enumerate(ys) for ix, x in enumerate(xs)]
+    chunk = max(1, int(chunk_size))
+    sample_map = None
+    post_log = bool(getattr(model, "post_log_transform", False))
+    eps = max(1e-6, float(getattr(model, "log_eps", 1.0)))
+    encoder_type = str(getattr(model, "encoder_type", ""))
+    with torch.no_grad():
+        for start in range(0, len(coords), chunk):
+            batch_coords = coords[start : start + chunk]
+            x_tiles = torch.cat(
+                [x_pad[:, :, y : y + patch, x : x + patch] for _iy, _ix, y, x in batch_coords],
+                dim=0,
+            ).to(device, non_blocking=True)
+            cdd_tiles = None
+            if cdd_pad is not None:
+                cdd_tiles = torch.cat(
+                    [cdd_pad[:, :, y : y + patch, x : x + patch] for _iy, _ix, y, x in batch_coords],
+                    dim=0,
+                ).to(device, non_blocking=True)
+            mask_one = torch.zeros((len(batch_coords), 1, patch, patch), dtype=x_tiles.dtype, device=device)
+            mask_one[:, :, box0:box1, box0:box1] = 1.0
+            if post_log:
+                base = torch.clamp(x_tiles, min=0.0)
+                base_std = torch.std(base, dim=(-2, -1), keepdim=True)
+                log_floor = torch.clamp(base_std * float(getattr(model, "cdd_log_std_floor_mult", 0.05)), min=eps)
+            else:
+                log_floor = torch.ones((len(batch_coords), 1, 1, 1), dtype=x_tiles.dtype, device=device)
+            if encoder_type in ("cdd_scaleaware_convnext", "convnext_dense_pyramid", "escnn_c4_pyramid"):
+                if cdd_tiles is None:
+                    raise RuntimeError(f"composed mask_predict requires CDD for encoder_type={encoder_type}")
+                if sampled_mask_scale is None or sampled_mask_box_size is None:
+                    sampled_mask_scale = float(getattr(model, "mask_scale", 1.0))
+                    sampled_mask_box_size = int(max(1, uniform_box_size or display_box))
+                mask_tokens, _mask_boxes = _scaleaware_center_mask_tokens_2d(
+                    model=model,
+                    batch_size=len(batch_coords),
+                    channels=int(cdd_tiles.shape[1]),
+                    patch=patch,
+                    dtype=cdd_tiles.dtype,
+                    device=device,
+                    mask_scale=float(sampled_mask_scale),
+                    mask_box_size=int(sampled_mask_box_size),
+                    uniform_box_size=uniform_box_size,
+                )
+                cdd_masked = cdd_tiles * (1.0 - mask_tokens)
+                x_enc = torch.log(torch.clamp(x_tiles, min=0.0) + log_floor) if post_log else x_tiles
+                context_map, _ = _encode_context_2d(
+                    model,
+                    x_enc=x_enc,
+                    cdd_tile=cdd_masked,
+                    log_floor=log_floor,
+                    mask_tokens=mask_tokens,
+                    cdd_preencoded=False,
+                )
+            elif encoder_type == "convnext_dense_masktoken":
+                x_masked = x_tiles * (1.0 - mask_one)
+                x_masked_enc = torch.log(torch.clamp(x_masked, min=0.0) + log_floor) if post_log else x_masked
+                context_map, _ = _encode_context_2d(
+                    model,
+                    x_enc=x_masked_enc,
+                    cdd_tile=None,
+                    log_floor=log_floor,
+                    mask_tokens=mask_one,
+                    cdd_preencoded=False,
+                )
+            else:
+                x_masked = x_tiles * (1.0 - mask_one)
+                x_masked_enc = torch.log(torch.clamp(x_masked, min=0.0) + log_floor) if post_log else x_masked
+                context_map, _ = _encode_context_2d(
+                    model,
+                    x_enc=x_masked_enc,
+                    cdd_tile=None,
+                    log_floor=log_floor,
+                    mask_tokens=None,
+                    cdd_preencoded=False,
+                )
+            pred = model.predictor(model.projector(context_map))
+            points = pred[:, :, center, center].detach().cpu()
+            if sample_map is None:
+                sample_map = torch.empty((b, int(points.shape[1]), len(ys), len(xs)), dtype=torch.float32)
+            for row, (iy, ix, _y, _x) in enumerate(batch_coords):
+                sample_map[0, :, iy, ix] = points[row]
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    assert sample_map is not None
+    if sample_map.shape[-2:] == (h, w):
+        return sample_map
+    return F.interpolate(sample_map, size=(h, w), mode="bilinear", align_corners=True)
 
 
 def _prepare_full_mask_debug_2d(
@@ -659,9 +862,9 @@ def _run_tiled_dense_inference_2d(
             x_tile = x_raw[:, :, y0:ye, x0:xe]
             cdd_raw_tile = None if cdd_raw is None else cdd_raw[:, :, y0:ye, x0:xe]
             cdd_tile = None if cdd_source is None else cdd_source[:, :, y0:ye, x0:xe]
-            x_masked_tile = None if x_masked_raw is None else x_masked_raw[:, :, y0:ye, x0:xe]
-            cdd_masked_tile = None if cdd_masked_raw is None else cdd_masked_raw[:, :, y0:ye, x0:xe]
-            mask_token_tile = None if mask_token_raw is None else mask_token_raw[:, :, y0:ye, x0:xe]
+            x_masked_tile = None
+            cdd_masked_tile = None
+            mask_token_tile = None
             pad_h = max(0, int(tile_size) - int(x_tile.shape[-2]))
             pad_w = max(0, int(tile_size) - int(x_tile.shape[-1]))
             if pad_h or pad_w:
@@ -681,6 +884,25 @@ def _run_tiled_dense_inference_2d(
                     cdd_masked_tile = F.pad(cdd_masked_tile, (0, pad_w, 0, pad_h), mode=pad_mode)
                 if mask_token_tile is not None:
                     mask_token_tile = F.pad(mask_token_tile, (0, pad_w, 0, pad_h), mode=pad_mode)
+            if bool(mask_inference):
+                token_h, token_w = int(x_tile.shape[-2]), int(x_tile.shape[-1])
+                # Mask the full tile, then only stitch the interior crop. If
+                # the mask stops at the stitched window, the mask edge itself
+                # becomes a visible tile-grid artifact in the latent maps.
+                encoder_mask = torch.ones((b, 1, token_h, token_w), dtype=x_tile.dtype, device=x_tile.device)
+                encoder_type = str(getattr(model, "encoder_type", ""))
+                if encoder_type in ("cdd_scaleaware_convnext", "convnext_dense_pyramid", "escnn_c4_pyramid"):
+                    cdd_mask_source = cdd_tile if bool(cdd_preencoded) else cdd_raw_tile
+                    if cdd_mask_source is None:
+                        raise RuntimeError(f"mask_predict tiled inference requires CDD for encoder_type={encoder_type}")
+                    mask_token_tile = encoder_mask.expand(-1, int(cdd_mask_source.shape[1]), -1, -1)
+                    cdd_masked_tile = cdd_mask_source * (1.0 - mask_token_tile)
+                elif encoder_type == "convnext_dense_masktoken":
+                    mask_token_tile = encoder_mask
+                    x_masked_tile = x_tile * (1.0 - mask_token_tile)
+                else:
+                    mask_token_tile = encoder_mask
+                    x_masked_tile = x_tile * (1.0 - mask_token_tile)
             tile_out = _dense_forward_2d_tile(
                 model,
                 x_tile.to(device, non_blocking=True),
@@ -692,6 +914,7 @@ def _run_tiled_dense_inference_2d(
                 cdd_masked_tile=None if cdd_masked_tile is None else cdd_masked_tile.to(device, non_blocking=True),
                 mask_token_tile=None if mask_token_tile is None else mask_token_tile.to(device, non_blocking=True),
                 mask_inference=mask_inference,
+                cdd_masked_preencoded=bool(cdd_preencoded),
             )
             out_y0, out_y1 = y0 + wy0, y0 + wy1
             out_x0, out_x1 = x0 + wx0, x0 + wx1
@@ -876,6 +1099,10 @@ def run_post_training_inference(
     max_diagnostic_size: int | None = None,
     tile_size: int | None = 512,
     tile_overlap: int | None = None,
+    mask_predict_mode: str | None = None,
+    mask_predict_stride: int | None = None,
+    mask_predict_box_size: int | None = None,
+    mask_predict_chunk_size: int | None = None,
     inference_discard_margin: int | None = None,
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
@@ -966,6 +1193,40 @@ def run_post_training_inference(
         tta_view_count = 1
         shift_sums: dict[str, torch.Tensor] = {}
         shift_counts: dict[str, int] = {}
+        def _compute_mask_predict_map(fallback_map: torch.Tensor | None = None) -> torch.Tensor:
+            if mask_predict_mode is None:
+                raise ValueError("train.mask_predict_mode must be set explicitly when dashboard_mask_inference=true")
+            if mask_predict_stride is None:
+                raise ValueError("train.mask_predict_stride must be set explicitly when dashboard_mask_inference=true")
+            if mask_predict_chunk_size is None:
+                raise ValueError("train.mask_predict_chunk_size must be set explicitly when dashboard_mask_inference=true")
+            mode = str(mask_predict_mode).strip().lower()
+            if mode in ("composed", "composite", "glued", "pointwise", "local"):
+                if not (hasattr(model, "context_encoder") and hasattr(model, "projector") and hasattr(model, "predictor")):
+                    if fallback_map is not None:
+                        return fallback_map
+                    raise RuntimeError("composed mask_predict requires context_encoder/projector/predictor modules")
+                rf = int(_dense_output_receptive_field_2d(model))
+                max_box = int(mask_predict_box_size) if mask_predict_box_size is not None else int(_default_mask_predict_box_size_2d(model))
+                composite_patch = max(3, int(rf) + int(max_box) - 1)
+                if composite_patch % 2 == 0:
+                    composite_patch += 1
+                return _run_composed_mask_predict_2d(
+                    model=model,
+                    x_raw=x_raw.detach().cpu(),
+                    cdd_raw=None if cdd_raw is None else cdd_raw.detach().cpu(),
+                    patch_size=composite_patch,
+                    sample_stride=int(mask_predict_stride),
+                    mask_box_size=None if mask_predict_box_size is None else int(mask_predict_box_size),
+                    chunk_size=int(mask_predict_chunk_size),
+                    config_name=config_name,
+                ).to(x_raw.device)
+            raise ValueError(
+                f"Unsupported mask_predict_mode={mask_predict_mode!r}. "
+                "Use composite/composed so the mask is attached to each local encoder pass; "
+                "the old tiled full-mask mode is disabled because it can imprint tile borders."
+            )
+
         if use_tiled_2d:
             h, w = int(x_raw.shape[-2]), int(x_raw.shape[-1])
             probe_h = min(int(tile_size), h)
@@ -1010,25 +1271,9 @@ def run_post_training_inference(
                 model=model,
                 x_raw=x_raw.detach().cpu(),
                 cdd_raw=None if cdd_raw is None else cdd_raw.detach().cpu(),
-                x_masked_raw=(
-                    mask_debug_full.get("x_context_masked").detach().cpu()
-                    if torch.is_tensor(mask_debug_full.get("x_context_masked"))
-                    else None
-                ),
-                cdd_masked_raw=(
-                    mask_debug_full.get("cdd_channels_masked").detach().cpu()
-                    if torch.is_tensor(mask_debug_full.get("cdd_channels_masked"))
-                    else None
-                ),
-                mask_token_raw=(
-                    mask_debug_full.get("dip_field_per_channel").detach().cpu()
-                    if torch.is_tensor(mask_debug_full.get("dip_field_per_channel"))
-                    else (
-                        mask_debug_full.get("target_mask_map").detach().cpu()
-                        if torch.is_tensor(mask_debug_full.get("target_mask_map"))
-                        else None
-                    )
-                ),
+                x_masked_raw=None,
+                cdd_masked_raw=None,
+                mask_token_raw=None,
                 tile_size=int(tile_size),
                 tile_overlap=tile_overlap,
                 config_name=config_name,
@@ -1036,8 +1281,11 @@ def run_post_training_inference(
                 tta_mode=inference_tta_mode,
                 mask_inference=bool(mask_inference),
             )
-            for key in ("x_clean", "x_context", "context_map", "pred_map", "masked_pred_map", "gt_map"):
+            for key in ("x_clean", "x_context", "context_map", "pred_map", "mask_pred_map", "masked_pred_map", "masked_target_pred_map", "gt_map"):
                 outputs[key] = tiled[key].to(x_raw.device)
+            if bool(mask_inference) and str(mask_predict_mode).strip().lower() in ("composed", "composite", "glued", "pointwise", "local"):
+                outputs["mask_pred_map"] = _compute_mask_predict_map()
+                outputs["masked_pred_map"] = outputs["mask_pred_map"]
             if "tile_visit_map" in tiled:
                 outputs["tile_visit_map"] = tiled["tile_visit_map"].to(x_raw.device)
             outputs["x_clean_raw"] = x_raw
@@ -1105,11 +1353,11 @@ def run_post_training_inference(
                     out_i = _forward_one_tta(x_raw, cdd_raw)
                 if bool(mask_inference):
                     # Dashboard semantics keep two predictor branches:
-                    # pred_map is the clean-input prediction; masked_pred_map
-                    # is the prediction from the masked context used for JEPA
-                    # energy. The model forward returns only one pred_map, so
-                    # build the pair explicitly during dashboard inference.
-                    masked_pred_map_i = out_i["pred_map"]
+                    # Keep three dashboard branches:
+                    # pred_map: clean prediction;
+                    # mask_pred_map: context encoder masked immediately before inference;
+                    # masked_target_pred_map: model's target-masked JEPA branch.
+                    masked_target_pred_map_i = out_i["pred_map"]
                     def _forward_clean(xv: torch.Tensor, cdv: torch.Tensor | None) -> dict:
                         return model(
                             xv,
@@ -1130,11 +1378,13 @@ def run_post_training_inference(
                         )
                     else:
                         clean_out_i = _forward_clean(x_raw, cdd_raw)
-                    out_i["masked_pred_map"] = masked_pred_map_i
+                    out_i["masked_target_pred_map"] = masked_target_pred_map_i
+                    out_i["mask_pred_map"] = _compute_mask_predict_map(fallback_map=masked_target_pred_map_i)
+                    out_i["masked_pred_map"] = out_i["mask_pred_map"]
                     out_i["pred_map"] = clean_out_i["pred_map"]
                     if "context_map" in clean_out_i:
                         out_i["context_map"] = clean_out_i["context_map"]
-                for key in ("pred_map", "masked_pred_map", "gt_map", "context_map"):
+                for key in ("pred_map", "mask_pred_map", "masked_pred_map", "masked_target_pred_map", "gt_map", "context_map"):
                     value = out_i.get(key)
                     if value is None:
                         continue
@@ -1158,10 +1408,10 @@ def run_post_training_inference(
                     energy_sum = torch.zeros((bsz, 1, h, w), device=outputs["x_clean"].device, dtype=outputs["x_clean"].dtype)
                     count_map = torch.zeros_like(energy_sum)
                 point_energy_outputs = out_i
-                if "masked_pred_map" in out_i and "context_map" in out_i:
+                if "mask_pred_map" in out_i:
                     point_energy_outputs = dict(out_i)
                     point_energy_outputs["pred_patches"] = extract_location_patches(
-                        out_i["masked_pred_map"],
+                        out_i["mask_pred_map"],
                         out_i["target_locations"],
                         patch_size=patch_size,
                     )
@@ -1178,8 +1428,12 @@ def run_post_training_inference(
         if len(shifts) > 1:
             for key, value in shift_sums.items():
                 outputs[key] = value.div(float(max(1, shift_counts[key])))
-        if bool(mask_inference) and "masked_pred_map" not in outputs:
-            outputs["masked_pred_map"] = outputs["pred_map"]
+        if bool(mask_inference):
+            if "mask_pred_map" not in outputs:
+                outputs["mask_pred_map"] = outputs.get("masked_pred_map", outputs["pred_map"])
+            if "masked_target_pred_map" not in outputs:
+                outputs["masked_target_pred_map"] = outputs.get("masked_pred_map", outputs["mask_pred_map"])
+            outputs["masked_pred_map"] = outputs["mask_pred_map"]
 
     inference_outputs = {
         "inference_version": INFERENCE_VERSION,
@@ -1189,7 +1443,9 @@ def run_post_training_inference(
             "cdd_scaleaware_convnext tiled inference calls model(mask_inference=True) "
             "on each raw sliding-window tile, letting the model wrapper prepare "
             "masked CDD fields and mask tokens; "
-            "legacy pyramid encoders use masked CDD fields plus concatenated mask tokens"
+            "legacy pyramid encoders use masked CDD fields plus concatenated mask tokens; "
+            "mask_pred_map is the encoder-masked sliding prediction, while "
+            "masked_target_pred_map is saved only as a target-mask debug artifact"
         ),
         "patch_size": int(getattr(model, "patch_size", 1)),
         "inference_input_shape": tuple(int(v) for v in outputs["x_clean"].shape[-2:]),
@@ -1204,7 +1460,9 @@ def run_post_training_inference(
         "target_scales": outputs["target_scales"][:8].detach().cpu(),
         "target_valid": outputs["target_valid"][:8].detach().cpu(),
         "pred_map": outputs["pred_map"][:2].detach().cpu(),
+        "mask_pred_map": outputs.get("mask_pred_map", outputs.get("masked_pred_map", outputs["pred_map"]))[:2].detach().cpu(),
         "masked_pred_map": outputs.get("masked_pred_map", outputs["pred_map"])[:2].detach().cpu(),
+        "masked_target_pred_map": outputs.get("masked_target_pred_map", outputs.get("masked_pred_map", outputs["pred_map"]))[:2].detach().cpu(),
         "gt_map": outputs["gt_map"][:2].detach().cpu(),
         "context_map": outputs.get("context_map", outputs["pred_map"])[:2].detach().cpu(),
         "pred_patches": outputs["pred_patches"][:2].detach().cpu(),
@@ -1238,11 +1496,11 @@ def run_post_training_inference(
             inference_outputs[k] = outputs[k][:8].detach().cpu()
     energy_scalar = float(total_energy / max(1, total_valid))
     energy_outputs = outputs
-    if "masked_pred_map" in outputs:
+    if "mask_pred_map" in outputs:
         energy_outputs = dict(outputs)
-        energy_outputs["pred_map"] = outputs["masked_pred_map"]
+        energy_outputs["pred_map"] = outputs["mask_pred_map"]
         energy_outputs["pred_patches"] = extract_location_patches(
-            outputs["masked_pred_map"],
+            outputs["mask_pred_map"],
             outputs["target_locations"],
             patch_size=int(getattr(model, "patch_size", 1)),
         )
@@ -1279,7 +1537,7 @@ def run_post_training_inference(
     else:
         fov_border = int(max(0, float(inference_mask_border)))
     if fov_border > 0:
-        for key in ("pred_map", "masked_pred_map", "gt_map", "context_map",
+        for key in ("pred_map", "mask_pred_map", "masked_pred_map", "masked_target_pred_map", "gt_map", "context_map",
                     "target_energy_map", "target_energy_raw_map",
                     "target_energy_rel_gt_map", "target_energy_cosine_map",
                     "target_energy_point_map"):
@@ -1373,7 +1631,7 @@ def run_post_training_inference(
                 "inference_encoder_receptive_field": int(encoder_rf),
                 "inference_dense_output_receptive_field": int(dense_output_rf),
                 "inference_discard_margin": int(discard_margin),
-                "energy_reference": "masked_predict_minus_target",
+                "energy_reference": "mask_predict_minus_target",
                 "target_allowed_mask_present": bool("target_allowed_mask_map" in inference_outputs),
                 "target_allowed_mask_fraction": (
                     float(inference_outputs["target_allowed_mask_map"].float().mean().item())
@@ -1408,18 +1666,28 @@ def run_post_training_inference(
         with open(os.path.join(session_dir, "target_selection_summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
     _save_npz(os.path.join(session_dir, "pred_map.npz"), inference_outputs["pred_map"].numpy())
+    _save_npz(os.path.join(session_dir, "mask_pred_map.npz"), inference_outputs["mask_pred_map"].numpy())
     _save_npz(os.path.join(session_dir, "masked_pred_map.npz"), inference_outputs["masked_pred_map"].numpy())
+    _save_npz(os.path.join(session_dir, "masked_target_pred_map.npz"), inference_outputs["masked_target_pred_map"].numpy())
     _save_npz(os.path.join(session_dir, "gt_map.npz"), inference_outputs["gt_map"].numpy())
     pred_norm = inference_outputs["pred_map"].norm(dim=1).numpy()
+    mask_pred_norm = inference_outputs["mask_pred_map"].norm(dim=1).numpy()
     masked_pred_norm = inference_outputs["masked_pred_map"].norm(dim=1).numpy()
+    masked_target_pred_norm = inference_outputs["masked_target_pred_map"].norm(dim=1).numpy()
     gt_norm = inference_outputs["gt_map"].norm(dim=1).numpy()
     err_norm = (inference_outputs["pred_map"] - inference_outputs["gt_map"]).norm(dim=1).numpy()
+    mask_err_norm = (inference_outputs["mask_pred_map"] - inference_outputs["gt_map"]).norm(dim=1).numpy()
     masked_err_norm = (inference_outputs["masked_pred_map"] - inference_outputs["gt_map"]).norm(dim=1).numpy()
+    masked_target_err_norm = (inference_outputs["masked_target_pred_map"] - inference_outputs["gt_map"]).norm(dim=1).numpy()
     _save_npz(os.path.join(session_dir, "pred_latent_norm.npz"), pred_norm)
+    _save_npz(os.path.join(session_dir, "mask_pred_latent_norm.npz"), mask_pred_norm)
     _save_npz(os.path.join(session_dir, "masked_pred_latent_norm.npz"), masked_pred_norm)
+    _save_npz(os.path.join(session_dir, "masked_target_pred_latent_norm.npz"), masked_target_pred_norm)
     _save_npz(os.path.join(session_dir, "gt_latent_norm.npz"), gt_norm)
     _save_npz(os.path.join(session_dir, "pred_gt_latent_error_norm.npz"), err_norm)
+    _save_npz(os.path.join(session_dir, "mask_pred_gt_latent_error_norm.npz"), mask_err_norm)
     _save_npz(os.path.join(session_dir, "masked_pred_gt_latent_error_norm.npz"), masked_err_norm)
+    _save_npz(os.path.join(session_dir, "masked_target_pred_gt_latent_error_norm.npz"), masked_target_err_norm)
     print(
         f"[{config_name}] post_training_artifacts_saved session_dir={session_dir} "
         f"(run scripts/session_to_dash.py to generate plots/dashboards)"

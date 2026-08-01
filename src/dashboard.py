@@ -19,15 +19,16 @@ import numpy as np
 import plotly.graph_objects as go
 import torch
 from src.diagnostics import rank_dashboard
+from src.utils.support import invalid_support_border_from_config
 from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap, _target_region_mask_from_outputs
 
 
-DASHBOARD_VERSION = "production-diagnostics-v27-full-latent-dashboard-default"
+DASHBOARD_VERSION = "production-diagnostics-v30-invalid-support-border-mode"
 CONTROL_SCRIPT_SENTINEL = "window.JEPADashboardControls"
 DASHBOARD_COMPUTE_UMAP = os.environ.get("DASHBOARD_COMPUTE_UMAP", "1").strip().lower() in {"1", "true", "yes", "on"}
 DASHBOARD_UMAP_FIT_MAX_TOKENS = int(os.environ.get("DASHBOARD_UMAP_FIT_MAX_TOKENS", "12000"))
 DASHBOARD_UMAP_TRANSFORM_BATCH = int(os.environ.get("DASHBOARD_UMAP_TRANSFORM_BATCH", "8192"))
-DASHBOARD_UMAP_PYTHON = os.environ.get("DASHBOARD_UMAP_PYTHON", "/Users/gxli/anaconda3/envs/test/bin/python")
+DASHBOARD_UMAP_PYTHON = os.environ.get("DASHBOARD_UMAP_PYTHON", sys.executable)
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_DIR = os.path.join(ROOT_DIR, "scripts")
 
@@ -39,6 +40,8 @@ DASH_DATA_REQUIRED = {
     "dashboard_config_source",
     "orig",
     "target",
+    "valid_target_mask",
+    "rejected_mask",
     "target_loc_heatmap",
     "energy_map",
     "visit_heatmap",
@@ -108,7 +111,15 @@ def _ensure_session_rank_diagnostics(session_dir: str, outputs: dict[str, Any]) 
             return rank_diag
 
     erank_path = os.path.join(session_dir, "effective_rank.txt")
-    if not os.path.exists(erank_path):
+    rewrite_erank = not os.path.exists(erank_path)
+    if not rewrite_erank:
+        try:
+            with open(erank_path, "r", encoding="utf-8") as f:
+                current_erank = float((f.read() or "nan").strip())
+            rewrite_erank = (not np.isfinite(current_erank)) or current_erank <= 0.0
+        except Exception:
+            rewrite_erank = True
+    if rewrite_erank:
         try:
             gt_erank = float(rank_diag.get("gt", {}).get("erank", np.nan))
             if np.isfinite(gt_erank):
@@ -125,6 +136,7 @@ def _dashboard_umap_params(cfg: dict[str, Any]) -> dict[str, Any]:
     umap_cfg = train_cfg.get("umap", {}) if isinstance(train_cfg, dict) else {}
     if not isinstance(umap_cfg, dict):
         umap_cfg = {}
+    env_backend = os.environ.get("DASHBOARD_UMAP_BACKEND")
     return {
         "n_neighbors": int(umap_cfg.get("n_neighbors", 15)),
         "min_dist": float(umap_cfg.get("min_dist", 0.05)),
@@ -135,6 +147,7 @@ def _dashboard_umap_params(cfg: dict[str, Any]) -> dict[str, Any]:
         "transform_batch": int(umap_cfg.get("transform_batch", DASHBOARD_UMAP_TRANSFORM_BATCH)),
         "l2_normalize": bool(umap_cfg.get("l2_normalize", False)),
         "standardize": bool(umap_cfg.get("standardize", False)),
+        "backend": str(env_backend if env_backend else umap_cfg.get("backend", "auto")),
     }
 
 
@@ -149,6 +162,7 @@ def _compute_external_umap_nd(
     init: str = "spectral",
     fit_max_tokens: int = 12000,
     transform_batch: int = 8192,
+    backend: str = "auto",
 ) -> np.ndarray:
     py = os.environ.get("DASHBOARD_UMAP_PYTHON", DASHBOARD_UMAP_PYTHON)
     if not py or not os.path.exists(py):
@@ -190,24 +204,63 @@ def _compute_external_umap_nd(
             "import os, sys, numpy as np\n"
             "import tempfile\n"
             "os.makedirs(os.environ.get('NUMBA_CACHE_DIR', os.path.join(tempfile.gettempdir(), 'numba-cache')), exist_ok=True)\n"
-            "import umap\n"
             "x=np.load(sys.argv[1]).astype('float32')\n"
             "fit_x=np.load(sys.argv[2]).astype('float32')\n"
             "idx=np.load(sys.argv[3]).astype('int64')\n"
             "out=sys.argv[4]\n"
             "n_components=int(sys.argv[5]); n_neighbors=int(sys.argv[6]); min_dist=float(sys.argv[7])\n"
-            "metric=sys.argv[8]; random_state=int(sys.argv[9]); init=sys.argv[10]; transform_batch=int(sys.argv[11])\n"
-            "print(f'[dashboard] real umap fit_rows={fit_x.shape[0]} total_rows={x.shape[0]} transform_batch={transform_batch}', flush=True)\n"
-            "model=umap.UMAP(n_components=n_components,n_neighbors=n_neighbors,min_dist=min_dist,metric=metric,random_state=random_state,init=init)\n"
-            "z_fit=model.fit_transform(fit_x).astype('float32')\n"
+            "metric=sys.argv[8]; random_state=int(sys.argv[9]); init=sys.argv[10]; transform_batch=int(sys.argv[11]); backend=sys.argv[12].strip().lower()\n"
+            "if backend in ('', 'auto', 'gpu'):\n"
+            "    backend='auto'\n"
+            "elif backend in ('cuml', 'cu-ml', 'rapids'):\n"
+            "    backend='cuml'\n"
+            "elif backend in ('umap', 'umap-learn', 'cpu'):\n"
+            "    backend='umap-learn'\n"
+            "else:\n"
+            "    raise RuntimeError(f'Unsupported DASHBOARD_UMAP_BACKEND/config backend={backend!r}')\n"
+            "def _asnumpy(v):\n"
+            "    try:\n"
+            "        import cupy as cp\n"
+            "        if isinstance(v, cp.ndarray):\n"
+            "            return cp.asnumpy(v)\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    try:\n"
+            "        return v.to_numpy()\n"
+            "    except Exception:\n"
+            "        return np.asarray(v)\n"
+            "model=None; selected=None\n"
+            "if backend in ('auto', 'cuml'):\n"
+            "    try:\n"
+            "        from cuml.manifold import UMAP as UMAPCls\n"
+            "        model=UMAPCls(n_components=n_components,n_neighbors=n_neighbors,min_dist=min_dist,metric=metric,random_state=random_state,init=init)\n"
+            "        selected='cuml'\n"
+            "    except Exception as e:\n"
+            "        if backend == 'cuml':\n"
+            "            raise RuntimeError(f'Requested cuML UMAP failed: {type(e).__name__}: {e}')\n"
+            "        print(f'[dashboard] cuML UMAP unavailable; falling back to umap-learn: {type(e).__name__}: {e}', flush=True)\n"
+            "if model is None:\n"
+            "    import umap\n"
+            "    model=umap.UMAP(n_components=n_components,n_neighbors=n_neighbors,min_dist=min_dist,metric=metric,random_state=random_state,init=init)\n"
+            "    selected='umap-learn'\n"
+            "print(f'[dashboard] real umap backend={selected} fit_rows={fit_x.shape[0]} total_rows={x.shape[0]} transform_batch={transform_batch}', flush=True)\n"
+            "z_fit=_asnumpy(model.fit_transform(fit_x)).astype('float32')\n"
             "try:\n"
             "    if fit_x.shape[0] == x.shape[0]:\n"
             "        z=z_fit\n"
+            "    elif os.environ.get('DASHBOARD_UMAP_FULL_TRANSFORM', '0').strip().lower() not in ('1','true','yes','on'):\n"
+            "        from sklearn.neighbors import NearestNeighbors\n"
+            "        k=min(int(os.environ.get('DASHBOARD_UMAP_INTERP_K', '16')), fit_x.shape[0])\n"
+            "        nn=NearestNeighbors(n_neighbors=max(1, k), metric='euclidean').fit(fit_x)\n"
+            "        dist, nearest=nn.kneighbors(x, return_distance=True)\n"
+            "        w=1.0/np.maximum(dist, 1e-6)\n"
+            "        w=w/np.maximum(w.sum(axis=1, keepdims=True), 1e-12)\n"
+            "        z=np.einsum('nk,nkc->nc', w.astype('float32'), z_fit[nearest].astype('float32')).astype('float32')\n"
             "    else:\n"
             "        chunks=[]\n"
             "        bs=max(1, int(transform_batch))\n"
             "        for start in range(0, x.shape[0], bs):\n"
-            "            chunks.append(model.transform(x[start:start+bs]).astype('float32'))\n"
+            "            chunks.append(_asnumpy(model.transform(x[start:start+bs])).astype('float32'))\n"
             "        z=np.concatenate(chunks, axis=0)\n"
             "except Exception:\n"
             "    from sklearn.neighbors import NearestNeighbors\n"
@@ -235,6 +288,7 @@ def _compute_external_umap_nd(
                 str(int(random_state)),
                 str(init),
                 str(int(transform_batch)),
+                str(backend),
             ],
             cwd=ROOT_DIR,
             env=env,
@@ -418,7 +472,7 @@ def _verbose_artifact_report(session_dir: str) -> list[str]:
     if not os.path.isdir(results_dir):
         missing.append(f"missing_dir: {results_dir}")
         return missing
-    # Core branch artifacts expected from src/train.py save_inference_dashboard().
+    # Core branch artifacts exported by src.utils.viz.export_inference_dashboard_artifacts().
     for branch in ("predict", "target"):
         if not _has_required_branch_artifacts(results_dir, branch):
             missing.append(f"missing_branch_artifacts[{branch}]: map or legacy coordinate files absent")
@@ -799,6 +853,53 @@ def _rgb_from_xyz(
     return rgb, rgb_flat
 
 
+def _mask_flat_grid_values(
+    values: np.ndarray,
+    valid_mask: np.ndarray,
+    h: int,
+    w: int,
+) -> np.ndarray:
+    """Force dashboard-grid values outside the accepted mask to NaN."""
+    arr = np.asarray(values, dtype=np.float32).copy()
+    mask = np.asarray(valid_mask, dtype=bool)
+    if mask.shape != (h, w):
+        return arr
+    flat_mask = mask.reshape(-1)
+    if arr.ndim == 2 and arr.shape[0] == h * w:
+        arr[~flat_mask, :] = np.nan
+    elif arr.ndim == 1 and arr.shape[0] == h * w:
+        arr[~flat_mask] = np.nan
+    return arr
+
+
+def _resize_bool_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    arr = np.asarray(mask, dtype=bool)
+    h, w = int(shape[0]), int(shape[1])
+    if arr.shape == (h, w):
+        return arr.copy()
+    if arr.ndim != 2:
+        return np.ones((h, w), dtype=bool)
+    t = torch.from_numpy(arr.astype(np.float32)).view(1, 1, *arr.shape)
+    resized = torch.nn.functional.interpolate(t, size=(h, w), mode="nearest")[0, 0].numpy()
+    return (resized > 0.5).astype(bool)
+
+
+def _resize_2d_map(values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    h, w = int(shape[0]), int(shape[1])
+    if arr.shape == (h, w):
+        return arr.astype(np.float32, copy=False)
+    if arr.ndim != 2:
+        return np.full((h, w), np.nan, dtype=np.float32)
+    finite = np.isfinite(arr)
+    filled = np.where(finite, arr, 0.0).astype(np.float32)
+    t = torch.from_numpy(filled).view(1, 1, *filled.shape)
+    m = torch.from_numpy(finite.astype(np.float32)).view(1, 1, *finite.shape)
+    resized = torch.nn.functional.interpolate(t, size=(h, w), mode="bilinear", align_corners=False)[0, 0].numpy()
+    resized_mask = torch.nn.functional.interpolate(m, size=(h, w), mode="nearest")[0, 0].numpy() > 0.5
+    return np.where(resized_mask, resized, np.nan).astype(np.float32)
+
+
 def _fill_invalid_rgb_from_nearest(rgb: np.ndarray, valid: np.ndarray) -> np.ndarray:
     """Fill invalid display pixels from nearest valid row/column, preserving shape."""
     out = np.asarray(rgb, dtype=np.uint8).copy()
@@ -982,33 +1083,7 @@ def _viz_crop_border_from_config(session_dir: str) -> tuple[bool, int, str | Non
 
 
 def _encoder_fov_border_from_config_dict(cfg: dict) -> int:
-    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-    if not isinstance(model_cfg, dict):
-        return 0
-    depth = int(model_cfg.get("encoder_depth", 3))
-    kernel = int(model_cfg.get("encoder_kernel_size", 5))
-    mode = str(model_cfg.get("mode", "")).strip().lower()
-    encoder_type = str(model_cfg.get("encoder_type", "")).strip().lower()
-    if mode.startswith("3d") or "3d" in encoder_type:
-        rf = 1 + 2 * (3 - 1) + max(0, depth) * max(0, kernel - 1)
-        return max(0, rf // 2)
-    dilations = model_cfg.get("convnext_layer_dilations")
-    if dilations is None:
-        dil_list = [1] * max(0, depth)
-    else:
-        try:
-            dil_list = [int(v) for v in dilations]
-        except TypeError:
-            dil_list = [1] * max(0, depth)
-        if len(dil_list) < depth and dil_list:
-            reps = (depth + len(dil_list) - 1) // len(dil_list)
-            dil_list = (dil_list * reps)[:depth]
-        else:
-            dil_list = dil_list[:depth]
-    rf = 1 + 2 + 2
-    for dilation in dil_list:
-        rf += max(0, kernel - 1) * max(1, int(dilation))
-    return max(0, rf // 2)
+    return int(invalid_support_border_from_config(cfg))
 
 
 def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
@@ -1064,6 +1139,21 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     h, w = orig.shape
     _assert_not_stale_cropped_inference(session_dir, (h, w))
     dashboard_cfg, _dashboard_cfg_source = _load_session_config(session_dir)
+
+    def _source_session_dir() -> str | None:
+        inf_cfg = dashboard_cfg.get("_inference", {}) if isinstance(dashboard_cfg, dict) else {}
+        src = inf_cfg.get("source_session") if isinstance(inf_cfg, dict) else None
+        if not src:
+            return None
+        src_path = str(src)
+        if os.path.isdir(src_path):
+            return src_path
+        local_src = os.path.join(ROOT_DIR, "sessions", os.path.basename(src_path.rstrip(os.sep)))
+        if os.path.isdir(local_src):
+            return local_src
+        return None
+
+    source_session_dir = _source_session_dir()
     display_valid_target_mask = _valid_target_display_mask(outputs, (h, w), orig, dashboard_cfg)
 
     # Always render target locations as center points (not square footprints).
@@ -1112,10 +1202,18 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             energy_map = np.zeros((h, w), dtype=np.float32)
     energy_map = np.where(display_valid_target_mask, energy_map, 0.0).astype(np.float32)
 
-    visit_path = _prefer_npz(os.path.join(session_dir, "visited_target_frequency_canonical.npy"))
+    visit_owner_dir = session_dir
+    visit_path = _prefer_npz(os.path.join(visit_owner_dir, "visited_target_frequency_canonical.npy"))
     if not os.path.exists(visit_path):
-        visit_path = _prefer_npz(os.path.join(session_dir, "visited_target_frequency.npy"))
+        visit_path = _prefer_npz(os.path.join(visit_owner_dir, "visited_target_frequency.npy"))
+    if not os.path.exists(visit_path) and source_session_dir is not None:
+        visit_owner_dir = source_session_dir
+        visit_path = _prefer_npz(os.path.join(visit_owner_dir, "visited_target_frequency_canonical.npy"))
+        if not os.path.exists(visit_path):
+            visit_path = _prefer_npz(os.path.join(visit_owner_dir, "visited_target_frequency.npy"))
     count_visit_path = _prefer_npz(os.path.join(session_dir, "target_energy_count_map.npy"))
+    if not os.path.exists(count_visit_path) and source_session_dir is not None:
+        count_visit_path = _prefer_npz(os.path.join(source_session_dir, "target_energy_count_map.npy"))
     visit_heatmap_kind = "Target Coverage Heatmap"
     if os.path.exists(visit_path):
         visit_heatmap = _canonicalize_2d_map(_load_array(visit_path))
@@ -1210,6 +1308,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     if pred_map is None:
         raise RuntimeError(f"{session_dir}: inference outputs missing pred_map")
     h_lat, w_lat = int(pred_map.shape[-2]), int(pred_map.shape[-1])
+    if display_valid_target_mask.shape == (h_lat, w_lat):
+        latent_valid_mask = display_valid_target_mask.astype(bool)
+    else:
+        latent_valid_mask = _resize_bool_mask(display_valid_target_mask, (h_lat, w_lat))
 
     dashboard_config_source = _find_readable_session_config_path(session_dir)
     umap_params = _dashboard_umap_params(dashboard_cfg)
@@ -1318,8 +1420,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     def _slice_latent_xyz(prefix_out: str) -> np.ndarray:
         if prefix_out == "pred":
             src_map = outputs.get("pred_map", outputs.get("context_map"))
+        elif prefix_out == "mask_pred":
+            src_map = outputs.get("mask_pred_map", outputs.get("masked_pred_map", outputs.get("pred_map", outputs.get("context_map"))))
         elif prefix_out == "masked_pred":
-            src_map = outputs.get("masked_pred_map", outputs.get("pred_map", outputs.get("context_map")))
+            src_map = outputs.get("mask_pred_map", outputs.get("masked_pred_map", outputs.get("pred_map", outputs.get("context_map"))))
+        elif prefix_out == "masked_target_pred":
+            src_map = outputs.get("masked_target_pred_map", outputs.get("masked_pred_map", outputs.get("pred_map", outputs.get("context_map"))))
         elif prefix_out == "gt":
             src_map = outputs.get("gt_map", outputs.get("pred_map"))
         else:
@@ -1334,8 +1440,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     def _slice_latent_vectors(prefix_out: str) -> np.ndarray:
         if prefix_out == "pred":
             src_map = outputs.get("pred_map", outputs.get("context_map"))
+        elif prefix_out == "mask_pred":
+            src_map = outputs.get("mask_pred_map", outputs.get("masked_pred_map", outputs.get("pred_map", outputs.get("context_map"))))
         elif prefix_out == "masked_pred":
-            src_map = outputs.get("masked_pred_map", outputs.get("pred_map", outputs.get("context_map")))
+            src_map = outputs.get("mask_pred_map", outputs.get("masked_pred_map", outputs.get("pred_map", outputs.get("context_map"))))
+        elif prefix_out == "masked_target_pred":
+            src_map = outputs.get("masked_target_pred_map", outputs.get("masked_pred_map", outputs.get("pred_map", outputs.get("context_map"))))
         elif prefix_out == "gt":
             src_map = outputs.get("gt_map", outputs.get("pred_map"))
         else:
@@ -1352,6 +1462,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         if z.ndim != 2 or z.shape[0] != h_lat * w_lat or z.shape[1] == 0:
             empty = np.full((h_lat * w_lat, 3), np.nan, dtype=np.float32)
             return empty, empty.copy()
+        z = _mask_flat_grid_values(z, latent_valid_mask, h_lat, w_lat)
         valid = np.isfinite(z).all(axis=1)
         pca = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
         um = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
@@ -1364,6 +1475,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             pca_pad[:, : pca_valid.shape[1]] = pca_valid
             pca_valid = pca_pad
         pca[valid] = pca_valid
+        if not DASHBOARD_COMPUTE_UMAP:
+            return pca, um
         umap_valid = _compute_external_umap_nd(
             _preprocess_latents_for_umap(
                 z_valid,
@@ -1376,8 +1489,9 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             metric=str(umap_params["metric"]),
             random_state=int(umap_params["random_state"]),
             init=str(umap_params["init"]),
-            fit_max_tokens=max(1024, int(umap_params["fit_max_tokens"])),
+            fit_max_tokens=max(128, int(umap_params["fit_max_tokens"])),
             transform_batch=max(256, int(umap_params["transform_batch"])),
+            backend=str(umap_params.get("backend", "auto")),
         ).astype(np.float32, copy=False)
         um[valid] = umap_valid
         return pca, um
@@ -1386,6 +1500,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         z = _slice_latent_vectors(prefix_out)
         if z.ndim != 2 or z.shape[0] != h_lat * w_lat or z.shape[1] == 0:
             return np.full((h_lat * w_lat, 3), np.nan, dtype=np.float32)
+        z = _mask_flat_grid_values(z, latent_valid_mask, h_lat, w_lat)
         full = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
         finite = np.isfinite(z).all(axis=1)
         if int(np.count_nonzero(finite)) == 0:
@@ -1426,6 +1541,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     for prefix_saved, prefix_out in (
         ("context", "context"),
         ("predict", "pred"),
+        ("mask_predict", "mask_pred"),
         ("masked_predict", "masked_pred"),
         ("target", "gt"),
     ):
@@ -1457,6 +1573,9 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             )
             pca, um = _compute_slice_pca_umap(prefix_out)
             hh, ww = h_lat, w_lat
+        if (hh, ww) == (h_lat, w_lat):
+            pca = _mask_flat_grid_values(pca, latent_valid_mask, h_lat, w_lat)
+            um = _mask_flat_grid_values(um, latent_valid_mask, h_lat, w_lat)
         pca_spread = _embedding_spread_axes(pca)
         um_spread = _embedding_spread_axes(um)
         latent_spread = _latent_has_spread(prefix_out)
@@ -1478,6 +1597,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 )
         z_branch = _slice_latent_vectors(prefix_out)
         if z_branch.ndim == 2 and z_branch.shape[0] == h_lat * w_lat and z_branch.shape[1] > 0:
+            z_branch = _mask_flat_grid_values(z_branch, latent_valid_mask, h_lat, w_lat)
             finite_branch = np.isfinite(z_branch).all(axis=1)
             norm_branch = np.full((z_branch.shape[0],), np.nan, dtype=np.float32)
             if np.any(finite_branch):
@@ -1501,7 +1621,11 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             "full_latent_rgb_flat": full_rgb_flat,
         }
 
-    metrics_path = os.path.join(session_dir, "metrics.csv")
+    metrics_owner_dir = session_dir
+    metrics_path = os.path.join(metrics_owner_dir, "metrics.csv")
+    if not os.path.exists(metrics_path) and source_session_dir is not None:
+        metrics_owner_dir = source_session_dir
+        metrics_path = os.path.join(metrics_owner_dir, "metrics.csv")
     loss_x, loss_total, loss_prediction = [], [], []
     loss_spread = []
     loss_symmetry, weighted_symmetry = [], []
@@ -1565,8 +1689,40 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 targets_per_image.append(tpi if np.isfinite(tpi) else np.nan)
                 mask_footprint_mean_px.append(mfpx if np.isfinite(mfpx) else np.nan)
                 mask_scale_factor.append(msf if np.isfinite(msf) else np.nan)
+    if not loss_x:
+        epoch_summary_path = os.path.join(metrics_owner_dir, "epoch_summary.csv")
+        if not os.path.exists(epoch_summary_path) and source_session_dir is not None:
+            epoch_summary_path = os.path.join(source_session_dir, "epoch_summary.csv")
+        if os.path.exists(epoch_summary_path):
+            with open(epoch_summary_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        ep = float(row["epoch"])
+                        train_loss = float(row["train_loss"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if not (np.isfinite(ep) and np.isfinite(train_loss)):
+                        continue
+                    loss_x.append(ep)
+                    loss_total.append(train_loss)
+                    loss_prediction.append(np.nan)
+                    loss_spread.append(np.nan)
+                    loss_symmetry.append(np.nan)
+                    weighted_prediction.append(np.nan)
+                    weighted_spread.append(np.nan)
+                    weighted_symmetry.append(np.nan)
+                    embed_spread_mean.append(np.nan)
+                    embed_spread_min.append(np.nan)
+                    embed_under_spread_frac.append(np.nan)
+                    dead_channel_count.append(np.nan)
+                    targets_per_image.append(np.nan)
+                    mask_footprint_mean_px.append(np.nan)
+                    mask_scale_factor.append(np.nan)
     effective_rank_x, effective_rank_y = [], []
-    run_results_path = os.path.join(session_dir, "run_results.csv")
+    run_results_path = os.path.join(metrics_owner_dir, "run_results.csv")
+    if not os.path.exists(run_results_path) and source_session_dir is not None:
+        run_results_path = os.path.join(source_session_dir, "run_results.csv")
     if os.path.exists(run_results_path):
         with open(run_results_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -1640,8 +1796,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     mask_config_summary.append("mask_size_manual longer than sigmas; extras ignored")
             def _summary_box(i, s):
                 if _manual_boxes:
-                    return max(_ps, int(_manual_boxes[min(i, len(_manual_boxes) - 1)]))
-                return max(_ps, round(float(s) * _ms + _mb))
+                    raw_box = max(_ps, int(_manual_boxes[min(i, len(_manual_boxes) - 1)]))
+                else:
+                    raw_box = max(_ps, round(float(s) * _ms + _mb))
+                return int(raw_box if raw_box % 2 == 1 else raw_box + 1)
             for i, s in enumerate(_sigmas):
                 box = _summary_box(i, s)
                 mask_sigma_names.append(f"σ={s}")
@@ -1694,6 +1852,8 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         orig=orig,
         blurred=blurred,
         target=target.astype(np.float32),
+        valid_target_mask=display_valid_target_mask.astype(np.float32),
+        rejected_mask=(~display_valid_target_mask).astype(np.float32),
         target_loc_heatmap=target_loc_heatmap.astype(np.float32),
         target_loc_heatmap_kind=np.asarray(target_loc_heatmap_kind),
         energy_map=energy_map.astype(np.float32),
@@ -1718,6 +1878,15 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         pred_umap_rgb_flat=bundles["pred"]["umap_rgb_flat"],
         pred_full_latent_rgb=bundles["pred"]["full_latent_rgb"],
         pred_full_latent_rgb_flat=bundles["pred"]["full_latent_rgb_flat"],
+        mask_pred_pca3d=bundles["mask_pred"]["pca3d"],
+        mask_pred_umap3d=bundles["mask_pred"]["umap3d"],
+        mask_pred_full_latent3d=bundles["mask_pred"]["full_latent3d"],
+        mask_pred_pca_rgb=bundles["mask_pred"]["pca_rgb"],
+        mask_pred_pca_rgb_flat=bundles["mask_pred"]["pca_rgb_flat"],
+        mask_pred_umap_rgb=bundles["mask_pred"]["umap_rgb"],
+        mask_pred_umap_rgb_flat=bundles["mask_pred"]["umap_rgb_flat"],
+        mask_pred_full_latent_rgb=bundles["mask_pred"]["full_latent_rgb"],
+        mask_pred_full_latent_rgb_flat=bundles["mask_pred"]["full_latent_rgb_flat"],
         masked_pred_pca3d=bundles["masked_pred"]["pca3d"],
         masked_pred_umap3d=bundles["masked_pred"]["umap3d"],
         masked_pred_full_latent3d=bundles["masked_pred"]["full_latent3d"],
@@ -1738,6 +1907,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         gt_full_latent_rgb_flat=bundles["gt"]["full_latent_rgb_flat"],
         context_latent_norm=latent_norm_maps["context"],
         pred_latent_norm=latent_norm_maps["pred"],
+        mask_pred_latent_norm=latent_norm_maps["mask_pred"],
         masked_pred_latent_norm=latent_norm_maps["masked_pred"],
         gt_latent_norm=latent_norm_maps["gt"],
         loss_x=np.asarray(loss_x, dtype=np.float32),
@@ -1902,8 +2072,17 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         *,
         percentile_scale: bool = True,
         log1p_nonzero_nan: bool = False,
+        background: np.ndarray | None = None,
+        overlay_opacity: float = 0.78,
+        rejected_mask: np.ndarray | None = None,
     ) -> go.Figure:
         vals = np.asarray(z, dtype=np.float32)
+        rej_z = None
+        if rejected_mask is not None:
+            rej = np.asarray(rejected_mask, dtype=np.float32)
+            if rej.shape == vals.shape:
+                vals = np.where(rej > 0.5, np.nan, vals).astype(np.float32)
+                rej_z = np.where(rej > 0.5, 1.0, np.nan).astype(np.float32)
         if log1p_nonzero_nan:
             raw = np.asarray(vals, dtype=np.float32)
             out = np.full_like(raw, np.nan, dtype=np.float32)
@@ -1913,7 +2092,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             vals = out
         finite = vals[np.isfinite(vals)]
         if finite.size == 0:
-            vals = np.zeros_like(vals)
+            vals = vals if background is not None else np.zeros_like(vals)
             zmin, zmax = 0.0, 1.0
         else:
             if percentile_scale:
@@ -1924,8 +2103,30 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 zmax = zmin + 1.0
         h_v, w_v = vals.shape[-2:]
         x_v, y_v = _image_xy((h_v, w_v))
-        fig = go.Figure(
-            [
+        traces = []
+        if background is not None:
+            bg = np.asarray(background, dtype=np.float32)
+            if bg.shape == vals.shape:
+                bg_finite = bg[np.isfinite(bg)]
+                if bg_finite.size:
+                    bg_lo, bg_hi = float(np.percentile(bg_finite, 1)), float(np.percentile(bg_finite, 99))
+                    if bg_hi <= bg_lo + 1e-12:
+                        bg_hi = bg_lo + 1.0
+                else:
+                    bg_lo, bg_hi = 0.0, 1.0
+                traces.append(
+                    go.Heatmap(
+                        z=bg,
+                        x=x_v,
+                        y=y_v,
+                        colorscale="Greys",
+                        zmin=bg_lo,
+                        zmax=bg_hi,
+                        showscale=False,
+                        hoverinfo="skip",
+                    )
+                )
+        traces.append(
                 go.Heatmap(
                     z=vals,
                     x=x_v,
@@ -1933,10 +2134,22 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                     colorscale=colorscale,
                     zmin=zmin,
                     zmax=zmax,
+                    opacity=float(overlay_opacity) if background is not None else 1.0,
                     showscale=False,
                 )
-            ]
         )
+        if rej_z is not None:
+            traces.append(
+                go.Heatmap(
+                    z=rej_z,
+                    x=x_v,
+                    y=y_v,
+                    colorscale=[[0.0, "rgba(220,0,0,0.55)"], [1.0, "rgba(220,0,0,0.55)"]],
+                    showscale=False,
+                    hoverinfo="skip",
+                )
+            )
+        fig = go.Figure(traces)
         fig.update_layout(
             template="plotly_white",
             title={"text": title, "x": 0.02},
@@ -1947,8 +2160,14 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         _apply_image_axes(fig, vals.shape[-2:])
         return fig
 
-    def img(title: str, rgb: np.ndarray) -> go.Figure:
-        vals = np.asarray(rgb)
+    def img(title: str, rgb: np.ndarray, rejected_mask: np.ndarray | None = None) -> go.Figure:
+        vals = np.asarray(rgb).copy()
+        if rejected_mask is not None:
+            rej = np.asarray(rejected_mask, dtype=np.float32)
+            if vals.ndim == 3 and vals.shape[:2] == rej.shape:
+                vals[rej > 0.5, :3] = 0
+                if vals.shape[2] >= 4:
+                    vals[rej > 0.5, 3] = 255
         fig = go.Figure([go.Image(z=vals)])
         fig.update_layout(
             template="plotly_white",
@@ -2366,7 +2585,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         out = np.divide(num, np.maximum(den, 1e-6), dtype=np.float32)
         out[den <= 0.0] = np.nan
         return out
-    n = min(loss_x.size, loss_total.size, loss_prediction.size) if (loss_x.size and loss_total.size and loss_prediction.size) else 0
+    n = min(loss_x.size, loss_total.size) if (loss_x.size and loss_total.size) else 0
     loss_terms = (
         ("prediction", "prediction_loss_weight", loss_prediction, weighted_prediction, "#636EFA"),
         ("spread", "spread_regularizer.weight", loss_spread, weighted_spread, "#EF553B"),
@@ -2650,7 +2869,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     )
     fig_energy_dist.update_layout(
         template="plotly_white",
-        title={"text": "Energy Map Distribution (Masked Predict - Target, 0-1.5)", "x": 0.02},
+        title={"text": "Energy Map Distribution (Mask Predict - Target, 0-1.5)", "x": 0.02},
         margin=dict(l=42, r=8, t=36, b=36),
         height=330,
         xaxis=dict(title="energy value", range=[0.0, 1.5]),
@@ -2658,29 +2877,45 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     )
 
     cards: list[dict] = []
-    for name, stem in (("Context", "context"), ("Masked Predict", "masked_pred"), ("Predict", "pred"), ("Target", "gt")):
+    rejected_mask = data["rejected_mask"] if "rejected_mask" in data.files else np.zeros_like(data["orig"], dtype=np.float32)
+    valid_target_mask = data["valid_target_mask"] if "valid_target_mask" in data.files else np.ones_like(data["orig"], dtype=np.float32)
+    prediction_branches = (
+        ("Context", "context"),
+        ("Mask Predict", "mask_pred"),
+        ("Predict", "pred"),
+        ("Target", "gt"),
+    )
+
+    def _has_finite_embedding(stem: str, kind: str) -> bool:
+        arr = np.asarray(data[f"{stem}_{kind}3d"], dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            return False
+        return bool(np.isfinite(arr[:, : min(3, arr.shape[1])]).all(axis=1).any())
+
+    for name, stem in prediction_branches:
         pca_scatter, _, _ = scatter3d(f"{name} PCA 3D Scatter", data[f"{stem}_pca3d"], data[f"{stem}_pca_rgb_flat"])
-        umap_scatter, _, _ = scatter3d(f"{name} {embedding_label} 3D Scatter", data[f"{stem}_umap3d"], data[f"{stem}_umap_rgb_flat"])
         # Keep strict left-right pairing: RGB map (left), RGB scatter (right).
         cards.append(
             {
                 "title": f"{name} PCA RGB",
-                "fig": img(f"{name} PCA RGB", data[f"{stem}_pca_rgb"]),
+                "fig": img(f"{name} PCA RGB", data[f"{stem}_pca_rgb"], rejected_mask=rejected_mask),
                 "group": f"{stem}-pca",
                 "raw_png": _raw_png_data_url(data[f"{stem}_pca_rgb"]),
             }
         )
         cards.append({"title": f"{name} PCA RGB Scatter", "fig": pca_scatter, "group": f"{stem}-pca"})
-        cards.append(
-            {
-                "title": f"{name} {embedding_label} RGB",
-                "fig": img(f"{name} {embedding_label} RGB", data[f"{stem}_umap_rgb"]),
-                "group": f"{stem}-{embedding_group}",
-                "raw_png": _raw_png_data_url(data[f"{stem}_umap_rgb"]),
-            }
-        )
-        cards.append({"title": f"{name} {embedding_label} RGB Scatter", "fig": umap_scatter, "group": f"{stem}-{embedding_group}"})
-    for name, stem in (("Context", "context"), ("Masked Predict", "masked_pred"), ("Predict", "pred"), ("Target", "gt")):
+        if _has_finite_embedding(stem, "umap"):
+            umap_scatter, _, _ = scatter3d(f"{name} {embedding_label} 3D Scatter", data[f"{stem}_umap3d"], data[f"{stem}_umap_rgb_flat"])
+            cards.append(
+                {
+                    "title": f"{name} {embedding_label} RGB",
+                    "fig": img(f"{name} {embedding_label} RGB", data[f"{stem}_umap_rgb"], rejected_mask=rejected_mask),
+                    "group": f"{stem}-{embedding_group}",
+                    "raw_png": _raw_png_data_url(data[f"{stem}_umap_rgb"]),
+                }
+            )
+            cards.append({"title": f"{name} {embedding_label} RGB Scatter", "fig": umap_scatter, "group": f"{stem}-{embedding_group}"})
+    for name, stem in prediction_branches:
         norm_key = f"{stem}_latent_norm"
         if norm_key in data.files:
             cards.append(
@@ -2761,13 +2996,53 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                         "group": "scale-probe-pred-sensitivity",
                     }
                 )
-    # Non-pair panels afterwards.
-    cards.append({"title": "Input (Log-Norm)", "fig": heat("Input (Log-Norm)", data["orig"], "Viridis"), "group": "input", "raw_png": _raw_png_data_url(data["orig"])})
+    # Non-pair diagnostics come after the left RGB / right embedding pairs.
+    diagnostic_cards = [
+        {"title": "Training Loss / Active Loss Terms (Weighted)", "fig": fig_weighted_components, "group": "weighted-loss-components"},
+    ]
+    visit_title = str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap"
+    diagnostic_cards.append({
+        "title": "Full Native Target Visits Over Input",
+        "fig": heat(
+            (
+                "Full Native Target Visits Over Input (log1p, zero=transparent)"
+                if "Unavailable" not in visit_title
+                else "Full Native Target Visits Over Input (unavailable; showing input)"
+            ),
+            data["visit_heatmap"],
+            "Cividis",
+            percentile_scale=False,
+            log1p_nonzero_nan=True,
+            background=data["orig"],
+            overlay_opacity=0.78,
+            rejected_mask=rejected_mask,
+        ),
+        "group": "visit",
+        "raw_png": _raw_png_data_url(data["visit_heatmap"]),
+    })
+    diagnostic_cards.extend(
+        [
+            {"title": "Active Loss Terms (Unweighted)", "fig": fig_loss_components, "group": "loss-components"},
+            {
+                "title": "Rejected Area Over Input",
+                "fig": heat(
+                    "Rejected Area Over Input",
+                    rejected_mask,
+                    "Reds",
+                    percentile_scale=False,
+                    background=data["orig"],
+                    overlay_opacity=0.42,
+                ),
+                "group": "rejected",
+                "raw_png": _raw_png_data_url(rejected_mask),
+            },
+            {"title": "Input (Log-Norm)", "fig": heat("Input (Log-Norm)", data["orig"], "Viridis"), "group": "input", "raw_png": _raw_png_data_url(data["orig"])},
+        ]
+    )
+    cards = cards + diagnostic_cards
     cards.append({"title": "Effective Rank", "fig": fig_eff_rank, "group": "eff-rank"})
     cards.extend(
         [
-            {"title": "Active Loss Terms (Unweighted)", "fig": fig_loss_components, "group": "loss-components"},
-            {"title": "Active Loss Terms (Weighted)", "fig": fig_weighted_components, "group": "weighted-loss-components"},
             {"title": "Embedding Spread Health", "fig": fig_spread_health, "group": "spread-health"},
             {"title": "Mask Geometry", "fig": fig_mask_geometry, "group": "mask-geometry"},
         ]
@@ -2777,31 +3052,48 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     cards.extend(
         [
             {"title": "Energy Distribution", "fig": fig_energy_dist, "group": "energy-dist"},
-            {"title": "Target Locations", "fig": heat("Target Locations", data["target"], "Magma"), "group": "target-loc", "raw_png": _raw_png_data_url(data["target"])},
-            {"title": "Energy Map (Masked Predict - Target)", "fig": heat("Energy Map (Masked Predict - Target)", data["energy_map"], "Inferno"), "group": "energy", "raw_png": _raw_png_data_url(data["energy_map"])},
+            {
+                "title": "Target Locations",
+                "fig": heat(
+                    "Target Locations",
+                    data["target"],
+                    "Magma",
+                    background=data["orig"],
+                    overlay_opacity=0.86,
+                    rejected_mask=rejected_mask,
+                ),
+                "group": "target-loc",
+                "raw_png": _raw_png_data_url(data["target"]),
+            },
+            {
+                "title": "Energy Map (Mask Predict - Target)",
+                "fig": heat(
+                    "Energy Map (Mask Predict - Target)",
+                    data["energy_map"],
+                    "Inferno",
+                    background=data["orig"],
+                    overlay_opacity=0.76,
+                    rejected_mask=rejected_mask,
+                ),
+                "group": "energy",
+                "raw_png": _raw_png_data_url(data["energy_map"]),
+            },
         ]
     )
     target_loc_heatmap_kind = str(data["target_loc_heatmap_kind"]) if "target_loc_heatmap_kind" in data.files else "Target Location Heatmap"
     if "Unavailable" not in target_loc_heatmap_kind:
         cards.append({
             "title": target_loc_heatmap_kind,
-            "fig": heat(target_loc_heatmap_kind, data["target_loc_heatmap"], "Magma"),
+            "fig": heat(
+                target_loc_heatmap_kind,
+                data["target_loc_heatmap"],
+                "Magma",
+                background=data["orig"],
+                overlay_opacity=0.82,
+                rejected_mask=rejected_mask,
+            ),
             "group": "target-heat",
             "raw_png": _raw_png_data_url(data["target_loc_heatmap"]),
-        })
-    visit_title = str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap"
-    if "Unavailable" not in visit_title:
-        cards.append({
-            "title": visit_title,
-            "fig": heat(
-                f"{visit_title} (log1p, zero=NaN)",
-                data["visit_heatmap"],
-                "Cividis",
-                percentile_scale=False,
-                log1p_nonzero_nan=True,
-            ),
-            "group": "visit",
-            "raw_png": _raw_png_data_url(data["visit_heatmap"]),
         })
     if model_mode in ("pyramid", "3d_slab") and "pyramid_mask_stack" in data.files:
         cards.append(
@@ -2811,6 +3103,53 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 "group": "pyr-mask-stack",
             }
         )
+    speed_results_dir = os.path.join(session_dir, "results")
+    for speed_name in ("predict", "target", "mask_predict", "masked_predict", "context"):
+        speed_prefix = "mask_predict" if speed_name == "mask_predict" else speed_name
+        label = {
+            "predict": "Predict",
+            "target": "Target",
+            "mask_predict": "Mask Predict",
+            "masked_predict": "Masked Predict",
+            "context": "Context",
+        }.get(speed_name, speed_name)
+        speed_specs = (
+            (f"{speed_prefix}_latent_speed_32d.npy", f"{label} 32D Latent Speed ||J||", "Inferno", "speed"),
+            (f"{speed_prefix}_latent_log_inv_det_32d.npy", f"{label} 32D log(1/det(G))", "RdBu_r", "log-inv-det"),
+            (f"{speed_prefix}_umap_speed_3d.npy", f"{label} UMAP Speed ||J||", "Inferno", "umap-speed"),
+            (f"{speed_prefix}_umap_log_inv_det_3d.npy", f"{label} UMAP log(1/det(G))", "RdBu_r", "umap-log-inv-det"),
+        )
+        any_speed = False
+        for filename, title, colorscale, group_suffix in speed_specs:
+            path = os.path.join(speed_results_dir, filename)
+            if not os.path.exists(path):
+                continue
+            try:
+                speed_map = np.asarray(np.squeeze(np.load(path)), dtype=np.float32)
+            except Exception:
+                speed_map = None
+            if speed_map is None or speed_map.ndim != 2:
+                continue
+            if speed_map.shape != data["orig"].shape:
+                speed_map = _resize_2d_map(speed_map, data["orig"].shape)
+            cards.append(
+                {
+                    "title": title,
+                    "fig": heat(
+                        title,
+                        speed_map,
+                        colorscale,
+                        background=data["orig"],
+                        overlay_opacity=0.72,
+                        rejected_mask=rejected_mask,
+                    ),
+                    "group": f"{speed_name}-{group_suffix}",
+                    "raw_png": _raw_png_data_url(speed_map),
+                }
+            )
+            any_speed = True
+        if any_speed:
+            break
     rendered = []
     for i, card in enumerate(cards):
         fig = card["fig"]
@@ -2879,13 +3218,15 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     ms_summary = data.get("mask_config_summary", np.array([], dtype=str))
     er_y = data.get("effective_rank_y", np.array([], dtype=np.float32))
     er_y_vals = np.asarray(er_y, dtype=np.float32).reshape(-1)
-    er_y_finite = er_y_vals[np.isfinite(er_y_vals)]
+    er_y_finite = er_y_vals[np.isfinite(er_y_vals) & (er_y_vals > 0.0)]
     latest_er = float(er_y_finite[-1]) if er_y_finite.size > 0 else None
-    if latest_er is None and "rank_gt_erank" in data.files:
-        gt_er_vals = np.asarray(data["rank_gt_erank"], dtype=np.float32).reshape(-1)
-        gt_er_vals = gt_er_vals[np.isfinite(gt_er_vals)]
-        if gt_er_vals.size > 0:
-            latest_er = float(gt_er_vals[-1])
+    for key in ("rank_gt_erank", "rank_pred_erank", "rank_context_erank"):
+        if latest_er is not None or key not in data.files:
+            continue
+        vals = np.asarray(data[key], dtype=np.float32).reshape(-1)
+        vals = vals[np.isfinite(vals) & (vals > 0.0)]
+        if vals.size > 0:
+            latest_er = float(vals[-1])
     dash_data_version = str(np.asarray(data.get("dashboard_version", np.asarray("missing"))).reshape(-1)[0])
     inference_version = str(np.asarray(data.get("inference_version", np.asarray("missing"))).reshape(-1)[0])
     masked_contract = str(np.asarray(data.get("masked_inference_contract", np.asarray("missing"))).reshape(-1)[0])
@@ -2985,7 +3326,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     if os.path.exists(inf_path_for_health):
         try:
             health_outputs = torch.load(inf_path_for_health, map_location="cpu", weights_only=False)
-            for key in ("pred_map", "masked_pred_map", "gt_map", "context_map", "target_energy_map"):
+            for key in ("pred_map", "mask_pred_map", "masked_target_pred_map", "masked_pred_map", "gt_map", "context_map", "target_energy_map"):
                 if key in health_outputs:
                     entry = _health_entry(key, health_outputs[key])
                     if entry:
@@ -2994,11 +3335,11 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                     if spread_entry:
                         health_entries.append(spread_entry)
                 else:
-                    if key == "masked_pred_map":
-                        health_entries.append("masked_pred_map: missing from inference_outputs.pt")
-            if "pred_map" in health_outputs and "masked_pred_map" in health_outputs:
+                    if key == "mask_pred_map":
+                        health_entries.append("mask_pred_map: missing from inference_outputs.pt")
+            if "pred_map" in health_outputs and "mask_pred_map" in health_outputs:
                 pred_arr = _to_np(health_outputs["pred_map"]).astype(np.float32, copy=False)
-                masked_arr = _to_np(health_outputs["masked_pred_map"]).astype(np.float32, copy=False)
+                masked_arr = _to_np(health_outputs["mask_pred_map"]).astype(np.float32, copy=False)
                 if pred_arr.shape == masked_arr.shape:
                     finite = np.isfinite(pred_arr) & np.isfinite(masked_arr)
                     n_finite = int(np.count_nonzero(finite))
@@ -3008,11 +3349,11 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                         std = float(np.nanstd(diff))
                         if max_abs <= 1e-6:
                             health_entries.append(
-                                f"pred_vs_masked_pred: IDENTICAL on finite values, finite_values={n_finite}/{pred_arr.size}"
+                                f"pred_vs_mask_pred: IDENTICAL on finite values, finite_values={n_finite}/{pred_arr.size}"
                             )
                         else:
                             health_entries.append(
-                                f"pred_vs_masked_pred: finite max_abs={max_abs:.3g}, std={std:.3g}, finite_values={n_finite}/{pred_arr.size}"
+                                f"pred_vs_mask_pred: finite max_abs={max_abs:.3g}, std={std:.3g}, finite_values={n_finite}/{pred_arr.size}"
                             )
         except Exception as e:
             health_entries.append(f"inference_outputs.pt: health check failed ({type(e).__name__})")
@@ -3517,7 +3858,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         print(f"dashboard_plot_item=CDD Scale Response: ok (source={src} shape={tuple(sp.shape)})")
     else:
         print("dashboard_plot_item=CDD Scale Response: empty (missing *_scale_response.pt)")
-    for name, stem in (("Context", "context"), ("Masked Predict", "masked_pred"), ("Predict", "pred"), ("Target", "gt")):
+    for name, stem in (
+        ("Context", "context"),
+        ("Mask Predict", "mask_pred"),
+        ("Predict", "pred"),
+        ("Target", "gt"),
+    ):
         pca_arr = np.asarray(data[f"{stem}_pca3d"], dtype=np.float32)
         um_arr = np.asarray(data[f"{stem}_umap3d"], dtype=np.float32)
         print(f"dashboard_plot_item={name} PCA Array Shape: shape={tuple(pca_arr.shape)}")
@@ -3653,25 +3999,42 @@ def main():
             for name in sorted(os.listdir(args.sessions_dir))
             if os.path.isdir(os.path.join(args.sessions_dir, name))
         ]
+    def _skip_existing_export(session_dir: str, export_path: str) -> bool:
+        if args.overwrite or args.reset:
+            return False
+        if args.stage in ("plot", "all") and os.path.exists(export_path):
+            print(f"skip_dashboard_export_exists={session_dir} export_html={export_path}")
+            return True
+        return False
+
     for name, session_dir in session_items:
         print("=" * 72)
         print(f"dashboard_session_begin={session_dir}")
         dash_html_path = os.path.join(session_dir, "dashboard.html")
         export_path = os.path.join(export_dir, f"{name.replace('/', '_')}.html")
-        # Plain exists skip — mirrors movie PNG behavior: if both files are
-        # already there and we're not forcing overwrite/reset, skip.
-        if (not args.overwrite) and (not args.reset) and os.path.exists(dash_html_path) and os.path.exists(export_path):
-            print(
-                f"skip_dashboard_exists={session_dir} "
-                f"session_html={dash_html_path} export_html={export_path}"
-            )
+        # Default mode is incremental: the exported dashboard is what pull-plots
+        # consumes, so if it already exists, do not inspect/recompute the session.
+        if _skip_existing_export(session_dir, export_path):
             skipped += 1
+            print(f"dashboard_session_end={session_dir}")
+            continue
+        # If the session already has a dashboard, export that file directly.
+        # Here --overwrite means overwrite the exported copy; --reset is the
+        # explicit request to discard/recompute session-local dashboard files.
+        if (not args.reset) and args.stage in ("plot", "all") and os.path.exists(dash_html_path):
+            src = _preferred_html_for_export(session_dir, dash_html_path)
+            shutil.copy2(src, export_path)
+            print(f"dashboard_html_reused={dash_html_path}")
+            print(f"dashboard_html_exported={export_path}")
+            exported += 1
+            processed += 1
             print(f"dashboard_session_end={session_dir}")
             continue
         inf_path = os.path.join(session_dir, "inference_outputs.pt")
         if not os.path.exists(inf_path):
             print(f"skip_no_inference={session_dir}")
             skipped += 1
+            print(f"dashboard_session_end={session_dir}")
             continue
         if args.stage == "plot":
             has_dash_npz = os.path.exists(os.path.join(session_dir, "dash_data.npz"))
@@ -3682,6 +4045,7 @@ def main():
                 else:
                     print(f"skip_no_dashboard_inputs={session_dir}")
                 skipped += 1
+                print(f"dashboard_session_end={session_dir}")
                 continue
         try:
             if args.reset:
@@ -3697,8 +4061,11 @@ def main():
             if args.stage in ("plot", "all"):
                 if not os.path.exists(os.path.join(session_dir, "dash_data.npz")):
                     compute_dash_data(session_dir, overwrite=args.overwrite)
-                html = plot_dash_html(session_dir, overwrite=args.overwrite)
-                print(f"dashboard_html_saved={html}")
+                    html = plot_dash_html(session_dir, overwrite=args.overwrite)
+                    print(f"dashboard_html_saved={html}")
+                else:
+                    html = plot_dash_html(session_dir, overwrite=args.overwrite)
+                    print(f"dashboard_html_saved={html}")
                 export_path = os.path.join(export_dir, f"{name.replace('/', '_')}.html")
                 src = _preferred_html_for_export(session_dir, html)
                 shutil.copy2(src, export_path)

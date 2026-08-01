@@ -3,6 +3,7 @@ import glob
 import os
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from src.utils.npy import _safe_load_npy, normalize01
@@ -64,6 +65,7 @@ class JEPADataset(Dataset):
         crop_min_valid_fraction: float = 0.0,
         cdd_use_log: bool = False,
         return_metadata: bool = False,
+        native_invalid_border_px: int = 0,
     ):
         self.input_type = str(input_type).lower()
         allowed_input_types = {"image", "cube", "image_batch"}
@@ -95,6 +97,7 @@ class JEPADataset(Dataset):
         self.cdd_use_log = bool(cdd_use_log)
         self.return_metadata = bool(return_metadata)
         self.crop_min_valid_fraction = float(crop_min_valid_fraction) if crop_min_valid_fraction is not None else 0.0
+        self.native_invalid_border_px = max(0, int(native_invalid_border_px))
 
         pattern = os.path.join(data_root, npy_pattern)
         self.pattern = pattern
@@ -119,7 +122,7 @@ class JEPADataset(Dataset):
     def _preprocess_arr2d(self, arr2d: np.ndarray) -> np.ndarray:
         arr = np.asarray(arr2d, dtype=np.float32)
         finite = np.isfinite(arr)
-        out = np.zeros_like(arr, dtype=np.float32)
+        out = np.full_like(arr, np.nan, dtype=np.float32)
         if not bool(finite.any()):
             return out
         finite_vals = arr[finite]
@@ -128,7 +131,36 @@ class JEPADataset(Dataset):
         denom = amax - amin
         if denom > 1e-20:
             out[finite] = (arr[finite] - amin) / denom
+        else:
+            out[finite] = 0.0
         return out
+
+    def _load_valid_mask(self, path: str, forced_slice_idx=None) -> np.ndarray:
+        """Load the native finite-data mask without normalizing away NaNs."""
+        if self._is_h5(path):
+            if h5py is None:
+                raise ImportError("h5py is required to read .h5 files; pip install h5py")
+            with h5py.File(path, "r") as h5_file:
+                arr2d, _ = self._extract_2d_from_array(h5_file["data"], forced_slice_idx=forced_slice_idx)
+                return np.isfinite(np.asarray(arr2d))
+        if self._is_fits(path):
+            if fits is None:
+                raise ImportError("astropy is required to read .fits files; pip install astropy")
+            raw = fits.getdata(path, memmap=True)
+        else:
+            raw = _safe_load_npy(path, mmap_mode="r")
+        arr2d, _ = self._extract_2d_from_array(raw, forced_slice_idx=forced_slice_idx)
+        return np.isfinite(np.asarray(arr2d))
+
+    def _apply_native_invalid_border(self, valid: np.ndarray) -> np.ndarray:
+        """Expand native no-data before cropping so outside-crop NaNs remain visible."""
+        valid = np.asarray(valid, dtype=bool)
+        border = self.native_invalid_border_px
+        if border <= 0 or valid.all():
+            return valid
+        invalid = torch.from_numpy(~valid).to(dtype=torch.float32)[None, None]
+        expanded = F.max_pool2d(invalid, kernel_size=2 * border + 1, stride=1, padding=border)
+        return ~(expanded[0, 0] > 0).numpy()
 
     @staticmethod
     def _probe_file_shape(path: str) -> tuple[int, ...]:
@@ -375,6 +407,15 @@ class JEPADataset(Dataset):
             # cdd_np is now (S, H, W) float32
             cdd_orig = torch.from_numpy(cdd_np.astype(np.float32))
             x_clean_full = cdd_orig.sum(dim=0, keepdim=True)  # 1 x H x W
+            valid_full = self._load_valid_mask(path, forced_slice_idx=forced_slice_idx)
+            valid_full = self._apply_native_invalid_border(valid_full)
+            if valid_full.shape != tuple(x_clean_full.shape[-2:]):
+                raise ValueError(
+                    f"Raw validity mask shape {valid_full.shape} does not match cached CDD "
+                    f"shape {tuple(x_clean_full.shape[-2:])} for {path}"
+                )
+            x_clean_full = x_clean_full.clone()
+            x_clean_full[:, ~torch.from_numpy(valid_full)] = float("nan")
             max_retries = 100
             for attempt in range(max_retries):
                 crop = self._crop_slices(int(cdd_orig.shape[-2]), int(cdd_orig.shape[-1]))
@@ -387,8 +428,8 @@ class JEPADataset(Dataset):
                     x_clean = x_clean_full
                 if self.crop_min_valid_fraction > 0.0 and self.crop_mode == "random" and crop is not None:
                     arr = x_clean.squeeze(0).numpy()
-                    finite_nonzero = np.isfinite(arr) & (arr > 1e-8)
-                    if finite_nonzero.mean() >= self.crop_min_valid_fraction:
+                    finite = np.isfinite(arr)
+                    if finite.mean() >= self.crop_min_valid_fraction:
                         break
                 else:
                     break
@@ -405,6 +446,7 @@ class JEPADataset(Dataset):
                     "full_w": int(x_clean_full.shape[-1]),
                     "crop_y0": cy0,
                     "crop_x0": cx0,
+                    "native_invalid_border_px": self.native_invalid_border_px,
                 })
                 return cdd_orig, x_clean, aug_meta
             return cdd_orig, x_clean
@@ -414,14 +456,17 @@ class JEPADataset(Dataset):
         for attempt in range(max_retries):
             sample = self._load_sample(path, forced_slice_idx=forced_slice_idx).clone()  # 1 x H x W
             full_h, full_w = int(sample.shape[-2]), int(sample.shape[-1])
+            if self.native_invalid_border_px > 0:
+                valid_full = self._apply_native_invalid_border(np.isfinite(sample.squeeze(0).numpy()))
+                sample[:, ~torch.from_numpy(valid_full)] = float("nan")
             crop = self._crop_slices(full_h, full_w)
             if crop is not None:
                 crop_y, crop_x = crop
                 sample = sample[..., crop_y, crop_x]
             if self.crop_min_valid_fraction > 0.0 and self.crop_mode == "random":
                 arr = sample.squeeze(0).numpy()
-                finite_nonzero = np.isfinite(arr) & (arr > 1e-8)
-                if finite_nonzero.mean() >= self.crop_min_valid_fraction:
+                finite = np.isfinite(arr)
+                if finite.mean() >= self.crop_min_valid_fraction:
                     break
             else:
                 break
@@ -438,6 +483,7 @@ class JEPADataset(Dataset):
                 "full_w": full_w,
                 "crop_y0": cy0,
                 "crop_x0": cx0,
+                "native_invalid_border_px": self.native_invalid_border_px,
             })
             return sample, aug_meta
         return sample

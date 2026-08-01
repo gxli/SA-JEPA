@@ -110,6 +110,62 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 
 ## 🚀 Quick Start
 
+### Mexico Latent-Speed Diagnostic Run
+
+The production Mexico diagnostic runner is:
+
+```bash
+PYTHONPATH=. python scripts/local_scripts/run_mexico_latent_speed_fullframe_v3.py
+```
+
+It writes:
+
+```text
+sessions/latent_speed_mexico_temp_fullframe_2_4_8_16
+```
+
+The dedicated `sessions/mexico_temp_full_v2` checkpoint uses Global Response
+Normalization and was trained with CDD scales `2,4,8,16`. The production runner
+therefore performs one full-frame pass and uses those trained scales. The older
+`run_mexico_latent_speed_tile384_v2.py` remains available specifically for
+tiling diagnostics, but its tile-wise latents are not seamless for a GRN model.
+NaN/no-data and outer-frame rejection default to the model-derived support
+radius (`ceil(max_sigma * mask_size_scaling)`, 20 px for this checkpoint).
+
+The run regenerates the single canonical session dashboard:
+
+```text
+sessions/latent_speed_mexico_temp_fullframe_2_4_8_16/dashboard.html
+```
+
+The old `results/latent_speed_dashboard.html` path is only a redirect for
+older tabs/scripts; do not use it as a separate dashboard source.
+
+To retrain the controlled 10-epoch max-scale comparison (`2,4,8,16` versus
+`2,4,8,16,32`), run:
+
+```bash
+PYTHONPATH=. python scripts/local_scripts/run_mexico_scale_comparison.py
+```
+
+This creates `mexico_temp_retrain_max16_10ep_v2` and
+`mexico_temp_retrain_max32_10ep_v2`, their full-frame latent-speed inference
+sessions, and `sessions/mexico_scale_comparison_10ep_v2.html`. Training visit
+counts are accumulated in native full-image coordinates on every batch and are
+drawn over the original image in both training and comparison dashboards.
+
+For the narrow full-frame first try (`2,4,8,16`, encoder width 32, kernel 7,
+32D latent, encoder FOV 17 px, batch size 8), run:
+
+```bash
+PYTHONPATH=. python scripts/local_scripts/run_mexico_small_fullframe.py
+```
+
+This writes `sessions/mexico_temp_small_fullframe_k7_max16_10ep` and
+`sessions/latent_speed_mexico_small_fullframe_k7_max16_10ep`, including
+`training_summary_dashboard.html` with the loss curve and full native visit map,
+the standard session dashboard, and the latent-speed dashboard.
+
 ### 🐍 Python API
 
 ```python
@@ -159,6 +215,27 @@ model.save_session(model.session_dir)
 print(f"Dashboard:     {dashboard_html}")
 print(f"Interactive:   {umap_html}")
 ```
+
+The training CLI now writes `dashboard.html` by default. A minimal config only
+needs to identify the input field; all model, training, full native visit-map,
+and dashboard settings inherit from the project base:
+
+```yaml
+data:
+  data_root: data/local_data
+  npy_pattern: mexico_temp.npy
+```
+
+For the no-argument local workflow, edit
+`scripts/local_scripts/configs/minimal_dashboard.yaml`, then run:
+
+```bash
+PYTHONPATH=. python scripts/local_scripts/run_minimal_dashboard.py
+```
+
+The first dashboard row contains the weighted training-loss curve and the full
+native target-visit map over the original image. Use `--no-dashboard` only for
+an intentionally artifact-free training run.
 
 ### 🔋 Cropped Field Training and Inference Mode
 

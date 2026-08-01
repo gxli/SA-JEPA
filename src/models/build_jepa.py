@@ -22,6 +22,14 @@ from .masking import (
 from .predictor import FullResPredictor
 from .symmetry import symmetric_forward_2d
 from src.losses import l2_normalize_patches
+from src.utils.support import (
+    cdd_support_border_from_model,
+    constrain_hardcap_to_encoder_footprint,
+    encoder_border_from_model,
+    encoder_receptive_field_from_model,
+    invalid_support_border_from_model,
+    normalize_invalid_support_border_mode,
+)
 
 # Shared encoder-type sets used by both build_jepa.py and train.py.
 CDD_CUBE_ENCODER_TYPES = frozenset({
@@ -97,6 +105,8 @@ class PyramidGridJEPA(nn.Module):
         target_nonoverlap: bool = True,
         target_allow_partial_overlap: float = 0.0,
         mask_box_hardcap: int | None = None,
+        nan_border_sigma_multiplier: float = 3.0,
+        invalid_support_border_mode: str = "cdd_support",
         use_grn: bool = True,
     ):
         super().__init__()
@@ -195,7 +205,23 @@ class PyramidGridJEPA(nn.Module):
         self.use_symmetric_feature_loss = bool(use_symmetric_feature_loss)
         self.target_nonoverlap = bool(target_nonoverlap)
         self.target_allow_partial_overlap = float(target_allow_partial_overlap)
-        self.mask_box_hardcap = None if mask_box_hardcap is None else int(mask_box_hardcap)
+        self.requested_mask_box_hardcap = None if mask_box_hardcap is None else int(mask_box_hardcap)
+        self.mask_box_hardcap = constrain_hardcap_to_encoder_footprint(
+            self.requested_mask_box_hardcap,
+            self.encoder_receptive_field(),
+        )
+        if (
+            self.requested_mask_box_hardcap is not None
+            and self.mask_box_hardcap is not None
+            and int(self.mask_box_hardcap) < int(self.requested_mask_box_hardcap)
+        ):
+            print(
+                "[support] mask_box_hardcap constrained to encoder footprint: "
+                f"requested={self.requested_mask_box_hardcap} effective={self.mask_box_hardcap} "
+                f"encoder_rf={self.encoder_receptive_field()} margin=20%"
+            )
+        self.nan_border_sigma_multiplier = float(nan_border_sigma_multiplier)
+        self.invalid_support_border_mode = normalize_invalid_support_border_mode(invalid_support_border_mode)
         self.projector_conv = bool(projector_conv)
         if self.mode not in ("image", "pyramid"):
             raise ValueError(f"Unknown mode={self.mode}; expected 'image' or 'pyramid'")
@@ -340,34 +366,45 @@ class PyramidGridJEPA(nn.Module):
         return int(round(float(value))), None
 
     def encoder_receptive_field(self) -> int:
-        depth = int(self.encoder_depth)
-        dilations = self.convnext_layer_dilations
-        if dilations is None:
-            dil_list = [1] * max(0, depth)
-        else:
-            dil_list = [int(d) for d in dilations]
-            if len(dil_list) < depth and dil_list:
-                reps = (depth + len(dil_list) - 1) // len(dil_list)
-                dil_list = (dil_list * reps)[:depth]
-            else:
-                dil_list = dil_list[:depth]
-        rf = 1 + 2 + 2
-        for dilation in dil_list:
-            rf += max(0, int(self.encoder_kernel_size) - 1) * max(1, int(dilation))
-        return max(1, int(rf))
+        return int(encoder_receptive_field_from_model(self))
+
+    def invalid_support_border_px(self, mask_scale: float | None = None) -> int:
+        """Pixel radius that must stay finite around a target/inference pixel."""
+        return int(invalid_support_border_from_model(self, mask_scale=mask_scale))
+
+    def encoder_receptive_field_border_px(self) -> int:
+        """Pixel radius implied by the encoder spatial receptive field."""
+        return int(encoder_border_from_model(self))
+
+    def cdd_support_border_px(self, mask_scale: float | None = None) -> int:
+        """Conservative CDD/mask support radius, separate from encoder border rejection."""
+        return int(cdd_support_border_from_model(self, mask_scale=mask_scale))
 
     def _apply_encoder_border_invalid_mask(self, invalid_pixel_mask: torch.Tensor) -> torch.Tensor:
         if invalid_pixel_mask.dim() != 4:
             return invalid_pixel_mask
         _, _, h, w = invalid_pixel_mask.shape
-        border = int(max(0, min(self.encoder_receptive_field() // 2, h // 2, w // 2)))
-        if border <= 0:
+        encoder_border = int(max(0, min(self.encoder_receptive_field() // 2, h // 2, w // 2)))
+        nan_border = int(max(0, min(self.invalid_support_border_px(), h // 2, w // 2)))
+
+        if encoder_border <= 0 and nan_border <= 0:
             return invalid_pixel_mask
+
+        # Dilate native no-data first. The crop edge is rejected independently
+        # by the encoder FOV and must not be dilated by the CDD support radius.
         out = invalid_pixel_mask.clone()
-        out[:, :, :border, :] = True
-        out[:, :, h - border :, :] = True
-        out[:, :, :, :border] = True
-        out[:, :, :, w - border :] = True
+        if nan_border > 0 and out.any():
+            k = 2 * nan_border + 1
+            invalid_float = out.float()
+            dilated = F.max_pool2d(invalid_float, kernel_size=k, stride=1, padding=nan_border)
+            out = dilated > 0.0
+
+        if encoder_border > 0:
+            out[:, :, :encoder_border, :] = True
+            out[:, :, h - encoder_border :, :] = True
+            out[:, :, :, :encoder_border] = True
+            out[:, :, :, w - encoder_border :] = True
+
         return out
 
     def sample_mask_params(self, device=None) -> tuple[float, int]:
@@ -438,6 +475,17 @@ class PyramidGridJEPA(nn.Module):
         if x_clean.shape[1] != 1:
             raise ValueError(f"Expected grayscale input, got {x_clean.shape[1]} channels")
 
+        # Compute NaN/invalid mask from the raw image BEFORE nan_to_num.
+        # NaN regions serve as a natural mask — targets + encoder input
+        # must both be rejected from these regions and their dilated surroundings.
+        invalid_pixel_mask = ~torch.isfinite(x_clean)
+        # Replace NaN with 0 in x_clean so downstream ops (std, log, etc.)
+        # don't propagate NaN.  The invalid_pixel_mask preserves the original
+        # NaN locations so the encoder can still reject those regions.
+        if invalid_pixel_mask.any():
+            x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
+        invalid_pixel_mask = self._apply_encoder_border_invalid_mask(invalid_pixel_mask)
+
         if context_data is not None:
             x_context = context_data[0].to(device=x_clean.device)
             target_locations = context_data[1].to(device=x_clean.device)
@@ -445,10 +493,6 @@ class PyramidGridJEPA(nn.Module):
             target_valid = context_data[3].to(device=x_clean.device)
             debug = context_data[4] if len(context_data) > 4 else {}
         else:
-            invalid_pixel_mask = ~torch.isfinite(x_clean)
-            if invalid_pixel_mask.any():
-                x_clean = torch.nan_to_num(x_clean, nan=0.0, posinf=0.0, neginf=0.0)
-            invalid_pixel_mask = self._apply_encoder_border_invalid_mask(invalid_pixel_mask)
 
             debug_encoder_types = CDD_DEBUG_ENCODER_TYPES | MASK_MAP_ENCODER_TYPES
             need_debug_tensors = bool(
@@ -573,6 +617,26 @@ class PyramidGridJEPA(nn.Module):
                 cdd_orig_enc = cdd_orig
                 cdd_masked_enc = cdd_masked
             zero_token = torch.zeros_like(dip_per_ch)
+            # Apply NaN border mask to CDD features + mask tokens.
+            # invalid_pixel_mask computed from x_clean may be all-False when
+            # context_data is pre-computed (training path).  In that case the
+            # merged mask is stored in the debug dict by prepare_context_batch.
+            effective_invalid = invalid_pixel_mask
+            if not effective_invalid.any() and "_invalid_pixel_mask" in debug:
+                effective_invalid = debug["_invalid_pixel_mask"].to(
+                    device=x_clean.device, dtype=torch.bool,
+                )
+            if effective_invalid.any():
+                s = cdd_orig_enc.shape[1]
+                inv_expanded = effective_invalid.expand(-1, s, -1, -1)
+                # Zero out CDD features at invalid regions so the encoder
+                # sees neutral input instead of fake cold (NaN→0) pixels.
+                cdd_orig_enc = cdd_orig_enc.masked_fill(inv_expanded, 0.0)
+                cdd_masked_enc = cdd_masked_enc.masked_fill(inv_expanded, 0.0)
+                # Set mask tokens at invalid regions so the per-scale adapter
+                # learns to ignore those positions entirely.
+                dip_per_ch = dip_per_ch.masked_fill(inv_expanded, 1.0)
+                zero_token = zero_token.masked_fill(inv_expanded, 1.0)
             # target: original per-scale channels + zero token maps
             enc_target = torch.cat([cdd_orig_enc, zero_token], dim=1)
             # context: masked per-scale channels + mask token maps

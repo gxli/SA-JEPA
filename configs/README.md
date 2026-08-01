@@ -44,6 +44,8 @@ and `cdd_scale_space` are rejected.
 | `data.cdd_precompute_max_gb` | `8.0` | Safety limit for estimated RAM cache size per node/process replica. |
 | `model.cdd_log_std_floor_mult` | `0.05` | Log-transform floor = `max(eps, std × floor_mult)`. |
 | `model.sigmas` | `[2,4,8,16]` | CDD scale hierarchy; 5 scales recommended `[2,4,8,16,32]`. |
+| `model.decomposition_backend` | `cdd` | Pyramid decomposition backend: `cdd`, `ring_conv`, or `ring_conv_weighted`. `ring_conv_weighted` computes ring averages then rescales components as `I_i / sum(I_i) * I_original`. |
+| `model.ring_radii` | `(0,) + sigmas` | Ring boundaries in pixels for ring backends; channels are `[r_i, r_{i+1})`. |
 | `model.align_scales` | `true` | Align mask centers across scale levels. |
 | `data.log_eps` | `1e-6` | Floor constant for log-preprocessing. |
 
@@ -162,6 +164,9 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.force_recompute_inference` | `false` | Re-run inference even if `inference_outputs.pt` exists. |
 | `train.inference_all_inputs` | `data.input_files` set | Run post-training inference for every resolved 2D input. Root `inference_outputs.pt` and dashboard artifacts use the first input; additional inputs are written under `inference_inputs/NNN_name/`. |
 | `train.post_training_artifacts` | `true` | Generate PCA/UMAP branch embedding artifacts from saved `inference_outputs.pt` after training. Set to `false` only for very large sessions where dashboard artifacts should be regenerated later. |
+| `train.mask_predict_mode` | config-required | Masked usage-inference branch. Use `composite` so mask+encoder are applied together per local window. |
+| `train.mask_predict_stride` | config-required | Spatial stride for composite masked inference sampling. Use `1` for full resolution; larger values interpolate. |
+| `train.mask_predict_chunk_size` | config-required | Number of local masked windows evaluated per forward chunk. Tune for GPU memory. |
 
 ## 8. Diagnostics & Visualization
 

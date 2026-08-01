@@ -614,11 +614,11 @@ class ScaleAwareJEPA:
             required = os.path.join(results_dir, "predict_umap_xyz.npy")
             if os.path.exists(required):
                 return
-            from src.utils.viz import save_inference_dashboard
+            from src.utils.viz import export_inference_dashboard_artifacts
 
             outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
             umap_cfg = cfg.get("train", {}).get("umap", {})
-            save_inference_dashboard(self._session_dir, outputs, umap_cfg=umap_cfg)
+            export_inference_dashboard_artifacts(self._session_dir, outputs, umap_cfg=umap_cfg)
         except Exception as e:
             print(f"[sajepa] inference UMAP artifact generation failed: {type(e).__name__}: {e}")
 

@@ -46,7 +46,7 @@ from src.models.masking import _max_effective_mask_box_size, prepare_context_bat
 from src.utils import log_error, set_error_log_path
 from src.utils.cdd_import import import_constrained_diffusion, safe_constrained_diffusion_decomposition
 from src.utils.npy import _safe_load_npy
-from src.utils.viz import _target_location_yx, save_inference_dashboard, save_volumetric_umap_embeddings
+from src.utils.viz import _target_location_yx, export_inference_dashboard_artifacts, save_volumetric_umap_embeddings
 
 LOGGER = logging.getLogger(__name__)
 warnings.filterwarnings(
@@ -471,6 +471,93 @@ def _save_cdd_disk_cache(data_path: str, meta_path: str, value: dict, meta: dict
     os.replace(tmp_meta, meta_path)
 
 
+def _normalize_decomposition_backend(model_cfg: dict, data_cfg: dict) -> str:
+    model_key = str(model_cfg.get("model_key", model_cfg.get("encoder_type", ""))).strip().lower()
+    backend_value = model_cfg.get(
+        "decomposition_backend",
+        model_cfg.get("pyramid_backend", data_cfg.get("decomposition_backend", "cdd")),
+    )
+    backend_key = str(backend_value).strip().lower().replace("-", "_")
+    if backend_key in ("ring_weighted", "ring_conv_weighted", "weighted_ring", "weighted_ring_conv"):
+        return "ring_conv_weighted"
+    if model_key.startswith("ring_") or "ring_conv" in model_key:
+        return "ring_conv"
+    key = backend_key
+    if key in ("ring", "ring_conv", "multiscale_ring", "multiscale_ring_conv"):
+        return "ring_conv"
+    if key in ("cdd", "constrained_diffusion", "constrained_diffusion_decomposition"):
+        return "cdd"
+    raise ValueError(
+        f"Unsupported decomposition backend={backend_value!r}; "
+        "expected 'cdd', 'ring_conv', or 'ring_conv_weighted'."
+    )
+
+
+def _resolve_ring_radii(model_cfg: dict) -> tuple[float, ...]:
+    radii = model_cfg.get("ring_radii", model_cfg.get("ring_conv_radii"))
+    if radii is None:
+        sigmas = tuple(float(s) for s in model_cfg.get("sigmas", [2, 4, 8]))
+        radii = (0.0,) + sigmas
+    vals = tuple(float(v) for v in radii)
+    if len(vals) < 2:
+        raise ValueError(f"ring_radii must contain at least two boundaries, got {vals!r}")
+    if vals[0] != 0.0:
+        vals = (0.0,) + vals
+    for lo, hi in zip(vals[:-1], vals[1:]):
+        if hi <= lo:
+            raise ValueError(f"ring_radii must be strictly increasing, got {vals!r}")
+    return vals
+
+
+def _ring_conv2d(
+    input_arr: np.ndarray,
+    radii: tuple[float, ...],
+    *,
+    device: torch.device,
+    weighted: bool = False,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """Return normalized disk/annulus averages as (S, *spatial)."""
+    arr = np.asarray(input_arr, dtype=np.float32)
+    if arr.ndim not in (2, 3):
+        raise ValueError(f"ring_conv expects a 2D image or 3D stack/volume, got shape={arr.shape}")
+    max_radius = float(radii[-1])
+    pad = int(math.ceil(max_radius))
+    yy, xx = np.mgrid[-pad : pad + 1, -pad : pad + 1]
+    dist = np.sqrt((yy.astype(np.float32) ** 2) + (xx.astype(np.float32) ** 2))
+    kernels = []
+    for i, (lo, hi) in enumerate(zip(radii[:-1], radii[1:])):
+        if i == 0 and float(lo) <= 0.0:
+            mask = dist < float(hi)
+        else:
+            mask = (dist >= float(lo)) & (dist < float(hi))
+        count = int(np.count_nonzero(mask))
+        if count <= 0:
+            raise ValueError(f"Empty ring kernel for radius range [{lo}, {hi})")
+        kernel = mask.astype(np.float32) / float(count)
+        kernels.append(kernel)
+
+    conv_device = device if device.type in ("cuda", "mps") else torch.device("cpu")
+    x_np = arr[None, None] if arr.ndim == 2 else arr[:, None]
+    x = torch.from_numpy(x_np).to(device=conv_device, dtype=torch.float32)
+    weight = torch.from_numpy(np.stack(kernels, axis=0)[:, None]).to(device=conv_device, dtype=torch.float32)
+    if pad > 0:
+        pad_mode = "reflect" if min(int(arr.shape[-2]), int(arr.shape[-1])) > pad else "replicate"
+        x = F.pad(x, (pad, pad, pad, pad), mode=pad_mode)
+    y = F.conv2d(x, weight)
+    if arr.ndim == 2:
+        out = y[0].detach().cpu().numpy()
+    else:
+        out = y.permute(1, 0, 2, 3).detach().cpu().numpy()
+    out = np.clip(np.asarray(out, dtype=np.float32), a_min=0.0, a_max=None)
+    if not bool(weighted):
+        return out
+    total = np.sum(out, axis=0, keepdims=True, dtype=np.float32)
+    original = np.asarray(arr, dtype=np.float32)[None, ...]
+    weights = np.divide(out, total, out=np.zeros_like(out, dtype=np.float32), where=total > float(eps))
+    return np.asarray(weights * original, dtype=np.float32)
+
+
 def _precompute_cdd_cache(
     *,
     data_cfg: dict,
@@ -481,9 +568,13 @@ def _precompute_cdd_cache(
     cache_replicas: int = 1,
 ) -> dict:
     """Pre-compute a bounded CDD decomposition cache on GPU, store in CPU RAM."""
+    decomposition_backend = _normalize_decomposition_backend(model_cfg, data_cfg)
     enabled = bool(data_cfg.get("cdd_precompute", True))
     if not enabled:
-        log_info(f"[{config_name}] CDD precompute: disabled by data.cdd_precompute=false")
+        log_info(
+            f"[{config_name}] CDD precompute: disabled by data.cdd_precompute=false "
+            f"(backend={decomposition_backend})"
+        )
         return {}
     data_root = data_cfg.get("data_root", "data")
     npy_pattern = data_cfg.get("npy_pattern", "*.npy")
@@ -499,6 +590,10 @@ def _precompute_cdd_cache(
     sigmas = tuple(model_cfg.get("sigmas", [2, 4, 8, 16]))
     cdd_num_channels = int(model_cfg.get("cdd_num_channels", len(sigmas)))
     cdd_request_num_channels = model_cfg.get("cdd_request_num_channels", None)
+    ring_radii = _resolve_ring_radii(model_cfg) if decomposition_backend in ("ring_conv", "ring_conv_weighted") else None
+    if ring_radii is not None:
+        cdd_num_channels = len(ring_radii) - 1
+        cdd_request_num_channels = None
     expected_default_scales = cdd_num_channels
     model_num_scales = int(model_cfg.get("num_scales", expected_default_scales))
     if device.type not in ("cuda", "mps"):
@@ -516,7 +611,8 @@ def _precompute_cdd_cache(
     else:
         disk_cache_dir = os.path.join(session_dir, "cdd_cache")
     cdd_meta = {
-        "version": 2,
+        "version": 3,
+        "decomposition_backend": decomposition_backend,
         "cdd_mode": cdd_mode,
         "cdd_constrained": cdd_constrained,
         "cdd_sm_mode": cdd_sm_mode,
@@ -529,6 +625,7 @@ def _precompute_cdd_cache(
         "cdd_min_scale": float(min(float(s) for s in sigmas)),
         "cdd_max_scale": float(max(float(s) for s in sigmas)),
         "sigmas": [float(s) for s in sigmas],
+        "ring_radii": None if ring_radii is None else [float(v) for v in ring_radii],
         "cdd_num_channels": cdd_num_channels,
         "cdd_request_num_channels": None if cdd_request_num_channels is None else int(cdd_request_num_channels),
         "model_num_scales": model_num_scales,
@@ -560,7 +657,7 @@ def _precompute_cdd_cache(
                 "or disable RAM precompute for DDP."
             )
     log_info(
-        f"[{config_name}] CDD precompute: {len(npy_files)} file(s), "
+        f"[{config_name}] CDD precompute: {len(npy_files)} file(s), backend={decomposition_backend}, "
         f"disk_cache={'on' if disk_cache_enabled else 'off'}"
         + (f" dir={disk_cache_dir}" if disk_cache_enabled else "")
     )
@@ -594,14 +691,14 @@ def _precompute_cdd_cache(
                     f"transformed_shape={tuple(cached['transformed'].shape)}"
                 )
                 continue
-        if cdd is None:
+        if decomposition_backend == "cdd" and cdd is None:
             allow_monai = cdd_gaussian_backend == "monai"
             cdd = import_constrained_diffusion(session_dir=session_dir, allow_monai=allow_monai)
             log_info(
                 f"[{config_name}] CDD import: constrained_diffusion "
                 f"monai={'on' if allow_monai else 'blocked'}"
             )
-        log_info(f"[{config_name}] CDD GPU compute: path={path}")
+        log_info(f"[{config_name}] CDD GPU compute: path={path} backend={decomposition_backend}")
         if path.endswith(".fits"):
             from astropy.io import fits as _fits
             arr = np.asarray(_fits.getdata(path, memmap=True), dtype=np.float32)
@@ -634,6 +731,32 @@ def _precompute_cdd_cache(
 
         def _compute_cdd_variant(input_arr: np.ndarray, label: str) -> np.ndarray:
             """Run CDD on *input_arr* and return (S, *spatial) channels."""
+            if decomposition_backend in ("ring_conv", "ring_conv_weighted"):
+                result = _ring_conv2d(
+                    input_arr,
+                    ring_radii,
+                    device=device,
+                    weighted=decomposition_backend == "ring_conv_weighted",
+                )
+                if result.ndim != input_arr.ndim + 1 or result.shape[1:] != input_arr.shape:
+                    raise ValueError(
+                        f"ring_conv output for {path} variant={label} must have one leading scale axis "
+                        f"over input shape {input_arr.shape}, got {result.shape}"
+                    )
+                if int(result.shape[0]) != model_num_scales:
+                    raise RuntimeError(
+                        f"[{config_name}] ring_conv/model scale mismatch for {path} variant={label}: "
+                        f"rings={list(zip(ring_radii[:-1], ring_radii[1:]))}, "
+                        f"cached_channels={int(result.shape[0])}, model_expected={model_num_scales}."
+                    )
+                log_info(
+                    f"[{config_name}] ring_conv channels variant={label}: "
+                    f"rings={list(zip(ring_radii[:-1], ring_radii[1:]))} "
+                    f"cached_channels={int(result.shape[0])} model_expected={model_num_scales} "
+                    f"input_shape={tuple(input_arr.shape)}"
+                )
+                return result.astype(np.float32, copy=False)
+
             channels_arr, residual, scales_used = safe_constrained_diffusion_decomposition(
                 cdd, input_arr, **cdd_kwargs,
             )
@@ -825,6 +948,9 @@ class _MaskingCollator:
         self.random_mask_box_per_target = bool(getattr(model, "random_mask_box_per_target", False))
         self.manual_mask_box_sizes = model.manual_mask_box_sizes
         self.encoder_border_margin = int(model.encoder_receptive_field()) // 2 if hasattr(model, "encoder_receptive_field") else 0
+        self.invalid_support_border_margin = int(
+            model.invalid_support_border_px() if hasattr(model, "invalid_support_border_px") else self.encoder_border_margin
+        )
         self.target_mask = target_mask
         self.target_threshold = target_threshold
         self.context_kwargs = {
@@ -867,7 +993,7 @@ class _MaskingCollator:
         metadata = None
         if isinstance(batch[0], (tuple, list)) and len(batch[0]) >= 2 and isinstance(batch[0][-1], dict):
             metadata = [item[-1] for item in batch]
-            batch = [item[:-1] for item in batch]
+            batch = [item[0] if len(item) == 2 else item[:-1] for item in batch]
         use_cdd = isinstance(batch[0], (tuple, list)) and len(batch[0]) == 2
         if self.use_cdd and self.require_precomputed_cdd and not use_cdd:
             raise RuntimeError(
@@ -885,12 +1011,31 @@ class _MaskingCollator:
         mask_scale, mask_box_size = self._sample_mask_params()
         invalid_pixel_mask = ~torch.isfinite(x_clean)
         border = int(max(0, min(self.encoder_border_margin, int(x_clean.shape[-2]) // 2, int(x_clean.shape[-1]) // 2)))
-        if border > 0:
-            invalid_pixel_mask = invalid_pixel_mask.clone()
-            invalid_pixel_mask[:, :, :border, :] = True
-            invalid_pixel_mask[:, :, int(x_clean.shape[-2]) - border :, :] = True
-            invalid_pixel_mask[:, :, :, :border] = True
-            invalid_pixel_mask[:, :, :, int(x_clean.shape[-1]) - border :] = True
+        # NaN border dilation: expand invalid regions so targets can't be placed
+        # where the encoder FOV / CDD support would reach into NaN/no-data regions.
+        # Mirrors _apply_encoder_border_invalid_mask in build_jepa.py.
+        nan_border = int(max(0, min(self.invalid_support_border_margin, int(x_clean.shape[-2]) // 2, int(x_clean.shape[-1]) // 2)))
+        native_border_preapplied = bool(metadata) and all(
+            int(item.get("native_invalid_border_px", 0) or 0) >= nan_border
+            for item in metadata
+        )
+        if border > 0 or nan_border > 0:
+            # Dilate only native no-data. Crop-edge rejection is a separate
+            # encoder-FOV margin; dilating that edge again over-crops every
+            # training cutout by border + nan_border.
+            native_invalid = invalid_pixel_mask.clone()
+            if nan_border > 0 and native_invalid.any() and not native_border_preapplied:
+                k = 2 * nan_border + 1
+                invalid_float = native_invalid.float()
+                dilated = F.max_pool2d(invalid_float, kernel_size=k, stride=1, padding=nan_border)
+                invalid_pixel_mask = dilated > 0.0
+            else:
+                invalid_pixel_mask = native_invalid
+            if border > 0:
+                invalid_pixel_mask[:, :, :border, :] = True
+                invalid_pixel_mask[:, :, int(x_clean.shape[-2]) - border :, :] = True
+                invalid_pixel_mask[:, :, :, :border] = True
+                invalid_pixel_mask[:, :, :, int(x_clean.shape[-1]) - border :] = True
         batch_target_mask = self.target_mask
         if self.target_threshold is not None and batch_target_mask is None:
             # Auto-generate from raw data: pixels > threshold are valid targets
@@ -944,12 +1089,23 @@ def _prepare_context_from_model(
     invalid_pixel_mask = ~torch.isfinite(x_clean)
     border_margin = int(model.encoder_receptive_field()) // 2 if hasattr(model, "encoder_receptive_field") else 0
     border = int(max(0, min(border_margin, int(x_clean.shape[-2]) // 2, int(x_clean.shape[-1]) // 2)))
-    if border > 0:
-        invalid_pixel_mask = invalid_pixel_mask.clone()
-        invalid_pixel_mask[:, :, :border, :] = True
-        invalid_pixel_mask[:, :, int(x_clean.shape[-2]) - border :, :] = True
-        invalid_pixel_mask[:, :, :, :border] = True
-        invalid_pixel_mask[:, :, :, int(x_clean.shape[-1]) - border :] = True
+    # NaN border dilation (mirrors _MaskingCollator and _apply_encoder_border_invalid_mask).
+    support_margin = int(model.invalid_support_border_px() if hasattr(model, "invalid_support_border_px") else border)
+    nan_border = int(max(0, min(support_margin, int(x_clean.shape[-2]) // 2, int(x_clean.shape[-1]) // 2)))
+    if border > 0 or nan_border > 0:
+        native_invalid = invalid_pixel_mask.clone()
+        if nan_border > 0 and native_invalid.any():
+            k = 2 * nan_border + 1
+            invalid_float = native_invalid.float()
+            dilated = F.max_pool2d(invalid_float, kernel_size=k, stride=1, padding=nan_border)
+            invalid_pixel_mask = dilated > 0.0
+        else:
+            invalid_pixel_mask = native_invalid
+        if border > 0:
+            invalid_pixel_mask[:, :, :border, :] = True
+            invalid_pixel_mask[:, :, int(x_clean.shape[-2]) - border :, :] = True
+            invalid_pixel_mask[:, :, :, :border] = True
+            invalid_pixel_mask[:, :, :, int(x_clean.shape[-1]) - border :] = True
     return prepare_context_batch(
         x_clean=x_clean,
         sigmas=model.sigmas,
@@ -1160,6 +1316,14 @@ def resolve_pipeline_config(model_cfg: dict) -> bool:
     return bool(model_cfg.get("post_log_transform", True))
 
 
+def resolve_cdd_cache_use_log(model_cfg: dict, data_cfg: dict) -> bool:
+    """Select transformed CDD cache only when explicitly requested or legacy default applies."""
+    for cfg in (model_cfg, data_cfg):
+        if isinstance(cfg, dict) and "cdd_use_log" in cfg:
+            return bool(cfg.get("cdd_use_log"))
+    return not bool(model_cfg.get("post_log_transform", True))
+
+
 def resolve_encoder_type_default(model_cfg: dict) -> str:
     """
     Restricted defaults aligned to the supported encoder matrix.
@@ -1202,6 +1366,9 @@ def _resolve_encoder_alias_2d(name: str) -> str:
         "convnext_image_dense_masked": "convnext_dense_masktoken",
         "cdd_scaleaware_convnext-pyramid-scaleaware": "cdd_scaleaware_convnext",
         "image_pyramid_cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
+        "ring_scaleaware_convnext": "cdd_scaleaware_convnext",
+        "ring_conv_scaleaware_convnext": "cdd_scaleaware_convnext",
+        "multiscale_ring_conv": "cdd_scaleaware_convnext",
         # Supported canonical names.
         "convnext_dense_masktoken": "convnext_dense_masktoken",
         "cdd_scaleaware_convnext": "cdd_scaleaware_convnext",
@@ -1329,6 +1496,11 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         target_nonoverlap=bool(model_cfg.get("target_nonoverlap", True)),
         target_allow_partial_overlap=float(model_cfg.get("target_allow_partial_overlap", 0.0)),
         mask_box_hardcap=model_cfg.get("mask_box_hardcap"),
+        nan_border_sigma_multiplier=float(model_cfg.get("nan_border_sigma_multiplier", data_cfg.get("nan_border_sigma_multiplier", 3.0))),
+        invalid_support_border_mode=model_cfg.get(
+            "invalid_support_border_mode",
+            data_cfg.get("invalid_support_border_mode", "cdd_support"),
+        ),
         use_grn=bool(model_cfg.get("use_grn", True)),
     ).to(device)
 
@@ -1913,7 +2085,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             normalize=bool(data_cfg.get("normalize", True)),
             crop_strategy=str(data_cfg.get("crop_strategy", "random")),
             cdd_cache=cdd_cache,
-            cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
+            cdd_use_log=resolve_cdd_cache_use_log(model_cfg, data_cfg),
         )
         val_dataset = None
         train_dataset = dataset
@@ -1930,7 +2102,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             normalize=bool(data_cfg.get("normalize", True)),
             crop_strategy="center",
             cdd_cache=cdd_cache,
-            cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
+            cdd_use_log=resolve_cdd_cache_use_log(model_cfg, data_cfg),
         )
         train_idx = []
         val_idx = []
@@ -1940,6 +2112,15 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         train_crop_mode = str(data_cfg.get("crop_mode", "none")).lower()
         train_crop_size = data_cfg.get("crop_size")
         val_crop_mode = "center" if train_crop_mode != "none" else "none"
+        native_invalid_border_px = 0
+        if bool(data_cfg.get("native_invalid_border_rejection", True)):
+            native_invalid_border_px = int(
+                model.invalid_support_border_px() if hasattr(model, "invalid_support_border_px") else model.encoder_receptive_field() // 2
+            )
+        log_info(
+            f"[{config_name}] Native invalid border rejection: "
+            f"border_px={native_invalid_border_px} before crop/augmentation"
+        )
         dataset = JEPADataset(
             num_samples=data_cfg.get("num_samples", 2000),
             data_root=data_cfg.get("data_root", "data"),
@@ -1954,8 +2135,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             input_type=input_type,
             image_batch_selected_indices=image_batch_selected_indices,
             cdd_cache=cdd_cache,
-            cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
+            cdd_use_log=resolve_cdd_cache_use_log(model_cfg, data_cfg),
             return_metadata=True,
+            crop_min_valid_fraction=float(data_cfg.get("crop_min_valid_fraction", 0.0)),
+            native_invalid_border_px=native_invalid_border_px,
         )
         val_fraction = float(train_cfg.get("val_fraction", 0.1))
         val_fraction = min(max(val_fraction, 0.0), 0.95)
@@ -1991,7 +2174,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 input_type=input_type,
                 image_batch_selected_indices=image_batch_selected_indices,
                 cdd_cache=cdd_cache,
-                cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
+                cdd_use_log=resolve_cdd_cache_use_log(model_cfg, data_cfg),
+                crop_min_valid_fraction=float(data_cfg.get("crop_min_valid_fraction", 0.0)),
+                native_invalid_border_px=native_invalid_border_px,
             )
             val_dataset.sample_index = val_idx
     if is_3d_mode:
@@ -2098,7 +2283,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             image_batch_inference=image_batch_inference,
             image_batch_selected_indices=image_batch_selected_indices,
             cdd_cache=cdd_cache,
-            cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
+            cdd_use_log=resolve_cdd_cache_use_log(model_cfg, data_cfg),
         )
         inference_dataset.sample_index = inference_sample_index[:1] if inference_sample_index else list(train_idx[:1])
         inference_dataset.num_samples = max(1, len(inference_dataset.sample_index))
@@ -2776,6 +2961,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 max_diagnostic_size=train_cfg.get("inference_max_diagnostic_size"),
                 tile_size=train_cfg.get("inference_tile_size", train_cfg.get("full_volume_spatial_tile_size", 512)),
                 tile_overlap=train_cfg.get("inference_tile_overlap"),
+                mask_predict_mode=train_cfg.get("mask_predict_mode", train_cfg.get("inference_mask_predict_mode")),
+                mask_predict_stride=train_cfg.get("mask_predict_stride", train_cfg.get("inference_mask_predict_stride")),
+                mask_predict_box_size=train_cfg.get("mask_predict_box_size", train_cfg.get("inference_mask_predict_box_size")),
+                mask_predict_chunk_size=train_cfg.get("mask_predict_chunk_size", train_cfg.get("inference_mask_predict_chunk_size")),
                 inference_discard_margin=train_cfg.get("inference_discard_margin"),
             )
             run_all_input_inference = bool(train_cfg.get("inference_all_inputs", bool(data_cfg.get("input_files"))))
@@ -2809,7 +2998,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         image_batch_inference=image_batch_inference,
                         image_batch_selected_indices=image_batch_selected_indices,
                         cdd_cache=cdd_cache,
-                        cdd_use_log=not bool(model_cfg.get("post_log_transform", True)),
+                        cdd_use_log=resolve_cdd_cache_use_log(model_cfg, data_cfg),
                     )
                     input_dataset.sample_index = [sample_key]
                     input_loader = DataLoader(
@@ -2840,6 +3029,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         max_diagnostic_size=train_cfg.get("inference_max_diagnostic_size"),
                         tile_size=train_cfg.get("inference_tile_size", train_cfg.get("full_volume_spatial_tile_size", 512)),
                         tile_overlap=train_cfg.get("inference_tile_overlap"),
+                        mask_predict_mode=train_cfg.get("mask_predict_mode", train_cfg.get("inference_mask_predict_mode")),
+                        mask_predict_stride=train_cfg.get("mask_predict_stride", train_cfg.get("inference_mask_predict_stride")),
+                        mask_predict_box_size=train_cfg.get("mask_predict_box_size", train_cfg.get("inference_mask_predict_box_size")),
+                        mask_predict_chunk_size=train_cfg.get("mask_predict_chunk_size", train_cfg.get("inference_mask_predict_chunk_size")),
                         inference_discard_margin=train_cfg.get("inference_discard_margin"),
                     )
                     manifest.append({
@@ -2871,7 +3064,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
             inference_pca = bool(train_cfg.get("inference_pca", True))
             inference_umap = bool(train_cfg.get("inference_umap", True))
-            artifacts_dir = save_inference_dashboard(session_dir, outputs, umap_cfg=umap_cfg, inference_pca=inference_pca, inference_umap=inference_umap)
+            artifacts_dir = export_inference_dashboard_artifacts(session_dir, outputs, umap_cfg=umap_cfg, inference_pca=inference_pca, inference_umap=inference_umap)
             log_info(f"[{config_name}] artifacts_saved={artifacts_dir}")
             effective_rank = ""
             rank_diag = {}
@@ -2947,37 +3140,126 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         elif is_main_process:
             log_info(f"[{config_name}] warning: inference_outputs.pt missing; skip artifact generation")
 
-    if is_main_process and not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)) and model_without_ddp.mode == "pyramid":
+    if is_main_process and not is_3d_mode and bool(train_cfg.get("scale_probe_enabled", False)):
         try:
-            from src.utils.scale_probe import probe_scale_response
+            from src.utils.scale_probe import (
+                build_cdd_reconstructed_image_variants,
+                probe_image_response,
+                probe_scale_response,
+            )
 
             model_without_ddp.eval()
             with torch.no_grad():
-                cdd_channels = None
-                if os.path.exists(inf_path):
-                    inf_outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
-                    cdd_channels = inf_outputs.get("cdd_channels_orig")
-                    if cdd_channels is not None:
-                        cdd_channels = cdd_channels[:1]
-                if cdd_channels is None or cdd_channels.ndim != 4:
-                    probe_batch, _ = next(iter(dataloader))
-                    probe_batch = probe_batch.to(device, non_blocking=True)
-                    # Let _prepare_context_from_model handle NaN internally.
-                    ctx_result = _prepare_context_from_model(model_without_ddp, probe_batch, return_debug=True)
-                    if len(ctx_result) >= 5:
-                        debug = ctx_result[4]
-                        cdd_channels = debug.get("cdd_channels_orig")
-                if cdd_channels is not None and cdd_channels.ndim == 4:
-                    report = probe_scale_response(
-                        model_without_ddp,
-                        x_pyr=cdd_channels.to(device),
-                        scale_names=train_cfg.get("scale_probe_names"),
-                        out_dir=session_dir,
-                        run_name=config_name,
-                    )
-                    log_info(f"[{config_name}] scale_probe_report={json.dumps(report['scale_drop_sensitivity_fraction'])}")
+                if model_without_ddp.mode == "pyramid":
+                    cdd_channels = None
+                    if os.path.exists(inf_path):
+                        inf_outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
+                        cdd_channels = inf_outputs.get("cdd_channels_orig")
+                        if cdd_channels is not None:
+                            cdd_channels = cdd_channels[:1]
+                    if cdd_channels is None or cdd_channels.ndim != 4:
+                        probe_item = next(iter(dataloader))
+                        probe_batch = probe_item[0] if isinstance(probe_item, (tuple, list)) else probe_item
+                        probe_batch = probe_batch.to(device, non_blocking=True)
+                        # Let _prepare_context_from_model handle NaN internally.
+                        ctx_result = _prepare_context_from_model(model_without_ddp, probe_batch, return_debug=True)
+                        if len(ctx_result) >= 5:
+                            debug = ctx_result[4]
+                            cdd_channels = debug.get("cdd_channels_orig")
+                    if cdd_channels is not None and cdd_channels.ndim == 4:
+                        report = probe_scale_response(
+                            model_without_ddp,
+                            x_pyr=cdd_channels.to(device),
+                            scale_names=train_cfg.get("scale_probe_names"),
+                            out_dir=session_dir,
+                            run_name=config_name,
+                        )
+                        log_info(f"[{config_name}] scale_probe_report={json.dumps(report['scale_drop_sensitivity_fraction'])}")
+                    else:
+                        log_info(f"[{config_name}] scale_probe: cdd_channels not available, skipping")
+                elif model_without_ddp.mode == "image":
+                    reference_input = None
+                    source_image = None
+                    if os.path.exists(inf_path):
+                        inf_outputs = torch.load(inf_path, map_location="cpu", weights_only=False)
+                        reference_input = inf_outputs.get("network_target_in")
+                        if reference_input is not None:
+                            reference_input = reference_input[:1]
+                        source_image = inf_outputs.get("x_clean_raw")
+                        if source_image is not None:
+                            source_image = source_image[:1]
+                    if (
+                        reference_input is None
+                        or reference_input.ndim != 4
+                        or source_image is None
+                        or source_image.ndim not in (3, 4)
+                    ):
+                        probe_item = next(iter(dataloader))
+                        probe_batch = probe_item[0] if isinstance(probe_item, (tuple, list)) else probe_item
+                        probe_batch = torch.nan_to_num(
+                            probe_batch.to(device, non_blocking=True),
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                        )
+                        probe_outputs = model_without_ddp(
+                            probe_batch[:1],
+                            return_debug=True,
+                            enable_grid_jitter=False,
+                            enable_target_dithering=False,
+                            mask_inference=False,
+                        )
+                        reference_input = probe_outputs.get("network_target_in")
+                        source_image = probe_outputs.get("x_clean_raw", probe_batch[:1])
+                    if reference_input is not None and reference_input.ndim == 4:
+                        variant_inputs = None
+                        scale_only_inputs = None
+                        variant_names = train_cfg.get(
+                            "image_scale_probe_names",
+                            train_cfg.get("scale_probe_image_names"),
+                        )
+                        try:
+                            variant_inputs, scale_only_inputs, variant_names = build_cdd_reconstructed_image_variants(
+                                reference_input.to(device),
+                                source_image=None if source_image is None else source_image.to(device),
+                                sigmas=tuple(model_cfg.get("sigmas", [2, 4, 8, 16])),
+                                cdd_mode=str(model_cfg.get("cdd_mode", data_cfg.get("cdd_mode", "log"))),
+                                cdd_constrained=bool(model_cfg.get("cdd_constrained", data_cfg.get("cdd_constrained", True))),
+                                cdd_sm_mode=str(model_cfg.get("cdd_sm_mode", data_cfg.get("cdd_sm_mode", "reflect"))),
+                                cdd_gaussian_backend=str(
+                                    model_cfg.get("cdd_gaussian_backend", data_cfg.get("cdd_gaussian_backend", "cpu"))
+                                ),
+                                cdd_append_last_residual=bool(model_cfg.get("cdd_append_last_residual", True)),
+                                post_log_transform=bool(model_cfg.get("post_log_transform", True)),
+                                log_eps=float(model_cfg.get("log_eps", 1.0)),
+                                cdd_log_std_floor_mult=float(model_cfg.get("cdd_log_std_floor_mult", 0.05)),
+                                perturb_channel=int(train_cfg.get("image_scale_probe_channel", 0)),
+                            )
+                            log_info(
+                                f"[{config_name}] image_scale_probe: using CDD reconstructed drop-scale variants "
+                                f"names={list(variant_names)}"
+                            )
+                        except Exception as cdd_probe_error:
+                            log_info(
+                                f"[{config_name}] image_scale_probe: CDD reconstructed variants failed "
+                                f"({type(cdd_probe_error).__name__}: {cdd_probe_error}); skipping image scale probe"
+                            )
+                        if variant_inputs is not None and scale_only_inputs is not None:
+                            report = probe_image_response(
+                                model_without_ddp,
+                                reference_input=reference_input.to(device),
+                                variant_inputs=variant_inputs,
+                                scale_only_inputs=scale_only_inputs,
+                                variant_names=variant_names,
+                                out_dir=session_dir,
+                                run_name=config_name,
+                                perturb_channel=int(train_cfg.get("image_scale_probe_channel", 0)),
+                            )
+                            log_info(f"[{config_name}] image_scale_probe_report={json.dumps(report['scale_drop_sensitivity_fraction'])}")
+                    else:
+                        log_info(f"[{config_name}] scale_probe: image reference input not available, skipping")
                 else:
-                    log_info(f"[{config_name}] scale_probe: cdd_channels not available, skipping")
+                    log_info(f"[{config_name}] scale_probe: unsupported mode={model_without_ddp.mode}, skipping")
             model_without_ddp.train()
         except Exception as e:
             log_error("scale_probe", e)
