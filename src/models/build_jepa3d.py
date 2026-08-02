@@ -62,7 +62,7 @@ class PyramidGridJEPA3D(nn.Module):
         final_norm: bool = True,
         activation_checkpointing: bool = True,
         target_invalid_region_skip: bool = True,
-        target_invalid_region_values=(0.0, "nan"),
+        target_invalid_region_values=("nan",),
         encoder_border_margin_xy: int = 0,
         mask_box_hardcap: int | None = None,
     ):

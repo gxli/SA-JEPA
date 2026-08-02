@@ -46,7 +46,7 @@ from src.inference import (
 )
 from src.utils.npy import _safe_load_npy, normalize01
 from src.utils.cdd_import import import_constrained_diffusion, safe_constrained_diffusion_decomposition
-from src.utils.support import invalid_support_border_from_config
+from src.utils.support import additional_crop_from_config, invalid_support_border_from_config
 from src.utils.viz import export_inference_dashboard_artifacts
 
 
@@ -426,10 +426,10 @@ def _erode_valid_mask(
     *,
     reject_outer_border: bool = True,
 ) -> np.ndarray:
-    """Reject pixels near no-data and, by default, the outer image border."""
+    """Reject pixels whose encoder support touches no-data or the outer frame."""
     valid = np.asarray(valid_mask, dtype=bool)
     b = int(max(0, border_px))
-    if b <= 0:
+    if valid.ndim != 2 or b <= 0:
         return valid.copy()
     invalid = torch.from_numpy((~valid).astype(np.float32))[None, None]
     k = 2 * b + 1
@@ -464,12 +464,13 @@ def _assert_valid_output_coverage(outputs: dict, valid_mask: np.ndarray | None) 
 def _configured_nan_border_px(model, config: dict, override: int | None = None) -> int:
     if override is not None and int(override) >= 0:
         return int(override)
+    extra_crop = int(additional_crop_from_config(config))
     if hasattr(model, "invalid_support_border_px"):
         try:
-            return int(max(0, model.invalid_support_border_px()))
+            return int(max(0, model.invalid_support_border_px() + extra_crop))
         except Exception:
             pass
-    return int(invalid_support_border_from_config(config))
+    return int(invalid_support_border_from_config(config) + extra_crop)
 
 
 def _apply_output_valid_mask(outputs: dict, valid_mask: np.ndarray | None) -> dict:
@@ -895,7 +896,22 @@ def save_inference_session(
         np.save(os.path.join(output_dir, "tile_visit_map.npy"), tile_layout.visit_map.astype(np.int32))
 
     # Save compressed NPZ maps and target metadata.
-    for key in ("pred_map", "mask_pred_map", "masked_pred_map", "masked_target_pred_map", "gt_map", "context_map", "target_locations", "target_scales", "target_valid", "target_energy_map"):
+    for key in (
+        "pred_map",
+        "mask_pred_map",
+        "masked_pred_map",
+        "masked_target_pred_map",
+        "gt_map",
+        "context_map",
+        "target_locations",
+        "target_scales",
+        "target_valid",
+        "target_allowed_mask_map",
+        "output_valid_mask",
+        "target_box_sizes",
+        "mask_footprint_px",
+        "target_energy_map",
+    ):
         val = outputs.get(key)
         if val is not None:
             _save_npz(os.path.join(output_dir, f"{key}.npz"), val.cpu().numpy() if hasattr(val, "cpu") else val)
@@ -1148,7 +1164,11 @@ Examples:
         if raw_arr_for_mask.ndim == 2:
             raw_valid = _valid_pixel_mask(raw_arr_for_mask)
             nan_border_px = _configured_nan_border_px(model, config, args.nan_border_px)
-            raw_output_valid_mask = _erode_valid_mask(raw_valid, nan_border_px)
+            raw_output_valid_mask = (
+                _erode_valid_mask(raw_valid, nan_border_px, reject_outer_border=True)
+                if nan_border_px > 0
+                else raw_valid.copy()
+            )
             rejected = int(raw_valid.sum() - raw_output_valid_mask.sum())
             print(
                 f"[inference] output NaN boundary rejection: border_px={nan_border_px} "

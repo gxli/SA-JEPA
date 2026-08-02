@@ -46,6 +46,7 @@ from src.models.masking import _max_effective_mask_box_size, prepare_context_bat
 from src.utils import log_error, set_error_log_path
 from src.utils.cdd_import import import_constrained_diffusion, safe_constrained_diffusion_decomposition
 from src.utils.npy import _safe_load_npy
+from src.utils.support import additional_crop_from_config
 from src.utils.viz import _target_location_yx, export_inference_dashboard_artifacts, save_volumetric_umap_embeddings
 
 LOGGER = logging.getLogger(__name__)
@@ -1396,6 +1397,18 @@ def _resolve_encoder_alias_3d(name: str) -> str:
     return alias.get(key, str(name))
 
 
+def _target_invalid_values_from_config(model_cfg: dict, default=("nan",)) -> tuple:
+    values = model_cfg.get("target_invalid_region_values", default)
+    if values is None:
+        return tuple(default)
+    if isinstance(values, str):
+        return (values,)
+    try:
+        return tuple(values)
+    except TypeError:
+        return (values,)
+
+
 def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, device: torch.device) -> PyramidGridJEPA:
     """Construct a PyramidGridJEPA from config dicts."""
     mask_spacing_scaling = float(model_cfg.get("mask_spacing_scaling", 1.5))
@@ -1484,7 +1497,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         encoder_final_norm_type=str(model_cfg.get("encoder_final_norm_type", "layernorm")),
         encoder_head_bias=bool(model_cfg.get("encoder_head_bias", True)),
         target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", True)),
-        target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", [0, "nan"])),
+        target_invalid_region_values=_target_invalid_values_from_config(model_cfg),
         target_sampling_mode=str(model_cfg.get("target_sampling_mode", "random")),
         priority_top_percent=float(model_cfg.get("priority_top_percent", 5.0)),
         priority_n_target=model_cfg.get("priority_n_target", 20),
@@ -1499,7 +1512,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         nan_border_sigma_multiplier=float(model_cfg.get("nan_border_sigma_multiplier", data_cfg.get("nan_border_sigma_multiplier", 3.0))),
         invalid_support_border_mode=model_cfg.get(
             "invalid_support_border_mode",
-            data_cfg.get("invalid_support_border_mode", "cdd_support"),
+            data_cfg.get("invalid_support_border_mode", "encoder_rf"),
         ),
         use_grn=bool(model_cfg.get("use_grn", True)),
     ).to(device)
@@ -1579,7 +1592,7 @@ def build_model3d_from_config(model_cfg: dict, train_cfg: dict, device: torch.de
         final_norm=bool(model_cfg.get("scaleaware_final_norm", True)),
         activation_checkpointing=bool(model_cfg.get("activation_checkpointing", True)),
         target_invalid_region_skip=bool(model_cfg.get("target_invalid_region_skip", True)),
-        target_invalid_region_values=tuple(model_cfg.get("target_invalid_region_values", (0.0, "nan"))),
+        target_invalid_region_values=_target_invalid_values_from_config(model_cfg),
         encoder_border_margin_xy=int(max(0, encoder_rf_depth // 2)),
         mask_box_hardcap=model_cfg.get("mask_box_hardcap"),
     ).to(device)
@@ -2114,12 +2127,19 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         val_crop_mode = "center" if train_crop_mode != "none" else "none"
         native_invalid_border_px = 0
         if bool(data_cfg.get("native_invalid_border_rejection", True)):
-            native_invalid_border_px = int(
+            native_invalid_base_border_px = int(
                 model.invalid_support_border_px() if hasattr(model, "invalid_support_border_px") else model.encoder_receptive_field() // 2
             )
+            native_invalid_extra_crop_px = int(additional_crop_from_config(config))
+            native_invalid_border_px = native_invalid_base_border_px + native_invalid_extra_crop_px
+        else:
+            native_invalid_base_border_px = 0
+            native_invalid_extra_crop_px = 0
         log_info(
             f"[{config_name}] Native invalid border rejection: "
-            f"border_px={native_invalid_border_px} before crop/augmentation"
+            f"border_px={native_invalid_border_px} "
+            f"(base={native_invalid_base_border_px} additional_crop={native_invalid_extra_crop_px}) "
+            "before crop/augmentation"
         )
         dataset = JEPADataset(
             num_samples=data_cfg.get("num_samples", 2000),
@@ -2966,6 +2986,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 mask_predict_box_size=train_cfg.get("mask_predict_box_size", train_cfg.get("inference_mask_predict_box_size")),
                 mask_predict_chunk_size=train_cfg.get("mask_predict_chunk_size", train_cfg.get("inference_mask_predict_chunk_size")),
                 inference_discard_margin=train_cfg.get("inference_discard_margin"),
+                additional_crop=additional_crop_from_config(config),
             )
             run_all_input_inference = bool(train_cfg.get("inference_all_inputs", bool(data_cfg.get("input_files"))))
             if run_all_input_inference and len(inference_sample_index) > 1:
@@ -3034,6 +3055,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         mask_predict_box_size=train_cfg.get("mask_predict_box_size", train_cfg.get("inference_mask_predict_box_size")),
                         mask_predict_chunk_size=train_cfg.get("mask_predict_chunk_size", train_cfg.get("inference_mask_predict_chunk_size")),
                         inference_discard_margin=train_cfg.get("inference_discard_margin"),
+                        additional_crop=additional_crop_from_config(config),
                     )
                     manifest.append({
                         "index": ordinal,

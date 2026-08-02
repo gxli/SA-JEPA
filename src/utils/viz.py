@@ -12,10 +12,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from src.utils.support import encoder_border_from_config
+from src.utils.support import encoder_border_from_config, effective_invalid_support_border_from_config
 
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(ROOT_DIR)
 MAX_PCA_FIT_TOKENS = 65536
 
 
@@ -454,21 +455,24 @@ def _fit_umap_nd_with_bundle(
             print(f"[warning] cuML UMAP unavailable, falling back to TorchDR: {type(e).__name__}: {e}", flush=True)
 
     if backend_norm in ("auto", "torchdr"):
-        try:
-            from torchdr import UMAP as TorchDRUMAP
+        if backend_norm == "auto" and not torch.cuda.is_available():
+            print("[inference] UMAP backend: skipping TorchDR (no CUDA), using umap-learn", flush=True)
+        else:
+            try:
+                from torchdr import UMAP as TorchDRUMAP
 
-            print("[inference] UMAP backend: TorchDR", flush=True)
-            model = TorchDRUMAP(**_torchdr_umap_params(params))
-            if needs_fit_transform:
-                model.fit(fit_x)
-                out = model.transform(z)
-            else:
-                out = model.fit_transform(z)
-            return _umap_result_to_numpy(out), _bundle("torchdr", model)
-        except Exception as e:
-            if backend_norm == "torchdr":
-                raise RuntimeError(f"Requested UMAP backend 'torchdr' failed: {type(e).__name__}: {e}") from e
-            print(f"[warning] TorchDR UMAP unavailable, falling back to umap-learn: {type(e).__name__}: {e}", flush=True)
+                print("[inference] UMAP backend: TorchDR", flush=True)
+                model = TorchDRUMAP(**_torchdr_umap_params(params))
+                if needs_fit_transform:
+                    model.fit(fit_x)
+                    out = model.transform(z)
+                else:
+                    out = model.fit_transform(z)
+                return _umap_result_to_numpy(out), _bundle("torchdr", model)
+            except Exception as e:
+                if backend_norm == "torchdr":
+                    raise RuntimeError(f"Requested UMAP backend 'torchdr' failed: {type(e).__name__}: {e}") from e
+                print(f"[warning] TorchDR UMAP unavailable, falling back to umap-learn: {type(e).__name__}: {e}", flush=True)
 
     import umap
 
@@ -549,21 +553,27 @@ def _compute_umap_nd(
             print(f"[warning] cuML UMAP unavailable, falling back to TorchDR: {type(e).__name__}: {e}", flush=True)
 
     if backend_norm in ("auto", "torchdr"):
-        try:
-            from torchdr import UMAP as TorchDRUMAP
+        # TorchDR is GPU-accelerated and can OOM on MPS/CPU for large
+        # datasets (e.g. 65K+ points with n_neighbors=50).  Only use it
+        # when CUDA is available; otherwise skip straight to CPU umap-learn.
+        if backend_norm == "auto" and not torch.cuda.is_available():
+            print("[inference] UMAP backend: skipping TorchDR (no CUDA), using umap-learn", flush=True)
+        else:
+            try:
+                from torchdr import UMAP as TorchDRUMAP
 
-            print("[inference] UMAP backend: TorchDR", flush=True)
-            torchdr_params = dict(ctor_params)
-            torchdr_params["fit_max_tokens"] = int(fit_max_tokens)
-            model = TorchDRUMAP(**_torchdr_umap_params(torchdr_params))
-            if needs_fit_transform:
-                model.fit(fit_x)
-                return _umap_result_to_numpy(model.transform(x))
-            return _umap_result_to_numpy(model.fit_transform(x))
-        except Exception as e:
-            if backend_norm == "torchdr":
-                raise RuntimeError(f"Requested UMAP backend 'torchdr' failed: {type(e).__name__}: {e}") from e
-            print(f"[warning] TorchDR UMAP unavailable, falling back to umap-learn: {type(e).__name__}: {e}", flush=True)
+                print("[inference] UMAP backend: TorchDR", flush=True)
+                torchdr_params = dict(ctor_params)
+                torchdr_params["fit_max_tokens"] = int(fit_max_tokens)
+                model = TorchDRUMAP(**_torchdr_umap_params(torchdr_params))
+                if needs_fit_transform:
+                    model.fit(fit_x)
+                    return _umap_result_to_numpy(model.transform(x))
+                return _umap_result_to_numpy(model.fit_transform(x))
+            except Exception as e:
+                if backend_norm == "torchdr":
+                    raise RuntimeError(f"Requested UMAP backend 'torchdr' failed: {type(e).__name__}: {e}") from e
+                print(f"[warning] TorchDR UMAP unavailable, falling back to umap-learn: {type(e).__name__}: {e}", flush=True)
 
     import umap
 
@@ -747,14 +757,15 @@ render(1.0, 99.0);
 def _build_input_validity_mask(x_clean_raw: torch.Tensor, target_h: int, target_w: int) -> np.ndarray:
     """Build a bool validity mask at latent-map resolution from the raw input.
 
-    A position is True when the corresponding input region contains mostly valid
-    (non-zero, non-NaN) pixels.  Uses average-pool downsampling so that isolated
-    single-pixel artefacts do not dominate the mask.
+    A position is True when the corresponding input region contains mostly finite
+    pixels.  Zero is a valid physical value for these maps; only NaN/Inf mark
+    no-data.  Uses average-pool downsampling so that isolated single-pixel
+    artefacts do not dominate the mask.
     """
     if x_clean_raw.dim() != 4:
         return np.ones((target_h, target_w), dtype=bool)
     inp = x_clean_raw[0:1, 0:1]  # [1, 1, H_in, W_in]
-    valid = (inp.abs() > 1e-12) & torch.isfinite(inp)
+    valid = torch.isfinite(inp)
     valid_f = valid.float()
     h_in, w_in = int(inp.shape[-2]), int(inp.shape[-1])
     k_h = max(1, h_in // target_h)
@@ -768,9 +779,67 @@ def _build_input_validity_mask(x_clean_raw: torch.Tensor, target_h: int, target_
     return mask
 
 
+def _config_input_validity_mask(session_dir: str, target_h: int, target_w: int) -> np.ndarray | None:
+    cfg = _load_session_config(session_dir)
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(data_cfg, dict):
+        return None
+    names: list[str] = []
+    for key in ("input_file", "input_path", "npy_file", "npy_path", "image_file"):
+        value = data_cfg.get(key)
+        if value:
+            names.append(str(value))
+    pattern = data_cfg.get("npy_pattern")
+    if pattern:
+        names.append(str(pattern))
+    data_root = str(data_cfg.get("data_root", "data"))
+    for name in names:
+        path = name
+        if not os.path.isabs(path):
+            path = os.path.join(PROJECT_ROOT, data_root, path)
+        if not os.path.exists(path):
+            continue
+        try:
+            arr = np.asarray(np.load(path), dtype=np.float32)
+        except Exception:
+            continue
+        arr = np.squeeze(arr)
+        if arr.ndim > 2:
+            arr = arr.reshape((-1,) + arr.shape[-2:])[0]
+        if arr.ndim != 2:
+            continue
+        t = torch.from_numpy(np.isfinite(arr).astype(np.float32))[None, None]
+        if int(t.shape[-2]) != int(target_h) or int(t.shape[-1]) != int(target_w):
+            t = F.interpolate(t, size=(target_h, target_w), mode="nearest")
+        return (t[0, 0] > 0.5).numpy().astype(bool)
+    return None
+
+
+def _erode_validity_mask(
+    valid_mask: np.ndarray,
+    border_px: int,
+    *,
+    reject_outer_border: bool = True,
+) -> np.ndarray:
+    """Reject pixels whose encoder support touches no-data or the outer frame."""
+    valid = np.asarray(valid_mask, dtype=bool)
+    b = int(max(0, border_px))
+    if valid.ndim != 2 or b <= 0:
+        return valid.copy()
+    invalid = torch.from_numpy((~valid).astype(np.float32))[None, None]
+    dilated_invalid = F.max_pool2d(invalid, kernel_size=2 * b + 1, stride=1, padding=b)[0, 0].numpy() > 0.0
+    accepted = valid & (~dilated_invalid)
+    if reject_outer_border:
+        accepted[:b, :] = False
+        accepted[-b:, :] = False
+        accepted[:, :b] = False
+        accepted[:, -b:] = False
+    return accepted
+
+
 def _target_allowed_validity_mask(outputs: dict, target_h: int, target_w: int) -> np.ndarray | None:
-    """Return the user-provided valid-target region at latent resolution."""
-    target_allowed = outputs.get("target_allowed_mask_map")
+    """Return the accepted output footprint at latent resolution."""
+    target_allowed = outputs.get("output_valid_mask", outputs.get("target_allowed_mask_map"))
     if target_allowed is None:
         return None
     tm = torch.as_tensor(target_allowed)
@@ -923,14 +992,14 @@ def export_inference_dashboard_artifacts(session_dir: str, outputs: dict, umap_c
     h_lat = int(pred_map.shape[-2])
     w_lat = int(pred_map.shape[-1])
     valid_mask_2d = _build_input_validity_mask(x_clean_raw, h_lat, w_lat)  # [H_lat, W_lat] bool
-    border_px = int(max(0, min(_latent_border_from_summary_or_config(session_dir), h_lat // 2, w_lat // 2)))
+    cfg = _load_session_config(session_dir)
+    config_valid = _config_input_validity_mask(session_dir, h_lat, w_lat)
+    if config_valid is not None:
+        valid_mask_2d &= config_valid
+    border_px = int(max(0, min(effective_invalid_support_border_from_config(cfg), h_lat // 2, w_lat // 2)))
     if border_px > 0:
-        valid_mask_2d = valid_mask_2d.copy()
-        valid_mask_2d[:border_px, :] = False
-        valid_mask_2d[h_lat - border_px :, :] = False
-        valid_mask_2d[:, :border_px] = False
-        valid_mask_2d[:, w_lat - border_px :] = False
-        print(f"[dashboard] latent PCA/UMAP border mask: border_px={border_px}")
+        valid_mask_2d = _erode_validity_mask(valid_mask_2d, border_px, reject_outer_border=True)
+        print(f"[dashboard] latent PCA/UMAP invalid-support mask: border_px={border_px}")
     target_allowed_mask = _target_allowed_validity_mask(outputs, h_lat, w_lat)
     if target_allowed_mask is not None:
         valid_mask_2d = valid_mask_2d & target_allowed_mask
@@ -1113,7 +1182,7 @@ def _build_volume_validity_mask(x_clean_raw: torch.Tensor, target_d: int, target
     if x.dim() != 5:
         return np.ones((target_d, target_h, target_w), dtype=bool)
     inp = x[0:1, 0:1]
-    valid = ((inp.abs() > 1e-12) & torch.isfinite(inp)).float()
+    valid = torch.isfinite(inp).float()
     pooled = F.interpolate(valid, size=(target_d, target_h, target_w), mode="nearest")
     return (pooled[0, 0] > 0.5).detach().cpu().numpy().astype(bool)
 

@@ -19,11 +19,11 @@ import numpy as np
 import plotly.graph_objects as go
 import torch
 from src.diagnostics import rank_dashboard
-from src.utils.support import invalid_support_border_from_config
+from src.utils.support import effective_invalid_support_border_from_config
 from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap, _target_region_mask_from_outputs
 
 
-DASHBOARD_VERSION = "production-diagnostics-v30-invalid-support-border-mode"
+DASHBOARD_VERSION = "production-diagnostics-v41-outer-fov-native-invalid"
 CONTROL_SCRIPT_SENTINEL = "window.JEPADashboardControls"
 DASHBOARD_COMPUTE_UMAP = os.environ.get("DASHBOARD_COMPUTE_UMAP", "1").strip().lower() in {"1", "true", "yes", "on"}
 DASHBOARD_UMAP_FIT_MAX_TOKENS = int(os.environ.get("DASHBOARD_UMAP_FIT_MAX_TOKENS", "12000"))
@@ -737,11 +737,48 @@ def _config_target_mask_display(cfg: dict[str, Any], shape: tuple[int, int]) -> 
     return (mask > 0.5).astype(bool)
 
 
+def _config_input_display(cfg: dict[str, Any], shape: tuple[int, int]) -> np.ndarray | None:
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(data_cfg, dict):
+        return None
+    names: list[str] = []
+    for key in ("input_file", "input_path", "npy_file", "npy_path", "image_file"):
+        value = data_cfg.get(key)
+        if value:
+            names.append(str(value))
+    pattern = data_cfg.get("npy_pattern")
+    if pattern:
+        names.append(str(pattern))
+    data_root = str(data_cfg.get("data_root", "data"))
+    for name in names:
+        path = name
+        if not os.path.isabs(path):
+            path = os.path.join(ROOT_DIR, data_root, path)
+        if not os.path.exists(path):
+            continue
+        try:
+            arr = np.asarray(np.load(path), dtype=np.float32)
+        except Exception:
+            continue
+        arr = np.squeeze(arr)
+        if arr.ndim > 2:
+            arr = arr.reshape((-1,) + arr.shape[-2:])[0]
+        if arr.ndim != 2:
+            continue
+        if arr.shape == tuple(shape):
+            return arr
+        if arr.shape == (shape[1], shape[0]):
+            return arr.T
+    return None
+
+
 def _config_zero_is_invalid_target(cfg: dict[str, Any]) -> bool:
     model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
     if not isinstance(model_cfg, dict) or not bool(model_cfg.get("target_invalid_region_skip", True)):
         return False
-    specs = model_cfg.get("target_invalid_region_values", (0.0, "nan"))
+    if "target_invalid_region_values" not in model_cfg:
+        return False
+    specs = model_cfg.get("target_invalid_region_values", ())
     if not isinstance(specs, (list, tuple)):
         specs = (specs,)
     for spec in specs:
@@ -753,35 +790,103 @@ def _config_zero_is_invalid_target(cfg: dict[str, Any]) -> bool:
     return False
 
 
+def _config_has_invalid_support_policy(cfg: dict[str, Any]) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    model_cfg = cfg.get("model", {})
+    data_cfg = cfg.get("data", {})
+    if isinstance(model_cfg, dict):
+        for key in ("invalid_support_border_mode", "nan_border_sigma_multiplier", "target_invalid_region_values"):
+            if key in model_cfg:
+                return True
+    if isinstance(data_cfg, dict):
+        for key in ("native_invalid_border_rejection", "target_threshold"):
+            if key in data_cfg:
+                return True
+    return False
+
+
 def _valid_target_display_mask(
     outputs: dict,
     shape: tuple[int, int],
     raw_display: np.ndarray,
     cfg: dict[str, Any] | None = None,
+    border_px_override: int | None = None,
 ) -> np.ndarray:
-    """Return valid target pixels in dashboard image coordinates."""
+    """Return the native target-support footprint, eroded exactly once.
+
+    Do not intersect this with output_valid_mask/target_allowed_mask_map here:
+    those maps may already include tiled inference rejection or support erosion.
+    Reusing them as input to this display rejection is what double-cropped the
+    target/visit diagnostics.
+    """
     cfg = cfg or {}
-    allowed = _extract_hw_map(outputs, ("target_allowed_mask_map",), shape)
-    if allowed is not None:
-        return (allowed > 0.5).astype(bool)
+    shape = tuple(int(v) for v in shape)
+    accepted = np.ones(shape, dtype=bool)
     configured_mask = _config_target_mask_display(cfg, shape)
     if configured_mask is not None:
-        return configured_mask
-    raw = np.asarray(raw_display, dtype=np.float32)
-    if raw.shape != tuple(shape):
+        configured_mask = configured_mask.astype(bool)
+        if configured_mask.any():
+            accepted &= configured_mask
+    raw_from_config = _config_input_display(cfg, shape)
+    raw = np.asarray(raw_from_config if raw_from_config is not None else raw_display, dtype=np.float32)
+    if raw.shape != shape:
         raw = _display_scalar_from_batched_tensor(outputs.get("x_clean_raw", outputs.get("x_clean", raw)))
-    if raw.shape != tuple(shape):
-        return np.ones(tuple(shape), dtype=bool)
-    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
-    if isinstance(data_cfg, dict) and data_cfg.get("target_threshold") is not None:
-        try:
-            threshold = float(data_cfg.get("target_threshold"))
-            return (np.isfinite(raw) & (raw > threshold)).astype(bool)
-        except (TypeError, ValueError):
-            pass
-    if _config_zero_is_invalid_target(cfg):
-        return (np.isfinite(raw) & (np.abs(raw) > 1e-12)).astype(bool)
-    return np.isfinite(raw).astype(bool)
+    if raw.shape == shape:
+        raw_valid = np.isfinite(raw)
+        data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+        if isinstance(data_cfg, dict) and data_cfg.get("target_threshold") is not None:
+            try:
+                threshold = float(data_cfg.get("target_threshold"))
+                raw_valid &= raw > threshold
+            except (TypeError, ValueError):
+                pass
+        if _config_zero_is_invalid_target(cfg):
+            raw_valid &= np.abs(raw) > 1e-12
+        accepted &= raw_valid.astype(bool)
+    border_px = int(max(0, border_px_override if border_px_override is not None else effective_invalid_support_border_from_config(cfg)))
+    if border_px > 0:
+        accepted = _erode_valid_display_mask(accepted, border_px, reject_outer_border=True)
+    return accepted
+
+
+def _erode_valid_display_mask(
+    valid_mask: np.ndarray,
+    border_px: int,
+    *,
+    reject_outer_border: bool = True,
+) -> np.ndarray:
+    """Reject pixels whose encoder support touches no-data or the outer frame."""
+    valid = np.asarray(valid_mask, dtype=bool)
+    b = int(max(0, border_px))
+    if valid.ndim != 2 or b <= 0:
+        return valid.copy()
+    invalid = torch.from_numpy((~valid).astype(np.float32)).view(1, 1, *valid.shape)
+    kernel = 2 * b + 1
+    dilated_invalid = (
+        torch.nn.functional.max_pool2d(invalid, kernel_size=kernel, stride=1, padding=b)[0, 0].numpy()
+        > 0.0
+    )
+    accepted = valid & (~dilated_invalid)
+    if reject_outer_border:
+        accepted[:b, :] = False
+        accepted[-b:, :] = False
+        accepted[:, :b] = False
+        accepted[:, -b:] = False
+    return accepted
+
+
+def _mask_display_values(values: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    """Set dashboard values outside the accepted display footprint to NaN."""
+    arr = np.asarray(values, dtype=np.float32)
+    mask = np.asarray(valid_mask, dtype=bool)
+    if mask.ndim != 2:
+        return arr
+    if arr.ndim == 2 and arr.shape == mask.shape:
+        return np.where(mask, arr, np.nan).astype(np.float32)
+    if arr.ndim == 3 and arr.shape[-2:] == mask.shape:
+        return np.where(mask[None, :, :], arr, np.nan).astype(np.float32)
+    return arr
 
 
 def _canonicalize_cube_hw(arr: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
@@ -1083,7 +1188,7 @@ def _viz_crop_border_from_config(session_dir: str) -> tuple[bool, int, str | Non
 
 
 def _encoder_fov_border_from_config_dict(cfg: dict) -> int:
-    return int(invalid_support_border_from_config(cfg))
+    return int(effective_invalid_support_border_from_config(cfg))
 
 
 def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
@@ -1135,7 +1240,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         raise RuntimeError(f"{session_dir}: inference outputs missing x_clean")
     ctx_raw = outputs.get("x_context", outputs.get("x_context_raw", x_clean))
     orig = _display_scalar_from_batched_tensor(x_clean)
+    if not np.isfinite(orig).any() and outputs.get("x_clean_raw") is not None:
+        orig = _display_scalar_from_batched_tensor(outputs.get("x_clean_raw"))
     blurred = _display_scalar_from_batched_tensor(ctx_raw)
+    if not np.isfinite(blurred).any() and outputs.get("x_context_raw") is not None:
+        blurred = _display_scalar_from_batched_tensor(outputs.get("x_context_raw"))
+    raw_mask_source = _display_scalar_from_batched_tensor(outputs.get("x_clean_raw", x_clean))
     h, w = orig.shape
     _assert_not_stale_cropped_inference(session_dir, (h, w))
     dashboard_cfg, _dashboard_cfg_source = _load_session_config(session_dir)
@@ -1154,9 +1264,17 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         return None
 
     source_session_dir = _source_session_dir()
-    display_valid_target_mask = _valid_target_display_mask(outputs, (h, w), orig, dashboard_cfg)
+    display_border_override = _summary_discard_margin(session_dir)
+    display_valid_target_mask = _valid_target_display_mask(
+        outputs,
+        (h, w),
+        raw_mask_source,
+        dashboard_cfg,
+        border_px_override=display_border_override if display_border_override > 0 else None,
+    )
 
-    # Always render target locations as center points (not square footprints).
+    # Render the same targets that entered the loss: target_valid is the
+    # source of truth. Invalid-region rejection must happen before this point.
     target_locations = outputs.get("target_locations")
     target_valid = outputs.get("target_valid")
     if target_locations is None:
@@ -1172,7 +1290,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 yy, xx = int(tloc[bi, ki, -2]), int(tloc[bi, ki, -1])
             else:
                 yy, xx = int(tloc[bi, ki, 0]), int(tloc[bi, ki, 1])
-            if 0 <= yy < h and 0 <= xx < w and bool(display_valid_target_mask[yy, xx]):
+            if 0 <= yy < h and 0 <= xx < w:
                 target[yy, xx] = 1.0
 
     target_loc_heatmap = _extract_hw_map(
@@ -1185,7 +1303,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         target_loc_heatmap_kind = "Target Location Heatmap Unavailable"
     else:
         target_loc_heatmap_kind = "Target Location Heatmap"
-    target_loc_heatmap = np.where(display_valid_target_mask, target_loc_heatmap, 0.0).astype(np.float32)
+    target_loc_heatmap = np.asarray(target_loc_heatmap, dtype=np.float32)
 
     energy_map = _extract_hw_map(outputs, ("target_energy_map",), (h, w))
     if energy_map is None:
@@ -1200,7 +1318,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 energy_map = np.zeros((h, w), dtype=np.float32)
         else:
             energy_map = np.zeros((h, w), dtype=np.float32)
-    energy_map = np.where(display_valid_target_mask, energy_map, 0.0).astype(np.float32)
+    energy_map = np.asarray(energy_map, dtype=np.float32)
 
     visit_owner_dir = session_dir
     visit_path = _prefer_npz(os.path.join(visit_owner_dir, "visited_target_frequency_canonical.npy"))
@@ -1214,28 +1332,28 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     count_visit_path = _prefer_npz(os.path.join(session_dir, "target_energy_count_map.npy"))
     if not os.path.exists(count_visit_path) and source_session_dir is not None:
         count_visit_path = _prefer_npz(os.path.join(source_session_dir, "target_energy_count_map.npy"))
-    visit_heatmap_kind = "Target Coverage Heatmap"
+    visit_heatmap_kind = "Target Coverage Unavailable"
     if os.path.exists(visit_path):
         visit_heatmap = _canonicalize_2d_map(_load_array(visit_path))
-        if visit_heatmap is None:
+        if visit_heatmap is None or visit_heatmap.shape != (h, w):
             visit_heatmap = np.zeros((h, w), dtype=np.float32)
+        else:
+            visit_heatmap_kind = "Full Native Target Visits"
     elif os.path.exists(count_visit_path):
         visit_heatmap = _canonicalize_2d_map(_load_array(count_visit_path))
         if visit_heatmap is None or visit_heatmap.shape != (h, w):
             visit_heatmap = np.zeros((h, w), dtype=np.float32)
         else:
-            visit_heatmap_kind = "Target Energy Coverage Heatmap"
+            visit_heatmap_kind = "Full-Frame Accepted Target Coverage"
     elif outputs.get("target_energy_count_map") is not None:
         visit_heatmap = _canonicalize_2d_map(_to_np(outputs["target_energy_count_map"]))
         if visit_heatmap is None or visit_heatmap.shape != (h, w):
             visit_heatmap = np.zeros((h, w), dtype=np.float32)
         else:
-            visit_heatmap_kind = "Target Energy Coverage Heatmap"
+            visit_heatmap_kind = "Full-Frame Accepted Target Coverage"
     else:
         visit_heatmap = np.zeros((h, w), dtype=np.float32)
-        visit_heatmap_kind = "Target Coverage Unavailable"
-    if visit_heatmap.shape == display_valid_target_mask.shape:
-        visit_heatmap = np.where(display_valid_target_mask, visit_heatmap, 0.0).astype(np.float32)
+    visit_heatmap = np.asarray(visit_heatmap, dtype=np.float32)
 
     # Dashboard-only pyramid mask stack (S,H,W), reconstructed from inference
     # tensors/artifacts. This is not written as a standalone debug file.
@@ -1279,6 +1397,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         pyramid_mask_stack = np.zeros((1, h, w), dtype=np.float32)
     else:
         pyramid_mask_stack = _canonicalize_cube_hw(pyramid_mask_stack, (h, w))
+    pyramid_mask_stack = np.where(display_valid_target_mask[None, :, :], pyramid_mask_stack, 0.0).astype(np.float32)
 
     # Load precomputed PCA/UMAP artifacts saved by training-time pipeline.
     results_dir = os.path.join(session_dir, "results")
@@ -1308,6 +1427,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     if pred_map is None:
         raise RuntimeError(f"{session_dir}: inference outputs missing pred_map")
     h_lat, w_lat = int(pred_map.shape[-2]), int(pred_map.shape[-1])
+    display_has_rejection = bool(np.any(~display_valid_target_mask))
     if display_valid_target_mask.shape == (h_lat, w_lat):
         latent_valid_mask = display_valid_target_mask.astype(bool)
     else:
@@ -1576,6 +1696,22 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         if (hh, ww) == (h_lat, w_lat):
             pca = _mask_flat_grid_values(pca, latent_valid_mask, h_lat, w_lat)
             um = _mask_flat_grid_values(um, latent_valid_mask, h_lat, w_lat)
+        if (hh, ww) == (h_lat, w_lat):
+            pca_finite_n = int(np.count_nonzero(np.isfinite(pca[:, :3]).all(axis=1))) if pca.ndim == 2 and pca.shape[1] >= 3 else 0
+            um_finite_n = int(np.count_nonzero(np.isfinite(um[:, :3]).all(axis=1))) if um.ndim == 2 and um.shape[1] >= 3 else 0
+            expected_n = int(np.count_nonzero(latent_valid_mask))
+            if pca_finite_n < int(0.9 * expected_n) or (DASHBOARD_COMPUTE_UMAP and um_finite_n < int(0.9 * expected_n)):
+                print(
+                    f"dashboard_note={session_dir}: {prefix_out} embedding artifacts have "
+                    f"unexpected holes pca={pca_finite_n}/{expected_n} umap={um_finite_n}/{expected_n}; "
+                    "recomputing from inference_outputs.pt"
+                )
+                pca_recomputed, um_recomputed = _compute_slice_pca_umap(prefix_out)
+                if int(np.count_nonzero(np.isfinite(pca_recomputed[:, :3]).all(axis=1))) >= max(4, pca_finite_n):
+                    pca = pca_recomputed
+                if int(np.count_nonzero(np.isfinite(um_recomputed[:, :3]).all(axis=1))) >= max(4, um_finite_n):
+                    um = um_recomputed
+                hh, ww = h_lat, w_lat
         pca_spread = _embedding_spread_axes(pca)
         um_spread = _embedding_spread_axes(um)
         latent_spread = _latent_has_spread(prefix_out)
@@ -2020,7 +2156,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
 
     def _image_axis_range(shape: tuple[int, int]) -> tuple[list[float], list[float]]:
         h, w = int(shape[0]), int(shape[1])
-        return [-0.5, float(w) - 0.5], [float(h) - 0.5, -0.5]
+        return [-0.5, float(w) - 0.5], [-0.5, float(h) - 0.5]
 
     def _image_xy(shape: tuple[int, int], *, explicit_y_down: bool = False) -> tuple[np.ndarray, np.ndarray]:
         h, w = int(shape[0]), int(shape[1])
@@ -2041,7 +2177,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     ) -> None:
         if explicit_y_down:
             h, w = int(shape[0]), int(shape[1])
-            xr, yr = [-0.5, float(w) - 0.5], [-(float(h) - 0.5), 0.5]
+            xr, yr = [-0.5, float(w) - 0.5], [-0.5, float(h) - 0.5]
         else:
             xr, yr = _image_axis_range(shape)
         fig.update_xaxes(
@@ -2179,7 +2315,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         _apply_image_axes(fig, vals.shape[:2])
         return fig
 
-    def scatter3d(title: str, xyz: np.ndarray, rgb_flat: np.ndarray) -> tuple[go.Figure, int, int]:
+    def scatter3d(
+        title: str,
+        xyz: np.ndarray,
+        rgb_flat: np.ndarray,
+        display_valid_mask: np.ndarray | None = None,
+    ) -> tuple[go.Figure, int, int]:
         pts = np.asarray(xyz, dtype=np.float32)
         if pts.ndim == 3 and pts.shape[0] == 3:
             pts = np.transpose(pts, (1, 2, 0)).reshape(-1, 3)
@@ -2192,6 +2333,9 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         rgb = np.asarray(rgb_flat)
         if rgb.ndim == 3 and rgb.shape[-1] == 3:
             rgb = rgb.reshape(-1, 3)
+        keep_display = None
+        if display_valid_mask is not None:
+            keep_display = np.asarray(display_valid_mask, dtype=bool).reshape(-1)
         source_n = int(pts.shape[0]) if pts.ndim == 2 and pts.shape[1] >= 3 else 0
         if source_n == 0:
             x, y, z = [], [], []
@@ -2201,9 +2345,16 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             n = source_n
             if rgb.ndim == 2:
                 n = min(n, int(rgb.shape[0]))
+            if keep_display is not None:
+                n = min(n, int(keep_display.shape[0]))
             pts = pts[:n]
             if rgb.ndim == 2:
                 rgb = rgb[:n]
+            if keep_display is not None:
+                keep_display = keep_display[:n]
+                pts = pts[keep_display]
+                if rgb.ndim == 2:
+                    rgb = rgb[keep_display]
             finite = np.isfinite(pts[:, :3]).all(axis=1)
             finite_pts = pts[finite]
             finite_rgb = rgb[finite] if rgb.ndim == 2 else rgb
@@ -2483,7 +2634,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             r = i // cols + 1
             c = i % cols + 1
             h_i, w_i = arr[i].shape[-2:]
-            x_i, y_i = _image_xy((h_i, w_i), explicit_y_down=True)
+            x_i, y_i = _image_xy((h_i, w_i))
             kwargs = dict(
                 z=arr[i],
                 x=x_i,
@@ -2503,7 +2654,6 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 row=r,
                 col=c,
                 scaleanchor="x" if axis_idx == 1 else f"x{axis_idx}",
-                explicit_y_down=True,
             )
         fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=56, b=8), height=max(330, 260 * rows))
         return fig
@@ -2512,7 +2662,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         vals = np.asarray(winner, dtype=np.float32)
         labels = [str(v) for v in np.asarray(names).reshape(-1)]
         n_scales = max(1, len(labels))
-        x_v, y_v = _image_xy(vals.shape[-2:], explicit_y_down=True)
+        x_v, y_v = _image_xy(vals.shape[-2:])
         fig = go.Figure(
             [
                 go.Heatmap(
@@ -2532,7 +2682,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             ]
         )
         fig.update_layout(template="plotly_white", title={"text": title, "x": 0.02}, margin=dict(l=8, r=8, t=36, b=8), height=330)
-        _apply_image_axes(fig, vals.shape[-2:], explicit_y_down=True)
+        _apply_image_axes(fig, vals.shape[-2:])
         return fig
 
     def _npz_array(name: str, *legacy_names: str) -> np.ndarray:
@@ -2879,6 +3029,12 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     cards: list[dict] = []
     rejected_mask = data["rejected_mask"] if "rejected_mask" in data.files else np.zeros_like(data["orig"], dtype=np.float32)
     valid_target_mask = data["valid_target_mask"] if "valid_target_mask" in data.files else np.ones_like(data["orig"], dtype=np.float32)
+    display_valid_mask = np.asarray(valid_target_mask, dtype=np.float32) > 0.5
+    if not np.any(display_valid_mask) and "rejected_mask" in data.files:
+        display_valid_mask = ~(np.asarray(rejected_mask, dtype=np.float32) > 0.5)
+    if not np.any(display_valid_mask):
+        display_valid_mask = np.isfinite(np.asarray(data["orig"], dtype=np.float32))
+    display_rejected_mask = (~display_valid_mask).astype(np.float32)
     prediction_branches = (
         ("Context", "context"),
         ("Mask Predict", "mask_pred"),
@@ -2892,24 +3048,44 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             return False
         return bool(np.isfinite(arr[:, : min(3, arr.shape[1])]).all(axis=1).any())
 
+    def _mask_for_rgb(rgb: np.ndarray) -> np.ndarray | None:
+        vals = np.asarray(rgb)
+        if vals.ndim >= 2 and tuple(vals.shape[:2]) == tuple(display_valid_mask.shape):
+            return display_valid_mask
+        return None
+
     for name, stem in prediction_branches:
-        pca_scatter, _, _ = scatter3d(f"{name} PCA 3D Scatter", data[f"{stem}_pca3d"], data[f"{stem}_pca_rgb_flat"])
+        pca_mask = _mask_for_rgb(data[f"{stem}_pca_rgb"])
+        pca_rejected = None if pca_mask is None else (~pca_mask).astype(np.float32)
+        pca_scatter, _, _ = scatter3d(
+            f"{name} PCA 3D Scatter",
+            data[f"{stem}_pca3d"],
+            data[f"{stem}_pca_rgb_flat"],
+            pca_mask,
+        )
         # Keep strict left-right pairing: RGB map (left), RGB scatter (right).
         cards.append(
             {
                 "title": f"{name} PCA RGB",
-                "fig": img(f"{name} PCA RGB", data[f"{stem}_pca_rgb"], rejected_mask=rejected_mask),
+                "fig": img(f"{name} PCA RGB", data[f"{stem}_pca_rgb"], rejected_mask=pca_rejected),
                 "group": f"{stem}-pca",
                 "raw_png": _raw_png_data_url(data[f"{stem}_pca_rgb"]),
             }
         )
         cards.append({"title": f"{name} PCA RGB Scatter", "fig": pca_scatter, "group": f"{stem}-pca"})
         if _has_finite_embedding(stem, "umap"):
-            umap_scatter, _, _ = scatter3d(f"{name} {embedding_label} 3D Scatter", data[f"{stem}_umap3d"], data[f"{stem}_umap_rgb_flat"])
+            umap_mask = _mask_for_rgb(data[f"{stem}_umap_rgb"])
+            umap_rejected = None if umap_mask is None else (~umap_mask).astype(np.float32)
+            umap_scatter, _, _ = scatter3d(
+                f"{name} {embedding_label} 3D Scatter",
+                data[f"{stem}_umap3d"],
+                data[f"{stem}_umap_rgb_flat"],
+                umap_mask,
+            )
             cards.append(
                 {
                     "title": f"{name} {embedding_label} RGB",
-                    "fig": img(f"{name} {embedding_label} RGB", data[f"{stem}_umap_rgb"], rejected_mask=rejected_mask),
+                    "fig": img(f"{name} {embedding_label} RGB", data[f"{stem}_umap_rgb"], rejected_mask=umap_rejected),
                     "group": f"{stem}-{embedding_group}",
                     "raw_png": _raw_png_data_url(data[f"{stem}_umap_rgb"]),
                 }
@@ -2928,9 +3104,26 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             )
     if "scale_probe_sensitivity_maps" in data.files and "scale_probe_names" in data.files:
         sp_names = data["scale_probe_names"]
-        sp_sens_maps = _orient_cdd_probe_for_display(data["scale_probe_sensitivity_maps"])
-        sp_sim_maps = _orient_cdd_probe_for_display(data["scale_probe_scale_only_sim_maps"]) if "scale_probe_scale_only_sim_maps" in data.files else np.asarray([], dtype=np.float32)
-        sp_winner = _orient_cdd_probe_for_display(data["scale_probe_winner_map"]) if "scale_probe_winner_map" in data.files else np.asarray([], dtype=np.float32)
+        sp_sens_maps = _mask_display_values(
+            _orient_cdd_probe_for_display(data["scale_probe_sensitivity_maps"]),
+            valid_target_mask,
+        )
+        sp_sim_maps = (
+            _mask_display_values(
+                _orient_cdd_probe_for_display(data["scale_probe_scale_only_sim_maps"]),
+                valid_target_mask,
+            )
+            if "scale_probe_scale_only_sim_maps" in data.files
+            else np.asarray([], dtype=np.float32)
+        )
+        sp_winner = (
+            _mask_display_values(
+                _orient_cdd_probe_for_display(data["scale_probe_winner_map"]),
+                valid_target_mask,
+            )
+            if "scale_probe_winner_map" in data.files
+            else np.asarray([], dtype=np.float32)
+        )
         sp_sens_mean = np.asarray(data["scale_probe_sensitivity_mean"], dtype=np.float32) if "scale_probe_sensitivity_mean" in data.files else np.asarray([], dtype=np.float32)
         sp_sens_frac = np.asarray(data["scale_probe_sensitivity_fraction"], dtype=np.float32) if "scale_probe_sensitivity_fraction" in data.files else np.asarray([], dtype=np.float32)
         sp_sim_mean = np.asarray(data["scale_probe_scale_only_similarity"], dtype=np.float32) if "scale_probe_scale_only_similarity" in data.files else np.asarray([], dtype=np.float32)
@@ -2987,7 +3180,10 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 }
             )
         if "scale_probe_pred_sensitivity_maps" in data.files:
-            sp_pred_maps = _orient_cdd_probe_for_display(data["scale_probe_pred_sensitivity_maps"])
+            sp_pred_maps = _mask_display_values(
+                _orient_cdd_probe_for_display(data["scale_probe_pred_sensitivity_maps"]),
+                valid_target_mask,
+            )
             if sp_pred_maps.ndim == 3 and sp_pred_maps.size > 0:
                 cards.append(
                     {
@@ -3001,13 +3197,19 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         {"title": "Training Loss / Active Loss Terms (Weighted)", "fig": fig_weighted_components, "group": "weighted-loss-components"},
     ]
     visit_title = str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap"
+    visit_is_accepted_coverage = "Accepted Target Coverage" in visit_title
+    visit_panel_title = (
+        "Full-Frame Accepted Target Coverage Over Input"
+        if visit_is_accepted_coverage
+        else "Full Native Target Visits Over Input"
+    )
     diagnostic_cards.append({
-        "title": "Full Native Target Visits Over Input",
+        "title": visit_panel_title,
         "fig": heat(
             (
-                "Full Native Target Visits Over Input (log1p, zero=transparent)"
+                f"{visit_panel_title} (log1p, zero=transparent)"
                 if "Unavailable" not in visit_title
-                else "Full Native Target Visits Over Input (unavailable; showing input)"
+                else f"{visit_panel_title} (unavailable; showing input)"
             ),
             data["visit_heatmap"],
             "Cividis",
@@ -3015,7 +3217,6 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             log1p_nonzero_nan=True,
             background=data["orig"],
             overlay_opacity=0.78,
-            rejected_mask=rejected_mask,
         ),
         "group": "visit",
         "raw_png": _raw_png_data_url(data["visit_heatmap"]),
@@ -3027,14 +3228,14 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 "title": "Rejected Area Over Input",
                 "fig": heat(
                     "Rejected Area Over Input",
-                    rejected_mask,
+                    display_rejected_mask,
                     "Reds",
                     percentile_scale=False,
                     background=data["orig"],
                     overlay_opacity=0.42,
                 ),
                 "group": "rejected",
-                "raw_png": _raw_png_data_url(rejected_mask),
+                "raw_png": _raw_png_data_url(display_rejected_mask),
             },
             {"title": "Input (Log-Norm)", "fig": heat("Input (Log-Norm)", data["orig"], "Viridis"), "group": "input", "raw_png": _raw_png_data_url(data["orig"])},
         ]
@@ -3868,8 +4069,10 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         um_arr = np.asarray(data[f"{stem}_umap3d"], dtype=np.float32)
         print(f"dashboard_plot_item={name} PCA Array Shape: shape={tuple(pca_arr.shape)}")
         print(f"dashboard_plot_item={name} {embedding_label} Array Shape: shape={tuple(um_arr.shape)}")
-        _, pca_source_n, pca_rendered_n = scatter3d(f"{name} PCA 3D Scatter", pca_arr, data[f"{stem}_pca_rgb_flat"])
-        _, umap_source_n, umap_rendered_n = scatter3d(f"{name} {embedding_label} 3D Scatter", um_arr, data[f"{stem}_umap_rgb_flat"])
+        pca_mask = _mask_for_rgb(data[f"{stem}_pca_rgb"])
+        umap_mask = _mask_for_rgb(data[f"{stem}_umap_rgb"])
+        _, pca_source_n, pca_rendered_n = scatter3d(f"{name} PCA 3D Scatter", pca_arr, data[f"{stem}_pca_rgb_flat"], pca_mask)
+        _, umap_source_n, umap_rendered_n = scatter3d(f"{name} {embedding_label} 3D Scatter", um_arr, data[f"{stem}_umap_rgb_flat"], umap_mask)
         same_shape = pca_arr.shape == um_arr.shape
         if same_shape and pca_arr.size > 0:
             common = np.isfinite(pca_arr[:, :3]).all(axis=1) & np.isfinite(um_arr[:, :3]).all(axis=1)

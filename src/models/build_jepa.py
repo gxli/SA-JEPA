@@ -94,7 +94,7 @@ class PyramidGridJEPA(nn.Module):
         encoder_final_norm_type: str = "layernorm",
         encoder_head_bias: bool = True,
         target_invalid_region_skip: bool = True,
-        target_invalid_region_values=(0.0, "nan"),
+        target_invalid_region_values=("nan",),
         target_sampling_mode: str = "random",
         priority_top_percent: float = 5.0,
         priority_n_target: int | str = 20,
@@ -106,7 +106,7 @@ class PyramidGridJEPA(nn.Module):
         target_allow_partial_overlap: float = 0.0,
         mask_box_hardcap: int | None = None,
         nan_border_sigma_multiplier: float = 3.0,
-        invalid_support_border_mode: str = "cdd_support",
+        invalid_support_border_mode: str = "encoder_rf",
         use_grn: bool = True,
     ):
         super().__init__()
@@ -192,7 +192,7 @@ class PyramidGridJEPA(nn.Module):
         self.use_grn = bool(use_grn)
         self.target_invalid_region_skip = bool(target_invalid_region_skip)
         if target_invalid_region_values is None:
-            self.target_invalid_region_values = (0.0, "nan")
+            self.target_invalid_region_values = ("nan",)
         else:
             self.target_invalid_region_values = tuple(target_invalid_region_values)
         self.target_sampling_mode = normalize_target_sampling_mode(str(target_sampling_mode))

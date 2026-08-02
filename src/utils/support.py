@@ -108,7 +108,7 @@ def constrain_hardcap_to_encoder_footprint(
 
 
 def normalize_invalid_support_border_mode(mode: Any) -> str:
-    value = str(mode or "cdd_support").strip().lower().replace("-", "_").replace(" ", "_")
+    value = str(mode or "encoder_rf").strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
         "cdd": "cdd_support",
         "cdd_support_border": "cdd_support",
@@ -182,13 +182,12 @@ def cdd_support_border_px(
 
 
 def cdd_support_border_from_model(model: Any, mask_scale: Any | None = None) -> int:
-    rf = encoder_receptive_field_from_model(model)
     return cdd_support_border_px(
         sigmas=getattr(model, "sigmas", [2, 4, 8, 16]),
         mask_scale=getattr(model, "mask_scale", 1.0) if mask_scale is None else mask_scale,
         support_multiplier=getattr(model, "nan_border_sigma_multiplier", 3.0),
         hardcap=getattr(model, "mask_box_hardcap", None),
-        encoder_rf_px=rf,
+        encoder_rf_px=encoder_receptive_field_from_model(model),
     )
 
 
@@ -213,7 +212,9 @@ def cdd_support_border_from_config(config: dict[str, Any] | None) -> int:
 
 
 def invalid_support_border_from_model(model: Any, mask_scale: Any | None = None) -> int:
-    mode = normalize_invalid_support_border_mode(getattr(model, "invalid_support_border_mode", "cdd_support"))
+    mode = normalize_invalid_support_border_mode(
+        getattr(model, "invalid_support_border_mode", "encoder_rf")
+    )
     if mode == "encoder_width_half_plus_one":
         return encoder_width_half_plus_one_border_px(getattr(model, "encoder_width", 32))
     if mode == "encoder_rf":
@@ -226,13 +227,40 @@ def invalid_support_border_from_config(config: dict[str, Any] | None) -> int:
     data_cfg = config.get("data", {}) if isinstance(config, dict) else {}
     data_cfg = data_cfg if isinstance(data_cfg, dict) else {}
     mode = normalize_invalid_support_border_mode(
-        cfg.get("invalid_support_border_mode", data_cfg.get("invalid_support_border_mode", "cdd_support"))
+        cfg.get(
+            "invalid_support_border_mode",
+            data_cfg.get("invalid_support_border_mode", "encoder_rf"),
+        )
     )
     if mode == "encoder_width_half_plus_one":
         return encoder_width_half_plus_one_border_px(cfg.get("encoder_width", cfg.get("latent_channels", 32)))
     if mode == "encoder_rf":
         return encoder_border_from_config(config)
     return cdd_support_border_from_config(config)
+
+
+def additional_crop_from_config(config: dict[str, Any] | None) -> int:
+    """Optional extra crop/rejection pixels added on top of RF support.
+
+    Accept both ``additional_crop`` and the misspelled ``addition_crop`` for
+    local experiment configs.
+    """
+
+    if not isinstance(config, dict):
+        return 0
+    for section in (config.get("data", {}), config.get("train", {}), config.get("model", {}), config):
+        if not isinstance(section, dict):
+            continue
+        for key in ("additional_crop", "addition_crop"):
+            if key in section:
+                return int(max(0, _as_int(section.get(key), 0)))
+    return 0
+
+
+def effective_invalid_support_border_from_config(config: dict[str, Any] | None) -> int:
+    """Base invalid support border plus optional additional_crop."""
+
+    return int(invalid_support_border_from_config(config) + additional_crop_from_config(config))
 
 
 def support_geometry_from_model(model: Any) -> SupportGeometry:
@@ -250,7 +278,8 @@ def support_geometry_from_model(model: Any) -> SupportGeometry:
 
 def support_geometry_from_config(config: dict[str, Any] | None) -> SupportGeometry:
     rf = encoder_receptive_field_from_config(config)
-    requested_hardcap = _model_cfg(config).get("mask_box_hardcap")
+    cfg = _model_cfg(config)
+    requested_hardcap = cfg.get("mask_box_hardcap")
     return SupportGeometry(
         encoder_rf_px=int(rf),
         encoder_border_px=encoder_border_from_rf(rf),

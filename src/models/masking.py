@@ -179,13 +179,13 @@ def _build_random_catalogue_from_array(
     h: int,
     w: int,
 ) -> list[tuple[int, int]]:
-    """All valid nonzero image pixels, shuffled later by torch."""
+    """All finite image pixels, shuffled later by torch."""
     arr2d = np.asarray(arr)
     if arr2d.ndim != 2:
         return []
     half_lo = int(patch_size) // 2
     half_hi = int(patch_size) - half_lo
-    valid = np.isfinite(arr2d) & (arr2d > 1e-8)
+    valid = np.isfinite(arr2d)
     if half_lo > 0:
         valid[:half_lo, :] = False
         valid[:, :half_lo] = False
@@ -518,7 +518,7 @@ def _target_patch_has_valid_input(
     cx: int,
     inner_target_size: int,
 ) -> bool:
-    """Check whether every pixel in the target input patch is valid.
+    """Check whether every pixel in a centered target footprint is valid.
 
     ``valid_pixels`` is a precomputed boolean mask of the same shape as the
     full array: True = valid data, False = sentinel / NaN / invalid region.
@@ -533,10 +533,25 @@ def _target_patch_has_valid_input(
     h, w = valid_pixels.shape
     if py0 < 0 or px0 < 0 or py1 > h or px1 > w:
         return False
-    patch = valid_pixels[py0:py1, px0:px1]
-    if patch.size == 0:
+    footprint = valid_pixels[py0:py1, px0:px1]
+    if footprint.size == 0:
         return False
-    return bool(np.all(patch))
+    return bool(np.all(footprint))
+
+
+def _target_center_has_valid_input(valid_pixels: np.ndarray, cy: int, cx: int) -> bool:
+    """Check one already-eroded target center.
+
+    ``valid_pixels`` may already include the encoder/support border rejection.
+    Do not check a whole mask box against it again, or the target footprint is
+    effectively cropped by support + mask radius.
+    """
+    h, w = valid_pixels.shape
+    iy = int(cy)
+    ix = int(cx)
+    if iy < 0 or ix < 0 or iy >= h or ix >= w:
+        return False
+    return bool(valid_pixels[iy, ix])
 
 
 def make_pyramid_grid_context(
@@ -565,7 +580,7 @@ def make_pyramid_grid_context(
     enable_target_dithering: bool = True,
     lattice_shift_override: Optional[Tuple[int, int]] = None,
     target_invalid_region_skip: bool = True,
-    target_invalid_region_values=(0.0, "nan"),
+    target_invalid_region_values=("nan",),
     invalid_pixel_mask: Optional[torch.Tensor] = None,
     target_sampling_mode: str = "random",
     priority_top_percent: float = 5.0,
@@ -846,11 +861,7 @@ def make_pyramid_grid_context(
                         x1 = int(cx) + int(cand_half_hi)
                         if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
                             continue
-                        if not _target_patch_has_valid_input(
-                            valid_pixels=valid_pixels,
-                            cy=int(cy), cx=int(cx),
-                            inner_target_size=inner_target_size,
-                        ):
+                        if not _target_center_has_valid_input(valid_pixels, int(cy), int(cx)):
                             continue
                         good_candidates.append((int(cy), int(cx)))
                         good_candidate_boxes.append(int(cand_box))
@@ -939,6 +950,8 @@ def make_pyramid_grid_context(
                         dithering_pixels=priority_dithering_pixels,
                         device=x_clean.device,
                     )
+                    if not _target_center_has_valid_input(valid_pixels, int(cy1), int(cx1)):
+                        continue
                     priority_centers_dithered.append((int(cy1), int(cx1)))
                     dithered_boxes.append(int(cand_box))
 
@@ -1073,33 +1086,38 @@ def make_pyramid_grid_context(
             # while priority_catalogue holds the pre-dither seed centers.
             if sampled_mode and len(priority_centers_dithered) > 0:
                 unique_loc_to_scale = {(int(cy), int(cx)): float(active_sigmas[0]) for cy, cx in priority_centers_dithered}
+                unique_loc_to_box = {
+                    (int(cy), int(cx)): int(priority_center_boxes[i]) if i < len(priority_center_boxes) else int(base_box)
+                    for i, (cy, cx) in enumerate(priority_centers_dithered)
+                }
             else:
                 sample_locations = list(applied_locations)
                 sample_scales = list(applied_scales)
                 unique_loc_to_scale = {}
-                for (cy, cx), s in zip(sample_locations, sample_scales):
+                unique_loc_to_box = {}
+                for (cy, cx), s, box_i in zip(sample_locations, sample_scales, applied_boxes):
                     key = (int(cy), int(cx))
                     if key not in unique_loc_to_scale:
                         unique_loc_to_scale[key] = float(s)
+                        unique_loc_to_box[key] = int(round(float(box_i)))
+                    else:
+                        unique_loc_to_box[key] = max(unique_loc_to_box[key], int(round(float(box_i))))
             sample_locations = []
             sample_scales = []
-            patch_half_lo = int(inner_target_size) // 2
-            patch_half_hi = int(inner_target_size) - patch_half_lo
             for cy, cx in unique_loc_to_scale.keys():
                 iy = int(cy)
                 ix = int(cx)
-                if iy - patch_half_lo < 0 or ix - patch_half_lo < 0:
+                target_footprint = int(max(int(inner_target_size), int(unique_loc_to_box.get((iy, ix), inner_target_size))))
+                footprint_half_lo = target_footprint // 2
+                footprint_half_hi = target_footprint - footprint_half_lo
+                if iy - footprint_half_lo < 0 or ix - footprint_half_lo < 0:
                     continue
-                if iy + patch_half_hi > h or ix + patch_half_hi > w:
+                if iy + footprint_half_hi > h or ix + footprint_half_hi > w:
                     continue
                 if sample_invalid_mask is not None and bool(sample_invalid_mask[iy, ix]):
                     continue
                 if bool(target_invalid_region_skip) or sampled_mode:
-                    if not _target_patch_has_valid_input(
-                        valid_pixels=valid_pixels,
-                        cy=iy, cx=ix,
-                        inner_target_size=inner_target_size,
-                    ):
+                    if not _target_center_has_valid_input(valid_pixels, iy, ix):
                         continue
                 sample_locations.append((iy, ix))
                 sample_scales.append(float(unique_loc_to_scale[(cy, cx)]))
@@ -1223,7 +1241,7 @@ def prepare_context_batch(
     enable_target_dithering: bool = True,
     lattice_shift_override: Optional[Tuple[int, int]] = None,
     target_invalid_region_skip: bool = True,
-    target_invalid_region_values=(0.0, "nan"),
+    target_invalid_region_values=("nan",),
     target_sampling_mode: str = "random",
     priority_top_percent: float = 5.0,
     priority_n_target: int | str = 20,

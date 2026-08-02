@@ -150,7 +150,7 @@ def _mask_invalid_targets_from_input(
     outputs: dict,
     x_input: torch.Tensor,
     patch_size: int,
-    invalid_values=(0.0, "nan"),
+    invalid_values=("nan",),
 ) -> int:
     loc = outputs["target_locations"]
     valid = outputs["target_valid"]
@@ -158,8 +158,6 @@ def _mask_invalid_targets_from_input(
         return 0
     bsz, ksz, _ = loc.shape
     h, w = int(x_input.shape[-2]), int(x_input.shape[-1])
-    half_lo = int(patch_size) // 2
-    half_hi = int(patch_size) - half_lo
     invalid_specs = tuple(invalid_values) if invalid_values is not None else tuple()
     updated = valid.clone()
     numeric_specs = []
@@ -175,27 +173,47 @@ def _mask_invalid_targets_from_input(
     loc_y, loc_x = _target_location_yx(loc)
     loc_y = loc_y.long()
     loc_x = loc_x.long()
-    y0 = loc_y - half_lo
-    x0 = loc_x - half_lo
-    y1 = loc_y + half_hi
-    x1 = loc_x + half_hi
-    in_bounds = (y0 >= 0) & (x0 >= 0) & (y1 <= h) & (x1 <= w)
-    invalid_target = valid & ~in_bounds
-    if int(patch_size) > 0 and h >= int(patch_size) and w >= int(patch_size):
-        patches = F.unfold(x_input[:, :1], kernel_size=int(patch_size)).transpose(1, 2)
-        linear = (y0.clamp(0, h - int(patch_size)) * (w - int(patch_size) + 1) + x0.clamp(0, w - int(patch_size))).clamp_min(0)
-        gather_idx = linear.unsqueeze(-1).expand(-1, -1, patches.shape[-1])
-        target_patches = patches.gather(1, gather_idx)
-        invalid_mask = torch.zeros_like(target_patches, dtype=torch.bool)
-        if check_nan:
-            invalid_mask |= ~torch.isfinite(target_patches)
-        for spec in numeric_specs:
-            invalid_mask |= torch.isclose(
-                target_patches,
-                torch.tensor(spec, device=target_patches.device, dtype=target_patches.dtype),
-            )
-        invalid_target |= valid & in_bounds & invalid_mask.all(dim=-1)
-    else:
+    box_sizes = outputs.get("target_box_sizes")
+    box_tensor = None
+    if box_sizes is not None:
+        box_tensor = torch.as_tensor(box_sizes, device=loc.device).float()
+        if box_tensor.shape[:2] != valid.shape[:2]:
+            box_tensor = None
+    fallback_box = outputs.get("mask_footprint_px", patch_size)
+    try:
+        fallback_box_int = int(max(int(patch_size), round(float(torch.as_tensor(fallback_box).float().reshape(-1)[0].item()))))
+    except Exception:
+        fallback_box_int = int(max(1, patch_size))
+    invalid_target = torch.zeros_like(valid, dtype=torch.bool)
+    for bi in range(int(bsz)):
+        for ki in range(int(ksz)):
+            if not bool(valid[bi, ki].item()):
+                continue
+            box = fallback_box_int
+            if box_tensor is not None:
+                box = int(max(int(patch_size), round(float(box_tensor[bi, ki].item()))))
+            box = int(max(1, box))
+            half_lo = box // 2
+            half_hi = box - half_lo
+            y0 = int(loc_y[bi, ki].item()) - half_lo
+            x0 = int(loc_x[bi, ki].item()) - half_lo
+            y1 = int(loc_y[bi, ki].item()) + half_hi
+            x1 = int(loc_x[bi, ki].item()) + half_hi
+            if y0 < 0 or x0 < 0 or y1 > h or x1 > w:
+                invalid_target[bi, ki] = True
+                continue
+            footprint = x_input[bi : bi + 1, :1, y0:y1, x0:x1]
+            invalid_mask = torch.zeros_like(footprint, dtype=torch.bool)
+            if check_nan:
+                invalid_mask |= ~torch.isfinite(footprint)
+            for spec in numeric_specs:
+                invalid_mask |= torch.isclose(
+                    footprint,
+                    torch.tensor(spec, device=footprint.device, dtype=footprint.dtype),
+                )
+            if bool(invalid_mask.any().item()):
+                invalid_target[bi, ki] = True
+    if not (check_nan or numeric_specs):
         invalid_target |= valid
     updated[invalid_target] = False
     outputs["target_valid"] = updated
@@ -1104,6 +1122,7 @@ def run_post_training_inference(
     mask_predict_box_size: int | None = None,
     mask_predict_chunk_size: int | None = None,
     inference_discard_margin: int | None = None,
+    additional_crop: int = 0,
 ) -> str:
     inference_outputs_path = os.path.join(session_dir, "inference_outputs.pt")
     print(f"[{config_name}] inference_version={INFERENCE_VERSION}", flush=True)
@@ -1188,7 +1207,7 @@ def run_post_training_inference(
         total_energy = 0.0
         total_valid = 0
         invalid_region_skip = bool(getattr(model, "target_invalid_region_skip", False))
-        invalid_region_values = tuple(getattr(model, "target_invalid_region_values", (0.0, "nan")))
+        invalid_region_values = tuple(getattr(model, "target_invalid_region_values", ("nan",)))
         patch_size = int(getattr(model, "patch_size", 2))
         tta_view_count = 1
         shift_sums: dict[str, torch.Tensor] = {}
@@ -1476,6 +1495,8 @@ def run_post_training_inference(
         inference_outputs["target_mask_map"] = outputs["target_mask_map"][:8].detach().cpu()
     if "target_allowed_mask_map" in outputs:
         inference_outputs["target_allowed_mask_map"] = outputs["target_allowed_mask_map"][:8].detach().cpu()
+    if "output_valid_mask" in outputs:
+        inference_outputs["output_valid_mask"] = outputs["output_valid_mask"][:8].detach().cpu()
     if "cdd_channels_orig" in outputs:
         inference_outputs["cdd_channels_orig"] = outputs["cdd_channels_orig"][:8].detach().cpu()
     if "cdd_channels_masked" in outputs:
@@ -1486,6 +1507,10 @@ def run_post_training_inference(
         inference_outputs["pyramid_mask_token"] = outputs["pyramid_mask_token"][:8].detach().cpu()
     if "tile_visit_map" in outputs:
         inference_outputs["tile_visit_map"] = outputs["tile_visit_map"][:8].detach().cpu()
+    if "target_box_sizes" in outputs:
+        inference_outputs["target_box_sizes"] = outputs["target_box_sizes"][:8].detach().cpu()
+    if "mask_footprint_px" in outputs:
+        inference_outputs["mask_footprint_px"] = outputs["mask_footprint_px"].detach().cpu()
     for k in (
         "priority_good_candidates",
         "priority_nonzero_mean",
@@ -1578,6 +1603,8 @@ def run_post_training_inference(
         _save_npz(os.path.join(session_dir, "target_mask_map.npz"), inference_outputs["target_mask_map"].numpy())
     if "target_allowed_mask_map" in inference_outputs:
         _save_npz(os.path.join(session_dir, "target_allowed_mask_map.npz"), inference_outputs["target_allowed_mask_map"].numpy())
+    if "output_valid_mask" in inference_outputs:
+        _save_npz(os.path.join(session_dir, "output_valid_mask.npz"), inference_outputs["output_valid_mask"].numpy())
     if "cdd_channels_orig" in inference_outputs:
         _save_npz(os.path.join(session_dir, "cdd_channels_orig.npz"), inference_outputs["cdd_channels_orig"].numpy())
     if "cdd_channels_masked" in inference_outputs:
@@ -1604,13 +1631,15 @@ def run_post_training_inference(
     _save_npz(os.path.join(session_dir, "target_energy_count_map.npz"), inference_outputs["target_energy_count_map"].numpy())
     if "tile_visit_map" in inference_outputs:
         _save_npz(os.path.join(session_dir, "tile_visit_map.npz"), inference_outputs["tile_visit_map"].numpy())
+    if "target_box_sizes" in inference_outputs:
+        _save_npz(os.path.join(session_dir, "target_box_sizes.npz"), inference_outputs["target_box_sizes"].numpy())
+    if "mask_footprint_px" in inference_outputs:
+        _save_npz(os.path.join(session_dir, "mask_footprint_px.npz"), inference_outputs["mask_footprint_px"].numpy())
     encoder_rf = int(_encoder_receptive_field_2d(model))
     dense_output_rf = int(_dense_output_receptive_field_2d(model))
+    extra_crop = int(max(0, int(additional_crop or 0)))
     if inference_discard_margin is None or str(inference_discard_margin).strip().lower() == "auto":
-        # Tiled inference already handles tile-boundary overlap via tile_overlap.
-        # No discard margin is needed; a positive value leaks into downstream
-        # dashboard border logic where it is misinterpreted as a crop signal.
-        discard_margin = 0
+        discard_margin = int(max(0, dense_output_rf // 2 + extra_crop))
     else:
         discard_margin = int(max(0, int(inference_discard_margin)))
     with open(os.path.join(session_dir, "jepa_energy_summary.json"), "w", encoding="utf-8") as f:
@@ -1631,6 +1660,7 @@ def run_post_training_inference(
                 "inference_encoder_receptive_field": int(encoder_rf),
                 "inference_dense_output_receptive_field": int(dense_output_rf),
                 "inference_discard_margin": int(discard_margin),
+                "inference_additional_crop": int(extra_crop),
                 "energy_reference": "mask_predict_minus_target",
                 "target_allowed_mask_present": bool("target_allowed_mask_map" in inference_outputs),
                 "target_allowed_mask_fraction": (
