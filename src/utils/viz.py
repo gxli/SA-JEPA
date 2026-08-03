@@ -581,7 +581,10 @@ def _compute_umap_nd(
     model = umap.UMAP(**ctor_params)
     if needs_fit_transform:
         model.fit(fit_x)
-        return _umap_result_to_numpy(model.transform(x))
+        # Batch the out-of-sample transform: a single call on hundreds of
+        # thousands of points spikes CPU memory/time on the fallback path.
+        out = _transform_chunked(model, x)
+        return _umap_result_to_numpy(out)
     return _umap_result_to_numpy(model.fit_transform(x))
 
 
@@ -1055,6 +1058,8 @@ def export_inference_dashboard_artifacts(session_dir: str, outputs: dict, umap_c
         z = np.transpose(latent_map, (1, 2, 0)).reshape(-1, fmap.shape[1]).astype(np.float32)
         pca3 = _robust_pca(z, valid_mask_flat, fit_max_tokens=fit_max_tokens) if inference_pca else np.full((z.shape[0], 3), np.nan, dtype=np.float32)
         umap3 = np.full((z.shape[0], 3), np.nan, dtype=np.float32)
+        bundle = None
+        combined = None
         if inference_umap:
             source_weights = (
                 _umap_weights_path(source_session, branch_name)
@@ -1121,6 +1126,27 @@ def export_inference_dashboard_artifacts(session_dir: str, outputs: dict, umap_c
             raise RuntimeError(f"UMAP embedding shape {umap3.shape} cannot reshape exactly to (3,{h_map},{w_map})")
         pca_map = np.transpose(pca3.reshape(h_map, w_map, 3), (2, 0, 1)).astype(np.float32)
         umap_map = np.transpose(umap3.reshape(h_map, w_map, 3), (2, 0, 1)).astype(np.float32)
+        # Record which pixels actually entered the UMAP fit.  Out-of-fit pixels
+        # are anchor-quantized by cuML/umap transform and render as tiling
+        # artifacts in the 3D scatter; the dashboard renders only fit pixels.
+        # Full-fit (no subsampling) or no-bundle (fallback) paths mark every
+        # valid pixel as fit — never an all-False mask.
+        umap_fit_mask = np.zeros(expected_n, dtype=bool)
+        if combined is not None and np.any(combined):
+            if bundle is not None and bundle.get("fit_indices") is not None:
+                try:
+                    combined_idx = np.where(combined)[0]
+                    fi = np.asarray(bundle["fit_indices"], dtype=np.int64)
+                    fi = fi[(fi >= 0) & (fi < combined_idx.size)]
+                    umap_fit_mask[combined_idx[fi]] = True
+                except Exception:
+                    umap_fit_mask[combined] = True
+            else:
+                # Full fit on all valid pixels, or fallback without a bundle.
+                umap_fit_mask[combined] = True
+        else:
+            umap_fit_mask[:] = True
+        np.save(os.path.join(results_dir, f"{branch_name}_umap_fit_mask.npy"), umap_fit_mask)
         np.save(os.path.join(results_dir, f"{branch_name}_spatial_shape.npy"), np.asarray([h_map, w_map], dtype=np.int64))
         np.save(os.path.join(results_dir, f"{branch_name}_latent_vectors_full.npy"), latent_map)
         np.save(os.path.join(results_dir, f"{branch_name}_pca_xyz.npy"), pca_map)

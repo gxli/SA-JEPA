@@ -1529,6 +1529,24 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             )
         return np.stack([x[:n], y[:n], z[:n]], axis=1).astype(np.float32)
 
+    def _load_umap_fit_mask(prefix: str, hh: int, ww: int) -> np.ndarray | None:
+        """Load the per-pixel UMAP fit mask (True = point entered the UMAP fit).
+
+        Out-of-fit pixels get anchor-quantized coordinates from model.transform()
+        and render as tiling artifacts.  Missing mask file (older sessions or
+        recomputed embeddings) -> None, meaning "render all points" (status quo).
+        """
+        mask_path = _resolve_artifact_path(f"{prefix}_umap_fit_mask.npy")
+        if not mask_path:
+            return None
+        try:
+            arr = np.asarray(np.load(mask_path), dtype=bool).reshape(-1)
+        except Exception:
+            return None
+        if arr.shape[0] != hh * ww:
+            return None
+        return arr
+
     def _load_hw(prefix: str) -> tuple[int, int]:
         shp = os.path.join(results_dir, f"{prefix}_spatial_shape.npy")
         if os.path.exists(shp):
@@ -1670,18 +1688,22 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             hh, ww = _load_hw(src_prefix)
             pca = _load_xyz_triplet(src_prefix, "pca", hh, ww)
             um = _load_xyz_triplet(src_prefix, "umap", hh, ww)
+            um_fit_mask = _load_umap_fit_mask(src_prefix, hh, ww)
         except Exception:
             if prefix_saved == "context":
                 try:
                     hh, ww = _load_hw("predict")
                     pca = _load_xyz_triplet("predict", "pca", hh, ww)
                     um = _load_xyz_triplet("predict", "umap", hh, ww)
+                    um_fit_mask = _load_umap_fit_mask("predict", hh, ww)
                 except Exception:
                     pca, um = _compute_slice_pca_umap(prefix_out)
                     hh, ww = h_lat, w_lat
+                    um_fit_mask = None
             else:
                 pca, um = _compute_slice_pca_umap(prefix_out)
                 hh, ww = h_lat, w_lat
+                um_fit_mask = None
         if pca.shape[0] != hh * ww or um.shape[0] != hh * ww:
             # Scatter artifacts can be sampled/volumetric and therefore cannot
             # be reshaped into the displayed slice. Use the actual slice latent
@@ -1693,6 +1715,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
             )
             pca, um = _compute_slice_pca_umap(prefix_out)
             hh, ww = h_lat, w_lat
+            um_fit_mask = None
         if (hh, ww) == (h_lat, w_lat):
             pca = _mask_flat_grid_values(pca, latent_valid_mask, h_lat, w_lat)
             um = _mask_flat_grid_values(um, latent_valid_mask, h_lat, w_lat)
@@ -1712,6 +1735,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                 if int(np.count_nonzero(np.isfinite(um_recomputed[:, :3]).all(axis=1))) >= max(4, um_finite_n):
                     um = um_recomputed
                 hh, ww = h_lat, w_lat
+                um_fit_mask = None
         pca_spread = _embedding_spread_axes(pca)
         um_spread = _embedding_spread_axes(um)
         latent_spread = _latent_has_spread(prefix_out)
@@ -1748,6 +1772,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         bundles[prefix_out] = {
             "pca3d": pca,
             "umap3d": um,
+            "umap_fit_mask": um_fit_mask,
             "full_latent3d": full_xyz,
             "pca_rgb": pca_rgb,
             "pca_rgb_flat": pca_rgb_flat,
@@ -1998,6 +2023,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         pyramid_mask_stack=pyramid_mask_stack.astype(np.float32),
         context_pca3d=bundles["context"]["pca3d"],
         context_umap3d=bundles["context"]["umap3d"],
+        context_umap_fit_mask=bundles["context"].get("umap_fit_mask"),
         context_full_latent3d=bundles["context"]["full_latent3d"],
         context_pca_rgb=bundles["context"]["pca_rgb"],
         context_pca_rgb_flat=bundles["context"]["pca_rgb_flat"],
@@ -2007,6 +2033,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         context_full_latent_rgb_flat=bundles["context"]["full_latent_rgb_flat"],
         pred_pca3d=bundles["pred"]["pca3d"],
         pred_umap3d=bundles["pred"]["umap3d"],
+        pred_umap_fit_mask=bundles["pred"].get("umap_fit_mask"),
         pred_full_latent3d=bundles["pred"]["full_latent3d"],
         pred_pca_rgb=bundles["pred"]["pca_rgb"],
         pred_pca_rgb_flat=bundles["pred"]["pca_rgb_flat"],
@@ -2016,6 +2043,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         pred_full_latent_rgb_flat=bundles["pred"]["full_latent_rgb_flat"],
         mask_pred_pca3d=bundles["mask_pred"]["pca3d"],
         mask_pred_umap3d=bundles["mask_pred"]["umap3d"],
+        mask_pred_umap_fit_mask=bundles["mask_pred"].get("umap_fit_mask"),
         mask_pred_full_latent3d=bundles["mask_pred"]["full_latent3d"],
         mask_pred_pca_rgb=bundles["mask_pred"]["pca_rgb"],
         mask_pred_pca_rgb_flat=bundles["mask_pred"]["pca_rgb_flat"],
@@ -2025,6 +2053,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         mask_pred_full_latent_rgb_flat=bundles["mask_pred"]["full_latent_rgb_flat"],
         masked_pred_pca3d=bundles["masked_pred"]["pca3d"],
         masked_pred_umap3d=bundles["masked_pred"]["umap3d"],
+        masked_pred_umap_fit_mask=bundles["masked_pred"].get("umap_fit_mask"),
         masked_pred_full_latent3d=bundles["masked_pred"]["full_latent3d"],
         masked_pred_pca_rgb=bundles["masked_pred"]["pca_rgb"],
         masked_pred_pca_rgb_flat=bundles["masked_pred"]["pca_rgb_flat"],
@@ -2034,6 +2063,7 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         masked_pred_full_latent_rgb_flat=bundles["masked_pred"]["full_latent_rgb_flat"],
         gt_pca3d=bundles["gt"]["pca3d"],
         gt_umap3d=bundles["gt"]["umap3d"],
+        gt_umap_fit_mask=bundles["gt"].get("umap_fit_mask"),
         gt_full_latent3d=bundles["gt"]["full_latent3d"],
         gt_pca_rgb=bundles["gt"]["pca_rgb"],
         gt_pca_rgb_flat=bundles["gt"]["pca_rgb_flat"],
@@ -2088,6 +2118,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         mask_config_summary=np.array(mask_config_summary, dtype=str),
     )
     dash_payload.update(scale_probe_data)
+    # Optional keys (e.g. *umap_fit_mask) may be None when the artifact is
+    # missing. np.savez would store None as a 0-d object array, which the
+    # default allow_pickle=False load then refuses — drop them instead.
+    dash_payload = {k: v for k, v in dash_payload.items() if v is not None}
     np.savez_compressed(out_npz, **dash_payload)
     return out_npz
 
@@ -3076,11 +3110,20 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         if _has_finite_embedding(stem, "umap"):
             umap_mask = _mask_for_rgb(data[f"{stem}_umap_rgb"])
             umap_rejected = None if umap_mask is None else (~umap_mask).astype(np.float32)
+            umap_scatter_mask = umap_mask
+            if f"{stem}_umap_fit_mask" in data.files:
+                fit_arr = np.asarray(data[f"{stem}_umap_fit_mask"], dtype=bool).reshape(-1)
+                if fit_arr.size > 0:
+                    base = umap_scatter_mask.reshape(-1) if umap_scatter_mask is not None else np.ones(fit_arr.shape, dtype=bool)
+                    if base.shape == fit_arr.shape:
+                        umap_scatter_mask = base & fit_arr
+                    else:
+                        umap_scatter_mask = fit_arr
             umap_scatter, _, _ = scatter3d(
                 f"{name} {embedding_label} 3D Scatter",
                 data[f"{stem}_umap3d"],
                 data[f"{stem}_umap_rgb_flat"],
-                umap_mask,
+                umap_scatter_mask,
             )
             cards.append(
                 {
@@ -3213,7 +3256,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             ),
             data["visit_heatmap"],
             "Cividis",
-            percentile_scale=False,
+            percentile_scale=True,
             log1p_nonzero_nan=True,
             background=data["orig"],
             overlay_opacity=0.78,
