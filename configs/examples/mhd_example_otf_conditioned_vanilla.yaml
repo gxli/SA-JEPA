@@ -1,0 +1,10 @@
+# Conditioned vanilla control: four independent target batches per outer step,
+# matched to the macro-plus-three-micro arms in targets, passes, and updates.
+
+base_config: mhd_example_otf_conditioned_latent.yaml
+
+train:
+  locality_refinement: false
+  vanilla_matched_steps: true
+  locality_refinement_knn_space: random
+

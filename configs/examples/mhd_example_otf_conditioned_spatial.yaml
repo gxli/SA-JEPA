@@ -1,0 +1,9 @@
+# Conditioned spatial arm: the same compute budget as the latent arm, with
+# microbatch targets sampled inside one encoder receptive-field radius.
+
+base_config: mhd_example_otf_conditioned_latent.yaml
+
+train:
+  locality_refinement_knn_space: spatial
+  locality_refinement_spatial_fov_factor: 1.0
+
