@@ -3035,7 +3035,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         "spatial_fov_factor": locality_spatial_fov_factor,
                         "spatial_radius_px": locality_spatial_radius_px,
                         "one_target_per_otf_pass": locality_refinement_n_target is not None,
-                        "hinge_reference": "macro_initial_rms_normalized_std_hinge",
+                        "hinge_reference": "macro_initial_sample_normalized_std_hinge",
                         "hinge_penalty": (
                             "standard_spread_hinge"
                             if vanilla_matched_steps

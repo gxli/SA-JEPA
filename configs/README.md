@@ -141,7 +141,7 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.spread_regularizer.target` | `context` | Which encoder to regularize (`context` or `target`). |
 | `train.spread_regularizer.spatial_mode` | `pooled` | `pooled` (per-map) or `per_patch`. |
 | `train.spread_regularizer.weight` | `2` | Regularizer multiplier (recommend `5` for production). |
-| `train.spread_regularizer.target_std` | `1.0` | Dimensionless per-channel spread target after centering and shared global-RMS normalization. `1.0` is the canonical isotropic target; global latent rescaling cannot change this loss. |
+| `train.spread_regularizer.target_std` | `1.0` | Dimensionless per-channel spread target after each embedding is L2-normalized to radius `sqrt(D)`. `1.0` is the canonical isotropic target; latent amplitude cannot change this loss. |
 | `train.spread_regularizer.eps` | `0.0001` | Numerical stability epsilon. |
 | `train.vicreg_spatial_mode` | `pooled` | VICReg spatial aggregation mode. |
 
@@ -176,7 +176,7 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.mask_predict_chunk_size` | config-required | Number of local masked windows evaluated per forward chunk. Tune for GPU memory. |
 
 When locality refinement is enabled, the macro context embeddings define a
-detached initial RMS-normalized std-hinge value. Each locality microstep
+detached initial per-sample-normalized std-hinge value. Each locality microstep
 computes its own hinge and adds `relu(micro_hinge - initial_hinge)`. Because a
 larger hinge means less relative spread, the term is zero when the micro
 manifold is unchanged or better and positive only when it contracts.

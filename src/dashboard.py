@@ -23,7 +23,7 @@ from src.utils.support import effective_invalid_support_border_from_config
 from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap, _target_region_mask_from_outputs
 
 
-DASHBOARD_VERSION = "production-diagnostics-v45-rms-spread-and-locality-contraction"
+DASHBOARD_VERSION = "production-diagnostics-v46-spherical-spread-and-locality-contraction"
 CONTROL_SCRIPT_SENTINEL = "window.JEPADashboardControls"
 DASHBOARD_COMPUTE_UMAP = os.environ.get("DASHBOARD_COMPUTE_UMAP", "1").strip().lower() in {"1", "true", "yes", "on"}
 DASHBOARD_UMAP_FIT_MAX_TOKENS = int(os.environ.get("DASHBOARD_UMAP_FIT_MAX_TOKENS", "12000"))
@@ -3169,8 +3169,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 cells=dict(
                     values=[
                         [
-                            "Average RMS-relative spread",
-                            "Weakest RMS-relative spread",
+                            "Average spherical spread",
+                            "Weakest spherical spread",
                             "Under-spread dimensions",
                             "Dead channels",
                         ],
@@ -3197,7 +3197,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     )
     fig_spread_health.update_layout(
         template="plotly_white",
-        title={"text": f"RMS-Normalized Embedding Spread (latest step: {_fmt_table_value(latest_step, integer=True)})", "x": 0.02},
+        title={"text": f"Per-Sample-Normalized Embedding Spread (latest step: {_fmt_table_value(latest_step, integer=True)})", "x": 0.02},
         margin=dict(l=8, r=8, t=42, b=8),
         height=330,
     )

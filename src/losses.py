@@ -84,20 +84,23 @@ def _offdiag(x: torch.Tensor) -> torch.Tensor:
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 
-def _rms_normalized_centered_embeddings(
+def _sample_l2_normalized_embeddings(
     z: torch.Tensor,
     eps: float = 1e-4,
 ) -> torch.Tensor:
-    """Center embeddings and remove their arbitrary global amplitude.
+    """Remove per-sample amplitude while retaining directional differences.
 
-    A single RMS is shared by every sample and channel.  Per-channel
-    normalization would erase the anisotropy that the spread loss is meant to
-    detect.  Keeping the denominator in the graph also makes the objective and
-    its gradient invariant to a global rescaling outside the numerical floor.
+    Every sample is placed on the radius-sqrt(D) sphere before statistics are
+    computed across samples.  This leaves the JEPA tensors themselves untouched
+    while making the regularizer dimensionless.  ``F.normalize`` also supplies
+    an inverse-norm gradient, so small nonzero latents receive a well-conditioned
+    anti-collapse signal instead of having to learn an arbitrary global gain.
     """
-    centered = z.float() - z.float().mean(dim=0, keepdim=True)
-    global_rms = torch.sqrt(centered.square().mean()).clamp_min(float(eps))
-    return centered / global_rms
+    z = z.float()
+    if z.ndim != 2:
+        raise ValueError(f"Expected a 2D embedding matrix, got {tuple(z.shape)}")
+    feature_scale = float(max(1, int(z.shape[1]))) ** 0.5
+    return F.normalize(z, p=2.0, dim=-1, eps=float(eps)) * feature_scale
 
 
 def _std_hinge(z: torch.Tensor, target_std: float, eps: float = 1e-4) -> torch.Tensor:
@@ -106,13 +109,14 @@ def _std_hinge(z: torch.Tensor, target_std: float, eps: float = 1e-4) -> torch.T
 
 
 def embedding_channel_std(z: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    """Return channel std in units of the embedding's shared global RMS."""
+    """Return channel std after per-sample spherical normalization."""
     z = z.float()
     if z.ndim != 2:
         raise ValueError(f"Expected a 2D embedding matrix, got {tuple(z.shape)}")
     if z.shape[0] == 0:
         return z.new_zeros((z.shape[1],))
-    normalized = _rms_normalized_centered_embeddings(z, eps=float(eps))
+    normalized = _sample_l2_normalized_embeddings(z, eps=float(eps))
+    normalized = normalized - normalized.mean(dim=0, keepdim=True)
     variance = normalized.square().mean(dim=0)
     return torch.sqrt(variance.clamp_min(float(eps) ** 2))
 
@@ -239,9 +243,10 @@ def spread_regularizer_loss(
     """
     Scale-invariant standard-deviation hinge on context embeddings.
 
-    Embeddings are centered and divided by one shared global RMS before the
-    channel standard deviations are measured.  Consequently the loss cannot
-    be satisfied by merely increasing the final projector gain.
+    Each embedding is normalized to radius ``sqrt(D)`` before channel standard
+    deviations are measured across samples.  Consequently the loss cannot be
+    satisfied by merely increasing the final projector gain, and small latent
+    amplitudes do not weaken its backward signal.
     """
     z = z.float()  # cast to fp32 to avoid underflow in fp16
     if z.numel() == 0 or z.shape[0] < 2:
@@ -410,7 +415,8 @@ def embedding_spread_stats(
         }
     centered = z - z.mean(dim=0, keepdim=True)
     raw_var = centered.var(dim=0, unbiased=False)
-    normalized = _rms_normalized_centered_embeddings(z, eps=1e-4)
+    normalized = _sample_l2_normalized_embeddings(z, eps=1e-4)
+    normalized = normalized - normalized.mean(dim=0, keepdim=True)
     var = normalized.var(dim=0, unbiased=False)
     cov = (normalized.T @ normalized) / max(1, int(normalized.shape[0]))
     try:
