@@ -23,7 +23,7 @@ from src.utils.support import effective_invalid_support_border_from_config
 from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap, _target_region_mask_from_outputs
 
 
-DASHBOARD_VERSION = "production-diagnostics-v44-locality-hinge-comparison"
+DASHBOARD_VERSION = "production-diagnostics-v45-rms-spread-and-locality-contraction"
 CONTROL_SCRIPT_SENTINEL = "window.JEPADashboardControls"
 DASHBOARD_COMPUTE_UMAP = os.environ.get("DASHBOARD_COMPUTE_UMAP", "1").strip().lower() in {"1", "true", "yes", "on"}
 DASHBOARD_UMAP_FIT_MAX_TOKENS = int(os.environ.get("DASHBOARD_UMAP_FIT_MAX_TOKENS", "12000"))
@@ -2970,7 +2970,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         for values, name, color in (
             (locality_initial_hinge, "initial macro hinge", "#3B82F6"),
             (locality_micro_hinge, "micro hinge mean", "#F97316"),
-            (locality_hinge_penalty, "hinge-shrink penalty", "#DC2626"),
+            (locality_hinge_penalty, "micro contraction penalty", "#DC2626"),
         ):
             if values.size >= n and np.isfinite(values[:n]).any():
                 _add_loss_trace(
@@ -3169,8 +3169,8 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 cells=dict(
                     values=[
                         [
-                            "Average embedding spread",
-                            "Weakest dimension spread",
+                            "Average RMS-relative spread",
+                            "Weakest RMS-relative spread",
                             "Under-spread dimensions",
                             "Dead channels",
                         ],
@@ -3197,7 +3197,7 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
     )
     fig_spread_health.update_layout(
         template="plotly_white",
-        title={"text": f"Embedding Spread Health (latest step: {_fmt_table_value(latest_step, integer=True)})", "x": 0.02},
+        title={"text": f"RMS-Normalized Embedding Spread (latest step: {_fmt_table_value(latest_step, integer=True)})", "x": 0.02},
         margin=dict(l=8, r=8, t=42, b=8),
         height=330,
     )

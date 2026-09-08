@@ -84,21 +84,37 @@ def _offdiag(x: torch.Tensor) -> torch.Tensor:
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 
+def _rms_normalized_centered_embeddings(
+    z: torch.Tensor,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """Center embeddings and remove their arbitrary global amplitude.
+
+    A single RMS is shared by every sample and channel.  Per-channel
+    normalization would erase the anisotropy that the spread loss is meant to
+    detect.  Keeping the denominator in the graph also makes the objective and
+    its gradient invariant to a global rescaling outside the numerical floor.
+    """
+    centered = z.float() - z.float().mean(dim=0, keepdim=True)
+    global_rms = torch.sqrt(centered.square().mean()).clamp_min(float(eps))
+    return centered / global_rms
+
+
 def _std_hinge(z: torch.Tensor, target_std: float, eps: float = 1e-4) -> torch.Tensor:
-    z = z - z.mean(dim=0, keepdim=True)
-    std = torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
+    std = embedding_channel_std(z, eps=float(eps))
     return torch.relu(float(target_std) - std).mean()
 
 
 def embedding_channel_std(z: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    """Return the per-channel population std used by spread hinge losses."""
+    """Return channel std in units of the embedding's shared global RMS."""
     z = z.float()
     if z.ndim != 2:
         raise ValueError(f"Expected a 2D embedding matrix, got {tuple(z.shape)}")
     if z.shape[0] == 0:
         return z.new_zeros((z.shape[1],))
-    centered = z - z.mean(dim=0, keepdim=True)
-    return torch.sqrt(centered.var(dim=0, unbiased=False) + float(eps))
+    normalized = _rms_normalized_centered_embeddings(z, eps=float(eps))
+    variance = normalized.square().mean(dim=0)
+    return torch.sqrt(variance.clamp_min(float(eps) ** 2))
 
 
 def embedding_std_hinge_loss(
@@ -121,11 +137,11 @@ def anchored_spread_hinge_loss(
     target_std: float = 1.0,
     eps: float = 1e-4,
 ) -> torch.Tensor:
-    """Penalize only a microstep hinge that falls below its initial hinge.
+    """Penalize only microstep contraction relative to the macro batch.
 
-    The detached scalar reference is the macro-step std-hinge value. The
-    penalty is zero when the microstep hinge is unchanged or larger, and is
-    positive only when the microstep hinge shrinks.
+    The hinge decreases as spread improves.  Therefore a microstep is worse
+    than its detached macro reference exactly when ``current_hinge`` is larger,
+    not smaller.  The penalty stays zero for unchanged or improved spread.
     """
     current_hinge = embedding_std_hinge_loss(
         z,
@@ -141,7 +157,7 @@ def anchored_spread_hinge_loss(
         raise ValueError(f"initial_hinge must be scalar, got {tuple(reference.shape)}")
     if z.shape[0] < 2:
         return z.sum() * 0.0
-    return torch.relu(reference.reshape(()) - current_hinge)
+    return torch.relu(current_hinge - reference.reshape(()))
 
 
 def _centered_std(z: torch.Tensor, eps: float) -> torch.Tensor:
@@ -221,8 +237,11 @@ def spread_regularizer_loss(
     eps: float = 1e-4,
 ) -> torch.Tensor:
     """
-    Standard-deviation hinge on context embeddings.
-    Gradients remain useful close to collapse without hidden projection modes.
+    Scale-invariant standard-deviation hinge on context embeddings.
+
+    Embeddings are centered and divided by one shared global RMS before the
+    channel standard deviations are measured.  Consequently the loss cannot
+    be satisfied by merely increasing the final projector gain.
     """
     z = z.float()  # cast to fp32 to avoid underflow in fp16
     if z.numel() == 0 or z.shape[0] < 2:
@@ -379,7 +398,7 @@ def embedding_spread_stats(
     target_std: float = 1.0,
     dead_channel_threshold: float = 1e-5,
 ) -> dict[str, float]:
-    """Compact collapse diagnostics for pooled context embeddings."""
+    """Compact scale-invariant collapse diagnostics for pooled embeddings."""
     z = z.detach().float()
     if z.numel() == 0:
         return {
@@ -389,9 +408,11 @@ def embedding_spread_stats(
             "dead_channel_count": 0,
             "context_manifold_size": 0.0,
         }
-    z = z - z.mean(dim=0, keepdim=True)
-    var = z.var(dim=0, unbiased=False)
-    cov = (z.T @ z) / max(1, int(z.shape[0]))
+    centered = z - z.mean(dim=0, keepdim=True)
+    raw_var = centered.var(dim=0, unbiased=False)
+    normalized = _rms_normalized_centered_embeddings(z, eps=1e-4)
+    var = normalized.var(dim=0, unbiased=False)
+    cov = (normalized.T @ normalized) / max(1, int(normalized.shape[0]))
     try:
         eig = torch.linalg.eigvalsh(cov).clamp_min(0.0)
     except NotImplementedError:
@@ -403,12 +424,13 @@ def embedding_spread_stats(
         p = p[p > 1e-20]
         if p.numel() > 0:
             rank = float(torch.exp(-(p * p.log()).sum()).item())
-    std = torch.sqrt(var + 1e-12)
+    std = torch.sqrt(var.clamp_min(1e-12))
+    raw_std = torch.sqrt(raw_var.clamp_min(1e-12))
     return {
         "embed_spread_mean": float(std.mean().item()),
         "embed_spread_min": float(std.min().item()),
         "embed_under_spread_frac": float((std < float(target_std)).float().mean().item()),
-        "dead_channel_count": int((std < float(dead_channel_threshold)).sum().item()),
+        "dead_channel_count": int((raw_std < float(dead_channel_threshold)).sum().item()),
         "context_manifold_size": rank,
     }
 

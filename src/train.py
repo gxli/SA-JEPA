@@ -2824,7 +2824,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 "prediction_weight*prediction_loss + spread_weight*spread_hinge"
                 if vanilla_matched_steps
                 else "prediction_weight*prediction_loss + "
-                "spread_weight*relu(macro_initial_hinge-micro_hinge)"
+                "spread_weight*relu(micro_hinge-macro_initial_hinge)"
             )
         )
     experimental_losses = dict(train_cfg.get("experimental_losses", {}))
@@ -3035,11 +3035,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         "spatial_fov_factor": locality_spatial_fov_factor,
                         "spatial_radius_px": locality_spatial_radius_px,
                         "one_target_per_otf_pass": locality_refinement_n_target is not None,
-                        "hinge_reference": "macro_initial_std_hinge",
+                        "hinge_reference": "macro_initial_rms_normalized_std_hinge",
                         "hinge_penalty": (
                             "standard_spread_hinge"
                             if vanilla_matched_steps
-                            else "relu(initial_hinge-micro_hinge)"
+                            else "relu(micro_hinge-initial_hinge)"
                         ),
                     },
                     "symmetry_loss_weight": symmetry_loss_weight,
