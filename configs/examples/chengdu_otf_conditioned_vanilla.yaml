@@ -1,0 +1,9 @@
+# Chengdu random-target control, matched to the macro-plus-micro arms.
+
+base_config: chengdu_otf_conditioned_latent.yaml
+
+train:
+  locality_refinement: false
+  vanilla_matched_steps: true
+  locality_refinement_knn_space: random
+

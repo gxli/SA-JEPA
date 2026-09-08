@@ -1,0 +1,32 @@
+# NGC 3627 conditioned latent-KNN arm. This retains the historical NGC dilation
+# schedule and tiled full-frame inference while matching the Chengdu/MHD budget.
+
+base_config: mhd_example_otf.yaml
+
+data:
+  npy_pattern: ngc3627_12m+7m+tp_co21_strict_mom0.npy_scale.npy_stack.npy
+  num_samples: 40
+  d4_augment: true
+
+model:
+  otf_masking: true
+  mask_size_scaling: 1.2
+  convnext_layer_dilations: [1, 1, 2, 4]
+  sigmas: [2, 4, 8, 16, 32]
+  mask_box_hardcap: 48
+
+train:
+  epochs: 6
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  n_target: 20
+  locality_refinement: true
+  vanilla_matched_steps: false
+  locality_refinement_n_step: 3
+  locality_refinement_knn_space: latent
+  inference_max_diagnostic_size: 0
+  inference_tile_size: 512
+  force_recompute_inference: true
+  inference_discard_margin: auto
+  viz_crop_border: false
+

@@ -1,0 +1,8 @@
+# NGC 3627 spatial/FOV control, matched to the latent arm in updates and OTF passes.
+
+base_config: ngc_otf_conditioned_latent.yaml
+
+train:
+  locality_refinement_knn_space: spatial
+  locality_refinement_spatial_fov_factor: 1.0
+
