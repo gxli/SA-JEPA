@@ -15,6 +15,8 @@ model:
   mask_box_hardcap: 48
 
 train:
+  spread_regularizer:
+    conditioning: sample_l2
   epochs: 6
   batch_size: 1
   gradient_accumulation_steps: 4
@@ -28,4 +30,3 @@ train:
   force_recompute_inference: true
   inference_discard_margin: auto
   viz_crop_border: false
-

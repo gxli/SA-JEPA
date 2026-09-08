@@ -10,6 +10,8 @@ model:
   otf_masking: true
 
 train:
+  spread_regularizer:
+    conditioning: sample_l2
   epochs: 6
   batch_size: 1
   gradient_accumulation_steps: 4
@@ -18,4 +20,3 @@ train:
   vanilla_matched_steps: false
   locality_refinement_n_step: 3
   locality_refinement_knn_space: latent
-

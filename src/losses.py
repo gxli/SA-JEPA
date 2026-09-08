@@ -47,7 +47,10 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     stale_keys = removed_flat_keys & set(train_cfg)
     assert not stale_keys, f"Use train.spread_regularizer instead of flat keys: {sorted(stale_keys)}"
     cfg = dict(train_cfg.get("spread_regularizer", {}))
-    expected_keys = {"type", "target", "weight", "target_std", "eps", "sketch_dim", "spatial_mode"}
+    expected_keys = {
+        "type", "target", "weight", "target_std", "eps", "sketch_dim",
+        "spatial_mode", "conditioning",
+    }
     extra_keys = set(cfg) - expected_keys
     assert not extra_keys, f"Unsupported train.spread_regularizer keys: {sorted(extra_keys)}"
     spread_type = str(cfg.get("type", "std_hinge"))
@@ -60,10 +63,14 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
     eps = float(cfg.get("eps", 1e-4))
     sketch_dim = int(cfg.get("sketch_dim", 64))
     spatial_mode = str(cfg.get("spatial_mode", "pooled"))
+    # Historical configurations did not contain this key.  Keep their raw
+    # numerical objective exactly, rather than silently changing its meaning.
+    conditioning = str(cfg.get("conditioning", "raw"))
     assert target_std >= 0
     assert eps > 0
     assert sketch_dim > 0
     assert spatial_mode in {"pooled", "dense"}
+    assert conditioning in {"raw", "global_rms", "sample_l2"}
     result = {
         "type": spread_type,
         "target": spread_target,
@@ -71,6 +78,7 @@ def parse_spread_regularizer_config(train_cfg: dict) -> dict[str, float | str]:
         "target_std": target_std,
         "eps": eps,
         "spatial_mode": spatial_mode,
+        "conditioning": conditioning,
     }
     if spread_type in ("weak_sigreg", "sketched_sigreg"):
         result["sketch_dim"] = sketch_dim
@@ -103,35 +111,70 @@ def _sample_l2_normalized_embeddings(
     return F.normalize(z, p=2.0, dim=-1, eps=float(eps)) * feature_scale
 
 
-def _std_hinge(z: torch.Tensor, target_std: float, eps: float = 1e-4) -> torch.Tensor:
-    std = embedding_channel_std(z, eps=float(eps))
+def _condition_embeddings(
+    z: torch.Tensor,
+    *,
+    conditioning: str,
+    eps: float,
+) -> torch.Tensor:
+    """Map embeddings to the explicit statistic space for spread losses."""
+    z = z.float()
+    if z.ndim != 2:
+        raise ValueError(f"Expected a 2D embedding matrix, got {tuple(z.shape)}")
+    if conditioning == "raw":
+        return z
+    if conditioning == "global_rms":
+        centered = z - z.mean(dim=0, keepdim=True)
+        rms = torch.sqrt(centered.square().mean()).clamp_min(float(eps))
+        return centered / rms
+    if conditioning == "sample_l2":
+        return _sample_l2_normalized_embeddings(z, eps=float(eps))
+    raise ValueError(f"Unsupported spread conditioning={conditioning!r}")
+
+
+def _channel_std_from_conditioned_embeddings(z: torch.Tensor, eps: float) -> torch.Tensor:
+    centered = z - z.mean(dim=0, keepdim=True)
+    variance = centered.square().mean(dim=0)
+    return torch.sqrt(variance.clamp_min(float(eps) ** 2))
+
+
+def _std_hinge(
+    z: torch.Tensor,
+    target_std: float,
+    eps: float = 1e-4,
+    conditioning: str = "raw",
+) -> torch.Tensor:
+    std = embedding_channel_std(z, eps=float(eps), conditioning=conditioning)
     return torch.relu(float(target_std) - std).mean()
 
 
-def embedding_channel_std(z: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    """Return channel std after per-sample spherical normalization."""
+def embedding_channel_std(
+    z: torch.Tensor,
+    eps: float = 1e-4,
+    conditioning: str = "raw",
+) -> torch.Tensor:
+    """Return channel std in the configured raw or conditioned statistic space."""
     z = z.float()
     if z.ndim != 2:
         raise ValueError(f"Expected a 2D embedding matrix, got {tuple(z.shape)}")
     if z.shape[0] == 0:
         return z.new_zeros((z.shape[1],))
-    normalized = _sample_l2_normalized_embeddings(z, eps=float(eps))
-    normalized = normalized - normalized.mean(dim=0, keepdim=True)
-    variance = normalized.square().mean(dim=0)
-    return torch.sqrt(variance.clamp_min(float(eps) ** 2))
+    z_reg = _condition_embeddings(z, conditioning=conditioning, eps=float(eps))
+    return _channel_std_from_conditioned_embeddings(z_reg, eps=float(eps))
 
 
 def embedding_std_hinge_loss(
     z: torch.Tensor,
     target_std: float = 1.0,
     eps: float = 1e-4,
+    conditioning: str = "raw",
 ) -> torch.Tensor:
     """Return the scalar standard-deviation hinge for an embedding matrix."""
     if z.ndim != 2:
         raise ValueError(f"Expected a 2D embedding matrix, got {tuple(z.shape)}")
     if z.shape[0] < 2:
         return z.sum() * 0.0
-    std = embedding_channel_std(z, eps=float(eps))
+    std = embedding_channel_std(z, eps=float(eps), conditioning=conditioning)
     return torch.relu(float(target_std) - std).mean()
 
 
@@ -140,6 +183,7 @@ def anchored_spread_hinge_loss(
     initial_hinge: torch.Tensor,
     target_std: float = 1.0,
     eps: float = 1e-4,
+    conditioning: str = "raw",
 ) -> torch.Tensor:
     """Penalize only microstep contraction relative to the macro batch.
 
@@ -151,6 +195,7 @@ def anchored_spread_hinge_loss(
         z,
         target_std=float(target_std),
         eps=float(eps),
+        conditioning=conditioning,
     )
     reference = torch.as_tensor(
         initial_hinge,
@@ -239,20 +284,25 @@ def spread_regularizer_loss(
     z: torch.Tensor,
     target_std: float = 1.0,
     eps: float = 1e-4,
+    conditioning: str = "raw",
 ) -> torch.Tensor:
     """
-    Scale-invariant standard-deviation hinge on context embeddings.
+    Standard-deviation hinge on context embeddings.
 
-    Each embedding is normalized to radius ``sqrt(D)`` before channel standard
-    deviations are measured across samples.  Consequently the loss cannot be
-    satisfied by merely increasing the final projector gain, and small latent
-    amplitudes do not weaken its backward signal.
+    ``conditioning='raw'`` reproduces the historical amplitude-sensitive loss.
+    ``'global_rms'`` removes one shared batch amplitude, and ``'sample_l2'``
+    measures directional sample spread on the radius-``sqrt(D)`` sphere.
     """
     z = z.float()  # cast to fp32 to avoid underflow in fp16
     if z.numel() == 0 or z.shape[0] < 2:
         return torch.tensor(0.0, device=z.device, dtype=z.dtype)
 
-    return _std_hinge(z, float(target_std), float(eps))
+    return _std_hinge(
+        z,
+        float(target_std),
+        float(eps),
+        conditioning=conditioning,
+    )
 
 
 def weak_sigreg_loss(
@@ -260,6 +310,7 @@ def weak_sigreg_loss(
     target_std: float = 1.0,
     sketch_dim: int = 64,
     eps: float = 1e-4,
+    conditioning: str = "raw",
 ) -> torch.Tensor:
     """Variance hinge plus an off-diagonal covariance penalty.
 
@@ -273,9 +324,12 @@ def weak_sigreg_loss(
         return torch.tensor(0.0, device=z.device, dtype=z.dtype)
 
     n, c = z.shape
+    z = _condition_embeddings(z, conditioning=conditioning, eps=float(eps))
     z = z - z.mean(dim=0, keepdim=True)
 
-    var_loss = _std_hinge(z, float(target_std), float(eps))
+    var_loss = torch.relu(
+        float(target_std) - _channel_std_from_conditioned_embeddings(z, float(eps))
+    ).mean()
 
     k = min(int(sketch_dim), int(c))
     if c > k:
@@ -297,6 +351,7 @@ def sketched_sigreg_loss(
     target_std: float = 1.0,
     sketch_dim: int = 64,
     eps: float = 1e-6,
+    conditioning: str = "raw",
 ) -> torch.Tensor:
     """Experimental sketched SIGReg variant kept for ablations.
 
@@ -310,6 +365,7 @@ def sketched_sigreg_loss(
     if z.numel() == 0 or z.shape[0] < 2:
         return z.sum() * 0.0
 
+    z = _condition_embeddings(z, conditioning=conditioning, eps=float(eps))
     z = z - z.mean(dim=0, keepdim=True)
     c = z.shape[1]
     sketch_dim = int(max(1, sketch_dim))
@@ -318,7 +374,9 @@ def sketched_sigreg_loss(
     y = z @ a
     projected_var_loss = (y.var(dim=0, unbiased=False) - float(target_std) ** 2).pow(2).mean()
 
-    escape_loss = _std_hinge(z, float(target_std), float(eps))
+    escape_loss = torch.relu(
+        float(target_std) - _channel_std_from_conditioned_embeddings(z, float(eps))
+    ).mean()
 
     std_corr = _centered_std(z, float(eps))
     z_corr = z / std_corr.clamp_min(float(eps)).unsqueeze(0)
@@ -333,11 +391,13 @@ def sketched_sigreg_loss(
 
 def compute_spread_regularizer_loss(z: torch.Tensor, cfg: dict[str, float | str]) -> torch.Tensor:
     sigreg_type = str(cfg.get("type", "std_hinge"))
+    conditioning = str(cfg.get("conditioning", "raw"))
     if sigreg_type == "std_hinge":
         return spread_regularizer_loss(
             z,
             target_std=float(cfg.get("target_std", 1.0)),
             eps=float(cfg.get("eps", 1e-4)),
+            conditioning=conditioning,
         )
     if sigreg_type == "weak_sigreg":
         return weak_sigreg_loss(
@@ -345,6 +405,7 @@ def compute_spread_regularizer_loss(z: torch.Tensor, cfg: dict[str, float | str]
             target_std=float(cfg.get("target_std", 1.0)),
             sketch_dim=int(cfg.get("sketch_dim", 64)),
             eps=float(cfg.get("eps", 1e-4)),
+            conditioning=conditioning,
         )
     if sigreg_type == "sketched_sigreg":
         return sketched_sigreg_loss(
@@ -352,6 +413,7 @@ def compute_spread_regularizer_loss(z: torch.Tensor, cfg: dict[str, float | str]
             target_std=float(cfg.get("target_std", 1.0)),
             sketch_dim=int(cfg.get("sketch_dim", 64)),
             eps=float(cfg.get("eps", 1e-6)),
+            conditioning=conditioning,
         )
     raise ValueError(f"Unsupported spread regularizer type: {sigreg_type}")
 
@@ -402,8 +464,9 @@ def embedding_spread_stats(
     z: torch.Tensor,
     target_std: float = 1.0,
     dead_channel_threshold: float = 1e-5,
+    conditioning: str = "raw",
 ) -> dict[str, float]:
-    """Compact scale-invariant collapse diagnostics for pooled embeddings."""
+    """Compact diagnostics in the same statistic space as the regularizer."""
     z = z.detach().float()
     if z.numel() == 0:
         return {
@@ -413,12 +476,12 @@ def embedding_spread_stats(
             "dead_channel_count": 0,
             "context_manifold_size": 0.0,
         }
-    centered = z - z.mean(dim=0, keepdim=True)
-    raw_var = centered.var(dim=0, unbiased=False)
-    normalized = _sample_l2_normalized_embeddings(z, eps=1e-4)
-    normalized = normalized - normalized.mean(dim=0, keepdim=True)
-    var = normalized.var(dim=0, unbiased=False)
-    cov = (normalized.T @ normalized) / max(1, int(normalized.shape[0]))
+    raw_centered = z - z.mean(dim=0, keepdim=True)
+    raw_var = raw_centered.var(dim=0, unbiased=False)
+    z_reg = _condition_embeddings(z, conditioning=conditioning, eps=1e-4)
+    centered = z_reg - z_reg.mean(dim=0, keepdim=True)
+    var = centered.var(dim=0, unbiased=False)
+    cov = (centered.T @ centered) / max(1, int(centered.shape[0]))
     try:
         eig = torch.linalg.eigvalsh(cov).clamp_min(0.0)
     except NotImplementedError:

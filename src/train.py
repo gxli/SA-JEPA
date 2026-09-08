@@ -3167,11 +3167,13 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     locality_initial_std = embedding_channel_std(
                         locality_initial_embeddings,
                         eps=spread_regularizer_eps,
+                        conditioning=str(spread_regularizer.get("conditioning", "raw")),
                     ).detach()
                     locality_initial_hinge = embedding_std_hinge_loss(
                         locality_initial_embeddings,
                         target_std=embed_spread_target,
                         eps=spread_regularizer_eps,
+                        conditioning=str(spread_regularizer.get("conditioning", "raw")),
                     ).detach()
             # DDP: sync component losses for accurate logging across all ranks
             if is_ddp:
@@ -3268,12 +3270,14 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                             micro_embeddings,
                             target_std=embed_spread_target,
                             eps=spread_regularizer_eps,
+                            conditioning=str(spread_regularizer.get("conditioning", "raw")),
                         )
                         micro_hinge_penalty = anchored_spread_hinge_loss(
                             micro_embeddings,
                             locality_initial_hinge,
                             target_std=embed_spread_target,
                             eps=spread_regularizer_eps,
+                            conditioning=str(spread_regularizer.get("conditioning", "raw")),
                         )
                         followup_hinge_loss = (
                             micro_raw_hinge if vanilla_matched_steps else micro_hinge_penalty
@@ -3293,6 +3297,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         embedding_channel_std(
                             micro_embeddings.detach(),
                             eps=spread_regularizer_eps,
+                            conditioning=str(spread_regularizer.get("conditioning", "raw")),
                         ).mean().item()
                     )
                     locality_micro_count += 1
@@ -3440,7 +3445,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             energy_val = compute_jepa_energy(outputs)
             target_valid_f = outputs["target_valid"].float()
             valid_frac = float(target_valid_f.mean().item())
-            ctx_stats = embedding_spread_stats(z_ctx, target_std=embed_spread_target)
+            ctx_stats = embedding_spread_stats(
+                z_ctx,
+                target_std=embed_spread_target,
+                conditioning=str(spread_regularizer.get("conditioning", "raw")),
+            )
             active_targets_by_sample = target_valid_f.sum(dim=1)
             targets_per_image = float(active_targets_by_sample.mean().item())
             target_slots_per_image = int(outputs["target_valid"].shape[1]) if outputs["target_valid"].dim() >= 2 else 0
