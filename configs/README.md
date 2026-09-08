@@ -153,6 +153,12 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.batch_size` | `4` | Per-GPU batch size. |
 | `train.gradient_accumulation_steps` | `1` | Effective batch = `batch_size × grad_accum`. |
 | `train.gradient_accumulation_mode` | `step` | `step` backprops each microbatch loss scaled by accumulation steps; `batch` concatenates accumulated outputs and computes one loss over the full window before backprop. |
+| `train.locality_refinement` | `false` | Add locality-focused JEPA microsteps to every macro batch. Requires `model.otf_masking: true` and a positive spread-regularizer weight. |
+| `train.vanilla_matched_steps` | `false` | Run independent regular JEPA follow-up batches so a vanilla ablation has the same number of target batches and OTF encoder passes as locality refinement. Mutually exclusive with `locality_refinement`. |
+| `train.locality_refinement_n_step` | `3` | Number of follow-up target batches per outer step. Their mean gradient is added to the first batch objective. |
+| `train.n_target` | `null` | Global exact target count for the first and every follow-up batch. With a fixed count, OTF executes one masked encoder pass per target, so every arm has identical compute. |
+| `train.locality_refinement_knn_space` | `spatial` | Microbatch sampling: `spatial` samples inside a Euclidean radius of one encoder FOV; `latent` directly takes the `n_target` nearest clean target-latent seeds. |
+| `train.locality_refinement_spatial_fov_factor` | `1.0` | Spatial sampling radius as a multiple of the encoder receptive-field width. |
 | `train.lr` | `0.0001` | Base learning rate (AdamW). |
 | `train.weight_decay` | `1e-5` | AdamW weight decay. |
 | `train.num_workers` | `8` | DataLoader worker processes. |
@@ -168,6 +174,25 @@ Set via `model.convnext_layer_dilations: [1, 1, 2, 4]`.
 | `train.mask_predict_mode` | config-required | Masked usage-inference branch. Use `composite` so mask+encoder are applied together per local window. |
 | `train.mask_predict_stride` | config-required | Spatial stride for composite masked inference sampling. Use `1` for full resolution; larger values interpolate. |
 | `train.mask_predict_chunk_size` | config-required | Number of local masked windows evaluated per forward chunk. Tune for GPU memory. |
+
+When locality refinement is enabled, the macro context embeddings define a
+detached initial std-hinge value. Each locality microstep computes its own
+std-hinge and adds `relu(initial_hinge - micro_hinge)`. The term is therefore
+zero when the micro hinge is unchanged or larger, and positive only when the
+hinge shrinks. `metrics.csv` records the initial hinge, raw micro hinge, and
+hinge-shrink penalty separately. The sampled anchor, selected neighbors, KNN
+ranks, and spatial distances are saved to
+`locality_refinement_matches.csv` in the session directory.
+Macro and micro target coordinates are saved together in
+`locality_refinement_target_locations.csv` for the dashboard's colored
+per-micro-batch location panel.
+
+Loss reporting keeps the nested optimization levels separate. `metrics.csv`
+stores `loss_macro`, `locality_micro_mean_loss`, every
+`locality_micro_step_<s>_loss`, and `loss_optimization_total`, where the last is
+exactly `loss_macro + locality_micro_mean_loss`. The dashboard plots these as
+distinct, explicitly labelled curves; `loss_total` remains a compatibility
+alias for `loss_optimization_total`.
 
 ## 8. Diagnostics & Visualization
 

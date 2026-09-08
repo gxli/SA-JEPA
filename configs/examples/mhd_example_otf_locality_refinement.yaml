@@ -1,0 +1,19 @@
+# Latent-KNN arm of the matched OTF experiment.
+
+base_config: mhd_example_otf.yaml
+
+data:
+  num_samples: 40
+
+model:
+  otf_masking: true
+
+train:
+  epochs: 6
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  locality_refinement: true
+  vanilla_matched_steps: false
+  locality_refinement_n_step: 3
+  n_target: 20
+  locality_refinement_knn_space: latent

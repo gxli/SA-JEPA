@@ -1,0 +1,9 @@
+# Matched vanilla arm: four independent regular JEPA target batches per outer
+# step, matching the two macro-micro arms exactly in epochs, targets, updates,
+# and one-target OTF encoder passes.
+
+base_config: mhd_example_otf_locality_refinement.yaml
+
+train:
+  locality_refinement: false
+  vanilla_matched_steps: true

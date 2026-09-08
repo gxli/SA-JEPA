@@ -67,6 +67,12 @@ model:
 train:
   batch_size: 4
   gradient_accumulation_mode: step
+  locality_refinement: false
+  vanilla_matched_steps: false
+  locality_refinement_n_step: 3
+  n_target: null
+  locality_refinement_knn_space: spatial
+  locality_refinement_spatial_fov_factor: 1.0
   diagnostic_interval: 1
   full_visit_map: true
   inference_tile_size: 768

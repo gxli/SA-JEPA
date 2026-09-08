@@ -6,6 +6,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .encoders import (
     CDDScaleAwareConvNeXtEncoder,
@@ -506,7 +507,11 @@ class PyramidGridJEPA(nn.Module):
         target_valid: torch.Tensor,
         debug: dict,
     ) -> dict:
-        """Run packed OTF context passes and assemble one result per target."""
+        """Run sequential OTF context passes and assemble one result per target.
+
+        Training checkpoints each pass so encoder activations are recomputed
+        during backward instead of retaining every pass in GPU memory.
+        """
         pass_ids = debug["otf_mask_pass_ids"].to(device=x_clean_enc.device, dtype=torch.long)
         if pass_ids.shape != target_valid.shape:
             raise RuntimeError(
@@ -581,6 +586,11 @@ class PyramidGridJEPA(nn.Module):
         symmetric_vars = []
         bsz, _, height, width = x_clean_enc.shape
 
+        def _run_context(function, *args):
+            if self.training and torch.is_grad_enabled():
+                return checkpoint(function, *args, use_reentrant=False)
+            return function(*args)
+
         for pass_index in range(num_passes):
             channels = int(cdd_orig.shape[1]) if cdd_orig is not None else 1
             mask_tokens = self._make_otf_mask_tokens(
@@ -613,15 +623,23 @@ class PyramidGridJEPA(nn.Module):
                 if self.scaleaware_norm_per_scale:
                     context_fields = norm_per_sample_channel(context_fields)
                 if self.use_symmetric_feature_loss:
-                    context_base, context_var = symmetric_forward_2d(
-                        self.context_encoder,
+                    context_base, context_var = _run_context(
+                        lambda fields, tokens: symmetric_forward_2d(
+                            self.context_encoder,
+                            fields,
+                            mask_tokens=tokens,
+                            return_var=True,
+                        ),
                         context_fields,
-                        mask_tokens=mask_tokens,
-                        return_var=True,
+                        mask_tokens,
                     )
                     symmetric_vars.append(context_var)
                 else:
-                    context_base = self.context_encoder(context_fields, mask_tokens=mask_tokens)
+                    context_base = _run_context(
+                        lambda fields, tokens: self.context_encoder(fields, mask_tokens=tokens),
+                        context_fields,
+                        mask_tokens,
+                    )
             elif self.encoder_type in ("convnext_dense_pyramid", "escnn_c4_pyramid"):
                 assert cdd_orig is not None
                 masked_raw = cdd_orig * (1.0 - mask_tokens)
@@ -636,27 +654,33 @@ class PyramidGridJEPA(nn.Module):
                     mask_tokens = mask_tokens.masked_fill(invalid_expanded, 1.0)
                 context_input = torch.cat([context_fields, mask_tokens], dim=1)
                 if self.use_symmetric_feature_loss:
-                    context_base, context_var = symmetric_forward_2d(
-                        self.context_encoder, context_input, return_var=True
+                    context_base, context_var = _run_context(
+                        lambda fields: symmetric_forward_2d(
+                            self.context_encoder, fields, return_var=True
+                        ),
+                        context_input,
                     )
                     symmetric_vars.append(context_var)
                 else:
-                    context_base = self.context_encoder(context_input)
+                    context_base = _run_context(self.context_encoder, context_input)
             else:
                 masked_image = x_clean_enc * (1.0 - mask_tokens)
                 context_input = torch.cat([masked_image, mask_tokens], dim=1)
                 if actual_context_in is None:
                     actual_context_in = context_input
                 if self.use_symmetric_feature_loss:
-                    context_base, context_var = symmetric_forward_2d(
-                        self.context_encoder, context_input, return_var=True
+                    context_base, context_var = _run_context(
+                        lambda fields: symmetric_forward_2d(
+                            self.context_encoder, fields, return_var=True
+                        ),
+                        context_input,
                     )
                     symmetric_vars.append(context_var)
                 else:
-                    context_base = self.context_encoder(context_input)
+                    context_base = _run_context(self.context_encoder, context_input)
 
-            context_proj = self.projector(context_base)
-            pred_map = self.predictor(context_proj)
+            context_proj = _run_context(self.projector, context_base)
+            pred_map = _run_context(self.predictor, context_proj)
             pred_for_pass = extract_location_patches(pred_map, target_locations, patch_size=self.patch_size)
             context_for_pass = extract_location_patches(context_proj, target_locations, patch_size=self.patch_size)
             selector = ((pass_ids == pass_index) & target_valid).view(

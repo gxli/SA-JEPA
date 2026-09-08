@@ -31,13 +31,18 @@ from src.diagnostics import (
 )
 from src.inference import run_post_training_inference, run_post_training_inference_3d
 from src.losses import (
+    anchored_spread_hinge_loss,
     compute_jepa_energy,
     compute_output_spread_regularizer_loss,
     compute_raw_mse_and_norm_err,
     compute_sim_var_cov,
     compute_sim_var_cov_torch,
     compute_target_energy_map,
+    embedding_channel_std,
+    embedding_std_hinge_loss,
     embedding_spread_stats,
+    extract_valid_dense_embeddings,
+    extract_valid_pooled_embeddings,
     parse_spread_regularizer_config,
 )
 from src.models.build_jepa import CDD_CUBE_ENCODER_TYPES, CDD_DEBUG_ENCODER_TYPES, MASK_MAP_ENCODER_TYPES, PyramidGridJEPA
@@ -156,6 +161,7 @@ def _inverse_augmented_yx_to_native(yy: int, xx: int, meta: dict | None) -> tupl
 def _format_active_loss_terms(
     *,
     total: float,
+    total_label: str = "total",
     prediction: float,
     prediction_weight: float,
     spread: float,
@@ -169,7 +175,7 @@ def _format_active_loss_terms(
 ) -> dict[str, str]:
     """Runtime loss printout: raw active terms plus weighted contribution."""
     terms = {
-        "total": _fmt_metric(total),
+        str(total_label): _fmt_metric(total),
         "pred": _fmt_metric(prediction),
         "wpred": _fmt_metric(prediction_weight * prediction),
     }
@@ -823,6 +829,199 @@ def _move_to_device(value, device: torch.device):
     return value
 
 
+def _sample_locality_refinement_context(
+    context_data: tuple,
+    *,
+    allow_partial_overlap: float = 0.0,
+    fixed_n_targets: int | None = None,
+    knn_space: str = "spatial",
+    candidate_latent_map: torch.Tensor | None = None,
+    spatial_radius_px: float | None = None,
+    one_target_per_pass: bool = False,
+) -> tuple[tuple | None, list[tuple]]:
+    """Sample one exactly-sized follow-up target set.
+
+    ``random`` draws an independent vanilla target batch. ``spatial`` draws
+    from candidates no farther than ``spatial_radius_px`` from one random
+    anchor. ``latent`` directly takes the exact nearest neighbors of one
+    random anchor in the clean projected target latent map.
+    """
+    if len(context_data) < 5 or not isinstance(context_data[4], dict):
+        return None, []
+    x_context, macro_locations, macro_scales, macro_valid, source_debug = context_data[:5]
+    candidate_locations = source_debug.get("candidate_locations")
+    candidate_box_sizes = source_debug.get("candidate_box_sizes")
+    candidate_valid = source_debug.get("candidate_valid")
+    target_box_sizes = source_debug.get("target_box_sizes")
+    if any(value is None for value in (candidate_locations, candidate_box_sizes, candidate_valid, target_box_sizes)):
+        return None, []
+    if candidate_locations.ndim != 3 or candidate_locations.shape[-1] != 2:
+        raise RuntimeError("candidate_locations must have shape BxMx2")
+    if candidate_valid.shape != candidate_locations.shape[:2]:
+        raise RuntimeError("candidate_valid must match candidate_locations[:2]")
+    if candidate_box_sizes.shape != candidate_locations.shape[:2]:
+        raise RuntimeError("candidate_box_sizes must match candidate_locations[:2]")
+    knn_space = str(knn_space).strip().lower()
+    if knn_space not in {"random", "spatial", "latent"}:
+        raise ValueError("knn_space must be 'random', 'spatial', or 'latent'")
+    if knn_space == "spatial" and (spatial_radius_px is None or spatial_radius_px <= 0):
+        raise ValueError("spatial sampling requires a positive spatial_radius_px")
+    if knn_space == "latent":
+        if candidate_latent_map is None or candidate_latent_map.ndim != 4:
+            raise RuntimeError("latent KNN requires candidate_latent_map with shape BxCxHxW")
+        if int(candidate_latent_map.shape[0]) != int(candidate_locations.shape[0]):
+            raise RuntimeError("candidate_latent_map batch size must match candidate_locations")
+
+    bsz, target_slots = macro_valid.shape
+    micro_locations = torch.zeros_like(macro_locations)
+    micro_scales = torch.zeros_like(macro_scales)
+    micro_valid = torch.zeros_like(macro_valid)
+    micro_box_sizes = torch.zeros_like(target_box_sizes)
+    review_rows: list[tuple] = []
+    for bi in range(int(bsz)):
+        candidate_indices = torch.nonzero(candidate_valid[bi], as_tuple=False).flatten()
+        requested = (
+            int(fixed_n_targets)
+            if fixed_n_targets is not None
+            else int(macro_valid[bi].sum().item())
+        )
+        if fixed_n_targets is not None and int(candidate_indices.numel()) < requested:
+            raise RuntimeError(
+                "Fixed locality target count cannot be satisfied: "
+                f"sample={bi} requested={requested} candidates={int(candidate_indices.numel())}"
+            )
+        n_targets = min(requested, int(target_slots), int(candidate_indices.numel()))
+        if fixed_n_targets is not None and n_targets != requested:
+            raise RuntimeError(
+                "Fixed locality target count exceeds the packed target slots: "
+                f"sample={bi} requested={requested} slots={int(target_slots)}"
+            )
+        if n_targets <= 0:
+            continue
+
+        pool_locations = candidate_locations[bi, candidate_indices]
+        anchor_pool_index = int(
+            torch.randint(0, int(candidate_indices.numel()), (), device=pool_locations.device).item()
+        )
+        anchor = pool_locations[anchor_pool_index]
+        offsets = pool_locations.float() - anchor.float().unsqueeze(0)
+        spatial_distances_sq = offsets.square().sum(dim=1)
+        latent_distances_sq = None
+        if candidate_latent_map is not None:
+            latent_height, latent_width = candidate_latent_map.shape[-2:]
+            pool_y = pool_locations[:, 0].long().clamp(0, int(latent_height) - 1)
+            pool_x = pool_locations[:, 1].long().clamp(0, int(latent_width) - 1)
+            pool_latents = candidate_latent_map[bi, :, pool_y, pool_x].transpose(0, 1).float()
+            anchor_latent = pool_latents[anchor_pool_index]
+            latent_distances_sq = (pool_latents - anchor_latent.unsqueeze(0)).square().sum(dim=1)
+        if knn_space == "latent":
+            assert latent_distances_sq is not None
+            selected_pool_indices = torch.topk(
+                latent_distances_sq,
+                k=n_targets,
+                largest=False,
+                sorted=True,
+            ).indices
+            selected_ranks = torch.arange(n_targets, device=pool_locations.device)
+            candidate_pool_size = n_targets
+        elif knn_space == "spatial":
+            radius_sq = float(spatial_radius_px) ** 2
+            local_pool = torch.nonzero(
+                spatial_distances_sq <= radius_sq,
+                as_tuple=False,
+            ).flatten()
+            if int(local_pool.numel()) < n_targets:
+                raise RuntimeError(
+                    "Spatial FOV neighborhood cannot satisfy fixed target count: "
+                    f"sample={bi} radius_px={float(spatial_radius_px):.3f} "
+                    f"requested={n_targets} candidates={int(local_pool.numel())}"
+                )
+            chosen_in_pool = torch.randperm(
+                int(local_pool.numel()), device=pool_locations.device
+            )[:n_targets]
+            selected_pool_indices = local_pool[chosen_in_pool]
+            spatial_order = torch.argsort(spatial_distances_sq)
+            spatial_rank = torch.empty_like(spatial_order)
+            spatial_rank[spatial_order] = torch.arange(
+                int(spatial_order.numel()), device=spatial_order.device
+            )
+            selected_ranks = spatial_rank[selected_pool_indices]
+            candidate_pool_size = int(local_pool.numel())
+        else:
+            selected_pool_indices = torch.randperm(
+                int(candidate_indices.numel()), device=pool_locations.device
+            )[:n_targets]
+            selected_ranks = torch.arange(n_targets, device=pool_locations.device)
+            candidate_pool_size = int(candidate_indices.numel())
+        selected_candidate_indices = candidate_indices[selected_pool_indices]
+
+        micro_locations[bi, :n_targets] = candidate_locations[bi, selected_candidate_indices]
+        micro_box_sizes[bi, :n_targets] = candidate_box_sizes[bi, selected_candidate_indices]
+        micro_valid[bi, :n_targets] = True
+        macro_scale_values = macro_scales[bi, macro_valid[bi]]
+        if macro_scale_values.numel() > 0:
+            scale_order = torch.randperm(
+                int(macro_scale_values.numel()),
+                device=macro_scale_values.device,
+            )
+            micro_scales[bi, :n_targets] = macro_scale_values[scale_order[:n_targets]]
+
+        selected_locations_cpu = micro_locations[bi, :n_targets].detach().cpu()
+        selected_ranks_cpu = selected_ranks.detach().cpu()
+        selected_spatial_distances_cpu = torch.sqrt(
+            spatial_distances_sq[selected_pool_indices]
+        ).detach().cpu()
+        selected_latent_distances_cpu = (
+            torch.sqrt(latent_distances_sq[selected_pool_indices]).detach().cpu()
+            if latent_distances_sq is not None
+            else None
+        )
+        anchor_cpu = anchor.detach().cpu()
+        for target_index in range(n_targets):
+            review_rows.append(
+                (
+                    int(bi),
+                    int(anchor_cpu[0]),
+                    int(anchor_cpu[1]),
+                    int(target_index),
+                    int(selected_locations_cpu[target_index, 0]),
+                    int(selected_locations_cpu[target_index, 1]),
+                    int(selected_ranks_cpu[target_index]),
+                    float(selected_spatial_distances_cpu[target_index]),
+                    (
+                        float(selected_latent_distances_cpu[target_index])
+                        if selected_latent_distances_cpu is not None
+                        else float("nan")
+                    ),
+                    int(n_targets),
+                    int(candidate_pool_size),
+                )
+            )
+
+    if not bool(micro_valid.any().item()):
+        return None, []
+
+    debug = dict(source_debug)
+    debug["target_box_sizes"] = micro_box_sizes
+    debug["otf_mask_pass_ids"] = pack_target_mask_passes(
+        micro_locations,
+        micro_valid,
+        micro_box_sizes,
+        height=int(x_context.shape[-2]),
+        width=int(x_context.shape[-1]),
+        allow_partial_overlap=float(allow_partial_overlap),
+        one_target_per_pass=bool(one_target_per_pass),
+    )
+    debug["otf_masking_enabled"] = True
+    return (x_context, micro_locations, micro_scales, micro_valid, debug), review_rows
+
+
+def _locality_context_embeddings(outputs: dict, spatial_mode: str) -> torch.Tensor:
+    if str(spatial_mode).lower() == "dense":
+        return extract_valid_dense_embeddings(outputs, key="context_patches")
+    return extract_valid_pooled_embeddings(outputs, key="context_patches")
+
+
 def _target_mask_from_data_threshold(data_cfg: dict, threshold: float, config_name: str) -> torch.Tensor | None:
     """Build a full-frame valid-target mask from the configured input array."""
     data_root = data_cfg.get("data_root", "data")
@@ -909,6 +1108,8 @@ class _MaskingCollator:
         require_precomputed_cdd: bool = False,
         target_mask: Optional[torch.Tensor] = None,
         target_threshold: Optional[float] = None,
+        locality_refinement: bool = False,
+        locality_refinement_n_target: int | None = None,
     ):
         enc_type = str(getattr(model, "encoder_type", "")).lower()
         self.use_cdd = bool(enc_type in CDD_CUBE_ENCODER_TYPES)
@@ -916,6 +1117,7 @@ class _MaskingCollator:
         self.require_precomputed_cdd = bool(require_precomputed_cdd)
         self.return_debug = bool(
             return_debug
+            or locality_refinement
             or enc_type in CDD_DEBUG_ENCODER_TYPES
             or enc_type in MASK_MAP_ENCODER_TYPES
         )
@@ -931,6 +1133,12 @@ class _MaskingCollator:
         )
         self.target_mask = target_mask
         self.target_threshold = target_threshold
+        self.locality_refinement = bool(locality_refinement)
+        self.locality_refinement_n_target = (
+            None
+            if locality_refinement_n_target is None
+            else int(locality_refinement_n_target)
+        )
         self.target_allow_partial_overlap = float(getattr(model, "target_allow_partial_overlap", 0.0))
         self.context_kwargs = {
             "sigmas": model.sigmas,
@@ -956,7 +1164,13 @@ class _MaskingCollator:
             "target_allow_partial_overlap": getattr(model, "target_allow_partial_overlap", 0.0),
             "mask_box_hardcap": getattr(model, "mask_box_hardcap", None),
             "use_cdd": self.use_cdd,
+            "return_candidate_pool": self.locality_refinement,
         }
+        if self.locality_refinement_n_target is not None:
+            # OTF packing handles spatial overlap in separate encoder passes,
+            # so both macro and locality batches can retain this exact count.
+            self.context_kwargs["priority_n_target"] = self.locality_refinement_n_target
+            self.context_kwargs["priority_min_targets_per_map"] = self.locality_refinement_n_target
 
     def _sample_mask_params(self) -> tuple[float, int]:
         mask_scale = self.mask_scale
@@ -1044,6 +1258,143 @@ class _MaskingCollator:
             target_mask=batch_target_mask,
             **self.context_kwargs,
         )
+        if self.locality_refinement_n_target is not None:
+            # Some stochastic samplers can return fewer than the requested
+            # number after their final validity checks. Refill empty slots from
+            # the complete valid candidate catalogue before OTF pass packing.
+            if len(context_data) >= 5 and isinstance(context_data[4], dict):
+                x_context, target_locations, target_scales, target_valid, source_debug = context_data[:5]
+                debug = dict(source_debug)
+                candidate_locations = debug.get("candidate_locations")
+                candidate_box_sizes = debug.get("candidate_box_sizes")
+                candidate_valid = debug.get("candidate_valid")
+                target_box_sizes = debug.get("target_box_sizes")
+                if all(
+                    value is not None
+                    for value in (
+                        candidate_locations,
+                        candidate_box_sizes,
+                        candidate_valid,
+                        target_box_sizes,
+                    )
+                ):
+                    target_locations = target_locations.clone()
+                    target_scales = target_scales.clone()
+                    target_valid = target_valid.clone()
+                    target_box_sizes = target_box_sizes.clone()
+                    expected = int(self.locality_refinement_n_target)
+                    current_slots = int(target_valid.shape[1])
+                    if current_slots < expected:
+                        extra_slots = expected - current_slots
+                        target_locations = torch.cat(
+                            [
+                                target_locations,
+                                torch.zeros(
+                                    (int(target_locations.shape[0]), extra_slots, int(target_locations.shape[2])),
+                                    device=target_locations.device,
+                                    dtype=target_locations.dtype,
+                                ),
+                            ],
+                            dim=1,
+                        )
+                        target_scales = torch.cat(
+                            [
+                                target_scales,
+                                torch.zeros(
+                                    (int(target_scales.shape[0]), extra_slots),
+                                    device=target_scales.device,
+                                    dtype=target_scales.dtype,
+                                ),
+                            ],
+                            dim=1,
+                        )
+                        target_valid = torch.cat(
+                            [
+                                target_valid,
+                                torch.zeros(
+                                    (int(target_valid.shape[0]), extra_slots),
+                                    device=target_valid.device,
+                                    dtype=torch.bool,
+                                ),
+                            ],
+                            dim=1,
+                        )
+                        target_box_sizes = torch.cat(
+                            [
+                                target_box_sizes,
+                                torch.zeros(
+                                    (int(target_box_sizes.shape[0]), extra_slots),
+                                    device=target_box_sizes.device,
+                                    dtype=target_box_sizes.dtype,
+                                ),
+                            ],
+                            dim=1,
+                        )
+                    for sample_index in range(int(target_valid.shape[0])):
+                        missing_slots = torch.nonzero(
+                            ~target_valid[sample_index], as_tuple=False
+                        ).flatten()[: max(0, expected - int(target_valid[sample_index].sum().item()))]
+                        if missing_slots.numel() == 0:
+                            continue
+                        candidate_indices = torch.nonzero(
+                            candidate_valid[sample_index], as_tuple=False
+                        ).flatten()
+                        selected_locations = {
+                            tuple(int(v) for v in location.tolist())
+                            for location in target_locations[sample_index, target_valid[sample_index]].cpu()
+                        }
+                        candidate_indices = torch.as_tensor(
+                            [
+                                int(index)
+                                for index in candidate_indices.tolist()
+                                if tuple(
+                                    int(v)
+                                    for v in candidate_locations[sample_index, int(index)].tolist()
+                                )
+                                not in selected_locations
+                            ],
+                            device=candidate_indices.device,
+                            dtype=torch.long,
+                        )
+                        if int(candidate_indices.numel()) < int(missing_slots.numel()):
+                            continue
+                        chosen = candidate_indices[
+                            torch.randperm(
+                                int(candidate_indices.numel()),
+                                device=candidate_indices.device,
+                            )[: int(missing_slots.numel())]
+                        ]
+                        target_locations[sample_index, missing_slots] = candidate_locations[
+                            sample_index, chosen
+                        ]
+                        target_box_sizes[sample_index, missing_slots] = candidate_box_sizes[
+                            sample_index, chosen
+                        ]
+                        valid_scales = target_scales[sample_index, target_valid[sample_index]]
+                        if valid_scales.numel() > 0:
+                            scale_indices = torch.randint(
+                                0,
+                                int(valid_scales.numel()),
+                                (int(missing_slots.numel()),),
+                                device=valid_scales.device,
+                            )
+                            target_scales[sample_index, missing_slots] = valid_scales[scale_indices]
+                        target_valid[sample_index, missing_slots] = True
+                    debug["target_box_sizes"] = target_box_sizes
+                    context_data = (
+                        x_context,
+                        target_locations,
+                        target_scales,
+                        target_valid,
+                        debug,
+                    )
+            target_counts = context_data[3].sum(dim=1)
+            expected = int(self.locality_refinement_n_target)
+            if bool((target_counts != expected).any().item()):
+                raise RuntimeError(
+                    "Fixed locality target count could not be produced for every sample: "
+                    f"requested={expected} actual={target_counts.tolist()}"
+                )
         if self.otf_masking:
             if len(context_data) < 5 or not isinstance(context_data[4], dict):
                 raise RuntimeError("Packed OTF masking requires masking debug tensors")
@@ -1072,6 +1423,7 @@ class _MaskingCollator:
                 height=int(x_clean.shape[-2]),
                 width=int(x_clean.shape[-1]),
                 allow_partial_overlap=self.target_allow_partial_overlap,
+                one_target_per_pass=self.locality_refinement_n_target is not None,
             )
             debug["otf_masking_enabled"] = True
             context_data = tuple(context_data[:4]) + (debug,)
@@ -1677,6 +2029,37 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     train_cfg = config["train"]
     model_cfg = config["model"]
     data_cfg = config["data"]
+    configured_locality_refinement = bool(train_cfg.get("locality_refinement", False))
+    vanilla_matched_steps = bool(train_cfg.get("vanilla_matched_steps", False))
+    if configured_locality_refinement and vanilla_matched_steps:
+        raise ValueError("Enable either locality_refinement or vanilla_matched_steps, not both")
+    locality_refinement = configured_locality_refinement or vanilla_matched_steps
+    locality_refinement_n_step = int(train_cfg.get("locality_refinement_n_step", 3))
+    locality_refinement_n_target_raw = train_cfg.get(
+        "n_target",
+        train_cfg.get("locality_refinement_n_target"),
+    )
+    locality_refinement_n_target = (
+        None
+        if locality_refinement_n_target_raw is None
+        else int(locality_refinement_n_target_raw)
+    )
+    locality_refinement_knn_space = (
+        "random"
+        if vanilla_matched_steps
+        else str(train_cfg.get("locality_refinement_knn_space", "spatial")).strip().lower()
+    )
+    locality_spatial_fov_factor = float(
+        train_cfg.get("locality_refinement_spatial_fov_factor", 1.0)
+    )
+    if locality_refinement and locality_refinement_n_step <= 0:
+        raise ValueError("train.locality_refinement_n_step must be positive when locality refinement is enabled")
+    if locality_refinement_n_target is not None and locality_refinement_n_target <= 0:
+        raise ValueError("train.n_target must be a positive integer or null")
+    if locality_refinement_knn_space not in {"random", "spatial", "latent"}:
+        raise ValueError("train.locality_refinement_knn_space must be 'spatial' or 'latent'")
+    if locality_spatial_fov_factor <= 0.0:
+        raise ValueError("train.locality_refinement_spatial_fov_factor must be positive")
     if "num_threads" in train_cfg:
         num_threads = max(1, int(train_cfg["num_threads"]))
         torch.set_num_threads(num_threads)
@@ -1754,6 +2137,32 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
 
     model = build_model3d_from_config(model_cfg, train_cfg, device) if is_3d_mode else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
+    locality_spatial_radius_px = None
+    if locality_refinement:
+        if is_3d_mode:
+            raise ValueError("train.locality_refinement currently supports 2D image/pyramid training only")
+        if not bool(getattr(model, "otf_masking", True)):
+            raise ValueError("train.locality_refinement requires model.otf_masking=true")
+        if str(getattr(model, "target_sampling_mode", "random")) not in {
+            "random",
+            "priority",
+            "priority_small_scale",
+        }:
+            raise ValueError(
+                "train.locality_refinement requires random, priority, or priority_small_scale target sampling"
+            )
+        if locality_refinement_knn_space == "spatial":
+            locality_spatial_radius_px = (
+                locality_spatial_fov_factor * float(model.encoder_receptive_field())
+            )
+        mode_label = "vanilla_matched" if vanilla_matched_steps else locality_refinement_knn_space
+        log_info(
+            f"[{config_name}] matched_target_batches=on mode={mode_label} "
+            f"batches_per_outer_step={1 + locality_refinement_n_step} "
+            f"targets_per_batch={'macro_count' if locality_refinement_n_target is None else locality_refinement_n_target} "
+            f"one_target_per_otf_pass={locality_refinement_n_target is not None} "
+            f"spatial_radius_px={locality_spatial_radius_px}"
+        )
     if is_main_process and not is_3d_mode:
         log_info(
             f"[{config_name}] masking_execution="
@@ -2283,6 +2692,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         require_precomputed_cdd=uses_cdd_channels,
         target_mask=target_mask,
         target_threshold=target_threshold,
+        locality_refinement=locality_refinement,
+        locality_refinement_n_target=locality_refinement_n_target,
     )
     if is_main_process and (not is_3d_mode) and str(getattr(model, "encoder_type", "")).lower() in CDD_CUBE_ENCODER_TYPES:
         log_info(
@@ -2401,6 +2812,21 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
     embed_spread_target = float(spread_regularizer["target_std"])
     spread_regularizer_eps = float(spread_regularizer["eps"])
     log_info(f"[{config_name}] spread_regularizer={json.dumps(spread_regularizer, sort_keys=True)}")
+    if locality_refinement and spread_regularizer_weight <= 0.0:
+        raise ValueError(
+            "train.locality_refinement requires train.spread_regularizer.weight > 0 "
+            "so every micro JEPA loss includes the anchored hinge term"
+        )
+    if locality_refinement:
+        log_info(
+            f"[{config_name}] followup_objective="
+            + (
+                "prediction_weight*prediction_loss + spread_weight*spread_hinge"
+                if vanilla_matched_steps
+                else "prediction_weight*prediction_loss + "
+                "spread_weight*relu(macro_initial_hinge-micro_hinge)"
+            )
+        )
     experimental_losses = dict(train_cfg.get("experimental_losses", {}))
     vicreg_var_weight = float(train_cfg.get("vicreg_var_weight", experimental_losses.get("vicreg_var_weight", 0.0)))
     vicreg_cov_weight = float(train_cfg.get("vicreg_cov_weight", experimental_losses.get("vicreg_cov_weight", 0.0)))
@@ -2449,6 +2875,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         "epoch",
         "batch",
         "global_step",
+        "loss_optimization_total",
+        "loss_macro",
         "loss_total",
         "loss_prediction",
         "lr",
@@ -2474,12 +2902,34 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         "dead_channel_count",
         "context_manifold_size",
         "targets_per_image",
+        "otf_macro_passes",
+        "otf_followup_mean_passes",
         "mask_footprint_mean_px",
         "mask_footprint_min_px",
         "mask_footprint_max_px",
         "mask_scale_factor",
-        "time_sec",
+        "locality_micro_mean_loss",
+        "locality_loss",
+        "locality_prediction",
+        "locality_hinge",
+        "locality_initial_hinge",
+        "locality_micro_hinge",
+        "locality_initial_std",
+        "locality_micro_std",
+        "locality_micro_steps",
     ]
+    for micro_step in range(locality_refinement_n_step if locality_refinement else 0):
+        step_number = micro_step + 1
+        metrics_header.extend(
+            [
+                f"locality_micro_step_{step_number}_loss",
+                f"locality_micro_step_{step_number}_prediction",
+                f"locality_micro_step_{step_number}_hinge",
+                f"locality_micro_step_{step_number}_hinge_penalty",
+                f"locality_micro_step_{step_number}_otf_passes",
+            ]
+        )
+    metrics_header.append("time_sec")
     if is_main_process:
         if os.path.exists(metrics_path):
             with open(metrics_path, "r", newline="", encoding="utf-8") as f:
@@ -2488,6 +2938,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 existing_header = list(reader.fieldnames or [])
             if existing_header != metrics_header:
                 legacy_names = {
+                    "loss_optimization_total": "loss_total",
                     "loss_total": "total_loss",
                     "loss_prediction": "loss_mse",
                     "loss_spread": "loss_sigreg",
@@ -2498,6 +2949,7 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     "embed_spread_mean": "ctx_std_mean",
                     "embed_spread_min": "ctx_std_min",
                     "context_manifold_size": "ctx_rank",
+                    "locality_micro_mean_loss": "locality_loss",
                 }
                 with open(metrics_path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.DictWriter(f, fieldnames=metrics_header)
@@ -2526,6 +2978,46 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         with open(visited_targets_log_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["epoch", "batch", "sample_idx", "target_idx", "z", "y", "x", "scale"])
+    locality_matches_path = os.path.join(session_dir, "locality_refinement_matches.csv")
+    if is_main_process and locality_refinement and not os.path.exists(locality_matches_path):
+        with open(locality_matches_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "epoch",
+                    "batch",
+                    "micro_step",
+                    "sample_idx",
+                    "anchor_y",
+                    "anchor_x",
+                    "target_idx",
+                    "target_y",
+                    "target_x",
+                    "neighbor_rank",
+                    "distance_px",
+                    "distance_latent",
+                    "n_targets",
+                    "knn_pool_size",
+                ]
+            )
+    locality_target_locations_path = os.path.join(
+        session_dir,
+        "locality_refinement_target_locations.csv",
+    )
+    if is_main_process and locality_refinement and not os.path.exists(locality_target_locations_path):
+        with open(locality_target_locations_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(
+                [
+                    "epoch",
+                    "batch",
+                    "micro_step",
+                    "sample_idx",
+                    "target_kind",
+                    "target_idx",
+                    "target_y",
+                    "target_x",
+                ]
+            )
 
     loss_weights_path = os.path.join(session_dir, "loss_weights.json")
     if is_main_process and not os.path.exists(loss_weights_path):
@@ -2534,6 +3026,22 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 {
                     "prediction_loss_weight": prediction_loss_weight,
                     "spread_regularizer": spread_regularizer,
+                    "locality_refinement": {
+                        "enabled": locality_refinement,
+                        "mode": "vanilla" if vanilla_matched_steps else locality_refinement_knn_space,
+                        "n_step": locality_refinement_n_step,
+                        "n_target": locality_refinement_n_target,
+                        "knn_space": locality_refinement_knn_space,
+                        "spatial_fov_factor": locality_spatial_fov_factor,
+                        "spatial_radius_px": locality_spatial_radius_px,
+                        "one_target_per_otf_pass": locality_refinement_n_target is not None,
+                        "hinge_reference": "macro_initial_std_hinge",
+                        "hinge_penalty": (
+                            "standard_spread_hinge"
+                            if vanilla_matched_steps
+                            else "relu(initial_hinge-micro_hinge)"
+                        ),
+                    },
                     "symmetry_loss_weight": symmetry_loss_weight,
                     "experimental_losses": experimental_losses,
                 },
@@ -2553,6 +3061,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         if is_ddp:
             train_sampler.set_epoch(epoch)
         epoch_total = 0.0
+        epoch_macro = 0.0
+        epoch_locality_micro_mean = 0.0
         epoch_prediction = 0.0
         epoch_sim = 0.0
         epoch_var = 0.0
@@ -2568,6 +3078,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         metrics_rows = []
         masked_scale_rows = []
         visited_rows = []
+        locality_match_rows = []
+        locality_target_location_rows = []
         tqdm.write(f"[{config_name}]")
         pbar = tqdm(
             enumerate(dataloader),
@@ -2597,6 +3109,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
             with autocast(device_type=autocast_device, enabled=use_amp):
                 outputs = model(x_clean, context_data=context_data) if not is_3d_mode else model(x_clean)
+                macro_otf_passes = int(
+                    outputs.get("otf_masking_num_passes", torch.tensor(0)).item()
+                )
                 if (
                     is_main_process
                     and batch_idx == 0
@@ -2642,6 +3157,22 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     + (spread_regularizer_weight * loss_spread)
                     + (symmetry_loss_weight * loss_symmetry)
                 )
+                locality_initial_std = None
+                locality_initial_hinge = None
+                if locality_refinement:
+                    locality_initial_embeddings = _locality_context_embeddings(
+                        outputs,
+                        spatial_mode=str(spread_regularizer.get("spatial_mode", "pooled")),
+                    )
+                    locality_initial_std = embedding_channel_std(
+                        locality_initial_embeddings,
+                        eps=spread_regularizer_eps,
+                    ).detach()
+                    locality_initial_hinge = embedding_std_hinge_loss(
+                        locality_initial_embeddings,
+                        target_std=embed_spread_target,
+                        eps=spread_regularizer_eps,
+                    ).detach()
             # DDP: sync component losses for accurate logging across all ranks
             if is_ddp:
                 components = torch.stack([
@@ -2662,9 +3193,219 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 cov_term_t = components[5] / w
             else:
                 log_loss_val = float(total_loss.item())
+            macro_loss_value = log_loss_val
 
             loss_for_backward = total_loss / accum_steps
             scaler.scale(loss_for_backward).backward()
+
+            locality_total_sum = 0.0
+            locality_prediction_sum = 0.0
+            locality_hinge_penalty_sum = 0.0
+            locality_micro_hinge_sum = 0.0
+            locality_micro_std_sum = 0.0
+            locality_micro_count = 0
+            locality_step_loss_values = [float("nan")] * locality_refinement_n_step
+            locality_step_prediction_values = [float("nan")] * locality_refinement_n_step
+            locality_step_hinge_values = [float("nan")] * locality_refinement_n_step
+            locality_step_hinge_penalty_values = [float("nan")] * locality_refinement_n_step
+            locality_step_otf_pass_values = [float("nan")] * locality_refinement_n_step
+            if locality_refinement:
+                assert (
+                    context_data is not None
+                    and locality_initial_std is not None
+                    and locality_initial_hinge is not None
+                )
+                macro_location_rows = []
+                if is_main_process:
+                    macro_locations_cpu = context_data[1].detach().cpu()
+                    macro_valid_cpu = context_data[3].detach().cpu().bool()
+                    for sample_index in range(int(macro_locations_cpu.shape[0])):
+                        for target_index in range(int(macro_locations_cpu.shape[1])):
+                            if not bool(macro_valid_cpu[sample_index, target_index]):
+                                continue
+                            macro_location_rows.append(
+                                (
+                                    int(sample_index),
+                                    "macro",
+                                    int(target_index),
+                                    int(macro_locations_cpu[sample_index, target_index, -2]),
+                                    int(macro_locations_cpu[sample_index, target_index, -1]),
+                                )
+                            )
+                for micro_step in range(locality_refinement_n_step):
+                    micro_context_data, match_rows = _sample_locality_refinement_context(
+                        context_data,
+                        allow_partial_overlap=float(getattr(model_without_ddp, "target_allow_partial_overlap", 0.0)),
+                        fixed_n_targets=locality_refinement_n_target,
+                        knn_space=locality_refinement_knn_space,
+                        candidate_latent_map=outputs["gt_map"].detach(),
+                        spatial_radius_px=locality_spatial_radius_px,
+                        one_target_per_pass=locality_refinement_n_target is not None,
+                    )
+                    micro_available = micro_context_data is not None
+                    if is_ddp:
+                        # Every DDP rank must execute the same number of
+                        # forwards/backwards. If any rank lacks a valid local
+                        # neighborhood, all ranks skip this microstep.
+                        availability = torch.tensor(
+                            int(micro_available),
+                            device=x_clean.device,
+                            dtype=torch.int32,
+                        )
+                        dist.all_reduce(availability, op=dist.ReduceOp.MIN)
+                        micro_available = bool(availability.item())
+                    if not micro_available:
+                        continue
+                    assert micro_context_data is not None
+                    with autocast(device_type=autocast_device, enabled=use_amp):
+                        micro_outputs = model(x_clean, context_data=micro_context_data)
+                        micro_prediction = model.compute_loss(micro_outputs)
+                        micro_embeddings = _locality_context_embeddings(
+                            micro_outputs,
+                            spatial_mode=str(spread_regularizer.get("spatial_mode", "pooled")),
+                        )
+                        micro_raw_hinge = embedding_std_hinge_loss(
+                            micro_embeddings,
+                            target_std=embed_spread_target,
+                            eps=spread_regularizer_eps,
+                        )
+                        micro_hinge_penalty = anchored_spread_hinge_loss(
+                            micro_embeddings,
+                            locality_initial_hinge,
+                            target_std=embed_spread_target,
+                            eps=spread_regularizer_eps,
+                        )
+                        followup_hinge_loss = (
+                            micro_raw_hinge if vanilla_matched_steps else micro_hinge_penalty
+                        )
+                        micro_loss = (
+                            (prediction_loss_weight * micro_prediction)
+                            + (spread_regularizer_weight * followup_hinge_loss)
+                        )
+                    scaler.scale(
+                        micro_loss / float(accum_steps * locality_refinement_n_step)
+                    ).backward()
+                    locality_total_sum += float(micro_loss.detach().item())
+                    locality_prediction_sum += float(micro_prediction.detach().item())
+                    locality_hinge_penalty_sum += float(followup_hinge_loss.detach().item())
+                    locality_micro_hinge_sum += float(micro_raw_hinge.detach().item())
+                    locality_micro_std_sum += float(
+                        embedding_channel_std(
+                            micro_embeddings.detach(),
+                            eps=spread_regularizer_eps,
+                        ).mean().item()
+                    )
+                    locality_micro_count += 1
+                    locality_step_loss_values[micro_step] = float(micro_loss.detach().item())
+                    locality_step_prediction_values[micro_step] = float(micro_prediction.detach().item())
+                    locality_step_hinge_values[micro_step] = float(micro_raw_hinge.detach().item())
+                    locality_step_hinge_penalty_values[micro_step] = float(
+                        followup_hinge_loss.detach().item()
+                    )
+                    locality_step_otf_pass_values[micro_step] = float(
+                        micro_outputs.get("otf_masking_num_passes", torch.tensor(0)).item()
+                    )
+                    if is_main_process:
+                        locality_match_rows.extend(
+                            (epoch + 1, batch_idx, micro_step + 1, *row)
+                            for row in match_rows
+                        )
+                        locality_target_location_rows.extend(
+                            (epoch + 1, batch_idx, micro_step + 1, *row)
+                            for row in macro_location_rows
+                        )
+                        locality_target_location_rows.extend(
+                            (
+                                epoch + 1,
+                                batch_idx,
+                                micro_step + 1,
+                                int(row[0]),
+                                "micro",
+                                int(row[3]),
+                                int(row[4]),
+                                int(row[5]),
+                            )
+                            for row in match_rows
+                        )
+
+            locality_loss_value = 0.0
+            locality_prediction_value = 0.0
+            locality_hinge_penalty_value = 0.0
+            locality_micro_hinge_value = 0.0
+            locality_micro_std_value = 0.0
+            locality_initial_hinge_value = (
+                float(locality_initial_hinge.item())
+                if locality_initial_hinge is not None and locality_initial_hinge.numel() == 1
+                else 0.0
+            )
+            locality_initial_std_value = (
+                float(locality_initial_std.mean().item())
+                if locality_initial_std is not None and locality_initial_std.numel() > 0
+                else 0.0
+            )
+            locality_followup_mean_otf_passes = (
+                float(np.nanmean(locality_step_otf_pass_values))
+                if any(math.isfinite(v) for v in locality_step_otf_pass_values)
+                else 0.0
+            )
+            if locality_refinement and is_ddp:
+                # Keep every plotted micro-step curve rank-averaged, just like
+                # the aggregate macro and locality metrics.
+                step_stats = torch.zeros(
+                    (locality_refinement_n_step, 5),
+                    device=x_clean.device,
+                    dtype=torch.float64,
+                )
+                for step_index in range(locality_refinement_n_step):
+                    if math.isfinite(locality_step_loss_values[step_index]):
+                        step_stats[step_index] = torch.tensor(
+                            [
+                                locality_step_loss_values[step_index],
+                                locality_step_prediction_values[step_index],
+                                locality_step_hinge_values[step_index],
+                                locality_step_hinge_penalty_values[step_index],
+                                1.0,
+                            ],
+                            device=x_clean.device,
+                            dtype=torch.float64,
+                        )
+                dist.all_reduce(step_stats, op=dist.ReduceOp.SUM)
+                for step_index in range(locality_refinement_n_step):
+                    step_count = float(step_stats[step_index, 4].item())
+                    if step_count <= 0.0:
+                        continue
+                    locality_step_loss_values[step_index] = float(step_stats[step_index, 0].item() / step_count)
+                    locality_step_prediction_values[step_index] = float(step_stats[step_index, 1].item() / step_count)
+                    locality_step_hinge_values[step_index] = float(step_stats[step_index, 2].item() / step_count)
+                    locality_step_hinge_penalty_values[step_index] = float(
+                        step_stats[step_index, 3].item() / step_count
+                    )
+            if locality_micro_count > 0:
+                locality_stats = torch.tensor(
+                    [
+                        locality_total_sum,
+                        locality_prediction_sum,
+                        locality_hinge_penalty_sum,
+                        locality_micro_hinge_sum,
+                        locality_micro_std_sum,
+                        locality_initial_hinge_value * locality_micro_count,
+                        locality_initial_std_value * locality_micro_count,
+                        float(locality_micro_count),
+                    ],
+                    device=x_clean.device,
+                    dtype=torch.float64,
+                )
+                if is_ddp:
+                    dist.all_reduce(locality_stats, op=dist.ReduceOp.SUM)
+                locality_count_global = max(1.0, float(locality_stats[7].item()))
+                locality_loss_value = float(locality_stats[0].item() / locality_count_global)
+                locality_prediction_value = float(locality_stats[1].item() / locality_count_global)
+                locality_hinge_penalty_value = float(locality_stats[2].item() / locality_count_global)
+                locality_micro_hinge_value = float(locality_stats[3].item() / locality_count_global)
+                locality_micro_std_value = float(locality_stats[4].item() / locality_count_global)
+                locality_initial_hinge_value = float(locality_stats[5].item() / locality_count_global)
+                locality_initial_std_value = float(locality_stats[6].item() / locality_count_global)
+                log_loss_val += locality_loss_value
 
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
                 scaler_scale_before_step = scaler.get_scale()
@@ -2729,11 +3470,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
             elapsed = time.time() - start
             global_step = epoch * max(1, len(dataloader)) + batch_idx
-            metrics_rows.append(
-                [
+            metric_row = [
                     epoch + 1,
                     batch_idx,
                     global_step,
+                    log_loss_val,
+                    macro_loss_value,
                     log_loss_val,
                     float(loss_prediction.item()),
                     float(current_lr),
@@ -2759,13 +3501,34 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     ctx_stats["dead_channel_count"],
                     ctx_stats["context_manifold_size"],
                     targets_per_image,
+                    macro_otf_passes,
+                    locality_followup_mean_otf_passes,
                     mask_footprint_mean_px,
                     mask_footprint_min_px,
                     mask_footprint_max_px,
                     mask_scale_factor,
-                    round(elapsed, 4),
+                    locality_loss_value,
+                    locality_loss_value,
+                    locality_prediction_value,
+                    locality_hinge_penalty_value,
+                    locality_initial_hinge_value,
+                    locality_micro_hinge_value,
+                    locality_initial_std_value,
+                    locality_micro_std_value,
+                    locality_micro_count,
                 ]
-            )
+            for step_index in range(locality_refinement_n_step if locality_refinement else 0):
+                metric_row.extend(
+                    [
+                        locality_step_loss_values[step_index],
+                        locality_step_prediction_values[step_index],
+                        locality_step_hinge_values[step_index],
+                        locality_step_hinge_penalty_values[step_index],
+                        locality_step_otf_pass_values[step_index],
+                    ]
+                )
+            metric_row.append(round(elapsed, 4))
+            metrics_rows.append(metric_row)
             should_log_diagnostics = (
                 ((batch_idx + 1) % diagnostic_interval == 0)
                 or ((batch_idx + 1) == len(dataloader))
@@ -2824,8 +3587,12 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             if is_main_process and (batch_idx + 1) % log_flush_interval == 0:
                 _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
                 _flush_csv_rows(visited_targets_log_path, visited_rows)
+                if locality_refinement:
+                    _flush_csv_rows(locality_matches_path, locality_match_rows)
+                    _flush_csv_rows(locality_target_locations_path, locality_target_location_rows)
             loss_terms = _format_active_loss_terms(
-                total=log_loss_val,
+                total=macro_loss_value if locality_refinement else log_loss_val,
+                total_label="macro" if locality_refinement else "total",
                 prediction=float(loss_prediction.item()),
                 prediction_weight=prediction_loss_weight,
                 spread=float(loss_spread.item()),
@@ -2837,6 +3604,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 vicreg_cov=float(cov_term_t.item()),
                 vicreg_cov_weight=vicreg_cov_weight,
             )
+            if locality_refinement:
+                loss_terms = {"overall": _fmt_metric(log_loss_val), **loss_terms}
             batch_diag = {
                 "ctx_std": f"{ctx_stats['embed_spread_mean']:.3f}",
                 "ctx_effrank": f"{ctx_stats['context_manifold_size']:.2f}",
@@ -2845,6 +3614,17 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             }
             if target_z_counts:
                 batch_diag["z_tgt"] = target_z_counts
+            if locality_refinement:
+                batch_diag["locality"] = (
+                    f"{locality_micro_count}x "
+                    f"mean={locality_loss_value:.3g} "
+                    f"steps=[{','.join(_fmt_metric(v) for v in locality_step_loss_values if math.isfinite(v))}] "
+                    f"pred={locality_prediction_value:.3g} "
+                    f"hinge={locality_micro_hinge_value:.3g}/{locality_initial_hinge_value:.3g} "
+                    f"hinge_penalty={locality_hinge_penalty_value:.3g} "
+                    f"std={locality_micro_std_value:.3g}/{locality_initial_std_value:.3g} "
+                    f"otf={macro_otf_passes}+[{','.join(_fmt_metric(v) for v in locality_step_otf_pass_values)}]"
+                )
             batch_optim = {
                 "lr": f"{current_lr:.1e}",
             }
@@ -2858,9 +3638,10 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             if _use_wandb and (batch_idx + 1) % log_flush_interval == 0:
                 import wandb
 
-                wandb.log(
-                    {
-                        "train/loss_total": total_loss.item(),
+                wandb_metrics = {
+                        "train/loss_optimization_total": log_loss_val,
+                        "train/loss_macro": macro_loss_value,
+                        "train/loss_total": log_loss_val,
                         "train/loss_prediction": loss_prediction.item(),
                         "train/loss_spread": loss_spread.item(),
                         "train/loss_symmetry": loss_symmetry.item(),
@@ -2874,11 +3655,26 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         "metrics/targets_per_image": targets_per_image,
                         "metrics/target_slots_per_image": target_slots_per_image,
                         "metrics/mask_footprint_mean_px": mask_footprint_mean_px,
+                        "train/locality_micro_mean_loss": locality_loss_value,
+                        "train/locality_loss": locality_loss_value,
+                        "train/locality_prediction": locality_prediction_value,
+                        "train/locality_hinge": locality_hinge_penalty_value,
+                        "metrics/locality_initial_hinge": locality_initial_hinge_value,
+                        "metrics/locality_micro_hinge": locality_micro_hinge_value,
+                        "metrics/locality_initial_std": locality_initial_std_value,
+                        "metrics/locality_micro_std": locality_micro_std_value,
                         "epoch": epoch + 1,
-                    },
+                    }
+                for step_index, step_loss in enumerate(locality_step_loss_values, start=1):
+                    if math.isfinite(step_loss):
+                        wandb_metrics[f"train/locality_micro_step_{step_index}_loss"] = step_loss
+                wandb.log(
+                    wandb_metrics,
                     step=global_step,
                 )
             epoch_total += log_loss_val
+            epoch_macro += macro_loss_value
+            epoch_locality_micro_mean += locality_loss_value
             epoch_prediction += float(loss_prediction.item())
             epoch_sim += float(sim_val)
             epoch_var += float(var_val)
@@ -2899,6 +3695,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     csv.writer(f).writerows(metrics_rows)
             _flush_csv_rows(masked_scales_log_path, masked_scale_rows)
             _flush_csv_rows(visited_targets_log_path, visited_rows)
+            if locality_refinement:
+                _flush_csv_rows(locality_matches_path, locality_match_rows)
+                _flush_csv_rows(locality_target_locations_path, locality_target_location_rows)
             if visit_counts is not None:
                 np.save(os.path.join(session_dir, "visited_target_frequency.npy"), visit_counts.astype(np.float32))
 
@@ -2906,7 +3705,8 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
             avg_total = epoch_total / epoch_batches
             avg_prediction = epoch_prediction / epoch_batches
             epoch_terms = _format_active_loss_terms(
-                total=avg_total,
+                total=(epoch_macro / epoch_batches) if locality_refinement else avg_total,
+                total_label="macro" if locality_refinement else "total",
                 prediction=avg_prediction,
                 prediction_weight=prediction_loss_weight,
                 spread=epoch_spread / epoch_batches,
@@ -2918,12 +3718,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 vicreg_cov=epoch_cov / epoch_batches,
                 vicreg_cov_weight=vicreg_cov_weight,
             )
+            if locality_refinement:
+                epoch_terms = {"overall": _fmt_metric(avg_total), **epoch_terms}
             epoch_diag = {
                 "ctx_std": _fmt_metric(epoch_embed_spread_mean / epoch_batches),
                 "ctx_effrank": _fmt_metric(epoch_context_manifold_size / epoch_batches),
                 "active_tgt": f"{epoch_targets_per_image / epoch_batches:.1f}/{epoch_target_slots_per_image / epoch_batches:.1f}",
                 "valid": _fmt_metric(epoch_valid_frac / epoch_batches),
             }
+            if locality_refinement:
+                epoch_diag["locality_micro_mean"] = _fmt_metric(
+                    epoch_locality_micro_mean / epoch_batches
+                )
             tqdm.write(
                 f"[{config_name}] E {epoch + 1}/{epochs} "
                 f"{_format_progress_line('[epoch]', epoch_terms, epoch_diag)}"

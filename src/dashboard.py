@@ -23,7 +23,7 @@ from src.utils.support import effective_invalid_support_border_from_config
 from src.utils.viz import _compute_pca_3d, _compute_umap_nd, _preprocess_latents_for_umap, _target_region_mask_from_outputs
 
 
-DASHBOARD_VERSION = "production-diagnostics-v41-outer-fov-native-invalid"
+DASHBOARD_VERSION = "production-diagnostics-v44-locality-hinge-comparison"
 CONTROL_SCRIPT_SENTINEL = "window.JEPADashboardControls"
 DASHBOARD_COMPUTE_UMAP = os.environ.get("DASHBOARD_COMPUTE_UMAP", "1").strip().lower() in {"1", "true", "yes", "on"}
 DASHBOARD_UMAP_FIT_MAX_TOKENS = int(os.environ.get("DASHBOARD_UMAP_FIT_MAX_TOKENS", "12000"))
@@ -70,6 +70,13 @@ DASH_DATA_REQUIRED = {
     "gt_umap_rgb",
     "gt_umap_rgb_flat",
     "pyramid_mask_stack",
+    "loss_optimization_total",
+    "loss_macro",
+    "locality_micro_mean_loss",
+    "locality_micro_step_losses",
+    "locality_initial_hinge",
+    "locality_micro_hinge",
+    "locality_hinge_penalty",
 }
 
 
@@ -1787,7 +1794,10 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
     if not os.path.exists(metrics_path) and source_session_dir is not None:
         metrics_owner_dir = source_session_dir
         metrics_path = os.path.join(metrics_owner_dir, "metrics.csv")
-    loss_x, loss_total, loss_prediction = [], [], []
+    loss_x, loss_total, loss_macro, locality_micro_mean_loss, loss_prediction = [], [], [], [], []
+    locality_initial_hinge, locality_micro_hinge, locality_hinge_penalty = [], [], []
+    locality_micro_step_ids: list[int] = []
+    locality_micro_step_series: dict[int, list[float]] = {}
     loss_spread = []
     loss_symmetry, weighted_symmetry = [], []
     weighted_prediction, weighted_spread = [], []
@@ -1807,11 +1817,31 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
 
         with open(metrics_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
+            for field_name in reader.fieldnames or []:
+                match = re.fullmatch(r"locality_micro_step_(\d+)_loss", str(field_name))
+                if match is not None:
+                    locality_micro_step_ids.append(int(match.group(1)))
+            locality_micro_step_ids = sorted(set(locality_micro_step_ids))
+            locality_micro_step_series = {step: [] for step in locality_micro_step_ids}
             for row in reader:
                 ep = _row_float(row, "epoch")
                 ba = _row_float(row, "batch", "step")
                 gs = _row_float(row, "global_step")
-                tl = _row_float(row, "loss_total", "total_loss", "train_loss", "loss")
+                tl = _row_float(
+                    row,
+                    "loss_optimization_total",
+                    "loss_total",
+                    "total_loss",
+                    "train_loss",
+                    "loss",
+                )
+                ml = _row_float(row, "loss_macro")
+                lmm = _row_float(row, "locality_micro_mean_loss", "locality_loss")
+                lih = _row_float(row, "locality_initial_hinge")
+                lmh = _row_float(row, "locality_micro_hinge")
+                lhp = _row_float(row, "locality_hinge")
+                if not np.isfinite(ml) and np.isfinite(tl):
+                    ml = tl - lmm if np.isfinite(lmm) else tl
                 jl = _row_float(row, "loss_prediction", "loss_jepa", "jepa_loss", "loss_mse")
                 sl = _row_float(row, "loss_spread", "loss_sigreg")
                 syml = _row_float(row, "loss_symmetry", "loss_symmetric")
@@ -1837,6 +1867,16 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     loss_x.pop()
                     continue
                 loss_total.append(tl if np.isfinite(tl) else np.nan)
+                loss_macro.append(ml if np.isfinite(ml) else np.nan)
+                locality_micro_mean_loss.append(lmm if np.isfinite(lmm) else np.nan)
+                locality_initial_hinge.append(lih if np.isfinite(lih) else np.nan)
+                locality_micro_hinge.append(lmh if np.isfinite(lmh) else np.nan)
+                locality_hinge_penalty.append(lhp if np.isfinite(lhp) else np.nan)
+                for step in locality_micro_step_ids:
+                    step_loss = _row_float(row, f"locality_micro_step_{step}_loss")
+                    locality_micro_step_series[step].append(
+                        step_loss if np.isfinite(step_loss) else np.nan
+                    )
                 loss_prediction.append(jl if np.isfinite(jl) else np.nan)
                 loss_spread.append(sl if np.isfinite(sl) else np.nan)
                 loss_symmetry.append(syml if np.isfinite(syml) else np.nan)
@@ -1867,6 +1907,11 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                         continue
                     loss_x.append(ep)
                     loss_total.append(train_loss)
+                    loss_macro.append(train_loss)
+                    locality_micro_mean_loss.append(np.nan)
+                    locality_initial_hinge.append(np.nan)
+                    locality_micro_hinge.append(np.nan)
+                    locality_hinge_penalty.append(np.nan)
                     loss_prediction.append(np.nan)
                     loss_spread.append(np.nan)
                     loss_symmetry.append(np.nan)
@@ -1880,6 +1925,12 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
                     targets_per_image.append(np.nan)
                     mask_footprint_mean_px.append(np.nan)
                     mask_scale_factor.append(np.nan)
+    if locality_micro_step_ids:
+        locality_micro_step_losses = np.column_stack(
+            [locality_micro_step_series[step] for step in locality_micro_step_ids]
+        ).astype(np.float32, copy=False)
+    else:
+        locality_micro_step_losses = np.empty((len(loss_x), 0), dtype=np.float32)
     effective_rank_x, effective_rank_y = [], []
     run_results_path = os.path.join(metrics_owner_dir, "run_results.csv")
     if not os.path.exists(run_results_path) and source_session_dir is not None:
@@ -2077,7 +2128,15 @@ def compute_dash_data(session_dir: str, overwrite: bool = False) -> str:
         masked_pred_latent_norm=latent_norm_maps["masked_pred"],
         gt_latent_norm=latent_norm_maps["gt"],
         loss_x=np.asarray(loss_x, dtype=np.float32),
+        loss_optimization_total=np.asarray(loss_total, dtype=np.float32),
         loss_total=np.asarray(loss_total, dtype=np.float32),
+        loss_macro=np.asarray(loss_macro, dtype=np.float32),
+        locality_micro_mean_loss=np.asarray(locality_micro_mean_loss, dtype=np.float32),
+        locality_initial_hinge=np.asarray(locality_initial_hinge, dtype=np.float32),
+        locality_micro_hinge=np.asarray(locality_micro_hinge, dtype=np.float32),
+        locality_hinge_penalty=np.asarray(locality_hinge_penalty, dtype=np.float32),
+        locality_micro_step_ids=np.asarray(locality_micro_step_ids, dtype=np.int32),
+        locality_micro_step_losses=locality_micro_step_losses,
         loss_prediction=np.asarray(loss_prediction, dtype=np.float32),
         loss_spread=np.asarray(loss_spread, dtype=np.float32),
         loss_symmetry=np.asarray(loss_symmetry, dtype=np.float32),
@@ -2730,7 +2789,22 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         return vals.astype(np.float32, copy=False)
 
     loss_x = _npz_array("loss_x")
-    loss_total = np.asarray(data["loss_total"], dtype=np.float32) if "loss_total" in data.files else np.asarray([], dtype=np.float32)
+    loss_total = _npz_array("loss_optimization_total", "loss_total")
+    loss_macro = _npz_array("loss_macro")
+    locality_micro_mean_loss = _npz_array("locality_micro_mean_loss")
+    locality_initial_hinge = _npz_array("locality_initial_hinge")
+    locality_micro_hinge = _npz_array("locality_micro_hinge")
+    locality_hinge_penalty = _npz_array("locality_hinge_penalty")
+    locality_micro_step_ids = (
+        np.asarray(data["locality_micro_step_ids"], dtype=np.int32).reshape(-1)
+        if "locality_micro_step_ids" in data.files
+        else np.asarray([], dtype=np.int32)
+    )
+    locality_micro_step_losses = (
+        np.asarray(data["locality_micro_step_losses"], dtype=np.float32)
+        if "locality_micro_step_losses" in data.files
+        else np.empty((loss_total.size, 0), dtype=np.float32)
+    )
     loss_prediction = _npz_array("loss_prediction", "loss_jepa")
     loss_spread = _npz_array("loss_spread", "loss_sigreg")
     loss_symmetry = _npz_array("loss_symmetry", "loss_symmetric")
@@ -2839,6 +2913,83 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
             )
         )
 
+    fig_optimization_objectives = go.Figure()
+    if n > 0:
+        lx = loss_x[:n]
+        _add_loss_trace(
+            fig_optimization_objectives,
+            x=lx,
+            y=loss_total[:n],
+            name="overall optimization loss (loss_total) = macro + mean(micro)",
+            color="#111111",
+        )
+        if loss_macro.size >= n and np.isfinite(loss_macro[:n]).any():
+            _add_loss_trace(
+                fig_optimization_objectives,
+                x=lx,
+                y=loss_macro[:n],
+                name="macro-step objective",
+                color="#636EFA",
+            )
+        if locality_micro_mean_loss.size >= n and np.isfinite(locality_micro_mean_loss[:n]).any():
+            _add_loss_trace(
+                fig_optimization_objectives,
+                x=lx,
+                y=locality_micro_mean_loss[:n],
+                name="locality micro-step mean",
+                color="#EF553B",
+            )
+        micro_colors = ("#AB63FA", "#00CC96", "#FFA15A", "#19D3F3", "#FF6692", "#B6E880")
+        if locality_micro_step_losses.ndim == 2 and locality_micro_step_losses.shape[0] >= n:
+            step_count = min(locality_micro_step_losses.shape[1], locality_micro_step_ids.size)
+            for step_index in range(step_count):
+                step_values = locality_micro_step_losses[:n, step_index]
+                if not np.isfinite(step_values).any():
+                    continue
+                step_number = int(locality_micro_step_ids[step_index])
+                _add_loss_trace(
+                    fig_optimization_objectives,
+                    x=lx,
+                    y=step_values,
+                    name=f"locality micro-step {step_number}",
+                    color=micro_colors[step_index % len(micro_colors)],
+                )
+    fig_optimization_objectives.update_layout(
+        template="plotly_white",
+        title={"text": "Optimization Objectives — Overall, Macro, and Locality Micro-Steps", "x": 0.02},
+        margin=dict(l=42, r=8, t=36, b=36),
+        height=370,
+        legend=active_loss_legend,
+    )
+    fig_optimization_objectives.update_xaxes(title_text="global_step")
+    fig_optimization_objectives.update_yaxes(title_text="weighted objective")
+
+    fig_locality_hinge = go.Figure()
+    if n > 0:
+        lx = loss_x[:n]
+        for values, name, color in (
+            (locality_initial_hinge, "initial macro hinge", "#3B82F6"),
+            (locality_micro_hinge, "micro hinge mean", "#F97316"),
+            (locality_hinge_penalty, "hinge-shrink penalty", "#DC2626"),
+        ):
+            if values.size >= n and np.isfinite(values[:n]).any():
+                _add_loss_trace(
+                    fig_locality_hinge,
+                    x=lx,
+                    y=values[:n],
+                    name=name,
+                    color=color,
+                )
+    fig_locality_hinge.update_layout(
+        template="plotly_white",
+        title={"text": "Locality Hinge — Initial, Micro, and Shrink Penalty", "x": 0.02},
+        margin=dict(l=42, r=8, t=36, b=36),
+        height=330,
+        legend=active_loss_legend,
+    )
+    fig_locality_hinge.update_xaxes(title_text="global_step")
+    fig_locality_hinge.update_yaxes(title_text="hinge value")
+
     fig_loss_components = go.Figure()
     if n > 0:
         lx = loss_x[:n]
@@ -2858,16 +3009,137 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
         lx = loss_x[:n]
         for name, _, weighted_arr, color in active_loss_terms:
             _add_loss_trace(fig_weighted_components, x=lx, y=weighted_arr, name=f"weighted_{name}", color=color)
-        _add_loss_trace(fig_weighted_components, x=lx, y=loss_total[:n], name="loss_total", color="#222222")
+        macro_curve = loss_macro[:n] if loss_macro.size >= n else loss_total[:n]
+        _add_loss_trace(
+            fig_weighted_components,
+            x=lx,
+            y=macro_curve,
+            name="macro-step objective",
+            color="#222222",
+        )
     fig_weighted_components.update_layout(
         template="plotly_white",
-        title={"text": "Active Loss Terms (Weighted into loss_total)", "x": 0.02},
+        title={"text": "Macro Step — Active Loss Terms (Weighted)", "x": 0.02},
         margin=dict(l=42, r=8, t=36, b=36),
         height=330,
         legend=active_loss_legend,
     )
     fig_weighted_components.update_xaxes(title_text="global_step")
     fig_weighted_components.update_yaxes(title_text="weighted contribution")
+
+    def _locality_target_locations_figure() -> go.Figure | None:
+        locations_path = os.path.join(session_dir, "locality_refinement_target_locations.csv")
+        if not os.path.exists(locations_path):
+            return None
+        records = []
+        with open(locations_path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    records.append(
+                        {
+                            "epoch": int(float(row["epoch"])),
+                            "batch": int(float(row["batch"])),
+                            "micro_step": int(float(row["micro_step"])),
+                            "sample_idx": int(float(row["sample_idx"])),
+                            "target_kind": str(row["target_kind"]).strip().lower(),
+                            "target_idx": int(float(row["target_idx"])),
+                            "target_y": float(row["target_y"]),
+                            "target_x": float(row["target_x"]),
+                        }
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if not records:
+            return None
+
+        latest_epoch, latest_batch = max((r["epoch"], r["batch"]) for r in records)
+        latest_records = [
+            r for r in records
+            if r["epoch"] == latest_epoch and r["batch"] == latest_batch
+        ]
+        sample_index = min(r["sample_idx"] for r in latest_records)
+        latest_records = [r for r in latest_records if r["sample_idx"] == sample_index]
+        micro_steps = sorted({r["micro_step"] for r in latest_records})
+        if not micro_steps:
+            return None
+
+        from plotly.subplots import make_subplots
+
+        cols = min(3, len(micro_steps))
+        rows = int(np.ceil(len(micro_steps) / max(1, cols)))
+        subplot_titles = [f"Micro-step {step}" for step in micro_steps]
+        fig = make_subplots(rows=rows, cols=cols, subplot_titles=subplot_titles)
+        display_h = max(
+            int(np.asarray(data["orig"]).shape[-2]),
+            int(max(r["target_y"] for r in latest_records)) + 1,
+        )
+        display_w = max(
+            int(np.asarray(data["orig"]).shape[-1]),
+            int(max(r["target_x"] for r in latest_records)) + 1,
+        )
+        for plot_index, micro_step in enumerate(micro_steps):
+            row_index = plot_index // cols + 1
+            col_index = plot_index % cols + 1
+            step_records = [r for r in latest_records if r["micro_step"] == micro_step]
+            for target_kind, color, symbol, label in (
+                ("macro", "#3B82F6", "circle", "macro targets"),
+                ("micro", "#F97316", "x", "micro targets"),
+            ):
+                points = [r for r in step_records if r["target_kind"] == target_kind]
+                fig.add_trace(
+                    go.Scattergl(
+                        x=[r["target_x"] for r in points],
+                        y=[r["target_y"] for r in points],
+                        mode="markers",
+                        name=label,
+                        legendgroup=target_kind,
+                        showlegend=(plot_index == 0),
+                        marker=dict(
+                            color=color,
+                            symbol=symbol,
+                            size=10 if target_kind == "micro" else 9,
+                            line=dict(color="white", width=1) if target_kind == "macro" else None,
+                        ),
+                        customdata=[r["target_idx"] for r in points],
+                        hovertemplate=(
+                            f"{label}<br>x=%{{x:.0f}}<br>y=%{{y:.0f}}"
+                            "<br>target=%{customdata}<extra></extra>"
+                        ),
+                    ),
+                    row=row_index,
+                    col=col_index,
+                )
+            axis_index = (row_index - 1) * cols + col_index
+            _apply_image_axes(
+                fig,
+                (display_h, display_w),
+                row=row_index,
+                col=col_index,
+                scaleanchor="x" if axis_index == 1 else f"x{axis_index}",
+            )
+            fig.update_yaxes(
+                range=[float(display_h) - 0.5, -0.5],
+                row=row_index,
+                col=col_index,
+            )
+        fig.update_layout(
+            template="plotly_white",
+            title={
+                "text": (
+                    "Macro vs Locality Micro-Batch Target Locations "
+                    f"(epoch {latest_epoch}, batch {latest_batch}, sample {sample_index})"
+                ),
+                "x": 0.02,
+            },
+            margin=dict(l=24, r=8, t=70, b=24),
+            height=max(370, 330 * rows),
+            plot_bgcolor="#F3F4F6",
+            legend=active_loss_legend,
+        )
+        return fig
+
+    fig_locality_targets = _locality_target_locations_figure()
+
     def _latest_finite(values: np.ndarray) -> float:
         arr = np.asarray(values, dtype=np.float32).reshape(-1)
         finite = arr[np.isfinite(arr)]
@@ -3237,8 +3509,36 @@ def plot_dash_html(session_dir: str, overwrite: bool = False) -> str:
                 )
     # Non-pair diagnostics come after the left RGB / right embedding pairs.
     diagnostic_cards = [
-        {"title": "Training Loss / Active Loss Terms (Weighted)", "fig": fig_weighted_components, "group": "weighted-loss-components"},
+        {
+            "title": "Training Loss / Overall vs Macro and Locality Micro-Steps",
+            "fig": fig_optimization_objectives,
+            "group": "optimization-objectives",
+        },
+        {
+            "title": "Macro-Step Loss / Active Loss Terms (Weighted)",
+            "fig": fig_weighted_components,
+            "group": "weighted-loss-components",
+        },
     ]
+    if any(
+        values.size > 0 and np.isfinite(values).any()
+        for values in (locality_initial_hinge, locality_micro_hinge, locality_hinge_penalty)
+    ):
+        diagnostic_cards.append(
+            {
+                "title": "Locality Hinge / Initial vs Micro and Shrink Penalty",
+                "fig": fig_locality_hinge,
+                "group": "locality-hinge",
+            }
+        )
+    if fig_locality_targets is not None:
+        diagnostic_cards.append(
+            {
+                "title": "Macro vs Locality Micro-Batch Target Locations",
+                "fig": fig_locality_targets,
+                "group": "locality-target-locations",
+            }
+        )
     visit_title = str(data["visit_heatmap_kind"]) if "visit_heatmap_kind" in data.files else "Visit Frequency Heatmap"
     visit_is_accepted_coverage = "Accepted Target Coverage" in visit_title
     visit_panel_title = (

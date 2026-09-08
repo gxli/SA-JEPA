@@ -1,0 +1,7 @@
+# Spatial-Euclidean KNN microstep arm of the matched 20-target ablation.
+
+base_config: mhd_example_otf_locality_refinement.yaml
+
+train:
+  locality_refinement_knn_space: spatial
+  locality_refinement_spatial_fov_factor: 1.0

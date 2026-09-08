@@ -520,6 +520,7 @@ def pack_target_mask_passes(
     height: int,
     width: int,
     allow_partial_overlap: float = 0.0,
+    one_target_per_pass: bool = False,
 ) -> torch.Tensor:
     """Greedily schedule every valid target into a compatible mask pass.
 
@@ -551,6 +552,14 @@ def pack_target_mask_passes(
     valid_cpu = target_valid.detach().to(device="cpu", dtype=torch.bool)
     boxes_cpu = target_box_sizes.detach().to(device="cpu", dtype=torch.float32)
     pass_ids = torch.full(target_valid.shape, -1, dtype=torch.long)
+
+    if bool(one_target_per_pass):
+        for bi in range(int(valid_cpu.shape[0])):
+            valid_indices = torch.nonzero(valid_cpu[bi], as_tuple=False).flatten()
+            pass_ids[bi, valid_indices] = torch.arange(
+                int(valid_indices.numel()), dtype=torch.long
+            )
+        return pass_ids.to(device=target_valid.device)
 
     for bi in range(int(locations_cpu.shape[0])):
         # Each group stores half-open rectangles (y0, y1, x0, x1).
@@ -687,6 +696,7 @@ def make_pyramid_grid_context(
     cdd_use_gpu: bool = False,
     cdd_orig_in: Optional[torch.Tensor] = None,
     use_cdd: bool = True,
+    return_candidate_pool: bool = False,
 ):
     """
     x_clean: B x 1 x H x W
@@ -748,6 +758,8 @@ def make_pyramid_grid_context(
     all_priority_auto_base_targets = []
     all_priority_effective_targets = []
     all_target_box_sizes = []
+    all_candidate_locations = []
+    all_candidate_box_sizes = []
 
     for bi in range(b):
         arr = x_clean[bi, 0].cpu().numpy().copy()
@@ -777,6 +789,8 @@ def make_pyramid_grid_context(
         priority_auto_base_targets_bi = 0.0
         priority_effective_targets_bi = 0.0
         priority_center_boxes: list[int] = []
+        candidate_locations_bi: list[tuple[int, int]] = []
+        candidate_box_sizes_bi: list[int] = []
 
         applied_locations = []
         applied_scales = []
@@ -960,6 +974,12 @@ def make_pyramid_grid_context(
                         good_candidate_boxes.append(int(cand_box))
                     priority_catalogue = good_candidates
                     candidate_boxes = good_candidate_boxes
+                    if bool(return_candidate_pool):
+                        # Keep the complete valid seed catalogue before macro
+                        # sampling/prescreening. Locality-refinement microsteps
+                        # draw their spatial KNN neighborhoods from this pool.
+                        candidate_locations_bi = list(good_candidates)
+                        candidate_box_sizes_bi = list(good_candidate_boxes)
                     if priority_sampling_mode:
                         budget_box = int(round(float(np.mean(candidate_boxes)))) if candidate_boxes else int(max_box)
                         prescreen_count = _fractional_spatial_target_budget(
@@ -1249,6 +1269,8 @@ def make_pyramid_grid_context(
             all_priority_prescreen_candidates.append(priority_prescreen_candidates_bi)
             all_priority_auto_base_targets.append(priority_auto_base_targets_bi)
             all_priority_effective_targets.append(priority_effective_targets_bi)
+            all_candidate_locations.append(candidate_locations_bi)
+            all_candidate_box_sizes.append(candidate_box_sizes_bi)
 
             continue
 
@@ -1311,6 +1333,42 @@ def make_pyramid_grid_context(
         "mask_footprint_px": torch.tensor(float(mask_box_size), dtype=x_clean.dtype, device=x_clean.device),
         "random_mask_box_per_target": torch.tensor(float(bool(random_mask_box_per_target)), dtype=x_clean.dtype, device=x_clean.device),
     }
+    if bool(return_candidate_pool):
+        max_candidates = max((len(v) for v in all_candidate_locations), default=0)
+        candidate_locations = torch.full(
+            (b, max_candidates, 2),
+            -1,
+            dtype=torch.long,
+            device=x_clean.device,
+        )
+        candidate_box_sizes = torch.zeros(
+            (b, max_candidates),
+            dtype=x_clean.dtype,
+            device=x_clean.device,
+        )
+        candidate_valid = torch.zeros(
+            (b, max_candidates),
+            dtype=torch.bool,
+            device=x_clean.device,
+        )
+        for bi, locations in enumerate(all_candidate_locations):
+            n_candidates = len(locations)
+            if n_candidates <= 0:
+                continue
+            candidate_locations[bi, :n_candidates] = torch.as_tensor(
+                locations,
+                dtype=torch.long,
+                device=x_clean.device,
+            )
+            candidate_box_sizes[bi, :n_candidates] = torch.as_tensor(
+                all_candidate_box_sizes[bi],
+                dtype=x_clean.dtype,
+                device=x_clean.device,
+            )
+            candidate_valid[bi, :n_candidates] = True
+        debug["candidate_locations"] = candidate_locations
+        debug["candidate_box_sizes"] = candidate_box_sizes
+        debug["candidate_valid"] = candidate_valid
     return x_context, target_locations, target_scales, target_valid, debug
 
 
@@ -1356,6 +1414,7 @@ def prepare_context_batch(
     use_cdd: bool = True,
     invalid_pixel_mask_in: Optional[torch.Tensor] = None,
     target_mask: Optional[torch.Tensor] = None,
+    return_candidate_pool: bool = False,
 ):
     """Prepare context tensors from a clean batch.
 
@@ -1417,6 +1476,7 @@ def prepare_context_batch(
         cdd_use_gpu=cdd_use_gpu,
         cdd_orig_in=cdd_orig_in,
         use_cdd=use_cdd,
+        return_candidate_pool=return_candidate_pool,
     )
     # Inject the merged NaN/invalid mask into the debug dict so forward()
     # can apply it to CDD features before the encoder sees them.

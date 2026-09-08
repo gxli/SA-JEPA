@@ -90,6 +90,60 @@ def _std_hinge(z: torch.Tensor, target_std: float, eps: float = 1e-4) -> torch.T
     return torch.relu(float(target_std) - std).mean()
 
 
+def embedding_channel_std(z: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """Return the per-channel population std used by spread hinge losses."""
+    z = z.float()
+    if z.ndim != 2:
+        raise ValueError(f"Expected a 2D embedding matrix, got {tuple(z.shape)}")
+    if z.shape[0] == 0:
+        return z.new_zeros((z.shape[1],))
+    centered = z - z.mean(dim=0, keepdim=True)
+    return torch.sqrt(centered.var(dim=0, unbiased=False) + float(eps))
+
+
+def embedding_std_hinge_loss(
+    z: torch.Tensor,
+    target_std: float = 1.0,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """Return the scalar standard-deviation hinge for an embedding matrix."""
+    if z.ndim != 2:
+        raise ValueError(f"Expected a 2D embedding matrix, got {tuple(z.shape)}")
+    if z.shape[0] < 2:
+        return z.sum() * 0.0
+    std = embedding_channel_std(z, eps=float(eps))
+    return torch.relu(float(target_std) - std).mean()
+
+
+def anchored_spread_hinge_loss(
+    z: torch.Tensor,
+    initial_hinge: torch.Tensor,
+    target_std: float = 1.0,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """Penalize only a microstep hinge that falls below its initial hinge.
+
+    The detached scalar reference is the macro-step std-hinge value. The
+    penalty is zero when the microstep hinge is unchanged or larger, and is
+    positive only when the microstep hinge shrinks.
+    """
+    current_hinge = embedding_std_hinge_loss(
+        z,
+        target_std=float(target_std),
+        eps=float(eps),
+    )
+    reference = torch.as_tensor(
+        initial_hinge,
+        device=current_hinge.device,
+        dtype=current_hinge.dtype,
+    ).detach()
+    if reference.numel() != 1:
+        raise ValueError(f"initial_hinge must be scalar, got {tuple(reference.shape)}")
+    if z.shape[0] < 2:
+        return z.sum() * 0.0
+    return torch.relu(reference.reshape(()) - current_hinge)
+
+
 def _centered_std(z: torch.Tensor, eps: float) -> torch.Tensor:
     z = z - z.mean(dim=0, keepdim=True)
     return torch.sqrt(z.var(dim=0, unbiased=False) + float(eps))
