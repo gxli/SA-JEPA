@@ -48,6 +48,16 @@ def _run_training_with_oom_retries(cfg: dict, *, config_name: str, sessions_root
                 raise
             train_cfg["batch_size"] = trainer.batch_size
             train_cfg["gradient_accumulation_steps"] = trainer.accumulation_steps
+            ratio = float(trainer.batch_size) / float(initial_batch)
+            if ratio < 1.0:
+                for tkey in ("inference_tile_size", "full_volume_spatial_tile_size", "inference_spatial_tile_size_3d"):
+                    if tkey in train_cfg and train_cfg[tkey] is not None:
+                        try:
+                            old_val = float(train_cfg[tkey])
+                        except (TypeError, ValueError):
+                            continue
+                        train_cfg[tkey] = max(64, int(old_val * ratio))
+                _logger.info("scaled inference tile sizes: ratio=%.2f", ratio)
             clear_memory_cache()
 
 

@@ -61,6 +61,7 @@ and `cdd_scale_space` are rejected.
 | `model.target_sampling_mode` | `random` | `random`, `priority`, or `priority_small_scale`. |
 | `model.target_nonoverlap` | `true` | Prevent target patches from overlapping. |
 | `model.target_allow_partial_overlap` | `0.0` | Tolerance for partial overlap (0 = strict). |
+| `model.otf_masking` | `true` | Retain overlapping targets and greedily schedule them into non-overlapping on-the-fly context-encoder passes. Set `false` to restore the legacy single-pass rejection behavior controlled by `target_nonoverlap`. |
 | `model.target_invalid_region_skip` | `true` | Skip targets in NaN/FOV border regions. |
 | `model.active_target_fraction` | `1.0` | Fraction of candidate grid cells that are eligible. |
 | `model.priority_top_percent` | `100` | Priority sampling: top-% of high-gradient cells. |

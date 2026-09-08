@@ -101,7 +101,7 @@ def _forward_tta_streaming_2d(
     """Run TTA one view at a time and average aligned maps without stacking views."""
     first_out = None
     sums: dict[str, torch.Tensor] = {}
-    counts: dict[str, int] = {}
+    counts: dict[str, torch.Tensor] = {}
     n_views = 0
     align_keys = set(keys) | {
         "x_clean_raw",
@@ -130,18 +130,20 @@ def _forward_tta_streaming_2d(
             value = out_v.get(key)
             if value is None:
                 continue
+            clean = torch.nan_to_num(value, nan=0.0)
+            valid = (~torch.isnan(value)).float()
             if key not in sums:
-                sums[key] = value
-                counts[key] = 1
+                sums[key] = clean
+                counts[key] = valid
             else:
-                sums[key].add_(value)
-                counts[key] += 1
+                sums[key].add_(clean)
+                counts[key].add_(valid)
         if out_v is not first_out:
             del out_v
     if first_out is None:
         raise ValueError("TTA produced no views")
     for key, value in sums.items():
-        first_out[key] = value.div(float(max(1, counts[key])))
+        first_out[key] = value / counts[key].clamp_min(1e-8)
     return first_out, n_views
 
 
@@ -863,20 +865,28 @@ def _run_tiled_dense_inference_2d(
     )
     sums: dict[str, torch.Tensor] = {}
     weight = torch.zeros((b, 1, h, w), dtype=torch.float32)
+    prev_y_end = 0
     for y0 in y_starts:
         ye = min(y0 + int(tile_size), h)
         valid_h = int(ye - y0)
         wy0 = 0 if y0 == 0 else min(margin, valid_h)
         wy1 = valid_h if ye == h else max(wy0, valid_h - min(margin, valid_h))
+        if y0 > 0:
+            wy0 = min(wy0, max(0, prev_y_end - y0))
         if wy1 <= wy0:
             continue
+        y_valid_end = y0 + wy1
+        prev_x_end = 0
         for x0 in x_starts:
             xe = min(x0 + int(tile_size), w)
             valid_w = int(xe - x0)
             wx0 = 0 if x0 == 0 else min(margin, valid_w)
             wx1 = valid_w if xe == w else max(wx0, valid_w - min(margin, valid_w))
+            if x0 > 0:
+                wx0 = min(wx0, max(0, prev_x_end - x0))
             if wx1 <= wx0:
                 continue
+            prev_x_end = x0 + wx1
             x_tile = x_raw[:, :, y0:ye, x0:xe]
             cdd_raw_tile = None if cdd_raw is None else cdd_raw[:, :, y0:ye, x0:xe]
             cdd_tile = None if cdd_source is None else cdd_source[:, :, y0:ye, x0:xe]
@@ -944,6 +954,7 @@ def _run_tiled_dense_inference_2d(
             weight[:, :, out_y0:out_y1, out_x0:out_x1] += 1.0
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+        prev_y_end = y_valid_end
 
     if not sums:
         raise RuntimeError(f"[{config_name}] tiled 2D dense inference produced no tiles")
@@ -987,7 +998,7 @@ def _run_tiled_dense_inference_2d_tta(
         )
 
     sums: dict[str, torch.Tensor] = {}
-    counts: dict[str, int] = {}
+    counts_nan_safe: dict[str, torch.Tensor] = {}
     n_views = 0
     x_tta, original_hw = _pad_even_spatial_2d(x_raw)
     cdd_tta = None
@@ -1026,16 +1037,18 @@ def _run_tiled_dense_inference_2d_tta(
         n_views += 1
         for key, value in tiled_view.items():
             aligned = _crop_spatial_2d(_apply_tta_2d(view_name, value), original_hw)
+            clean = torch.nan_to_num(aligned, nan=0.0)
+            valid = (~torch.isnan(aligned)).float()
             if key not in sums:
-                sums[key] = aligned
-                counts[key] = 1
+                sums[key] = clean
+                counts_nan_safe[key] = valid
             else:
-                sums[key].add_(aligned)
-                counts[key] += 1
+                sums[key].add_(clean)
+                counts_nan_safe[key].add_(valid)
         del tiled_view
     if not sums:
         raise RuntimeError(f"[{config_name}] tiled 2D TTA produced no views")
-    return {key: value.div(float(max(1, counts[key]))) for key, value in sums.items()}, n_views
+    return {key: value / counts_nan_safe[key].clamp_min(1e-8) for key, value in sums.items()}, n_views
 
 
 def _load_cdd_cache_for_image(session_dir: str, full_h: int, full_w: int, h: int, w: int,

@@ -5,11 +5,34 @@ import torch.nn.functional as F
 
 
 def l2_normalize_patches(tensor: torch.Tensor) -> torch.Tensor:
-    """L2-normalize per-target patch/cube tensors across all non-B/K dimensions."""
+    """L2-normalize per-target patch/cube tensors across all non-B/K dimensions.
+
+    When the flattened feature dimension (C * ...) is 1, L2 normalization reduces
+    every vector to ±1, destroying magnitude information. This function warns and
+    returns unmodified tensors when the feature dimension is too small.
+    """
     if tensor.dim() < 3:
         raise ValueError(f"Expected tensor with B,K,... shape, got {tuple(tensor.shape)}")
     b, k = tensor.shape[:2]
     patch_shape = tensor.shape[2:]
+    feature_dim = 1
+    for s in patch_shape:
+        feature_dim *= int(s)
+    if feature_dim < 2:
+        import warnings
+        warnings.warn(
+            f"l2_normalize_patches: feature dimension is {feature_dim} (shape={tuple(tensor.shape)}). "
+            "Normalizing a single scalar produces ±1 everywhere, destroying all magnitude. Skipping.",
+            RuntimeWarning,
+        )
+        return tensor
+    if feature_dim < 4:
+        import warnings
+        warnings.warn(
+            f"l2_normalize_patches: feature dimension is only {feature_dim} (shape={tuple(tensor.shape)}). "
+            "L2 normalization may be unstable; consider disabling normalize_loss_l2.",
+            RuntimeWarning,
+        )
     return F.normalize(tensor.reshape(b, k, -1), dim=2).reshape(b, k, *patch_shape)
 
 

@@ -104,6 +104,7 @@ class PyramidGridJEPA(nn.Module):
         use_symmetric_feature_loss: bool = False,
         target_nonoverlap: bool = True,
         target_allow_partial_overlap: float = 0.0,
+        otf_masking: bool = True,
         mask_box_hardcap: int | None = None,
         nan_border_sigma_multiplier: float = 3.0,
         invalid_support_border_mode: str = "encoder_rf",
@@ -205,6 +206,7 @@ class PyramidGridJEPA(nn.Module):
         self.use_symmetric_feature_loss = bool(use_symmetric_feature_loss)
         self.target_nonoverlap = bool(target_nonoverlap)
         self.target_allow_partial_overlap = float(target_allow_partial_overlap)
+        self.otf_masking = bool(otf_masking)
         self.requested_mask_box_hardcap = None if mask_box_hardcap is None else int(mask_box_hardcap)
         self.mask_box_hardcap = constrain_hardcap_to_encoder_footprint(
             self.requested_mask_box_hardcap,
@@ -428,6 +430,264 @@ class PyramidGridJEPA(nn.Module):
 
         return float(mask_scale), int(mask_box_size)
 
+    def _make_otf_mask_tokens(
+        self,
+        *,
+        pass_index: int,
+        pass_ids_cpu: torch.Tensor,
+        target_locations_cpu: torch.Tensor,
+        target_scales_cpu: torch.Tensor,
+        target_valid_cpu: torch.Tensor,
+        target_box_sizes_cpu: torch.Tensor,
+        cdd_box_sizes_cpu: torch.Tensor | None,
+        channels: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Build one packed, per-scale mask without rejecting any target."""
+        bsz, target_slots = target_valid_cpu.shape
+        tokens = torch.zeros((bsz, channels, height, width), device=device, dtype=dtype)
+        sampled_mode = self.target_sampling_mode in ("random", "priority", "priority_small_scale")
+        mask_all_scales = bool(self.align_scales or sampled_mode)
+
+        for bi in range(int(bsz)):
+            for ki in range(int(target_slots)):
+                if not bool(target_valid_cpu[bi, ki]) or int(pass_ids_cpu[bi, ki]) != int(pass_index):
+                    continue
+                cy = int(target_locations_cpu[bi, ki, 0])
+                cx = int(target_locations_cpu[bi, ki, 1])
+                target_box = max(self.patch_size, int(round(float(target_box_sizes_cpu[bi, ki]))))
+
+                if channels == 1:
+                    channel_boxes = ((0, target_box),)
+                elif self.random_mask_box_per_target:
+                    channel_boxes = tuple((ci, target_box) for ci in range(channels))
+                elif mask_all_scales:
+                    channel_boxes = tuple(
+                        (
+                            ci,
+                            max(
+                                self.patch_size,
+                                int(round(float(cdd_box_sizes_cpu[bi, min(ci, cdd_box_sizes_cpu.shape[1] - 1)])))
+                                if cdd_box_sizes_cpu is not None and cdd_box_sizes_cpu.numel() > 0
+                                else target_box,
+                            ),
+                        )
+                        for ci in range(channels)
+                    )
+                else:
+                    scale = float(target_scales_cpu[bi, ki])
+                    ci = min(range(channels), key=lambda idx: abs(float(self.sigmas[min(idx, len(self.sigmas) - 1)]) - scale))
+                    channel_boxes = ((ci, target_box),)
+
+                for ci, box in channel_boxes:
+                    half_lo = int(box) // 2
+                    half_hi = int(box) - half_lo
+                    y0 = max(0, cy - half_lo)
+                    y1 = min(height, cy + half_hi)
+                    x0 = max(0, cx - half_lo)
+                    x1 = min(width, cx + half_hi)
+                    if y1 > y0 and x1 > x0:
+                        tokens[bi, ci, y0:y1, x0:x1] = 1.0
+        return tokens
+
+    def _forward_packed_otf(
+        self,
+        *,
+        x_clean_enc: torch.Tensor,
+        cdd_orig: torch.Tensor | None,
+        cdd_orig_enc: torch.Tensor | None,
+        effective_invalid: torch.Tensor,
+        log_floor: torch.Tensor | None,
+        target_locations: torch.Tensor,
+        target_scales: torch.Tensor,
+        target_valid: torch.Tensor,
+        debug: dict,
+    ) -> dict:
+        """Run packed OTF context passes and assemble one result per target."""
+        pass_ids = debug["otf_mask_pass_ids"].to(device=x_clean_enc.device, dtype=torch.long)
+        if pass_ids.shape != target_valid.shape:
+            raise RuntimeError(
+                "otf_mask_pass_ids must match target_valid, "
+                f"got {tuple(pass_ids.shape)} vs {tuple(target_valid.shape)}"
+            )
+        num_passes = max(1, int(pass_ids.max().item()) + 1)
+        target_box_sizes = debug["target_box_sizes"].to(device=x_clean_enc.device, dtype=x_clean_enc.dtype)
+        cdd_box_sizes = debug.get("cdd_box_sizes")
+
+        # Mask construction is discrete. Copy its compact metadata once instead
+        # of synchronizing the accelerator for every target and every pass.
+        pass_ids_cpu = pass_ids.detach().cpu()
+        target_locations_cpu = target_locations.detach().cpu()
+        target_scales_cpu = target_scales.detach().cpu()
+        target_valid_cpu = target_valid.detach().cpu()
+        target_box_sizes_cpu = target_box_sizes.detach().cpu()
+        cdd_box_sizes_cpu = None if cdd_box_sizes is None else cdd_box_sizes.detach().cpu()
+
+        actual_target_in = None
+        target_symmetric_var = None
+        if self.encoder_type == "cdd_scaleaware_convnext":
+            if cdd_orig_enc is None:
+                raise RuntimeError("Packed OTF CDD masking requires clean CDD channels")
+            target_fields = norm_per_sample_channel(cdd_orig_enc) if self.scaleaware_norm_per_scale else cdd_orig_enc
+            zero_tokens = torch.zeros_like(target_fields)
+            with torch.no_grad():
+                if self.use_symmetric_feature_loss:
+                    gt_base, target_symmetric_var = symmetric_forward_2d(
+                        self.target_encoder,
+                        target_fields,
+                        mask_tokens=zero_tokens,
+                        return_var=True,
+                    )
+                else:
+                    gt_base = self.target_encoder(target_fields, mask_tokens=zero_tokens)
+        elif self.encoder_type in ("convnext_dense_pyramid", "escnn_c4_pyramid"):
+            if cdd_orig_enc is None:
+                raise RuntimeError("Packed OTF pyramid masking requires clean CDD channels")
+            zero_tokens = torch.zeros_like(cdd_orig_enc)
+            target_input = torch.cat([cdd_orig_enc, zero_tokens], dim=1)
+            with torch.no_grad():
+                if self.use_symmetric_feature_loss:
+                    gt_base, target_symmetric_var = symmetric_forward_2d(
+                        self.target_encoder, target_input, return_var=True
+                    )
+                else:
+                    gt_base = self.target_encoder(target_input)
+        elif self.encoder_type == "convnext_dense_masktoken":
+            zero_tokens = torch.zeros_like(x_clean_enc[:, :1])
+            target_input = torch.cat([x_clean_enc, zero_tokens], dim=1)
+            actual_target_in = target_input
+            with torch.no_grad():
+                if self.use_symmetric_feature_loss:
+                    gt_base, target_symmetric_var = symmetric_forward_2d(
+                        self.target_encoder, target_input, return_var=True
+                    )
+                else:
+                    gt_base = self.target_encoder(target_input)
+        else:
+            raise RuntimeError(f"Packed OTF masking is unsupported for encoder_type={self.encoder_type}")
+
+        with torch.no_grad():
+            gt_map = self.target_projector(gt_base)
+            gt_patches = extract_location_patches(gt_map, target_locations, patch_size=self.patch_size)
+
+        pred_patches = None
+        context_patches = None
+        representative_context = None
+        representative_pred = None
+        actual_context_in = None
+        symmetric_vars = []
+        bsz, _, height, width = x_clean_enc.shape
+
+        for pass_index in range(num_passes):
+            channels = int(cdd_orig.shape[1]) if cdd_orig is not None else 1
+            mask_tokens = self._make_otf_mask_tokens(
+                pass_index=pass_index,
+                pass_ids_cpu=pass_ids_cpu,
+                target_locations_cpu=target_locations_cpu,
+                target_scales_cpu=target_scales_cpu,
+                target_valid_cpu=target_valid_cpu,
+                target_box_sizes_cpu=target_box_sizes_cpu,
+                cdd_box_sizes_cpu=cdd_box_sizes_cpu,
+                channels=channels,
+                height=height,
+                width=width,
+                device=x_clean_enc.device,
+                dtype=x_clean_enc.dtype,
+            )
+
+            if self.encoder_type == "cdd_scaleaware_convnext":
+                assert cdd_orig is not None
+                masked_raw = cdd_orig * (1.0 - mask_tokens)
+                if self.post_log_transform:
+                    assert log_floor is not None
+                    context_fields = torch.log(torch.clamp(masked_raw, min=0.0) + log_floor)
+                else:
+                    context_fields = masked_raw
+                if effective_invalid.any():
+                    invalid_expanded = effective_invalid.expand(-1, context_fields.shape[1], -1, -1)
+                    context_fields = context_fields.masked_fill(invalid_expanded, 0.0)
+                    mask_tokens = mask_tokens.masked_fill(invalid_expanded, 1.0)
+                if self.scaleaware_norm_per_scale:
+                    context_fields = norm_per_sample_channel(context_fields)
+                if self.use_symmetric_feature_loss:
+                    context_base, context_var = symmetric_forward_2d(
+                        self.context_encoder,
+                        context_fields,
+                        mask_tokens=mask_tokens,
+                        return_var=True,
+                    )
+                    symmetric_vars.append(context_var)
+                else:
+                    context_base = self.context_encoder(context_fields, mask_tokens=mask_tokens)
+            elif self.encoder_type in ("convnext_dense_pyramid", "escnn_c4_pyramid"):
+                assert cdd_orig is not None
+                masked_raw = cdd_orig * (1.0 - mask_tokens)
+                if self.post_log_transform:
+                    assert log_floor is not None
+                    context_fields = torch.log(torch.clamp(masked_raw, min=0.0) + log_floor)
+                else:
+                    context_fields = masked_raw
+                if effective_invalid.any():
+                    invalid_expanded = effective_invalid.expand(-1, context_fields.shape[1], -1, -1)
+                    context_fields = context_fields.masked_fill(invalid_expanded, 0.0)
+                    mask_tokens = mask_tokens.masked_fill(invalid_expanded, 1.0)
+                context_input = torch.cat([context_fields, mask_tokens], dim=1)
+                if self.use_symmetric_feature_loss:
+                    context_base, context_var = symmetric_forward_2d(
+                        self.context_encoder, context_input, return_var=True
+                    )
+                    symmetric_vars.append(context_var)
+                else:
+                    context_base = self.context_encoder(context_input)
+            else:
+                masked_image = x_clean_enc * (1.0 - mask_tokens)
+                context_input = torch.cat([masked_image, mask_tokens], dim=1)
+                if actual_context_in is None:
+                    actual_context_in = context_input
+                if self.use_symmetric_feature_loss:
+                    context_base, context_var = symmetric_forward_2d(
+                        self.context_encoder, context_input, return_var=True
+                    )
+                    symmetric_vars.append(context_var)
+                else:
+                    context_base = self.context_encoder(context_input)
+
+            context_proj = self.projector(context_base)
+            pred_map = self.predictor(context_proj)
+            pred_for_pass = extract_location_patches(pred_map, target_locations, patch_size=self.patch_size)
+            context_for_pass = extract_location_patches(context_proj, target_locations, patch_size=self.patch_size)
+            selector = ((pass_ids == pass_index) & target_valid).view(
+                target_valid.shape[0], target_valid.shape[1], 1, 1, 1
+            )
+            selected_pred = torch.where(selector, pred_for_pass, torch.zeros_like(pred_for_pass))
+            selected_context = torch.where(selector, context_for_pass, torch.zeros_like(context_for_pass))
+            pred_patches = selected_pred if pred_patches is None else pred_patches + selected_pred
+            context_patches = selected_context if context_patches is None else context_patches + selected_context
+            if representative_context is None:
+                representative_context = context_base
+                representative_pred = pred_map
+
+        assert pred_patches is not None and context_patches is not None
+        assert representative_context is not None and representative_pred is not None
+        symmetric_var = torch.stack(symmetric_vars, dim=0).mean(dim=0) if symmetric_vars else None
+        return {
+            "context_map": representative_context,
+            "pred_map": representative_pred,
+            "gt_map": gt_map,
+            "pred_patches": pred_patches,
+            "gt_patches": gt_patches,
+            "context_patches": context_patches,
+            "symmetric_var": symmetric_var,
+            "target_symmetric_var": target_symmetric_var,
+            "actual_context_in": actual_context_in,
+            "actual_target_in": actual_target_in,
+            "num_passes": num_passes,
+            "pass_ids": pass_ids,
+        }
+
     @staticmethod
     def _coerce_manual_mask_box_sizes(value) -> tuple[int, ...] | None:
         if value is None:
@@ -579,6 +839,7 @@ class PyramidGridJEPA(nn.Module):
 
         x_clean_enc = x_clean
         x_context_enc = x_context
+        log_floor = None
         if self.post_log_transform:
             eps = max(1e-6, float(self.log_eps))
             # Shared floor keeps clean and masked CDD reconstructions on one scale.
@@ -599,6 +860,7 @@ class PyramidGridJEPA(nn.Module):
         dip_per_ch = None
         cdd_orig_enc = None
         cdd_masked_enc = None
+        effective_invalid = invalid_pixel_mask
         needs_cdd_cube = self.encoder_type in CDD_CUBE_ENCODER_TYPES
         if needs_cdd_cube:
             cdd_orig = debug["cdd_channels_orig"].to(device=x_clean.device, dtype=x_clean.dtype)
@@ -621,7 +883,6 @@ class PyramidGridJEPA(nn.Module):
             # invalid_pixel_mask computed from x_clean may be all-False when
             # context_data is pre-computed (training path).  In that case the
             # merged mask is stored in the debug dict by prepare_context_batch.
-            effective_invalid = invalid_pixel_mask
             if not effective_invalid.any() and "_invalid_pixel_mask" in debug:
                 effective_invalid = debug["_invalid_pixel_mask"].to(
                     device=x_clean.device, dtype=torch.bool,
@@ -646,7 +907,38 @@ class PyramidGridJEPA(nn.Module):
             enc_context = enc_target
         symmetric_var = None  # trainable context-encoder symmetry-view variance
         target_symmetric_var = None  # detached EMA diagnostic only
-        if self.encoder_type == "cdd_scaleaware_convnext":
+        packed_otf = None
+        use_packed_otf = bool(
+            self.otf_masking
+            and mask_inference
+            and isinstance(debug, dict)
+            and debug.get("otf_masking_enabled", False)
+            and "otf_mask_pass_ids" in debug
+            and "target_box_sizes" in debug
+        )
+        if use_packed_otf:
+            packed_otf = self._forward_packed_otf(
+                x_clean_enc=x_clean_enc,
+                cdd_orig=cdd_orig,
+                cdd_orig_enc=cdd_orig_enc,
+                effective_invalid=effective_invalid,
+                log_floor=log_floor,
+                target_locations=target_locations,
+                target_scales=target_scales,
+                target_valid=target_valid,
+                debug=debug,
+            )
+            context_map = packed_otf["context_map"]
+            pred_map = packed_otf["pred_map"]
+            gt_map = packed_otf["gt_map"]
+            pred_patches = packed_otf["pred_patches"]
+            gt_patches = packed_otf["gt_patches"]
+            context_patches = packed_otf["context_patches"]
+            symmetric_var = packed_otf["symmetric_var"]
+            target_symmetric_var = packed_otf["target_symmetric_var"]
+            actual_context_in = packed_otf["actual_context_in"]
+            actual_target_in = packed_otf["actual_target_in"]
+        elif self.encoder_type == "cdd_scaleaware_convnext":
             if self.mode != "pyramid":
                 raise ValueError("cdd_scaleaware_convnext requires mode='pyramid'.")
             mask_tokens = dip_per_ch
@@ -757,15 +1049,16 @@ class PyramidGridJEPA(nn.Module):
                 gt_map = self.target_encoder(enc_target)
             context_map = self.context_encoder(enc_context)
         context_base = context_map
-        gt_base = gt_map
-        context_proj = self.projector(context_base)
-        pred_map = self.predictor(context_proj)
-        with torch.no_grad():
-            gt_map = self.target_projector(gt_base)
+        if packed_otf is None:
+            gt_base = gt_map
+            context_proj = self.projector(context_base)
+            pred_map = self.predictor(context_proj)
+            with torch.no_grad():
+                gt_map = self.target_projector(gt_base)
 
-        pred_patches = extract_location_patches(pred_map, target_locations, patch_size=self.patch_size)
-        gt_patches = extract_location_patches(gt_map, target_locations, patch_size=self.patch_size)
-        context_patches = extract_location_patches(context_proj, target_locations, patch_size=self.patch_size)
+            pred_patches = extract_location_patches(pred_map, target_locations, patch_size=self.patch_size)
+            gt_patches = extract_location_patches(gt_map, target_locations, patch_size=self.patch_size)
+            context_patches = extract_location_patches(context_proj, target_locations, patch_size=self.patch_size)
 
         out = {
             "pred_patches": pred_patches,
@@ -791,6 +1084,11 @@ class PyramidGridJEPA(nn.Module):
         if actual_context_in is not None:
             out["network_context_in"] = actual_context_in
             out["network_target_in"] = actual_target_in
+        if packed_otf is not None:
+            out["otf_masking_num_passes"] = torch.tensor(
+                float(packed_otf["num_passes"]), device=x_clean.device, dtype=x_clean.dtype
+            )
+            out["otf_mask_pass_ids"] = packed_otf["pass_ids"]
         for key in ("mask_scale_factor", "mask_footprint_px", "cdd_box_sizes", "target_box_sizes", "random_mask_box_per_target"):
             if key in debug:
                 out[key] = debug[key].to(device=x_clean.device, dtype=x_clean.dtype)

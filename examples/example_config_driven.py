@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Config-driven MHD example — loads config from YAML file."""
+import argparse
 import os, sys
 from pathlib import Path
 
@@ -72,8 +73,17 @@ def _write_interactive_umap_full_latent(session_dir: str, branch: str = "predict
 
 
 def main() -> None:
-    model = ScaleAwareJEPA(config=os.path.join(ROOT, "configs", "examples", "mhd_example.yaml"))
-    model.train(config_name="example_config_driven", sessions_dir=os.path.join(ROOT, "sessions"), dashboard=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        default=os.path.join(ROOT, "configs", "examples", "mhd_example.yaml"),
+    )
+    parser.add_argument("--name", default="example_config_driven")
+    parser.add_argument("--sessions-dir", default=os.path.join(ROOT, "sessions"))
+    args = parser.parse_args()
+
+    model = ScaleAwareJEPA(config=args.config)
+    model.train(config_name=args.name, sessions_dir=args.sessions_dir, dashboard=True)
     dashboard = os.path.join(model.session_dir, "dashboard.html")
     interactive_html = _write_interactive_umap_full_latent(model.session_dir, branch="predict")
     print(

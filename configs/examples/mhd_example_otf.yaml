@@ -1,0 +1,10 @@
+# MHD config-driven example using packed on-the-fly masking.
+# Run:
+#   python examples/example_config_driven.py \
+#     --config configs/examples/mhd_example_otf.yaml \
+#     --name example_config_driven_otf
+
+base_config: mhd_example.yaml
+
+model:
+  otf_masking: true

@@ -512,6 +512,99 @@ def _ensure_target_patches_masked(
             )
 
 
+def pack_target_mask_passes(
+    target_locations: torch.Tensor,
+    target_valid: torch.Tensor,
+    target_box_sizes: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+    allow_partial_overlap: float = 0.0,
+) -> torch.Tensor:
+    """Greedily schedule every valid target into a compatible mask pass.
+
+    Targets are never rejected for overlapping another target.  Instead, each
+    target is assigned to the first pass whose existing mask union overlaps no
+    more than ``allow_partial_overlap`` of the target's own mask footprint.
+    Invalid/padded target slots receive pass id ``-1``.
+    """
+    if target_locations.ndim != 3 or target_locations.shape[-1] != 2:
+        raise ValueError(
+            "target_locations must have shape BxKx2, "
+            f"got {tuple(target_locations.shape)}"
+        )
+    if target_valid.shape != target_locations.shape[:2]:
+        raise ValueError(
+            "target_valid must match target_locations[:2], "
+            f"got {tuple(target_valid.shape)} vs {tuple(target_locations.shape[:2])}"
+        )
+    if target_box_sizes.shape != target_locations.shape[:2]:
+        raise ValueError(
+            "target_box_sizes must match target_locations[:2], "
+            f"got {tuple(target_box_sizes.shape)} vs {tuple(target_locations.shape[:2])}"
+        )
+
+    h = max(1, int(height))
+    w = max(1, int(width))
+    allowed = min(max(float(allow_partial_overlap), 0.0), 0.95)
+    locations_cpu = target_locations.detach().to(device="cpu", dtype=torch.long)
+    valid_cpu = target_valid.detach().to(device="cpu", dtype=torch.bool)
+    boxes_cpu = target_box_sizes.detach().to(device="cpu", dtype=torch.float32)
+    pass_ids = torch.full(target_valid.shape, -1, dtype=torch.long)
+
+    for bi in range(int(locations_cpu.shape[0])):
+        # Each group stores half-open rectangles (y0, y1, x0, x1).
+        groups: list[list[tuple[int, int, int, int]]] = []
+        for ki in range(int(locations_cpu.shape[1])):
+            if not bool(valid_cpu[bi, ki]):
+                continue
+            cy = int(locations_cpu[bi, ki, 0])
+            cx = int(locations_cpu[bi, ki, 1])
+            box = max(1, int(round(float(boxes_cpu[bi, ki]))))
+            half_lo = box // 2
+            half_hi = box - half_lo
+            rect = (
+                max(0, cy - half_lo),
+                min(h, cy + half_hi),
+                max(0, cx - half_lo),
+                min(w, cx + half_hi),
+            )
+            y0, y1, x0, x1 = rect
+            if y1 <= y0 or x1 <= x0:
+                continue
+
+            assigned = False
+            for pass_index, existing in enumerate(groups):
+                if allowed <= 0.0:
+                    compatible = all(
+                        y1 <= ey0 or y0 >= ey1 or x1 <= ex0 or x0 >= ex1
+                        for ey0, ey1, ex0, ex1 in existing
+                    )
+                else:
+                    # Measure overlap with the existing union, matching the
+                    # occupancy-map semantics of the legacy rejection sampler.
+                    occupied = np.zeros((y1 - y0, x1 - x0), dtype=np.bool_)
+                    for ey0, ey1, ex0, ex1 in existing:
+                        iy0 = max(y0, ey0)
+                        iy1 = min(y1, ey1)
+                        ix0 = max(x0, ex0)
+                        ix1 = min(x1, ex1)
+                        if iy1 > iy0 and ix1 > ix0:
+                            occupied[iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0] = True
+                    compatible = float(occupied.mean()) <= allowed
+                if compatible:
+                    existing.append(rect)
+                    pass_ids[bi, ki] = int(pass_index)
+                    assigned = True
+                    break
+
+            if not assigned:
+                groups.append([rect])
+                pass_ids[bi, ki] = int(len(groups) - 1)
+
+    return pass_ids.to(device=target_locations.device)
+
+
 def _target_patch_has_valid_input(
     valid_pixels: np.ndarray,
     cy: int,
@@ -951,7 +1044,12 @@ def make_pyramid_grid_context(
                         device=x_clean.device,
                     )
                     if not _target_center_has_valid_input(valid_pixels, int(cy1), int(cx1)):
-                        continue
+                        # The seed was pre-screened before dithering. Falling
+                        # back to it preserves the requested target budget
+                        # without moving a target into invalid support.
+                        cy1, cx1 = int(cy0), int(cx0)
+                        if not _target_center_has_valid_input(valid_pixels, int(cy1), int(cx1)):
+                            continue
                     priority_centers_dithered.append((int(cy1), int(cx1)))
                     dithered_boxes.append(int(cand_box))
 
@@ -1143,7 +1241,9 @@ def make_pyramid_grid_context(
             all_dip_proto_per_channel.append(dip_proto_ch_t.cpu())
             all_cdd_box_sizes.append(torch.tensor(cdd_box_sizes, dtype=torch.float32))
             all_cdd_blur_sigmas.append(torch.tensor(cdd_blur_sigmas, dtype=torch.float32))
-            all_target_box_sizes.append(list(applied_boxes))
+            all_target_box_sizes.append(
+                [float(unique_loc_to_box[(int(cy), int(cx))]) for cy, cx in sample_locations]
+            )
             all_priority_good_candidates.append(priority_good_candidates_bi)
             all_priority_nonzero_mean.append(priority_nonzero_mean_bi)
             all_priority_prescreen_candidates.append(priority_prescreen_candidates_bi)

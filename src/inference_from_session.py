@@ -114,10 +114,8 @@ def _tile_crops_2d(
     h, w = arr2d.shape
     cs = int(crop_size)
     if h <= cs and w <= cs:
-        # No tiling needed — return the whole thing (possibly padded)
         if h < cs or w < cs:
-            padded = np.zeros((cs, cs), dtype=np.float32)
-            padded[:h, :w] = np.asarray(arr2d, dtype=np.float32)
+            padded = np.pad(np.asarray(arr2d, dtype=np.float32), ((0, max(0, cs - h)), (0, max(0, cs - w))), mode="reflect")
             return [padded]
         return [np.asarray(arr2d, dtype=np.float32).copy()]
 
@@ -125,22 +123,28 @@ def _tile_crops_2d(
     if crop_mode == "center":
         y0 = max(0, (h - cs) // 2)
         x0 = max(0, (w - cs) // 2)
-        tile = np.zeros((cs, cs), dtype=np.float32)
-        th = min(cs, h - y0)
-        tw = min(cs, w - x0)
-        tile[:th, :tw] = np.asarray(arr2d[y0 : y0 + th, x0 : x0 + tw], dtype=np.float32)
+        region = np.asarray(arr2d[y0:y0 + min(cs, h - y0), x0:x0 + min(cs, w - x0)], dtype=np.float32)
+        th, tw = int(region.shape[0]), int(region.shape[1])
+        pad_h = max(0, cs - th)
+        pad_w = max(0, cs - tw)
+        tile = np.pad(region, ((0, pad_h), (0, pad_w)), mode="reflect") if (pad_h or pad_w) else region.copy()
         return [tile]
 
     tiles = []
-    stride = max(1, cs // 2)  # 50% overlap
+    stride = max(1, cs // 2)
     for y0 in range(0, h, stride):
         y1 = min(y0 + cs, h)
         for x0 in range(0, w, stride):
             x1 = min(x0 + cs, w)
-            tile = np.zeros((cs, cs), dtype=np.float32)
+            region = np.asarray(arr2d[y0:y1, x0:x1], dtype=np.float32)
             th = y1 - y0
             tw = x1 - x0
-            tile[:th, :tw] = np.asarray(arr2d[y0:y1, x0:x1], dtype=np.float32)
+            pad_h = max(0, cs - th)
+            pad_w = max(0, cs - tw)
+            if pad_h or pad_w:
+                tile = np.pad(region, ((0, pad_h), (0, pad_w)), mode="reflect")
+            else:
+                tile = region.copy()
             tiles.append(tile)
 
     return tiles
@@ -198,8 +202,7 @@ def _tile_crops_2d_with_layout(
                 f"{cs}x{cs} cutout, below crop_min_valid_fraction={crop_min_valid_fraction:.3f}."
             )
         if h < cs or w < cs:
-            padded = np.zeros((cs, cs), dtype=np.float32)
-            padded[:h, :w] = np.asarray(arr2d, dtype=np.float32)
+            padded = np.pad(np.asarray(arr2d, dtype=np.float32), ((0, max(0, cs - h)), (0, max(0, cs - w))), mode="reflect")
             visit_map = np.ones((h, w), dtype=np.int32)
             return [padded], TileLayout2D((h, w), cs, ((0, 0),), ((h, w),), visit_map, valid_mask_arr.copy(), float(crop_min_valid_fraction))
         if bool((~valid_mask_arr).any()):
@@ -212,10 +215,11 @@ def _tile_crops_2d_with_layout(
     if crop_mode == "center":
         y0 = max(0, (h - cs) // 2)
         x0 = max(0, (w - cs) // 2)
-        tile = np.zeros((cs, cs), dtype=np.float32)
-        th = min(cs, h - y0)
-        tw = min(cs, w - x0)
-        tile[:th, :tw] = np.asarray(arr2d[y0 : y0 + th, x0 : x0 + tw], dtype=np.float32)
+        region = np.asarray(arr2d[y0:y0 + min(cs, h - y0), x0:x0 + min(cs, w - x0)], dtype=np.float32)
+        th, tw = int(region.shape[0]), int(region.shape[1])
+        pad_h = max(0, cs - th)
+        pad_w = max(0, cs - tw)
+        tile = np.pad(region, ((0, pad_h), (0, pad_w)), mode="reflect") if (pad_h or pad_w) else region.copy()
         return [tile], None
 
     tiles = []
@@ -235,8 +239,12 @@ def _tile_crops_2d_with_layout(
             valid_fraction = float(valid_mask_arr[y0:y1, x0:x1].sum()) / float(max(1, th * tw))
             if valid_fraction <= min_valid:
                 continue
-            tile = np.zeros((cs, cs), dtype=np.float32)
-            tile[:th, :tw] = region
+            pad_h = max(0, int(cs) - int(th))
+            pad_w = max(0, int(cs) - int(tw))
+            if pad_h or pad_w:
+                tile = np.pad(region, ((0, pad_h), (0, pad_w)), mode="reflect")
+            else:
+                tile = region.copy()
             tiles.append(tile)
             origins.append((y0, x0))
             valid_shapes.append((th, tw))

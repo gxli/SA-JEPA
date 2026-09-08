@@ -56,6 +56,7 @@ model:
   active_target_fraction: 1.0
   target_nonoverlap: true
   target_allow_partial_overlap: 0.0
+  otf_masking: true
   target_invalid_region_skip: true
   priority_top_percent: 100
   priority_n_target: auto

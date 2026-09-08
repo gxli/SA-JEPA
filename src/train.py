@@ -42,7 +42,7 @@ from src.losses import (
 )
 from src.models.build_jepa import CDD_CUBE_ENCODER_TYPES, CDD_DEBUG_ENCODER_TYPES, MASK_MAP_ENCODER_TYPES, PyramidGridJEPA
 from src.models.build_jepa3d import PyramidGridJEPA3D, compute_3d_encoder_receptive_field_depth
-from src.models.masking import _max_effective_mask_box_size, prepare_context_batch
+from src.models.masking import _max_effective_mask_box_size, pack_target_mask_passes, prepare_context_batch
 from src.utils import log_error, set_error_log_path
 from src.utils.cdd_import import import_constrained_diffusion, safe_constrained_diffusion_decomposition
 from src.utils.npy import _safe_load_npy
@@ -198,30 +198,6 @@ def _flush_csv_rows(path: str, rows: list[list]) -> None:
     with open(path, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(rows)
     rows.clear()
-
-
-def _concat_accumulated_outputs(outputs_list: list[dict]) -> dict:
-    """Concatenate per-microbatch outputs so batch-stat losses see the full window."""
-    if not outputs_list:
-        raise ValueError("Cannot concatenate an empty accumulation window")
-    if len(outputs_list) == 1:
-        return outputs_list[0]
-
-    merged = {}
-    keys = set().union(*(outputs.keys() for outputs in outputs_list))
-    for key in keys:
-        values = [outputs[key] for outputs in outputs_list if key in outputs]
-        if len(values) != len(outputs_list):
-            continue
-        first = values[0]
-        if torch.is_tensor(first) and first.dim() > 0:
-            if all(torch.is_tensor(v) and v.dim() > 0 and tuple(v.shape[1:]) == tuple(first.shape[1:]) for v in values):
-                merged[key] = torch.cat(values, dim=0)
-            else:
-                merged[key] = first
-        else:
-            merged[key] = first
-    return merged
 
 
 def _collate_pad_spatial(batch: list[torch.Tensor]) -> torch.Tensor:
@@ -936,6 +912,7 @@ class _MaskingCollator:
     ):
         enc_type = str(getattr(model, "encoder_type", "")).lower()
         self.use_cdd = bool(enc_type in CDD_CUBE_ENCODER_TYPES)
+        self.otf_masking = bool(getattr(model, "otf_masking", True))
         self.require_precomputed_cdd = bool(require_precomputed_cdd)
         self.return_debug = bool(
             return_debug
@@ -954,6 +931,7 @@ class _MaskingCollator:
         )
         self.target_mask = target_mask
         self.target_threshold = target_threshold
+        self.target_allow_partial_overlap = float(getattr(model, "target_allow_partial_overlap", 0.0))
         self.context_kwargs = {
             "sigmas": model.sigmas,
             "mask_fraction": model.mask_fraction,
@@ -972,7 +950,9 @@ class _MaskingCollator:
             "priority_min_targets_per_map": model.priority_min_targets_per_map,
             "priority_dithering_pixels": model.priority_dithering_pixels,
             "priority_candidate_oversample": model.priority_candidate_oversample,
-            "target_nonoverlap": getattr(model, "target_nonoverlap", False),
+            # Packed OTF execution schedules overlaps into later passes, so the
+            # sampler must retain them instead of rejecting them up front.
+            "target_nonoverlap": False if self.otf_masking else getattr(model, "target_nonoverlap", False),
             "target_allow_partial_overlap": getattr(model, "target_allow_partial_overlap", 0.0),
             "mask_box_hardcap": getattr(model, "mask_box_hardcap", None),
             "use_cdd": self.use_cdd,
@@ -1064,6 +1044,37 @@ class _MaskingCollator:
             target_mask=batch_target_mask,
             **self.context_kwargs,
         )
+        if self.otf_masking:
+            if len(context_data) < 5 or not isinstance(context_data[4], dict):
+                raise RuntimeError("Packed OTF masking requires masking debug tensors")
+            debug = dict(context_data[4])
+            target_locations = context_data[1]
+            target_valid = context_data[3]
+            target_box_sizes = debug.get("target_box_sizes")
+            if target_box_sizes is None:
+                raise RuntimeError("Packed OTF masking requires target_box_sizes")
+            target_box_sizes = target_box_sizes.clone()
+            cdd_box_sizes = debug.get("cdd_box_sizes")
+            if cdd_box_sizes is not None and cdd_box_sizes.numel() > 0:
+                fallback_boxes = cdd_box_sizes.amax(dim=1, keepdim=True).expand_as(target_box_sizes)
+            else:
+                fallback_boxes = torch.full_like(target_box_sizes, float(max(1, self.mask_box_size)))
+            target_box_sizes = torch.where(
+                target_valid & (target_box_sizes <= 0),
+                fallback_boxes,
+                target_box_sizes,
+            )
+            debug["target_box_sizes"] = target_box_sizes
+            debug["otf_mask_pass_ids"] = pack_target_mask_passes(
+                target_locations,
+                target_valid,
+                target_box_sizes,
+                height=int(x_clean.shape[-2]),
+                width=int(x_clean.shape[-1]),
+                allow_partial_overlap=self.target_allow_partial_overlap,
+            )
+            debug["otf_masking_enabled"] = True
+            context_data = tuple(context_data[:4]) + (debug,)
         if metadata is not None:
             if len(context_data) >= 5 and isinstance(context_data[4], dict):
                 debug = dict(context_data[4])
@@ -1190,6 +1201,17 @@ def evaluate_validation(
         global_n = max(1.0, float(totals[2].item()))
         val_loss = float(totals[0].item() / global_n)
         val_sim = float(totals[1].item() / global_n)
+        world_size = torch.distributed.get_world_size()
+        if world_size > 1:
+            gathered = [None] * world_size
+            torch.distributed.all_gather_object(gathered, dict(scale_mse))
+            merged_scale_mse: dict[float, list[float]] = {}
+            for rank_dict in gathered:
+                if rank_dict is None:
+                    continue
+                for s, values in rank_dict.items():
+                    merged_scale_mse.setdefault(float(s), []).extend(values)
+            scale_mse = merged_scale_mse
 
     return {
         "val_loss": val_loss,
@@ -1508,6 +1530,7 @@ def build_model_from_config(model_cfg: dict, data_cfg: dict, train_cfg: dict, de
         and float(train_cfg.get("symmetry_loss_weight", 0.0)) > 0.0,
         target_nonoverlap=bool(model_cfg.get("target_nonoverlap", True)),
         target_allow_partial_overlap=float(model_cfg.get("target_allow_partial_overlap", 0.0)),
+        otf_masking=bool(model_cfg.get("otf_masking", True)),
         mask_box_hardcap=model_cfg.get("mask_box_hardcap"),
         nan_border_sigma_multiplier=float(model_cfg.get("nan_border_sigma_multiplier", data_cfg.get("nan_border_sigma_multiplier", 3.0))),
         invalid_support_border_mode=model_cfg.get(
@@ -1731,6 +1754,11 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         )
 
     model = build_model3d_from_config(model_cfg, train_cfg, device) if is_3d_mode else build_model_from_config(model_cfg, data_cfg, train_cfg, device)
+    if is_main_process and not is_3d_mode:
+        log_info(
+            f"[{config_name}] masking_execution="
+            f"{'packed_otf' if getattr(model, 'otf_masking', True) else 'legacy_single_pass'}"
+        )
 
     # DDP: wrap model for multi-GPU
     ddp_find_unused_parameters = bool(train_cfg.get("ddp_find_unused_parameters", True))
@@ -2540,7 +2568,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
         metrics_rows = []
         masked_scale_rows = []
         visited_rows = []
-        accumulated_outputs: list[dict] = []
         tqdm.write(f"[{config_name}]")
         pbar = tqdm(
             enumerate(dataloader),
@@ -2570,13 +2597,18 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
 
             with autocast(device_type=autocast_device, enabled=use_amp):
                 outputs = model(x_clean, context_data=context_data) if not is_3d_mode else model(x_clean)
-                if gradient_accumulation_mode == "batch":
-                    accumulated_outputs.append(outputs)
-                    is_accum_boundary = ((batch_idx + 1) % accum_steps == 0) or ((batch_idx + 1) == len(dataloader))
-                    if not is_accum_boundary:
-                        continue
-                    outputs = _concat_accumulated_outputs(accumulated_outputs)
-                    accumulated_outputs.clear()
+                if (
+                    is_main_process
+                    and batch_idx == 0
+                    and "otf_masking_num_passes" in outputs
+                ):
+                    valid_targets = int(outputs["target_valid"].sum().item())
+                    otf_passes = int(outputs["otf_masking_num_passes"].item())
+                    log_info(
+                        f"[{config_name}] epoch={epoch + 1} "
+                        f"otf_mask_passes={otf_passes} valid_targets={valid_targets}"
+                    )
+
                 zero_loss = outputs["pred_patches"].new_zeros(())
                 if abs(vicreg_var_weight) > 1e-12 or abs(vicreg_cov_weight) > 1e-12:
                     _, var_term_t, cov_term_t = compute_sim_var_cov_torch(
@@ -2610,24 +2642,38 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                     + (spread_regularizer_weight * loss_spread)
                     + (symmetry_loss_weight * loss_symmetry)
                 )
-            # DDP: sync a DETACHED clone for logging only (autograd must stay local)
+            # DDP: sync component losses for accurate logging across all ranks
             if is_ddp:
-                log_loss = total_loss.detach().clone()
-                dist.all_reduce(log_loss, op=dist.ReduceOp.SUM)
-                log_loss_val = float((log_loss / dist.get_world_size()).item())
+                components = torch.stack([
+                    total_loss.detach(),
+                    loss_prediction.detach(),
+                    loss_spread.detach(),
+                    loss_symmetry.detach(),
+                    var_term_t.detach(),
+                    cov_term_t.detach(),
+                ])
+                dist.all_reduce(components, op=dist.ReduceOp.SUM)
+                w = float(dist.get_world_size())
+                log_loss_val = float((components[0] / w).item())
+                loss_prediction = components[1] / w
+                loss_spread = components[2] / w
+                loss_symmetry = components[3] / w
+                var_term_t = components[4] / w
+                cov_term_t = components[5] / w
             else:
                 log_loss_val = float(total_loss.item())
 
-            loss_for_backward = total_loss / accum_steps if gradient_accumulation_mode == "step" else total_loss
+            loss_for_backward = total_loss / accum_steps
             scaler.scale(loss_for_backward).backward()
 
-            if gradient_accumulation_mode == "batch" or (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
                 scaler_scale_before_step = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 if (not use_amp) or scaler.get_scale() >= scaler_scale_before_step:
                     scheduler.step()
+                model_without_ddp.update_target_encoder()
             current_lr = scheduler.get_last_lr()[0]
 
             total_steps_sched = max(1, int(epochs) * max(1, len(dataloader)))
@@ -2645,7 +2691,6 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                 ema_final - 0.5 * (ema_final - ema_base) * (1.0 + math.cos(math.pi * ema_progress))
             )
             model_without_ddp.ema_momentum = new_momentum
-            model_without_ddp.update_target_encoder()
             sim_val, var_val, cov_val = compute_sim_var_cov(
                 outputs,
                 spatial_mode=vicreg_spatial_mode,
@@ -3026,9 +3071,9 @@ def run_training(config: dict, config_name: str, sessions_root: str = "sessions"
                         input_dataset,
                         batch_size=1,
                         shuffle=False,
-                        num_workers=num_workers,
+                        num_workers=0,
                         pin_memory=pin_memory,
-                        persistent_workers=persistent_workers,
+                        persistent_workers=False,
                         collate_fn=_collate_for_inference,
                         **loader_worker_kwargs,
                     )
